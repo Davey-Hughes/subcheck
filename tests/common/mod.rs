@@ -121,7 +121,7 @@ pub fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
-/// A file under tests/fixtures/, built by dev/make-subcheck-fixtures.sh.
+/// A file under tests/fixtures/, built by dev/make-fixtures.sh.
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")

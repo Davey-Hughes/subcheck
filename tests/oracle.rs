@@ -1,5 +1,5 @@
 //! `subs::extract` against mkvextract's own output for every text track in the fixtures
-//! (`tests/fixtures/expected/`, made by dev/make-subcheck-fixtures.sh), through both read paths.
+//! (`tests/fixtures/expected/`, made by dev/make-fixtures.sh), through both read paths.
 
 mod common;
 

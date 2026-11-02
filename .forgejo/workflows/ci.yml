@@ -1,0 +1,110 @@
+name: CI
+
+# `branches: [main]` on push, rather than every push everywhere. main is
+# protected and takes changes only through a pull request, so a push event on a
+# feature branch would just run the same jobs the PR is already running, twice.
+# What is left is the two moments that matter: the PR, and main after the merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# This file is the Forgejo half of a two-forge CI, and the half that gates.
+# .github/workflows/ci.yml lives on because this instance has docker runners
+# only, so the macOS leg exists there and nowhere here.
+#
+# It is NOT a pre-merge gate, though. Nothing pushes to GitHub by hand: the forge
+# push-mirrors every branch there, so the macOS job does run on a pull request's
+# branch, as a `push` event, shortly after each push. But its result never
+# reaches the Forgejo pull request, so nothing stops a merge on a red macOS run.
+# Before merging, look:
+#
+#   gh run list -R Davey-Hughes/subcheck --branch <branch>
+#
+# A macOS failure found only after the merge means main is broken: fix forward.
+#
+# The job clones with git rather than with actions/checkout, and the reason is
+# worth stating because the failure it avoids is silent. checkout is a
+# JavaScript action, and a JS action needs a node inside the job's container to
+# execute. The rust image carries none, and this runner does not inject one, so
+# a job combining `container:` with any JS action dies before its first step.
+#
+# The clone is authenticated because the instance requires sign-in for all
+# content, so an anonymous fetch is refused even for a public repository. The
+# runner supplies FORGEJO_TOKEN for exactly this, and FORGEJO_SERVER_URL is the
+# runner's own view of the forge -- an address on its container network --
+# rather than the public hostname.
+#
+# The job runs in rust:1.99.1-bookworm, the version rust-toolchain.toml names,
+# and the two move together. A floating rust:1-bookworm lets the runner keep
+# whatever copy it pulled last: on 2026-10-29 that was 1.97 while the local gate
+# had 1.99.1, and the two clippies disagreed. An exact tag cannot go stale, and
+# with it matching the file rustup has nothing to download in the job. Should
+# they ever differ, the file wins: rustup honours it inside the image too.
+
+jobs:
+  # The `apply` tests remux with mkvmerge and the `audio` tests decode with
+  # ffmpeg. They skip without them, so the job sets SUBCHECK_NEED_MKVMERGE and
+  # SUBCHECK_NEED_FFMPEG to make a missing one fail them instead. The tests read
+  # MKV fixtures committed under tests/fixtures/; dev/make-fixtures.sh builds
+  # them, only when a fixture changes. dev/check-all.sh runs these same steps
+  # locally: change it with this file.
+  subcheck:
+    name: subcheck
+    runs-on: docker
+    container:
+      image: rust:1.99.1-bookworm
+    steps:
+      - name: Checkout
+        env:
+          TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          host="${FORGEJO_SERVER_URL#http://}"; host="${host#https://}"
+          scheme="${FORGEJO_SERVER_URL%%://*}"
+          git init -q .
+          git remote add origin "${scheme}://x-access-token:${TOKEN}@${host}/${FORGEJO_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "$FORGEJO_REF"
+          git checkout -q FETCH_HEAD
+
+      # A dev script no test runs can carry a stray quote or a missing `fi` to
+      # main with CI green. This is the check that is about syntax.
+      - name: Syntax check
+        run: for f in dev/*.sh; do bash -n "$f"; done
+
+      # The image's minimal rustup profile has neither component, and what the
+      # image happens to carry is not something to lean on, so they are added
+      # here by name.
+      - name: Install rustfmt and clippy
+        run: rustup component add rustfmt clippy
+
+      # From MKVToolNix's own apt repository, pinned: bookworm's is 74.0, years behind the
+      # mkvmerge that remuxes the library, and apply's check models what mkvmerge writes. The
+      # repository keeps old releases, so the pin holds; to move on, change it here and in
+      # .github/workflows/ci.yml. Its signing key must be the one keyserver.ubuntu.com has too,
+      # alone in the file.
+      - name: Install mkvtoolnix
+        run: |
+          . /etc/os-release
+          key=/etc/apt/keyrings/gpg-pub-moritzbunkus.gpg
+          install -d /etc/apt/keyrings
+          curl -fsSL -o "$key" https://mkvtoolnix.download/gpg-pub-moritzbunkus.gpg
+          fpr=$(gpg --show-keys --with-colons "$key" | awk -F: '$1 == "pub" { getline; print $10 }')
+          [ "$fpr" = D9199745B0545F2E8197062B0F92290A445B9007 ] || { echo "unexpected MKVToolNix key: $fpr" >&2; exit 1; }
+          echo "deb [signed-by=$key] https://mkvtoolnix.download/$ID/ $VERSION_CODENAME main" >/etc/apt/sources.list.d/mkvtoolnix.list
+          apt-get update && apt-get install -y --no-install-recommends 'mkvtoolnix=103.0-*'
+
+      # bookworm's own (5.1): `audio`'s output on the fixtures is the same from it as from 9.0.
+      - name: Install ffmpeg
+        run: apt-get install -y --no-install-recommends ffmpeg
+
+      # So the log says which Rust this was (see the header).
+      - run: rustc --version
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+        env:
+          SUBCHECK_NEED_MKVMERGE: "1"
+          SUBCHECK_NEED_FFMPEG: "1"

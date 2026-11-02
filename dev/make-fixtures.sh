@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Rebuild subcheck-rs's test fixtures: small MKVs muxed from synthetic subtitles, and what mkvextract
+# Rebuild subcheck's test fixtures: small MKVs muxed from synthetic subtitles, and what mkvextract
 # makes of each of their text tracks -- the oracle that `subcheck extract` must match byte for byte.
 #
-#   dev/make-subcheck-fixtures.sh            # writes subcheck-rs/tests/fixtures/
-#   dev/make-subcheck-fixtures.sh OUT_DIR
+#   dev/make-fixtures.sh            # writes tests/fixtures/
+#   dev/make-fixtures.sh OUT_DIR
 #
 # Needs mkvmerge, mkvextract, mkvpropedit, ffmpeg and jq. The output is committed, so neither CI nor
 # `make check` needs any of them: run this only to add or change a fixture. Output is deterministic
@@ -13,7 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-out=${1:-subcheck-rs/tests/fixtures}
+out=${1:-tests/fixtures}
 for tool in mkvmerge mkvextract mkvpropedit ffmpeg jq; do
   command -v "$tool" >/dev/null || { echo "error: $tool not found" >&2; exit 1; }
 done

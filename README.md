@@ -27,6 +27,34 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
   TrueHD and its AC-3, a FLAC and an AAC of it) line up, with the `mkvmerge --sync` that fixes a
   steady lag. Needs ffmpeg; nothing recorded.
 
+## Install
+
+```sh
+cargo build --release
+ln -s "$PWD/target/release/subcheck" ~/.local/bin/subcheck   # any directory on your PATH
+```
+
+The link follows the build, so a later `cargo build --release` updates the command. Building needs
+a C compiler (SQLite is compiled in). At run time:
+
+| Needs | For |
+|---|---|
+| `claude`, `codex` or `ollama` (or any command, with `--llm-cmd`) | `scan` |
+| `mpv` | `o` in review |
+| mkvtoolnix | `apply` |
+| ffmpeg | `audio` |
+
+## Development
+
+`dev/check-all.sh` runs what CI gates on (rustfmt, clippy, the tests), with the `apply` and `audio`
+tests failing rather than skipping when mkvmerge or ffmpeg is missing. Run it before pushing a
+branch. The tests read small MKVs committed under `tests/fixtures/`, with mkvextract's output for
+each as the oracle; `dev/make-fixtures.sh` rebuilds them, needed only to add or change one.
+
+This repository's history before 2026-11-02 was in
+[daveyutils](https://github.com/Davey-Hughes/daveyutils): a `(daveyutils#N)` in a commit message is
+that repository's pull request N.
+
 ## Review
 
 `subcheck scan` opens this screen on the scan it starts, when stdout and stderr are a terminal

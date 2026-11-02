@@ -1,6 +1,6 @@
 //! `subcheck review`: accept, reject or reword each finding of a run, with a key that opens the
 //! moment in mpv. A pure Elm-style core (`model`, `update`) with the store and mpv at the edges
-//! (`run_effect`), as in nudge-rs's dashboard.
+//! (`run_effect`), as in nudge's dashboard (daveyutils).
 
 pub mod files;
 pub mod jobs;
@@ -41,7 +41,7 @@ use progress::Scan;
 use update::{Effect, Job, Mouse, Msg, Switch};
 
 /// A terminal event as a `Msg`. Ctrl and Alt chords never reach the plain-key handlers, so Ctrl-C
-/// quits instead of reading as `c` (the lesson of nudge-rs's `map_event`); with the mouse they are
+/// quits instead of reading as `c` (the lesson of nudge's `map_event`); with the mouse they are
 /// ignored.
 pub fn map_event(ev: &Event) -> Option<Msg> {
     let k = match ev {

@@ -28,7 +28,7 @@ pub use view::Selector;
 pub use write::{Attempt, Decided, Made, Saved, ScanRow, Swapped, is_busy};
 
 /// The state directory, from explicit inputs. An empty or relative `XDG_STATE_HOME` is ignored,
-/// as the XDG spec says and as nudge-rs does: a relative one would resolve against the cwd.
+/// as the XDG spec says and as nudge does: a relative one would resolve against the cwd.
 ///
 /// An absolute `XDG_STATE_HOME` wins on macOS too: macOS has no such convention, so one that is
 /// set was set on purpose (the tests rely on it to keep each run in a temporary directory).

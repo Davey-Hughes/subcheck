@@ -27,7 +27,7 @@ thiserror = "2"
 jiff = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# The review screen, at nudge-rs's versions.
+# The review screen, at the versions nudge (daveyutils) uses.
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29.0"
 # `audio`'s cross-correlation. Pure Rust, like flate2's backend.
@@ -47,8 +47,8 @@ tempfile = "3"
 # `group`'s tests point a child's stderr elsewhere.
 rustix = { version = "1", features = ["stdio"] }
 
-# Same policy as nudge-rs: CI gates on `cargo clippy --all-targets -- -D warnings`, so pedantic is
-# effectively deny. The three allows are the library-author lints nudge-rs turns off for the same
+# Same policy as nudge (daveyutils): CI gates on `cargo clippy --all-targets -- -D warnings`, so pedantic is
+# effectively deny. The three allows are the library-author lints nudge turns off for the same
 # reason: `pub` here marks module seams inside one binary, not an API anyone downstream calls.
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
