@@ -295,6 +295,27 @@ mux -o "$out/apply.mkv" --title 'Apply fixture' --chapters "$src/apply-chapters.
   --language 0:eng --track-name '0:English SDH' --default-track-flag 0:no \
   --hearing-impaired-flag 0:yes "$src/apply.srt"
 
+# What apply is tested on where ffmpeg wrote the original last, as a re-encode leaves a file. ffmpeg
+# carries mkvmerge's statistics tags through unchanged, so the audio's still count the PCM it was
+# before ffmpeg made it FLAC. The attachment's FileUID takes 8 bytes, zeros ahead, where mkvmerge
+# writes 1; the chapters have no EditionUID; the video says FlagInterlaced 2 (progressive) and has
+# no DisplayWidth/Height. ffmpeg 7 (Lavf61) wrote no audio DefaultDuration either: deleted here.
+{
+  apply_header
+  printf 'Dialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,We should leave befor it rains.\n'
+} >"$src/ffmpeg.ass"
+printf ';FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1500\ntitle=Part A\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=1500\nEND=3000\ntitle=Part B\n' >"$src/ffmpeg-chapters.txt"
+ffmpeg -nostdin -loglevel error -y -f lavfi -i color=c=black:s=64x36:r=24000/1001:d=3 \
+  -f lavfi -i anullsrc=r=8000:cl=mono -t 3 -map 0:v -map 1:a \
+  -c:v libx264 -preset ultrafast -crf 51 -threads 1 -c:a pcm_s16le \
+  -fflags +bitexact -flags:v +bitexact -flags:a +bitexact "$src/ffmpeg-pcm.mkv"
+mux -o "$src/ffmpeg-stats.mkv" "$src/ffmpeg-pcm.mkv"
+ffmpeg -nostdin -loglevel error -y -i "$src/ffmpeg-stats.mkv" -i "$src/ffmpeg.ass" \
+  -f ffmetadata -i "$src/ffmpeg-chapters.txt" -map 0 -map 1 -map_chapters 2 \
+  -c:v copy -c:a flac -c:s copy -attach "$src/fake-font.ttf" -metadata:s:t mimetype=font/ttf \
+  -fflags +bitexact -flags:a +bitexact "$out/apply-ffmpeg.mkv"
+mkvpropedit --quiet "$out/apply-ffmpeg.mkv" --edit track:a1 --delete default-duration
+
 # Text tracks timed by their DefaultDuration: blocks with no BlockDuration, so each line lasts the
 # track's DefaultDuration. mkvmerge's --default-duration also retimes a track's lines to one per
 # DefaultDuration: the SRT's are already that, 2 s each from 0 s; the ASS's become a frame each at

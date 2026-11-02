@@ -27,6 +27,7 @@ const ORACLE: &[(&str, usize, &str)] = &[
     ("apply.mkv", 2, "apply.track2.ass"),
     ("apply.mkv", 3, "apply.track3.ass"),
     ("apply.mkv", 4, "apply.track4.srt"),
+    ("apply-ffmpeg.mkv", 2, "apply-ffmpeg.track2.ass"),
     ("timed.mkv", 0, "timed.track0.srt"),
     ("timed.mkv", 1, "timed.track1.ass"),
     ("ties.mkv", 1, "ties.track1.ass"),

@@ -1221,6 +1221,7 @@ mod tests {
             byte_counts: std::collections::HashMap::new(),
             segment_uid: None,
             title: None,
+            writing_app: None,
             chapters_at: None,
             attachments_at: None,
             tags_at: None,

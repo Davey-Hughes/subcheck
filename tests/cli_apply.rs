@@ -1465,6 +1465,39 @@ fn an_ffmpeg_file_with_cues_for_only_some_events_loses_none() {
 }
 
 #[test]
+fn a_file_ffmpeg_wrote_last_is_fixed_and_passes_the_quick_check() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // Statistics tags ffmpeg kept from before it re-encoded the audio, and the attachment,
+    // chapters and headers as ffmpeg writes them: mkvmerge's remux writes them its own way.
+    let lines: &[Line] = &[(
+        "Default",
+        "We should leave befor it rains.",
+        "We should leave before it rains.",
+        &[(2, 1000, 2500)],
+    )];
+    let s = Setup::with("apply-ffmpeg.mkv", lines, 0);
+    let o = s.apply(&[]);
+    let text = stdout(&o);
+    assert!(
+        o.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        text.contains("  remuxed, verified (quick), swapped;"),
+        "{text}"
+    );
+    assert_eq!(
+        track(&s.file, 2),
+        std::fs::read_to_string(fixture("expected/apply-ffmpeg.track2.ass"))
+            .unwrap()
+            .replace("befor it", "before it")
+    );
+}
+
+#[test]
 fn a_replaced_tracks_own_tags_are_carried_over() {
     if !have_mkvmerge() {
         return;

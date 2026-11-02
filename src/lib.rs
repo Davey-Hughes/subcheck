@@ -10,6 +10,7 @@ pub mod audio;
 pub mod blocks;
 pub mod ebml;
 pub mod group;
+pub mod iso639;
 pub mod list;
 pub mod llm;
 pub mod mkv;

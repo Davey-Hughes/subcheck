@@ -17,6 +17,7 @@ pub const TIMESTAMP_SCALE: u32 = 0x002A_D7B1;
 pub const DURATION: u32 = 0x4489;
 pub const SEGMENT_UID: u32 = 0x73A4;
 pub const TITLE: u32 = 0x7BA9;
+pub const WRITING_APP: u32 = 0x5741;
 pub const TRACKS: u32 = 0x1654_AE6B;
 pub const TRACK_ENTRY: u32 = 0xAE;
 pub const TRACK_NUMBER: u32 = 0xD7;
@@ -211,12 +212,15 @@ pub struct Layout {
     pub duration_ns: Option<u64>,
     pub tracks: Vec<Track>,
     pub cues: Vec<Cue>,
-    /// `NUMBER_OF_FRAMES` statistics tags, by track UID.
+    /// `NUMBER_OF_FRAMES` statistics tags, by track UID: those the program that wrote the file
+    /// wrote (see [`parse_tags`]).
     pub frame_counts: HashMap<u64, u64>,
-    /// `NUMBER_OF_BYTES` statistics tags, by track UID.
+    /// `NUMBER_OF_BYTES` statistics tags, by track UID, as `frame_counts`.
     pub byte_counts: HashMap<u64, u64>,
     pub segment_uid: Option<Vec<u8>>,
     pub title: Option<String>,
+    /// The Info's WritingApp: the program that wrote the file.
+    pub writing_app: Option<String>,
     /// Absolute offsets of the Chapters, Attachments and Tags elements. Chapters and Attachments
     /// are read only by the verify after a remux (a file's fonts can be megabytes); Tags are also
     /// parsed for their statistics.
@@ -304,6 +308,7 @@ pub fn read_layout(r: &Reader) -> Result<Layout> {
         byte_counts: HashMap::new(),
         segment_uid: None,
         title: None,
+        writing_app: None,
         chapters_at: None,
         attachments_at: None,
         tags_at: None,
@@ -365,6 +370,13 @@ fn read_index(r: &Reader, layout: &mut Layout) -> Result<()> {
             load(r, &h, layout, &mut pending, &mut loaded)?;
         }
     }
+    // The statistics last: which of them count depends on the Info's WritingApp, which the Tags
+    // need not follow.
+    if let Some(at) = layout.tags_at {
+        let h = r.header_at(at)?;
+        (layout.frame_counts, layout.byte_counts) =
+            parse_tags(&r.data(&h)?, h.data_start, layout.writing_app.as_deref())?;
+    }
     Ok(())
 }
 
@@ -391,10 +403,8 @@ fn load(
         INFO => parse_info(&r.data(h)?, h.data_start, layout)?,
         TRACKS => layout.tracks = parse_tracks(&r.data(h)?, h.data_start)?,
         CUES => layout.cues = parse_cues(&r.data(h)?, h.data_start)?,
-        TAGS => {
-            (layout.frame_counts, layout.byte_counts) = parse_tags(&r.data(h)?, h.data_start)?;
-            layout.tags_at = Some(h.offset);
-        }
+        // Parsed once the walk is done: see [`read_index`].
+        TAGS => layout.tags_at = Some(h.offset),
         CHAPTERS => layout.chapters_at = Some(h.offset),
         ATTACHMENTS => layout.attachments_at = Some(h.offset),
         _ => {}
@@ -441,6 +451,7 @@ fn parse_info(data: &[u8], base: u64, layout: &mut Layout) -> Result<()> {
             DURATION => duration = ebml::float(v),
             SEGMENT_UID => layout.segment_uid = Some(v.to_vec()),
             TITLE => layout.title = Some(ebml::string(v)),
+            WRITING_APP => layout.writing_app = Some(ebml::string(v)),
             _ => {}
         }
     }
@@ -628,15 +639,23 @@ fn parse_cues(data: &[u8], base: u64) -> Result<Vec<Cue>> {
     Ok(out)
 }
 
-/// The statistics tags: `NUMBER_OF_FRAMES` and `NUMBER_OF_BYTES`, each by track UID.
-fn parse_tags(data: &[u8], base: u64) -> Result<(HashMap<u64, u64>, HashMap<u64, u64>)> {
+/// The statistics tags: `NUMBER_OF_FRAMES` and `NUMBER_OF_BYTES`, each by track UID, of the tags
+/// whose `_STATISTICS_WRITING_APP` is `wrote_file`, the file's WritingApp. Another program's may
+/// count a track that is no longer there: ffmpeg keeps the tags of a file it rewrites, so a track
+/// it re-encoded still has the counts mkvmerge took of the old one (Yuru Camp S2's FLAC, counted
+/// as the PCM it was). mkvpropedit's fresh counts go too, since ffmpeg would keep those as well.
+fn parse_tags(
+    data: &[u8],
+    base: u64,
+    wrote_file: Option<&str>,
+) -> Result<(HashMap<u64, u64>, HashMap<u64, u64>)> {
     let (mut frame_counts, mut byte_counts) = (HashMap::new(), HashMap::new());
     for (id, at, tag) in ebml::children(data, base)? {
         if id != TAG {
             continue;
         }
         let mut uids = Vec::new();
-        let (mut frames, mut bytes) = (None, None);
+        let (mut frames, mut bytes, mut app) = (None, None, None);
         for (cid, cat, v) in ebml::children(tag, at)? {
             match cid {
                 TARGETS => {
@@ -658,11 +677,15 @@ fn parse_tags(data: &[u8], base: u64) -> Result<(HashMap<u64, u64>, HashMap<u64,
                     match name.as_str() {
                         "NUMBER_OF_FRAMES" => frames = value.trim().parse::<u64>().ok(),
                         "NUMBER_OF_BYTES" => bytes = value.trim().parse::<u64>().ok(),
+                        "_STATISTICS_WRITING_APP" => app = Some(value),
                         _ => {}
                     }
                 }
                 _ => {}
             }
+        }
+        if app.is_none() || app.as_deref() != wrote_file {
+            continue;
         }
         for uid in uids {
             if let Some(frames) = frames {
@@ -686,6 +709,52 @@ mod tests {
         v.push(0x80 | u8::try_from(data.len()).unwrap());
         v.extend_from_slice(data);
         v
+    }
+
+    #[test]
+    fn statistics_count_only_when_the_program_that_wrote_the_file_wrote_them() {
+        // An element whose size fits a 2-byte vint.
+        let el2 = |id: &[u8], data: &[u8]| {
+            let len = u16::try_from(data.len()).unwrap();
+            [id, &(0x4000 | len).to_be_bytes(), data].concat()
+        };
+        let simple = |name: &str, value: &str| {
+            el2(
+                &[0x67, 0xC8],
+                &[
+                    el(&[0x45, 0xA3], name.as_bytes()),
+                    el(&[0x44, 0x87], value.as_bytes()),
+                ]
+                .concat(),
+            )
+        };
+        // Track 5's statistics, and the program that wrote them, if one is named.
+        let tags = |app: Option<&str>| {
+            let mut tag = el(&[0x63, 0xC0], &el(&[0x63, 0xC5], &[5]));
+            tag.extend(simple("NUMBER_OF_FRAMES", "75"));
+            tag.extend(simple("NUMBER_OF_BYTES", "576000"));
+            if let Some(app) = app {
+                tag.extend(simple("_STATISTICS_WRITING_APP", app));
+            }
+            el2(&[0x73, 0x73], &tag)
+        };
+        let mkvmerge = "mkvmerge v103.0 ('The Darkness') 64-bit";
+        let counts = |app, wrote_file| parse_tags(&tags(app), 0, wrote_file).unwrap();
+        let five = |n: u64| HashMap::from([(5, n)]);
+        assert_eq!(
+            counts(Some(mkvmerge), Some(mkvmerge)),
+            (five(75), five(576_000))
+        );
+        let none = (HashMap::new(), HashMap::new());
+        // ffmpeg wrote the file after mkvmerge counted its tracks, and kept the tags.
+        assert_eq!(counts(Some(mkvmerge), Some("Lavf61.7.100")), none);
+        // mkvpropedit's fresh counts too: ffmpeg would carry them on unchanged as well.
+        let mkvpropedit = "mkvpropedit v103.0 ('The Darkness') 64-bit";
+        assert_eq!(counts(Some(mkvpropedit), Some(mkvmerge)), none);
+        // Nothing to match.
+        assert_eq!(counts(None, Some(mkvmerge)), none);
+        assert_eq!(counts(Some(mkvmerge), None), none);
+        assert_eq!(counts(None, None), none);
     }
 
     #[test]

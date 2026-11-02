@@ -435,7 +435,8 @@ fn extract(
         f.write_all(&buf)?;
     }
     if verbose {
-        // Without the statistic, nothing says how many blocks the Cues should have covered.
+        // Without the statistic (or with one another program wrote), nothing says how many blocks
+        // the Cues should have covered.
         let unchecked =
             done.path == ReadPath::Cues && !layout.frame_counts.contains_key(&track.uid);
         eprintln!(
@@ -447,7 +448,7 @@ fn extract(
             r.reads(),
             r.file_size(),
             if unchecked {
-                " (no NUMBER_OF_FRAMES tag to check the Cues against)"
+                " (no NUMBER_OF_FRAMES tag by the file's writer to check the Cues against)"
             } else {
                 ""
             }

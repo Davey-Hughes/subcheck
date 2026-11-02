@@ -175,23 +175,6 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, warnings: &mut Vec<String>) {
     }
 }
 
-/// ISO 639-2 code to the ISO 639-1 code BCP 47 uses, for the languages subtitles here come in.
-fn iso639_1(code: &str) -> Option<&'static str> {
-    Some(match code {
-        "eng" => "en",
-        "jpn" => "ja",
-        "fre" | "fra" => "fr",
-        "ger" | "deu" => "de",
-        "spa" => "es",
-        "ita" => "it",
-        "por" => "pt",
-        "rus" => "ru",
-        "chi" | "zho" => "zh",
-        "kor" => "ko",
-        _ => return None,
-    })
-}
-
 /// Whether a track is in one of `langs`. Matroska's rule: LanguageBCP47, when present, overrides
 /// Language, and an absent Language means "eng", so a track tagged only `ja` in BCP 47 is not
 /// English.
@@ -202,7 +185,8 @@ pub fn wanted_language(track: &Track, langs: &[String]) -> bool {
             Some(tag) => {
                 let primary = tag.split('-').next().unwrap_or(tag);
                 primary.eq_ignore_ascii_case(want)
-                    || iso639_1(want).is_some_and(|code| primary.eq_ignore_ascii_case(code))
+                    || crate::iso639::alpha_2(want)
+                        .is_some_and(|code| primary.eq_ignore_ascii_case(code))
             }
             None => track.language == *want,
         })

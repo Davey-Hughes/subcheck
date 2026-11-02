@@ -7,6 +7,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use crate::audio;
 use crate::blocks::{self, Block, Timed};
 use crate::ebml::{self, Reader, Result};
+use crate::iso639;
 use crate::mkv::{self, Flags, Layout, Track};
 use crate::subs::{self, Kind};
 use crate::text::{timestamp, timestamp_ms};
@@ -45,7 +46,8 @@ pub fn compare(
             .chapters_at
             .map_or(Ok(None), |at| chapters(f.r, at))
     };
-    if chapters_of(original)? != chapters_of(remuxed)? {
+    let renumbered = renumbers_chapters(a.writing_app.as_deref());
+    if !same_chapters(chapters_of(original)?, chapters_of(remuxed)?, renumbered) {
         diffs.push("chapters differ".into());
     }
     if attachments(original)? != attachments(remuxed)? {
@@ -81,6 +83,114 @@ fn chapters(r: &Reader, at: u64) -> Result<Option<Vec<(u32, Value)>>> {
         .ok_or_else(|| ebml::Error::Unsupported("chapters that do not parse".into()))
 }
 
+/// Whether mkvmerge gives new UIDs to the editions and chapters of a file `writing_app` wrote (and
+/// to the tags that target them): it keeps only those of a file whose WritingApp starts
+/// `mkvmerge` or `no_variable_data`, any case, since HandBrake and others number them from 1. A
+/// file that names no WritingApp keeps its own.
+fn renumbers_chapters(writing_app: Option<&str>) -> bool {
+    writing_app.is_some_and(|app| {
+        let app = app.trim().to_ascii_lowercase();
+        !app.starts_with("mkvmerge") && !app.starts_with("no_variable_data")
+    })
+}
+
+/// Whether the remux's chapters (`now`) are the original's (`was`), as mkvmerge writes them: with
+/// new edition and chapter UIDs if it `renumbered` them, an EditionUID for an edition that had none
+/// (it gives each one), and each display's languages as players read them (see
+/// [`display_languages`]). Nothing could refer to a UID that was not there.
+fn same_chapters(
+    was: Option<Vec<(u32, Value)>>,
+    now: Option<Vec<(u32, Value)>>,
+    renumbered: bool,
+) -> bool {
+    match (was, now) {
+        (Some(mut was), Some(mut now)) => {
+            without_mkvmerges_own(&mut was, &mut now, renumbered);
+            was == now
+        }
+        (was, now) => was == now,
+    }
+}
+
+/// The children of one master of the original's chapters (`was`) and the remux's (`now`), with
+/// what [`same_chapters`] passes left out, and each master inside likewise with the one of its ID
+/// in the same place among the original's.
+fn without_mkvmerges_own(
+    was: &mut Vec<(u32, Value)>,
+    now: &mut Vec<(u32, Value)>,
+    renumbered: bool,
+) {
+    if renumbered {
+        was.retain(|(id, _)| *id != EDITION_UID && *id != CHAPTER_UID);
+        now.retain(|(id, _)| *id != EDITION_UID && *id != CHAPTER_UID);
+    }
+    if !was.iter().any(|(id, _)| *id == EDITION_UID) {
+        now.retain(|(id, _)| *id != EDITION_UID);
+    }
+    let mut seen: HashMap<u32, usize> = HashMap::new();
+    for (id, value) in now.iter_mut() {
+        let Value::Master(ours) = value else {
+            continue;
+        };
+        let nth = seen.entry(*id).or_default();
+        let theirs = was.iter_mut().filter(|(w, _)| w == id).nth(*nth);
+        *nth += 1;
+        if let Some((_, Value::Master(theirs))) = theirs {
+            if *id == CHAPTER_DISPLAY {
+                display_languages(theirs);
+                display_languages(ours);
+            }
+            without_mkvmerges_own(theirs, ours, renumbered);
+        }
+    }
+}
+
+/// A ChapterDisplay's children with its languages as players read them in place of its ChapLanguage
+/// and ChapLanguageBCP47 elements: its BCP 47 tags if it has any, else its ChapLanguages as BCP 47
+/// (`fr` for `fre` and `fra`, `haw` as it is), else Matroska's `en`; lowercase, as a set. mkvmerge
+/// writes ChapLanguage lowercase and bibliographic, `eng` where there was none, and adds the tag
+/// from it (checked, mkvmerge v103.0).
+fn display_languages(children: &mut Vec<(u32, Value)>) {
+    let of = |id: u32| -> Vec<String> {
+        children
+            .iter()
+            .filter(|(i, _)| *i == id)
+            .map(|(_, v)| text_of(v).to_ascii_lowercase())
+            .collect()
+    };
+    let mut languages = of(CHAP_LANGUAGE_BCP47);
+    if languages.is_empty() {
+        languages = of(CHAP_LANGUAGE)
+            .into_iter()
+            .map(|code| iso639::alpha_2(&code).map_or(code, str::to_string))
+            .collect();
+    }
+    if languages.is_empty() {
+        languages.push("en".into());
+    }
+    languages.sort();
+    languages.dedup();
+    children.retain(|(id, _)| *id != CHAP_LANGUAGE && *id != CHAP_LANGUAGE_BCP47);
+    children.push((
+        CHAP_LANGUAGE_BCP47,
+        Value::Raw(languages.join(" ").into_bytes()),
+    ));
+}
+
+/// A string element's text as [`value`] holds it (up to 8 bytes as an integer), read as Matroska
+/// reads a string: up to its first NUL, here trimmed. Empty for any other value.
+fn text_of(v: &Value) -> String {
+    let text = match v {
+        Value::Uint(u) => {
+            let bytes = u.to_be_bytes();
+            ebml::string(&bytes[bytes.iter().take_while(|&&b| b == 0).count()..])
+        }
+        Value::Raw(bytes) => ebml::string(bytes),
+        Value::Float(_) | Value::Master(_) => String::new(),
+    };
+    text.trim().to_string()
+}
+
 /// One attached file as its elements, in order: (ID, data).
 type Attached = Vec<(u32, Vec<u8>)>;
 
@@ -111,13 +221,15 @@ fn attached_files(r: &Reader, at: u64) -> Result<Vec<Attached>> {
 }
 
 /// One AttachedFile's data (at `base`) as compared: its elements but the MIME type, the file's
-/// bytes as their length and hash.
+/// bytes as their length and hash, its UID by value (ffmpeg writes one in 8 bytes, zeros ahead,
+/// that mkvmerge writes in fewer).
 fn attached(data: &[u8], base: u64) -> Result<Attached> {
     let mut elements = Vec::new();
     for (id, _, v) in ebml::children(data, base)? {
         match id {
             FILE_MIME_TYPE | mkv::CRC32 | mkv::VOID => {}
             FILE_DATA => elements.push((id, digest_of(v))),
+            FILE_UID if v.len() <= 8 => elements.push((id, ebml::uint(v).to_be_bytes().to_vec())),
             _ => elements.push((id, v.to_vec())),
         }
     }
@@ -127,6 +239,7 @@ fn attached(data: &[u8], base: u64) -> Result<Attached> {
 const ATTACHED_FILE: u32 = 0x61A7;
 const FILE_MIME_TYPE: u32 = 0x4660;
 const FILE_DATA: u32 = 0x465C;
+const FILE_UID: u32 = 0x46AE;
 
 fn digest_of(data: &[u8]) -> Vec<u8> {
     let mut h = DefaultHasher::new();
@@ -185,9 +298,12 @@ fn header(
         differs("flags");
     }
     // mkvmerge leaves a text track's DefaultDuration out of any remux and writes each block's
-    // duration instead, which the events are compared with.
+    // duration instead, which the events are compared with. It gives an audio track that had none
+    // (ffmpeg 7 wrote none) its codec's frame length, FLAC's 96 ms, AAC's 23.2: the frames are
+    // compared below, and their times, a frame laced behind its block's first timed by this.
     if t.default_duration != u.default_duration
         && !(t.is_text_subtitle() && u.default_duration.is_none())
+        && !(t.kind == mkv::TRACK_TYPE_AUDIO && t.default_duration.is_none())
     {
         differs("default duration");
     }
@@ -271,6 +387,11 @@ const FLOATS: &[u32] = &[
 ];
 /// Masters inside Video: Colour, MasteringMetadata, Projection.
 const VIDEO_MASTERS: &[u32] = &[0x55B0, 0x55D0, 0x7670];
+const EDITION_UID: u32 = 0x45BC;
+const CHAPTER_UID: u32 = 0x73C4;
+const CHAPTER_DISPLAY: u32 = 0x80;
+const CHAP_LANGUAGE: u32 = 0x437C;
+const CHAP_LANGUAGE_BCP47: u32 = 0x437D;
 /// Masters inside Chapters: EditionEntry, ChapterAtom, ChapterTrack, ChapterDisplay, ChapProcess,
 /// ChapProcessCommand, EditionDisplay.
 const CHAPTER_MASTERS: &[u32] = &[0x45B9, 0xB6, 0x8F, 0x80, 0x6944, 0x6911, 0x4520];
@@ -283,13 +404,100 @@ enum Value {
     Master(Vec<(u32, Value)>),
 }
 
-fn same_properties(a: Option<&[u8]>, b: Option<&[u8]>) -> bool {
-    match (a, b) {
+/// Whether a track's Video or Audio element in the remux (`now`) says what the original's (`was`)
+/// does: by value, each child Matroska would take as said when left out left out (see
+/// [`default_of`]); as bytes, if either does not parse. And mkvmerge 103 keeps no FlagInterlaced
+/// from a Matroska file (checked on progressive H.264, HEVC, MPEG-2 and VP9, each of which says in
+/// its stream whether it is interlaced): a 2, progressive, left out passes. A 1 left out changes
+/// what a player that goes by the flag does, and does not.
+fn same_properties(was: Option<&[u8]>, now: Option<&[u8]>) -> bool {
+    match (was, now) {
         (None, None) => true,
-        (Some(a), Some(b)) => values(a, VIDEO_MASTERS) == values(b, VIDEO_MASTERS),
+        (Some(a), Some(b)) => match (values(a, VIDEO_MASTERS), values(b, VIDEO_MASTERS)) {
+            (Some(was), Some(now)) => {
+                let (mut was, now) = (explicit(was), explicit(now));
+                if !now.iter().any(|(id, _)| *id == FLAG_INTERLACED) {
+                    was.retain(|(id, v)| !(*id == FLAG_INTERLACED && *v == Value::Uint(2)));
+                }
+                was == now
+            }
+            _ => a == b,
+        },
         _ => false,
     }
 }
+
+/// A Video or Audio element's children without those that say what Matroska takes them to be
+/// when left out: mkvmerge leaves out a Channels of 1 and a SamplingFrequency of 8000 that ffmpeg
+/// writes, and writes a DisplayWidth and DisplayHeight of the pixel size that ffmpeg leaves out.
+fn explicit(children: Vec<(u32, Value)>) -> Vec<(u32, Value)> {
+    let defaults: Vec<Option<Value>> = children
+        .iter()
+        .map(|(id, _)| default_of(*id, &children))
+        .collect();
+    children
+        .into_iter()
+        .zip(defaults)
+        .filter(|((_, v), default)| default.as_ref() != Some(v))
+        .map(|(child, _)| child)
+        .collect()
+}
+
+/// What Matroska takes the Video or Audio child `id` to be when left out, beside its `siblings`,
+/// where it says.
+fn default_of(id: u32, siblings: &[(u32, Value)]) -> Option<Value> {
+    let get = |id: u32| siblings.iter().find(|(i, _)| *i == id).map(|(_, v)| v);
+    let uint = |id: u32, default: u64| match get(id) {
+        Some(Value::Uint(v)) => Some(*v),
+        Some(_) => None,
+        None => Some(default),
+    };
+    // In pixels, the width or height less its crops.
+    let shown = |size: u32, crops: [u32; 2]| {
+        if uint(DISPLAY_UNIT, 0)? != 0 {
+            return None;
+        }
+        let size = uint(size, 0).filter(|&s| s > 0)?;
+        let crop = uint(crops[0], 0)?.checked_add(uint(crops[1], 0)?)?;
+        size.checked_sub(crop).map(Value::Uint)
+    };
+    match id {
+        FLAG_INTERLACED | STEREO_MODE | ALPHA_MODE | PIXEL_CROP_BOTTOM | PIXEL_CROP_TOP
+        | PIXEL_CROP_LEFT | PIXEL_CROP_RIGHT | DISPLAY_UNIT | ASPECT_RATIO_TYPE | EMPHASIS => {
+            Some(Value::Uint(0))
+        }
+        FIELD_ORDER => Some(Value::Uint(2)),
+        CHANNELS => Some(Value::Uint(1)),
+        SAMPLING_FREQUENCY => Some(Value::Float(8000f64.to_bits())),
+        OUTPUT_SAMPLING_FREQUENCY => match get(SAMPLING_FREQUENCY) {
+            Some(Value::Float(rate)) => Some(Value::Float(*rate)),
+            Some(_) => None,
+            None => Some(Value::Float(8000f64.to_bits())),
+        },
+        DISPLAY_WIDTH => shown(PIXEL_WIDTH, [PIXEL_CROP_LEFT, PIXEL_CROP_RIGHT]),
+        DISPLAY_HEIGHT => shown(PIXEL_HEIGHT, [PIXEL_CROP_TOP, PIXEL_CROP_BOTTOM]),
+        _ => None,
+    }
+}
+
+const FLAG_INTERLACED: u32 = 0x9A;
+const FIELD_ORDER: u32 = 0x9D;
+const STEREO_MODE: u32 = 0x53B8;
+const ALPHA_MODE: u32 = 0x53C0;
+const PIXEL_WIDTH: u32 = 0xB0;
+const PIXEL_HEIGHT: u32 = 0xBA;
+const PIXEL_CROP_BOTTOM: u32 = 0x54AA;
+const PIXEL_CROP_TOP: u32 = 0x54BB;
+const PIXEL_CROP_LEFT: u32 = 0x54CC;
+const PIXEL_CROP_RIGHT: u32 = 0x54DD;
+const DISPLAY_WIDTH: u32 = 0x54B0;
+const DISPLAY_HEIGHT: u32 = 0x54BA;
+const DISPLAY_UNIT: u32 = 0x54B2;
+const ASPECT_RATIO_TYPE: u32 = 0x54B3;
+const SAMPLING_FREQUENCY: u32 = 0xB5;
+const OUTPUT_SAMPLING_FREQUENCY: u32 = 0x78B5;
+const CHANNELS: u32 = 0x9F;
+const EMPHASIS: u32 = 0x52F1;
 
 /// A master's children as values, sorted, its CRC-32 and Void left out at every level, `masters`
 /// parsed as masters in turn; `None` when they do not parse.
@@ -406,7 +614,8 @@ fn subtitles(
 
 /// Whether reading `tracks` of a file must walk its Clusters: its Cues are trusted only where its
 /// statistics say how many blocks they should lead to, and a track with Cues for only some of its
-/// blocks would otherwise lose the rest unseen (mkvmerge writes the statistics; ffmpeg does not).
+/// blocks would otherwise lose the rest unseen (mkvmerge writes the statistics; ffmpeg writes none,
+/// and those it keeps from an earlier mux do not count).
 pub fn must_walk(layout: &Layout, tracks: &[&Track]) -> bool {
     tracks
         .iter()
@@ -704,6 +913,121 @@ mod tests {
     }
 
     #[test]
+    fn video_and_audio_values_at_their_defaults_say_what_none_says() {
+        let uint = |id: &[u8], v: u8| el(id, &[v]);
+        let float = |id: &[u8], v: f32| el(id, &v.to_be_bytes());
+        let same = |was: &[Vec<u8>], now: &[Vec<u8>]| {
+            same_properties(Some(&was.concat()), Some(&now.concat()))
+        };
+        // ffmpeg writes Channels (9F) 1 and SamplingFrequency (B5) 8000; mkvmerge leaves both out.
+        let depth = uint(&[0x62, 0x64], 16);
+        let mono = [uint(&[0x9F], 1), float(&[0xB5], 8000.0), depth.clone()];
+        assert!(same(&mono, std::slice::from_ref(&depth)));
+        assert!(!same(
+            &[uint(&[0x9F], 2), depth.clone()],
+            std::slice::from_ref(&depth)
+        ));
+        assert!(!same(&[float(&[0xB5], 48000.0)], &[]));
+        // OutputSamplingFrequency (78B5) is the SamplingFrequency unless it says otherwise.
+        let rate = float(&[0xB5], 48000.0);
+        assert!(same(
+            &[rate.clone(), float(&[0x78, 0xB5], 48000.0)],
+            std::slice::from_ref(&rate)
+        ));
+        assert!(!same(
+            &[rate.clone(), float(&[0x78, 0xB5], 96000.0)],
+            std::slice::from_ref(&rate)
+        ));
+        // mkvmerge writes DisplayWidth (54B0) and DisplayHeight (54BA) as the pixel size (B0, BA),
+        // less any crop (54CC left, 54DD right), when DisplayUnit (54B2) is pixels; ffmpeg leaves
+        // them out.
+        let pixels = [uint(&[0xB0], 64), uint(&[0xBA], 36)];
+        let shown = |w: u8, h: u8| [uint(&[0x54, 0xB0], w), uint(&[0x54, 0xBA], h)];
+        assert!(same(&pixels, &[pixels.as_slice(), &shown(64, 36)].concat()));
+        assert!(!same(
+            &pixels,
+            &[pixels.as_slice(), &shown(85, 36)].concat()
+        ));
+        let cropped = [
+            pixels.as_slice(),
+            &[uint(&[0x54, 0xCC], 2), uint(&[0x54, 0xDD], 2)],
+        ]
+        .concat();
+        assert!(same(
+            &cropped,
+            &[cropped.as_slice(), &shown(60, 36)].concat()
+        ));
+        assert!(!same(
+            &cropped,
+            &[cropped.as_slice(), &shown(64, 36)].concat()
+        ));
+        // In another unit (3: an aspect ratio), a DisplayWidth is no pixel count.
+        let ratio = [pixels.as_slice(), &[uint(&[0x54, 0xB2], 3)]].concat();
+        assert!(!same(&ratio, &[ratio.as_slice(), &shown(64, 36)].concat()));
+        assert!(same(
+            &[pixels.as_slice(), &[uint(&[0x54, 0xB2], 0)]].concat(),
+            &pixels
+        ));
+    }
+
+    #[test]
+    fn properties_that_do_not_parse_compare_as_bytes() {
+        // A DisplayWidth whose size says 5 bytes, with 1 there.
+        let cut = |b: u8| [0x54, 0xB0, 0x85, b];
+        assert!(!same_properties(Some(&cut(1)), Some(&cut(2))));
+        assert!(same_properties(Some(&cut(1)), Some(&cut(1))));
+        assert!(!same_properties(
+            Some(&cut(1)),
+            Some(&[0x54, 0xB0, 0x81, 1])
+        ));
+    }
+
+    #[test]
+    fn a_progressive_flag_mkvmerge_leaves_out_is_no_difference() {
+        // FlagInterlaced (9A): 2 is progressive, 1 interlaced, 0 (the default) undetermined.
+        let flag = |v: u8| el(&[0x9A], &[v]);
+        let pixels = el(&[0xB0], &[64]);
+        let same = |was: &[Vec<u8>], now: &[Vec<u8>]| {
+            same_properties(Some(&was.concat()), Some(&now.concat()))
+        };
+        let alone = std::slice::from_ref(&pixels);
+        assert!(same(&[flag(2), pixels.clone()], alone));
+        assert!(same(&[flag(2), pixels.clone()], &[flag(0), pixels.clone()]));
+        assert!(same(&[flag(2), pixels.clone()], &[flag(2), pixels.clone()]));
+        // Interlaced left out is a difference, and so is progressive made up.
+        assert!(!same(&[flag(1), pixels.clone()], alone));
+        assert!(!same(alone, &[flag(2), pixels.clone()]));
+    }
+
+    #[test]
+    fn an_audio_default_duration_where_the_original_had_none_is_no_difference() {
+        let flac = |d: Option<u64>| Track {
+            kind: mkv::TRACK_TYPE_AUDIO,
+            codec: "A_FLAC".into(),
+            default_duration: d,
+            ..track("jpn", None)
+        };
+        // ffmpeg 7 wrote none; mkvmerge writes the codec's frame length, FLAC's 96 ms here.
+        assert_eq!(
+            diffs(&flac(None), &flac(Some(96_000_000))),
+            [] as [String; 0]
+        );
+        let differs = ["track 2: default duration differs"];
+        assert_eq!(
+            diffs(&flac(Some(23_219_954)), &flac(Some(96_000_000))),
+            differs
+        );
+        assert_eq!(diffs(&flac(Some(96_000_000)), &flac(None)), differs);
+        // Video keeps its own.
+        let video = |d: Option<u64>| Track {
+            kind: mkv::TRACK_TYPE_VIDEO,
+            codec: "V_MPEG4/ISO/AVC".into(),
+            ..flac(d)
+        };
+        assert_eq!(diffs(&video(None), &video(Some(41_708_333))), differs);
+    }
+
+    #[test]
     fn flags_left_out_read_as_their_defaults() {
         let set = Flags {
             enabled: Some(true),
@@ -735,6 +1059,20 @@ mod tests {
             file(b"font/ttf", b"xyz")
         );
         assert_ne!(file(b"font/ttf", b"xyz"), file(b"font/ttf", b"xyZ"));
+    }
+
+    #[test]
+    fn an_attached_files_uid_compares_by_value() {
+        // FileName "a.ttf", FileUID: ffmpeg writes 4 in 8 bytes, mkvmerge in 1.
+        let file = |uid: &[u8]| {
+            let mut v = vec![0x46, 0x6E, 0x85];
+            v.extend_from_slice(b"a.ttf");
+            v.extend_from_slice(&[0x46, 0xAE, 0x80 | u8::try_from(uid.len()).unwrap()]);
+            v.extend_from_slice(uid);
+            attached(&v, 0).unwrap()
+        };
+        assert_eq!(file(&[0, 0, 0, 0, 0, 0, 0, 4]), file(&[4]));
+        assert_ne!(file(&[0, 0, 0, 0, 0, 0, 0, 4]), file(&[5]));
     }
 
     fn track(language: &str, bcp47: Option<&str>) -> Track {
@@ -980,6 +1318,166 @@ mod tests {
             values(&ffmpeg, CHAPTER_MASTERS),
             values(&later, CHAPTER_MASTERS)
         );
+    }
+
+    #[test]
+    fn an_edition_uid_where_the_original_had_none_is_no_difference() {
+        // EditionEntry (45B9) with one ChapterAtom, and EditionUID (45BC) `uid` if there is one.
+        let edition = |uid: Option<u8>| {
+            let atom = el(&[0xB6], &el(&[0x73, 0xC4], &[7]));
+            let uid = uid.map_or(Vec::new(), |u| el(&[0x45, 0xBC], &[u]));
+            el(&[0x45, 0xB9], &[uid, atom].concat())
+        };
+        let same = |was: &[Option<u8>], now: &[Option<u8>]| {
+            let chapters = |uids: &[Option<u8>]| {
+                values(
+                    &uids.iter().flat_map(|&u| edition(u)).collect::<Vec<u8>>(),
+                    CHAPTER_MASTERS,
+                )
+            };
+            same_chapters(chapters(was), chapters(now), false)
+        };
+        // mkvmerge gives each edition one; ffmpeg writes none.
+        assert!(same(&[None], &[Some(9)]));
+        assert!(same(&[Some(9)], &[Some(9)]));
+        assert!(!same(&[Some(9)], &[Some(8)]));
+        assert!(!same(&[Some(9)], &[None]));
+        // Edition by edition.
+        assert!(same(&[Some(9), None], &[Some(9), Some(3)]));
+        assert!(!same(&[None, Some(9)], &[Some(3), Some(8)]));
+        // No chapters on either side, or on one.
+        assert!(same_chapters(None, None, false));
+        assert!(!same_chapters(None, chapters_of_one(), false));
+    }
+
+    /// One edition with one atom, as compared.
+    fn chapters_of_one() -> Option<Vec<(u32, Value)>> {
+        values(
+            &el(&[0x45, 0xB9], &el(&[0xB6], &el(&[0x73, 0xC4], &[7]))),
+            CHAPTER_MASTERS,
+        )
+    }
+
+    /// An edition of atoms, each (ChapterUID, ChapterTimeStart), with EditionUID `edition` if any.
+    fn edition_of(edition: Option<u8>, atoms: &[(u8, u8)]) -> Vec<u8> {
+        let uid = edition.map_or(Vec::new(), |u| el(&[0x45, 0xBC], &[u]));
+        let atoms = atoms
+            .iter()
+            .flat_map(|&(uid, start)| {
+                el(
+                    &[0xB6],
+                    &[el(&[0x73, 0xC4], &[uid]), el(&[0x91], &[start])].concat(),
+                )
+            })
+            .collect::<Vec<u8>>();
+        el(&[0x45, 0xB9], &[uid, atoms].concat())
+    }
+
+    #[test]
+    fn chapters_mkvmerge_renumbered_compare_without_their_uids() {
+        let same = |was: &[u8], now: &[u8], renumbered| {
+            same_chapters(
+                values(was, CHAPTER_MASTERS),
+                values(now, CHAPTER_MASTERS),
+                renumbered,
+            )
+        };
+        // ffmpeg's chapters 1 and 2, and mkvmerge's remux of them: new UIDs, and an EditionUID.
+        let ffmpeg = edition_of(None, &[(1, 0), (2, 15)]);
+        let remux = edition_of(Some(70), &[(81, 0), (92, 15)]);
+        assert!(same(&ffmpeg, &remux, true));
+        assert!(!same(&ffmpeg, &remux, false));
+        // The times still count, and the editions' UIDs where both had one.
+        assert!(!same(
+            &ffmpeg,
+            &edition_of(Some(70), &[(81, 0), (92, 16)]),
+            true
+        ));
+        let both = edition_of(Some(5), &[(1, 0)]);
+        assert!(same(&both, &edition_of(Some(6), &[(81, 0)]), true));
+        assert!(!same(&both, &edition_of(Some(6), &[(81, 0)]), false));
+        // Nested atoms are renumbered too.
+        let nested = |outer: u8, inner: u8| {
+            el(
+                &[0x45, 0xB9],
+                &el(
+                    &[0xB6],
+                    &[
+                        el(&[0x73, 0xC4], &[outer]),
+                        el(&[0xB6], &el(&[0x73, 0xC4], &[inner])),
+                    ]
+                    .concat(),
+                ),
+            )
+        };
+        assert!(same(&nested(1, 2), &nested(3, 4), true));
+        assert!(!same(&nested(1, 2), &nested(3, 4), false));
+    }
+
+    #[test]
+    fn mkvmerge_renumbers_the_chapters_of_a_file_another_program_wrote() {
+        assert!(renumbers_chapters(Some("Lavf61.7.100")));
+        assert!(renumbers_chapters(Some("Lavf")));
+        assert!(renumbers_chapters(Some("HandBrake 1.6.1 2023012300")));
+        assert!(!renumbers_chapters(Some(
+            "mkvmerge v103.0 ('The Darkness') 64-bit"
+        )));
+        assert!(!renumbers_chapters(Some(" MKVMerge v9.0")));
+        assert!(!renumbers_chapters(Some("no_variable_data")));
+        // None to go by: mkvmerge keeps them.
+        assert!(!renumbers_chapters(None));
+    }
+
+    #[test]
+    fn chapter_languages_compare_as_players_read_them() {
+        // A ChapterAtom whose ChapterDisplay (80) has ChapString (85) "A", ChapLanguages (437C)
+        // `iso` and ChapLanguageBCP47s (437D) `tags`.
+        let display = |iso: &[&[u8]], tags: &[&[u8]]| {
+            let langs: Vec<u8> = iso
+                .iter()
+                .map(|l| el(&[0x43, 0x7C], l))
+                .chain(tags.iter().map(|t| el(&[0x43, 0x7D], t)))
+                .flatten()
+                .collect();
+            let display = el(&[0x80], &[el(&[0x85], b"A"), langs].concat());
+            values(
+                &el(
+                    &[0x45, 0xB9],
+                    &el(&[0xB6], &[el(&[0x73, 0xC4], &[7]), display].concat()),
+                ),
+                CHAPTER_MASTERS,
+            )
+        };
+        let same = |was, now| same_chapters(was, now, false);
+        // ffmpeg writes ChapLanguage alone; mkvmerge writes it lowercase and bibliographic, and
+        // adds the tag from it (checked, mkvmerge v103.0).
+        assert!(same(display(&[b"und"], &[]), display(&[b"und"], &[b"und"])));
+        assert!(same(display(&[b"eng"], &[]), display(&[b"eng"], &[b"en"])));
+        assert!(same(display(&[b"fra"], &[]), display(&[b"fre"], &[b"fr"])));
+        assert!(same(display(&[b"ENG"], &[]), display(&[b"eng"], &[b"en"])));
+        assert!(same(
+            display(&[b"eng\0"], &[]),
+            display(&[b"eng"], &[b"en"])
+        ));
+        assert!(same(display(&[b"ara"], &[]), display(&[b"ara"], &[b"ar"])));
+        assert!(same(display(&[b"haw"], &[]), display(&[b"haw"], &[b"haw"])));
+        // Players go by the tag: one of another language is a difference.
+        assert!(!same(display(&[b"eng"], &[]), display(&[b"eng"], &[b"ja"])));
+        assert!(!same(display(&[b"und"], &[]), display(&[b"und"], &[b"en"])));
+        assert!(!same(
+            display(&[b"eng"], &[b"en"]),
+            display(&[b"eng"], &[b"ja"])
+        ));
+        assert!(!same(display(&[b"eng"], &[]), display(&[b"jpn"], &[b"ja"])));
+        // A tag alone, and the ChapLanguage mkvmerge writes from it.
+        assert!(same(display(&[], &[b"ja"]), display(&[b"jpn"], &[b"ja"])));
+        // No language at all is Matroska's `eng`: mkvmerge writes `eng`, tagged `en`.
+        assert!(same(display(&[], &[]), display(&[b"eng"], &[b"en"])));
+        assert!(!same(display(&[], &[]), display(&[b"jpn"], &[b"ja"])));
+        // Every language of the display counts.
+        let both: &[&[u8]] = &[b"jpn", b"eng"];
+        assert!(same(display(both, &[]), display(both, &[b"ja", b"en"])));
+        assert!(!same(display(both, &[]), display(both, &[b"en"])));
     }
 
     #[test]

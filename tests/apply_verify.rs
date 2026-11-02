@@ -134,6 +134,34 @@ fn a_good_remux_passes_quick_and_full() {
 }
 
 #[test]
+fn a_good_remux_of_a_file_ffmpeg_wrote_last_passes_quick_and_full() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // As ffmpeg leaves a file it re-encoded: mkvmerge's statistics tags carried through from before
+    // (the audio's count the PCM it was), and an attachment UID, chapters and video and audio
+    // headers that mkvmerge writes its own way.
+    let dir = tempfile::tempdir().unwrap();
+    let original = fixture("apply-ffmpeg.mkv");
+    let (_, layout) = mkv::open(&original).unwrap();
+    let (blocks, files) = fix(&original, dir.path(), &[(2, "befor", "before")]);
+    let out = dir.path().join("out.mkv");
+    remux::run(
+        "mkvmerge".as_ref(),
+        &remux::args(&original, &layout, &files, &verify::Languages::new(), &out),
+    )
+    .unwrap();
+    assert_eq!(
+        compare_with(&original, &out, &blocks, false),
+        [] as [String; 0]
+    );
+    assert_eq!(
+        compare_with(&original, &out, &blocks, true),
+        [] as [String; 0]
+    );
+}
+
+#[test]
 fn tracks_timed_by_their_default_duration_pass() {
     if !have_mkvmerge() {
         return;

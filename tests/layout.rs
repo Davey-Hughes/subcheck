@@ -46,6 +46,24 @@ fn layout_of_an_ffmpeg_file() {
 }
 
 #[test]
+fn statistics_another_program_wrote_are_not_counts() {
+    // ffmpeg re-encoded the audio after mkvmerge counted its PCM, and kept the tags.
+    let (_, layout) = mkv::open(&fixture("apply-ffmpeg.mkv")).unwrap();
+    assert_eq!(layout.writing_app.as_deref(), Some("Lavf"));
+    assert!(layout.frame_counts.is_empty(), "{:?}", layout.frame_counts);
+    assert!(layout.byte_counts.is_empty(), "{:?}", layout.byte_counts);
+    // mkvmerge's own are.
+    let (_, layout) = mkv::open(&fixture("multi.mkv")).unwrap();
+    assert!(
+        (layout.writing_app.as_deref()).is_some_and(|app| app.starts_with("mkvmerge v")),
+        "{:?}",
+        layout.writing_app
+    );
+    assert_eq!(layout.frame_counts.len(), 4);
+    assert_eq!(layout.byte_counts.len(), 4);
+}
+
+#[test]
 fn zlib_track_records_its_encoding() {
     let (_, layout) = mkv::open(&fixture("ass-zlib.mkv")).unwrap();
     let encodings = &layout.tracks[0].encodings;

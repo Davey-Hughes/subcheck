@@ -358,6 +358,21 @@ A fixed track goes into the remux in that language too, so mkvmerge takes it whe
 the file's own (`xyz`). mkvmerge also trims spaces and tabs from a track name it is given, and
 leaves an empty one out, which the check expects too.
 
+The frame counts are the statistics tags mkvmerge writes, taken only from the program that wrote
+the file. ffmpeg keeps the tags of a file it rewrites, so a track it re-encoded can still carry
+mkvmerge's counts of what it was before. A track that lacks them in either file has its frames
+compared by hash instead, which reads both files end to end.
+
+mkvmerge writes some of what ffmpeg writes its own way, which the check expects too: an attachment's
+UID in fewer bytes, an EditionUID for an edition that had none, and a chapter's language in its own
+form (`fre` and a BCP 47 `fr` for `fra`). So it compares each chapter's languages as players read
+them: its BCP 47 tags, else its language codes, else English. mkvmerge also gives new UIDs to the
+editions and chapters of a file another program wrote (any whose WritingApp does not start
+`mkvmerge` or `no_variable_data`, in any case), so the check compares those chapters without their
+UIDs. In the track headers it expects an audio default duration where the original had none, a
+FlagInterlaced of 2 (progressive) left out, and on either side, a value left out or written where
+Matroska takes it as said (one channel, 8000 Hz, a display size of the picture's own).
+
 A fixed track goes through its text format, which cuts each time down to the millisecond (SRT) or
 the centisecond (ASS). Where that would change a time, a fix on that track is left for a hand fix
 before any remux, and the output names the first such time: an ASS track timed to the
