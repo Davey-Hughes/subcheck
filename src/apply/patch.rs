@@ -8,7 +8,7 @@ use super::exact::{Early, Unwritable};
 use super::karaoke::{self, Align, Letter, Widths};
 use super::shift::{self, Shifts};
 use crate::blocks::Block;
-use crate::store::{Finding, Run, State, TimingFix};
+use crate::store::{Finding, LineRef, Run, State, TimingFix};
 use crate::subs::{self, Kind};
 use crate::text::{self, Event, Occurrence};
 
@@ -44,8 +44,9 @@ pub enum Outcome {
     /// row; narrower when negative), with the widths of the characters in `guessed` measured in no
     /// row's style.
     Respaced { px: i64, guessed: String },
-    /// A timing fix: this many events move by whole frames.
-    Shifted { events: usize },
+    /// A timing fix: this many events move by whole frames, and those in `cut` start at 0 because
+    /// the shift moves their start a frame or more before it.
+    Shifted { events: usize, cut: Vec<LineRef> },
     /// Its events read the fix already.
     AlreadyApplied,
     /// Left for a fix by hand, and why.

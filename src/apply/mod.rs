@@ -847,9 +847,12 @@ impl Job<'_> {
                 continue;
             };
             for l in &fix.unshifted {
-                let (start, end) = (time(view.kind, l.start_ms), time(view.kind, l.end_ms));
-                let text = line_text(view.kind, &l.raw);
-                writeln!(out, "    left where it is: {start} – {end}  {text}")?;
+                writeln!(out, "    {}", line_said(view.kind, "left where it is", l))?;
+            }
+            if let Outcome::Shifted { cut, .. } = outcome {
+                for l in cut {
+                    writeln!(out, "    {}", line_said(view.kind, "cut short at 0:00", l))?;
+                }
             }
             // Each moving stretch's first and last line, before and after.
             let shifted = grid
@@ -1275,8 +1278,8 @@ fn status(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Patched => "ok".to_string(),
         Outcome::Respaced { px, guessed } => respaced(*px, guessed),
-        Outcome::Shifted { events: 1 } => "ok (1 event moved)".into(),
-        Outcome::Shifted { events } => format!("ok ({events} events moved)"),
+        Outcome::Shifted { events: 1, .. } => "ok (1 event moved)".into(),
+        Outcome::Shifted { events, .. } => format!("ok ({events} events moved)"),
         Outcome::AlreadyApplied => "already applied".into(),
         Outcome::ByHand(why) => format!("by hand: {why}"),
         Outcome::NotFound => "not found: the file changed since the scan".into(),
@@ -1294,6 +1297,13 @@ fn time(kind: Kind, ms: i64) -> String {
         Kind::Ass | Kind::Ssa => timestamp(ms),
         Kind::Srt => crate::text::timestamp_ms(ms),
     }
+}
+
+/// A recorded line under a timing fix, at its recorded times: `left where it is: 0:01:02.03 –
+/// 0:01:04.05  Text`.
+fn line_said(kind: Kind, what: &str, l: &store::LineRef) -> String {
+    let (start, end) = (time(kind, l.start_ms), time(kind, l.end_ms));
+    format!("{what}: {start} – {end}  {}", line_text(kind, &l.raw))
 }
 
 /// A recorded line's text.
@@ -1445,13 +1455,24 @@ mod tests {
 
     #[test]
     fn a_shift_says_how_many_events_it_moves() {
+        let shifted = |events| Outcome::Shifted {
+            events,
+            cut: vec![],
+        };
+        assert_eq!(status(&shifted(1)), "ok (1 event moved)");
+        assert_eq!(status(&shifted(2)), "ok (2 events moved)");
+    }
+
+    #[test]
+    fn a_line_cut_short_at_the_start_is_said_at_its_recorded_times() {
+        let l = store::LineRef {
+            raw: "0,Default,,0,0,0,,Early.".into(),
+            start_ms: 2500,
+            end_ms: 5000,
+        };
         assert_eq!(
-            status(&Outcome::Shifted { events: 1 }),
-            "ok (1 event moved)"
-        );
-        assert_eq!(
-            status(&Outcome::Shifted { events: 2 }),
-            "ok (2 events moved)"
+            line_said(Kind::Ass, "cut short at 0:00", &l),
+            "cut short at 0:00: 0:00:02.50 – 0:00:05.00  Early."
         );
     }
 

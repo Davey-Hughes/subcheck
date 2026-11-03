@@ -394,6 +394,9 @@ millisecond past one at either millisecond, both ways in one file. Where a line'
 such a frame, apply takes its time from the Cues if it is a keyframe, and otherwise reads it from
 the video around it; video there that does not read fails the file. A line still left a
 millisecond unsure leaves its fix for a hand fix, and so does a typo on it once the fix is in.
+A line the shift moves wholly before 0:00 leaves the fix for a hand fix too, naming it: apply
+leaves no line out. One whose start it moves a frame or more before 0:00 starts at 0:00, and the
+output names it (`cut short at 0:00`).
 
 `--no-backup` keeps no original. `--dry-run` shows each changed event before and after, and writes
 nothing. It also checks what stops apply before it writes, an earlier `.orig` in the way or too

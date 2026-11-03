@@ -566,6 +566,8 @@ pub fn plan(fix: &TimingFix, track: &Track, grid: &Grid) -> Plan {
     // is read for them once.
     let mut sure = true;
     let mut settle = Vec::new();
+    let mut cut = Vec::new();
+    let first_frame = grid.frame_of(0);
     for (i, k) in keys.iter().enumerate() {
         let Some(s) = each[i].filter(|_| shifts.shown(k.1, k.2)) else {
             continue;
@@ -579,17 +581,45 @@ pub fn plan(fix: &TimingFix, track: &Track, grid: &Grid) -> Plan {
             }
             continue;
         };
+        // The frames the line starts and stops showing on once moved. A time moved before the
+        // frame at 0 is held at 0.
+        let [to_start, to_end] = [start, end].map(|x| grid.frame_of(x) - i128::from(s.frames));
         // Rounded to the track's precision, a time in a frame shorter than that may land in
-        // another; one at the very start stays there.
-        for (old, new) in [(start, new_start), (end, new_end)] {
-            if new != 0 && grid.frame_of(new) != grid.frame_of(old) - i128::from(s.frames) {
+        // another; one held at 0 stays there.
+        for (to, new) in [(to_start, new_start), (to_end, new_end)] {
+            if new != 0 && grid.frame_of(new) != to {
                 return hand("the shift did not land on the frame grid");
             }
         }
-        // A line shown on a frame keeps one, but one at the very start shifted earlier, its start
-        // held at 0, may have no time left.
+        // A block with no duration and no DefaultDuration to take one from has no end of its
+        // own: an SRT line shown until the next.
+        let has_end = track.blocks[i].duration.is_some() || track.default_duration.is_some();
+        // A line that would stop showing on the frame at 0 or before shows on none, and one with
+        // no end of its own that would start before it may show for no time: a remux would drop
+        // the first (SRT) or show it on no frame. apply leaves out no line, so the fix is a hand
+        // fix. A line whose own end is its start shows on no frame wherever it moves.
+        let gone = if has_end {
+            end > start && to_end <= first_frame
+        } else {
+            to_start < first_frame
+        };
+        if gone {
+            let at = super::time(track.kind, k.1);
+            return hand(&format!("the shift moves the line at {at} before 0:00"));
+        }
+        // A frame exactly between two stored times can put both ends of a line in one frame,
+        // where rounding to the track's precision may leave them equal.
         if new_end <= new_start && end > start {
             return hand("the shift leaves a line no time");
+        }
+        // The rest of a line that would start showing before the frame at 0 still shows, from
+        // it: kept, but said.
+        if end > start && to_start < first_frame {
+            cut.push(LineRef {
+                raw: lines[i].0.clone(),
+                start_ms: k.1,
+                end_ms: k.2,
+            });
         }
         let scale = i128::from(track.scale.max(1));
         let timestamp = i64::try_from(new_start / scale).unwrap_or(i64::MAX);
@@ -598,9 +628,7 @@ pub fn plan(fix: &TimingFix, track: &Track, grid: &Grid) -> Plan {
         let Ok(length) = u64::try_from((new_end - new_start) / scale) else {
             return hand("the shift leaves a line no time");
         };
-        // The moved end, as a duration; a block with none and no DefaultDuration to take one from
-        // keeps none (an SRT line shown until the next).
-        let has_end = track.blocks[i].duration.is_some() || track.default_duration.is_some();
+        // The moved end, as a duration; a block with no end of its own keeps none.
         times.push((i, timestamp, has_end.then_some(length)));
     }
     if !sure {
@@ -611,6 +639,7 @@ pub fn plan(fix: &TimingFix, track: &Track, grid: &Grid) -> Plan {
     Plan {
         outcome: Outcome::Shifted {
             events: times.len(),
+            cut,
         },
         times,
         lines: Lines::AsScanned,
@@ -883,6 +912,14 @@ mod tests {
         }
     }
 
+    /// A timing fix's outcome moving `events` events, none of them cut short at 0.
+    fn shifted(events: usize) -> Outcome {
+        Outcome::Shifted {
+            events,
+            cut: vec![],
+        }
+    }
+
     fn whole() -> TimingFix {
         let ends = (line(2040, 4040, "One."), line(10_040, 12_040, "Three."));
         fix(vec![stretch(None, None, 1, Some(ends))], vec![])
@@ -892,7 +929,7 @@ mod tests {
     fn a_late_track_moves_every_line_a_frame_and_then_reads_as_applied() {
         let blocks = late();
         let p = plan(&whole(), &track(&blocks), &grid());
-        assert_eq!(p.outcome, Outcome::Shifted { events: 3 });
+        assert_eq!(p.outcome, shifted(3));
         assert_eq!(
             p.times,
             [
@@ -964,10 +1001,7 @@ mod tests {
         );
         let p = plan(&partial, &track(&blocks), &grid());
         let moved: Vec<usize> = p.times.iter().map(|t| t.0).collect();
-        assert_eq!(
-            (p.outcome, moved),
-            (Outcome::Shifted { events: 2 }, vec![0, 1])
-        );
+        assert_eq!((p.outcome, moved), (shifted(2), vec![0, 1]));
         // Line two recorded as left where it is.
         let ends = (line(2040, 4040, "One."), line(2040, 4040, "One."));
         let with_unshifted = fix(
@@ -1024,7 +1058,7 @@ mod tests {
             whole(84),
             Outcome::ByHand("the keyframes do not fix the frame grid to the millisecond".into())
         );
-        assert_eq!(whole(230), Outcome::Shifted { events: 1 });
+        assert_eq!(whole(230), shifted(1));
     }
 
     #[test]
@@ -1107,15 +1141,82 @@ mod tests {
     }
 
     #[test]
-    fn a_line_the_shift_leaves_no_time_is_left_for_a_hand_fix() {
+    fn a_line_the_shift_moves_before_0_is_left_for_a_hand_fix_that_names_it() {
         // One frame from 0: a frame earlier, it would start and end at 0.
         let blocks = [block(0, 0, 40, "One.")];
         let ends = (line(0, 40, "One."), line(0, 40, "One."));
-        let fix = fix(vec![stretch(None, None, 1, Some(ends))], vec![]);
+        let fix_one = fix(vec![stretch(None, None, 1, Some(ends))], vec![]);
         assert_eq!(
-            plan(&fix, &track(&blocks), &grid()).outcome,
-            Outcome::ByHand("the shift leaves a line no time".into())
+            plan(&fix_one, &track(&blocks), &grid()).outcome,
+            Outcome::ByHand("the shift moves the line at 0:00:00.00 before 0:00".into())
         );
+        // Three seconds earlier, the first line would end a second before 0.
+        let blocks = [
+            block(0, 1000, 2000, "Gone."),
+            block(1, 10_000, 12_000, "Kept."),
+        ];
+        let ends = (line(1000, 2000, "Gone."), line(10_000, 12_000, "Kept."));
+        let fix_three = fix(vec![stretch(None, None, 75, Some(ends))], vec![]);
+        assert_eq!(
+            plan(&fix_three, &track(&blocks), &grid()).outcome,
+            Outcome::ByHand("the shift moves the line at 0:00:01.00 before 0:00".into())
+        );
+        // An SRT line of no time (shown until the next) moved before 0 would start there, and
+        // may show for no time; named to the millisecond, as SRT writes it.
+        let mut no_time = block(0, 1234, 1234, "Gone.");
+        no_time.duration = None;
+        let blocks = [no_time, block(1, 10_000, 12_000, "Kept.")];
+        let srt = Track {
+            kind: Kind::Srt,
+            ..track(&blocks)
+        };
+        let ends = (line(1234, 1234, "Gone."), line(10_000, 12_000, "Kept."));
+        let fix_srt = fix(vec![stretch(None, None, 75, Some(ends))], vec![]);
+        assert_eq!(
+            plan(&fix_srt, &srt, &grid()).outcome,
+            Outcome::ByHand("the shift moves the line at 0:00:01.234 before 0:00".into())
+        );
+    }
+
+    #[test]
+    fn a_line_the_shift_moves_partly_before_0_starts_there_and_is_named() {
+        // Three seconds earlier, 2.5 to 5 s would be -0.5 to 2 s: it shows from 0.
+        let blocks = [
+            block(0, 2500, 5000, "Early."),
+            block(1, 10_000, 12_000, "Kept."),
+        ];
+        let ends = (line(2500, 5000, "Early."), line(10_000, 12_000, "Kept."));
+        let early = fix(vec![stretch(None, None, 75, Some(ends))], vec![]);
+        let p = plan(&early, &track(&blocks), &grid());
+        assert_eq!(
+            p.outcome,
+            Outcome::Shifted {
+                events: 2,
+                cut: vec![line(2500, 5000, "Early.")],
+            }
+        );
+        assert_eq!(p.times, [(0, 0, Some(2000)), (1, 7000, Some(2000))]);
+        // 2.99 s would be -0.01 s, in the frame at 0: held at 0, it shows on the same frames.
+        let blocks = [
+            block(0, 2990, 5000, "Close."),
+            block(1, 10_000, 12_000, "Kept."),
+        ];
+        let ends = (line(2990, 5000, "Close."), line(10_000, 12_000, "Kept."));
+        let close = fix(vec![stretch(None, None, 75, Some(ends))], vec![]);
+        assert_eq!(plan(&close, &track(&blocks), &grid()).outcome, shifted(2));
+        // One whose own end is its start shows on no frame wherever it moves: neither a hand fix
+        // nor named.
+        let blocks = [
+            block(0, 1000, 1000, "Blank."),
+            block(1, 10_000, 12_000, "Kept."),
+        ];
+        let ends = (line(1000, 1000, "Blank."), line(10_000, 12_000, "Kept."));
+        let blank = fix(vec![stretch(None, None, 75, Some(ends))], vec![]);
+        assert_eq!(plan(&blank, &track(&blocks), &grid()).outcome, shifted(2));
+        // A line the shift leaves inside the video is named by none.
+        let late = late();
+        let p = plan(&whole(), &track(&late), &grid());
+        assert_eq!(p.outcome, shifted(3));
     }
 
     #[test]
@@ -1237,7 +1338,7 @@ mod tests {
         let mut blocks = late();
         blocks.push(drawing(3, 5500, 7000));
         let p = plan(&late_from_two(), &track(&blocks), &grid());
-        assert_eq!(p.outcome, Outcome::Shifted { events: 3 });
+        assert_eq!(p.outcome, shifted(3));
         assert_eq!(moved(&p), [1, 2, 3]);
         assert_eq!(p.times[2], (3, 5460, Some(1500)));
     }
@@ -1286,10 +1387,7 @@ mod tests {
         let mut blocks = late();
         blocks.push(drawing(3, 3000, 6500));
         let p = plan(&late_from_two(), &track(&blocks), &grid());
-        assert_eq!(
-            (moved(&p), p.outcome),
-            (vec![1, 2], Outcome::Shifted { events: 2 })
-        );
+        assert_eq!((moved(&p), p.outcome), (vec![1, 2], shifted(2)));
         // Late only at line two: one starting before it and reaching line three stays too, though
         // the first line it meets moves.
         let two = (line(6040, 8040, "Two."), line(6040, 8040, "Two."));
