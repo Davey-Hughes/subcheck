@@ -1,7 +1,5 @@
-# The one Rust that dev/check-all.sh and both forges' CI build with. Unpinned, the local gate ran
-# whatever `rustup update` last fetched while CI ran the rust:1-bookworm its runner had cached, and
-# the two clippies disagreed: daveyutils#46 passed locally on 1.99 and failed CI on 1.97's
-# `duration_suboptimal_units`.
+# The one Rust that dev/check-all.sh and both forges' CI build with, so the local gate and CI lint
+# with the same clippy (daveyutils#52).
 #
 # rustup finds this file from the working directory upward, so it governs every cargo run inside
 # the repository.

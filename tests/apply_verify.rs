@@ -167,9 +167,9 @@ fn tracks_timed_by_their_default_duration_pass() {
         return;
     }
     // Two text tracks whose lines take their duration from the track's DefaultDuration, 2 s and
-    // a 23.976 fps frame; the first gets a fix. mkvmerge (74, 82, 102 and 103) leaves a text track's
-    // DefaultDuration out of any remux, fixed or not, and writes each line's duration instead,
-    // rounded to the millisecond: no difference.
+    // a 23.976 fps frame; the first gets a fix. Every mkvmerge version checked leaves a text
+    // track's DefaultDuration out of any remux, fixed or not, and writes each line's duration
+    // instead, rounded to the millisecond: no difference.
     let dir = tempfile::tempdir().unwrap();
     let original = fixture("timed.mkv");
     let (r, layout) = mkv::open(&original).unwrap();
@@ -378,7 +378,7 @@ fn a_remux_that_moves_an_audio_track_is_caught() {
         [] as [String; 0]
     );
     // Track 1 moved 30 ms later. Every frame and byte is still there, so nothing else in the check
-    // sees it: FMAB's TrueHD, moved 67 ms early by mkvmerge 102, passed the same way.
+    // sees it.
     assert_eq!(
         check(&audio_remuxed(dir.path(), "moved.mkv", &["--sync", "1:30"])),
         ["track 1: audio frame at 0:00:00.026 is at 0:00:00.057 in the remux"]

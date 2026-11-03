@@ -76,7 +76,7 @@ fn a_track_its_tags_call_empty_is_not_walked() {
     let read = blocks::read_tracks(&r, &layout, &[2], false).unwrap();
     assert_eq!(read[0].path, ReadPath::Empty);
     assert_eq!(read[0].blocks.len(), 0);
-    // A real 5.9 GB file took 372 s to walk, to learn the same thing.
+    // A walk would read the whole file, to learn the same thing.
     assert_eq!(r.reads(), before, "read the file to learn nothing");
 }
 
@@ -122,7 +122,7 @@ fn cues_read_less_than_the_whole_file() {
     let (r, layout) = mkv::open(&fixture("multi.mkv")).unwrap();
     let before = r.bytes_read();
     blocks::read_tracks(&r, &layout, &[2], false).unwrap();
-    // Five subtitle blocks in a 15 KB file of video: the fast path must not read it all.
+    // Five subtitle blocks in a file of video: the fast path must not read it all.
     assert!(
         r.bytes_read() - before < r.file_size() / 2,
         "read {} of {}",

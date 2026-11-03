@@ -88,8 +88,8 @@ fn a_scan_on_the_screen_fills_the_list_and_passes_decisions_on() {
         let e01_done = matches!(&msg, Msg::Scan(Event::Finished { path, .. }) if *path == e01);
         send(&mut model, msg, &mut store, &mut player, &tx);
         if e01_done {
-            // E01's two findings are rows of their own: accept both before E02's arrive (they are
-            // in the channel already, behind this one). E01's alone so far: were E02's here too,
+            // E01's two findings are rows of their own: accept both before E02's arrive (they may
+            // be in the channel already, behind this one). E01's alone so far: were E02's here too,
             // there would be no late join to see.
             assert_eq!(model.run.findings.len(), 2);
             assert_eq!(model.rows.len(), 2);

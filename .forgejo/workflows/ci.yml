@@ -13,8 +13,8 @@ env:
   CARGO_TERM_COLOR: always
 
 # This file is the Forgejo half of a two-forge CI, and the half that gates.
-# .github/workflows/ci.yml lives on because this instance has docker runners
-# only, so the macOS leg exists there and nowhere here.
+# .github/workflows/ci.yml exists because this instance has docker runners
+# only, so the macOS leg runs there and nowhere here.
 #
 # It is NOT a pre-merge gate, though. Nothing pushes to GitHub by hand: the forge
 # push-mirrors every branch there, so the macOS job does run on a pull request's
@@ -40,10 +40,9 @@ env:
 #
 # The job runs in rust:1.99.1-bookworm, the version rust-toolchain.toml names,
 # and the two move together. A floating rust:1-bookworm lets the runner keep
-# whatever copy it pulled last: on 2026-10-29 that was 1.97 while the local gate
-# had 1.99.1, and the two clippies disagreed. An exact tag cannot go stale, and
-# with it matching the file rustup has nothing to download in the job. Should
-# they ever differ, the file wins: rustup honours it inside the image too.
+# whatever copy it pulled last. An exact tag cannot go stale, and with it
+# matching the file rustup has nothing to download in the job. Should they ever
+# differ, the file wins: rustup honours it inside the image too.
 
 jobs:
   # The `apply` tests remux with mkvmerge and the `audio` tests decode with
@@ -96,7 +95,8 @@ jobs:
           echo "deb [signed-by=$key] https://mkvtoolnix.download/$ID/ $VERSION_CODENAME main" >/etc/apt/sources.list.d/mkvtoolnix.list
           apt-get update && apt-get install -y --no-install-recommends 'mkvtoolnix=103.0-*'
 
-      # bookworm's own (5.1): `audio`'s output on the fixtures is the same from it as from 9.0.
+      # bookworm's own (5.1): the newer ffmpeg checked gives `audio` the same
+      # output on the fixtures.
       - name: Install ffmpeg
         run: apt-get install -y --no-install-recommends ffmpeg
 

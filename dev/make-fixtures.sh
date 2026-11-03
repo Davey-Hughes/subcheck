@@ -6,7 +6,7 @@
 #   dev/make-fixtures.sh OUT_DIR
 #
 # Needs mkvmerge, mkvextract, mkvpropedit, ffmpeg and jq. The output is committed, so neither CI nor
-# `make check` needs any of them: run this only to add or change a fixture. Output is deterministic
+# dev/check-all.sh runs this: run it only to add or change a fixture. Output is deterministic
 # (mkvmerge --deterministic, ffmpeg bitexact), so rerunning it unchanged leaves `git status` clean.
 #
 # Synthetic text only. The repository is public, so no real fansub lines go in here.
@@ -24,7 +24,7 @@ mkdir -p "$out/expected"
 
 # One ASS script exercising what extract has to reproduce: a Comment event (kept in CodecPrivate),
 # two events with the same start, override tags, \N, a comma inside the text, and a ReadOrder that
-# is not time order (the last line is the earliest-but-one in time).
+# is not time order (the last line is the latest-but-one in time).
 cat >"$src/a.ass" <<'EOF'
 [Script Info]
 ScriptType: v4.00+

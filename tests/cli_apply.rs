@@ -166,8 +166,7 @@ impl Setup {
         s
     }
 
-    /// A copy of fixture `name` in `media/`, scanned with the fake LLM (which finds nothing in
-    /// it), and every finding accepted.
+    /// A copy of fixture `name` in `media/`, scanned with the fake LLM, and every finding accepted.
     fn scanned(name: &str) -> Setup {
         Setup::scanned_with(name, |_| {})
     }
@@ -214,7 +213,7 @@ impl Setup {
 
     /// A check of `path` of kind `check`, under the run, with `findings`: it replaces the file's
     /// check of that kind, so give a kind's findings all at once. Their decisions carry over from
-    /// the check it replaces, where one has the same line and fix. Returns their IDs.
+    /// the check it replaces, where one has the same `CarryKey`. Returns their IDs.
     fn save(&self, path: &Path, check: Check, findings: Vec<Finding>) -> Vec<u64> {
         let mut store = self.store();
         let scan = store.newest_scan().unwrap().unwrap();
@@ -1100,7 +1099,7 @@ fn a_bad_remux_leaves_the_original_and_no_remux_behind() {
     let s = Setup::new();
     // Each reads no languages (`-J`), as mkvmerge reads a file it knows no tracks in.
     let known = "[ \"$1\" = --version ] && exit 0\n[ \"$1\" = -J ] && echo '{}' && exit 0\n";
-    // Says it worked, but writes garbage where the remux goes (-o is its third argument).
+    // Says it worked, but writes garbage where the remux goes (its third argument, after -o).
     let garbage = script(&s.root, "garbage", &format!("{known}echo junk > \"$3\"\n"));
     let o = s.apply(&["--mkvmerge", garbage.to_str().unwrap()]);
     let text = stdout(&o);
