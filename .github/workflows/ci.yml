@@ -42,7 +42,10 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends ffmpeg
       #
-      # Keep these three in step with the job in .forgejo/workflows/ci.yml.
+      # Keep these three in step with the job in .forgejo/workflows/ci.yml, all
+      # but its coverage floor. One check of the floor, in the job that gates, is
+      # enough; and on macOS, where the `apply` and `audio` tests skip, the share
+      # would be of a smaller suite than the one the floor is set for.
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test

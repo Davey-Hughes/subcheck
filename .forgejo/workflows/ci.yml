@@ -73,11 +73,30 @@ jobs:
       - name: Syntax check
         run: for f in dev/*.sh; do bash -n "$f"; done
 
-      # The image's minimal rustup profile has neither component, and what the
+      # The image's minimal rustup profile has none of the three, and what the
       # image happens to carry is not something to lean on, so they are added
-      # here by name.
-      - name: Install rustfmt and clippy
-        run: rustup component add rustfmt clippy
+      # here by name. llvm-tools is what cargo llvm-cov reads coverage with. It
+      # stays out of rust-toolchain.toml, which would download it for every cargo
+      # run in the repository, the GitHub legs and every build from source among
+      # them.
+      - name: Install rustfmt, clippy and llvm-tools
+        run: rustup component add rustfmt clippy llvm-tools
+
+      # A prebuilt release binary, not `cargo install`, which would compile it in
+      # every job. The musl build is static, so it runs on bookworm's glibc.
+      #
+      # The digest is not upstream's: the release publishes no checksum for this
+      # asset, and a release asset can be replaced in place. To move on, change
+      # the version and the digest together, the digest from a download of the
+      # new version, never copied from anywhere else. dev/check-all.sh reads
+      # the version out of the URL below, so it stays the one URL of its kind.
+      - name: Install cargo-llvm-cov
+        run: |
+          curl -fsSL -o /tmp/llvm-cov.tar.gz \
+            https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz
+          echo "3fca950394a3c49457657c158b1619cec8dfd2647ae5b48746734c0ab969a522  /tmp/llvm-cov.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/llvm-cov.tar.gz -C /usr/local/bin
+          cargo llvm-cov --version
 
       # From MKVToolNix's own apt repository, pinned: bookworm's is 74.0, years behind the
       # mkvmerge that remuxes the library, and apply's check models what mkvmerge writes. The
@@ -104,7 +123,32 @@ jobs:
       - run: rustc --version
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+
+      # The test step: `cargo llvm-cov` runs `cargo test` with the build
+      # instrumented, and fails the job when the share of lines the tests reach
+      # falls under the floor. The share counts test code too (the in-file test
+      # modules, src/test_support.rs), not only the code that ships.
+      #
+      # 90 is chosen, not derived. It leaves room for code the Rust tests reach
+      # poorly, such as an FFI layer driven from another language or
+      # platform-conditional code, to land without lowering the floor in the same
+      # pull request. dev/check-all.sh reads the floor out of the `floor=` line
+      # below, so it stays a line of its own and the one such line in this file.
+      # cargo llvm-cov fails under the floor without saying so, hence the
+      # message.
+      - name: Tests, with coverage
+        run: |
+          floor=90
+          cargo llvm-cov --fail-under-lines "$floor" || {
+            echo "error: cargo llvm-cov failed. If it built and every test passed, compare TOTAL's Lines Cover with the $floor% floor" >&2
+            exit 1
+          }
         env:
           SUBCHECK_NEED_MKVMERGE: "1"
           SUBCHECK_NEED_FFMPEG: "1"
+
+      # cargo llvm-cov does not run doctests (instrumenting them needs nightly),
+      # so they run here, uninstrumented. The step is there so that a doctest,
+      # once written, runs.
+      - name: Doctests
+        run: cargo test --doc
