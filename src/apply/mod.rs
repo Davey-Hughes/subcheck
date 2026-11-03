@@ -617,7 +617,7 @@ impl Job<'_> {
         if self.timing.is_empty() {
             return Ok((patch::plan(views, self.fixes, self.karaoke), None));
         }
-        let video = crate::timing::video(layout);
+        let video = crate::timing::frames(layout);
         let fit = video
             .as_ref()
             .map_err(String::clone)

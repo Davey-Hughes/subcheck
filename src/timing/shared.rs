@@ -1,40 +1,57 @@
 //! Lines two tracks of one file share, and how many frames apart they are. A Signs/Songs track
 //! repeats lines of its Full track (signs, songs, the OP and ED) but rarely has enough of them on
-//! cuts for a verdict of its own (K-On!!: 21 of 24 episodes). Where its lines are another track's
-//! to the frame, it is timed as that track is.
+//! cuts for a verdict of its own. Where its lines are another track's, a whole number of frames
+//! apart, it is timed as that track is.
 
 use std::collections::{HashMap, HashSet};
 
 use super::lines;
-use super::{Analysis, OFFSETS, Stretch, Verdict, Video, decided, frame_index, slot, within};
+use super::{Analysis, MAX_OFFSET, Stretch, Verdict, Video, frame_index, wide};
 use crate::text::Event;
 
 /// How one track's lines sit against the same lines in another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shared {
-    /// Distinct times (per style, start or end) of lines with a twin, at most 3 frames apart.
+    /// Distinct times (per style, start or end) of lines with a twin.
     pub times: usize,
-    /// How many of them sit at each gap, this track's frame less the other's, -3 to +3.
-    pub counts: [usize; OFFSETS],
+    /// How many of them sit at each gap, this track's frame less the other's.
+    pub counts: wide::Hits,
 }
 
 impl Shared {
-    /// The gap the shared times agree on: at least 10 of them and twice the runner-up, as for an
-    /// offset.
+    /// The gap the shared times agree on: at least MIN_AT_OFFSET of them, and twice as many as at
+    /// any other gap, however near. Two groups' karaoke, each timed to the music, sits a frame or
+    /// three apart and smears over neighbouring gaps; a gap read off such a smear would contradict
+    /// a track's own verdict.
     pub fn gap(&self) -> Option<i64> {
-        decided(&self.counts)
+        wide::decided_by(&self.counts, |g, gap| g != gap).map(|(gap, _)| gap)
     }
 
     /// How many shared times sit at `gap`.
     pub fn at(&self, gap: i64) -> usize {
-        self.counts[slot(gap)]
+        self.counts.get(&gap).copied().unwrap_or(0)
     }
 }
 
-/// Each event's twin in `other`: the one event there with the same raw text starting within 3
-/// frames of it. `None` when there is none, or more than one: a sign repeated frame by frame would
-/// match its neighbour as well as itself, and a shift would read as no shift.
+/// How many frames apart a line and its twin may be. A video with too few keyframes to scan wide
+/// has its tracks looked at within ±MAX_OFFSET only, so a gap between twins is held to that too:
+/// further off, it would give a track following its twins a shift its own times are never
+/// measured for.
+fn reach(video: &Video) -> i64 {
+    if video.judged {
+        wide::reach(video)
+    } else {
+        MAX_OFFSET
+    }
+}
+
+/// Each event's twin in `other`: the one event there with the same raw text starting within
+/// MAX_OFFSET frames of it or, when none is that near, within [`reach`] frames. `None` when there
+/// is none, or two or more within the nearer bound that holds any: a sign repeated frame by frame
+/// would match its neighbour as well as itself, and a shift would read as no shift. A chorus line
+/// or a sign that comes back within reach is told from its repeat by the nearer bound.
 pub fn twins(video: &Video, track: &[Event], other: &[Event]) -> Vec<Option<usize>> {
+    let bounds = [MAX_OFFSET, reach(video)].map(|b| u128::from(b.unsigned_abs()));
     let mut by_raw: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, e) in other.iter().enumerate() {
         by_raw.entry(e.raw.as_str()).or_default().push(i);
@@ -43,20 +60,25 @@ pub fn twins(video: &Video, track: &[Event], other: &[Event]) -> Vec<Option<usiz
         .iter()
         .map(|e| {
             let at = frame_index(video, e.start_ms);
-            let mut near = by_raw
-                .get(e.raw.as_str())?
+            let namesakes = by_raw.get(e.raw.as_str())?;
+            let apart = |i: usize| (frame_index(video, other[i].start_ms) - at).unsigned_abs();
+            bounds
                 .iter()
-                .filter(|&&i| within(frame_index(video, other[i].start_ms) - at).is_some());
-            let one = *near.next()?;
-            near.next().is_none().then_some(one)
+                .find_map(|&bound| {
+                    let mut near = namesakes.iter().copied().filter(|&i| apart(i) <= bound);
+                    let one = near.next()?;
+                    Some(near.next().is_none().then_some(one))
+                })
+                .flatten()
         })
         .collect()
 }
 
 /// The gaps between `track`'s lines and their twins in `other`.
 pub fn shared(video: &Video, track: &[Event], other: &[Event], twins: &[Option<usize>]) -> Shared {
+    let reach = reach(video);
     let mut seen = HashSet::new();
-    let mut counts = [0; OFFSETS];
+    let mut counts = wide::Hits::new();
     for (e, twin) in track.iter().zip(twins) {
         let Some(t) = twin.map(|i| &other[i]) else {
             continue;
@@ -66,13 +88,16 @@ pub fn shared(video: &Video, track: &[Event], other: &[Event], twins: &[Option<u
             if !seen.insert((e.style.as_str(), is_end, mine)) {
                 continue;
             }
-            if let Some(gap) = within(frame_index(video, mine) - frame_index(video, theirs)) {
-                counts[slot(gap)] += 1;
+            let gap = i64::try_from(frame_index(video, mine) - frame_index(video, theirs))
+                .ok()
+                .filter(|g| g.unsigned_abs() <= reach.unsigned_abs());
+            if let Some(gap) = gap {
+                *counts.entry(gap).or_default() += 1;
             }
         }
     }
     Shared {
-        times: counts.iter().sum(),
+        times: counts.values().sum(),
         counts,
     }
 }
@@ -104,16 +129,23 @@ pub enum Lines {
 /// What the file's tracks' shared lines say, track by track. Each track is compared with the
 /// other tracks that have a verdict, and the one it shares the most times with at an agreed gap
 /// is used (on a tie, the smaller gap, then the lower ID). A track with too few lines or an
-/// unclear verdict follows it. A shifted or in-sync track is checked against it when that track is
-/// shifted or in sync too; a partial one is not checked.
+/// unclear verdict follows it, unless part of the track is flagged at another shift. A shifted or
+/// in-sync track is checked against it when that track is shifted or in sync too; a partial one is
+/// not checked.
 ///
 /// `tracks`: each track's mkvmerge ID, events and analysis.
 pub fn lines_of(video: &Video, tracks: &[(usize, &[Event], &Analysis)]) -> Vec<Option<Lines>> {
     tracks
         .iter()
         .map(|&(id, mine, own)| {
-            // A partial track's verdict is not checked against shared lines: nothing to compute.
-            if matches!(own.verdict, Verdict::Partial(_)) {
+            // A partial track's verdict is not checked against shared lines, and neither is a
+            // track flagged for part of its length at another shift: one gap cannot speak for both
+            // parts, and following its twins would move the whole track by the shift of whichever
+            // part they share. A track torn between two whole-track shifts is one track, and its
+            // twins settle which way it points.
+            if matches!(own.verdict, Verdict::Partial(_))
+                || own.rival.is_some_and(|r| r.span.is_some())
+            {
                 return None;
             }
             let (source, theirs, twins, shared, gap) = tracks
@@ -227,13 +259,18 @@ fn follow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timing::synthetic;
+    use crate::timing::wide::Hits;
+    use crate::timing::{OFFSETS, analyse};
 
     /// 25 fps, a keyframe every 2 s.
     fn video() -> Video {
-        Video {
-            frame_ns: 40_000_000,
-            keyframes_ns: (0..=900).map(|i| i * 2_000_000_000).collect(),
-        }
+        Video::unjudged(40_000_000, (0..=900).map(|i| i * 2_000_000_000).collect())
+    }
+
+    /// [`video`], scanned wide: twins are looked for up to ten seconds apart.
+    fn judged() -> Video {
+        Video::all_cuts(40_000_000, video().keyframes_ns)
     }
 
     fn event(text: &str, start_ms: i64, end_ms: i64) -> Event {
@@ -261,22 +298,140 @@ mod tests {
     }
 
     #[test]
-    fn a_twin_is_the_one_line_with_the_same_raw_text_within_three_frames() {
+    fn a_twin_is_the_one_line_with_the_same_raw_text_within_ten_seconds() {
         let other = [
             event("A", 1000, 2000),
             event("B", 5000, 6000),
             // The same sign on two frames in a row: neither is anyone's only twin.
             event("C", 9000, 9040),
             event("C", 9040, 9080),
+            event("E", 30_000, 31_000),
+            event("F", 50_000, 51_000),
+            event("F", 55_000, 56_000),
         ];
         let track = [
             event("A", 1040, 2040),
-            // Four frames from its namesake: too far.
             event("B", 5160, 6160),
             event("C", 9040, 9080),
             event("D", 1000, 2000),
+            // Eleven seconds from its namesake: too far.
+            event("E", 41_000, 42_000),
+            // Two namesakes within reach, 2 s and 3 s off: neither is its only twin.
+            event("F", 52_000, 53_000),
         ];
-        assert_eq!(twins(&video(), &track, &other), [Some(0), None, None, None]);
+        assert_eq!(
+            twins(&judged(), &track, &other),
+            [Some(0), Some(1), None, None, None, None]
+        );
+    }
+
+    #[test]
+    fn a_namesake_within_three_frames_is_the_twin_however_many_are_within_ten_seconds() {
+        let other = [
+            // A chorus line sung twice, 6 s apart.
+            event("Chorus", 10_000, 12_000),
+            event("Chorus", 16_000, 18_000),
+            event("Sign", 30_000, 31_000),
+            event("Sign", 37_000, 38_000),
+        ];
+        let track = [
+            // A frame after the first chorus line.
+            event("Chorus", 10_040, 12_040),
+            // 3 s after one sign and 4 s before the other: neither is its only twin.
+            event("Sign", 33_000, 34_000),
+        ];
+        assert_eq!(twins(&judged(), &track, &other), [Some(0), None]);
+    }
+
+    #[test]
+    fn on_a_clip_too_short_to_scan_wide_a_twin_is_within_three_frames() {
+        // 24 frames apart: a clip's track is looked at within 3 frames, a longer video's within
+        // ten seconds.
+        let other = [event("A", 10_000, 12_000)];
+        let track = [event("A", 10_960, 12_960)];
+        let (short, long) = (video(), judged());
+        assert_eq!(twins(&short, &track, &other), [None]);
+        assert_eq!(twins(&long, &track, &other), [Some(0)]);
+        // Nor is a pair that far apart counted at its gap.
+        assert_eq!(shared(&short, &track, &other, &[Some(0)]).times, 0);
+        assert_eq!(shared(&long, &track, &other, &[Some(0)]).at(24), 2);
+    }
+
+    #[test]
+    fn a_gap_needs_twice_the_times_of_any_other_however_near() {
+        let split = Shared {
+            times: 249,
+            counts: Hits::from([(23, 51), (24, 198)]),
+        };
+        assert_eq!((split.gap(), split.at(24)), (Some(24), 198));
+        let torn = Shared {
+            times: 300,
+            counts: Hits::from([(0, 150), (24, 150)]),
+        };
+        assert_eq!(torn.gap(), None);
+        // Karaoke timed to the music a frame or three apart in each track.
+        let smeared = Shared {
+            times: 95,
+            counts: Hits::from([(2, 30), (3, 40), (4, 25)]),
+        };
+        assert_eq!(smeared.gap(), None);
+    }
+
+    #[test]
+    fn a_track_a_second_after_its_twins_follows_them_and_a_two_frame_verdict_is_blocked() {
+        let cuts = synthetic::cuts(500);
+        let video = synthetic::yuru(&cuts);
+        let late = synthetic::track(&cuts, 24);
+        let on = synthetic::track(&cuts, 0);
+        let in_sync = analysis(Verdict::InSync, vec![Some(0); on.len()]);
+        // With no verdict of its own, it takes the other track's, 24 frames on.
+        let unclear = analysis(Verdict::Unclear, vec![None; late.len()]);
+        let out = lines_of(&video, &[(3, &late, &unclear), (5, &on, &in_sync)]);
+        let Some(Lines::Follows(f)) = &out[0] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(
+            (f.source, f.gap, f.verdict.clone()),
+            (5, 24, Verdict::Shifted(24))
+        );
+        // Read as two frames early, its twins say otherwise: no fix.
+        let early = analysis(Verdict::Shifted(-2), vec![Some(0); late.len()]);
+        let out = lines_of(&video, &[(3, &late, &early), (5, &on, &in_sync)]);
+        assert_eq!(
+            out[0],
+            Some(Lines::Disagrees {
+                source: 5,
+                says: Verdict::Shifted(24)
+            })
+        );
+    }
+
+    #[test]
+    fn a_track_torn_between_two_whole_track_shifts_follows_its_twins() {
+        let cuts = synthetic::cuts(500);
+        // Every keyframe taken for a cut: a track a second late reads two frames early as well.
+        let video = Video::all_cuts(
+            synthetic::FRAME_NS,
+            synthetic::keyframes_ns(&synthetic::keyframes(&cuts, 26, &[24])),
+        );
+        let late = synthetic::track(&cuts, 24);
+        let on = synthetic::track(&cuts, 0);
+        let torn = analyse(&video, &late);
+        let r = torn.rival.expect("a rival");
+        assert_eq!(
+            (torn.verdict.clone(), r.ours.0, r.theirs.0, r.span),
+            (Verdict::Unclear, -2, 24, None)
+        );
+        // Read off the same keyframes, the twins' own times are unclear too: their verdict is set.
+        let in_sync = analysis(Verdict::InSync, vec![Some(0); on.len()]);
+        let out = lines_of(&video, &[(3, &late, &torn), (5, &on, &in_sync)]);
+        let Some(Lines::Follows(f)) = &out[0] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(
+            (f.source, f.gap, f.verdict.clone()),
+            (5, 24, Verdict::Shifted(24))
+        );
     }
 
     #[test]
@@ -308,6 +463,9 @@ mod tests {
             frame_ns: 40_000_000,
             each,
             unshifted: Vec::new(),
+            centre: 0,
+            rival: None,
+            peaks: Vec::new(),
         }
     }
 
@@ -454,16 +612,14 @@ mod tests {
     #[test]
     fn frames_at_either_end_of_time_are_far_apart_not_an_overflow() {
         // At 1 ns a frame, a line at the end of i64 ms is more frames in than an i64 counts.
-        let video = Video {
-            frame_ns: 1,
-            keyframes_ns: (0..=10).map(|i| i * 1_000_000_000).collect(),
-        };
+        let video = Video::unjudged(1, (0..=10).map(|i| i * 1_000_000_000).collect());
         let mine = [event("Sign", -1000, -500)];
         let theirs = [event("Sign", i64::MAX, i64::MAX)];
         assert_eq!(twins(&video, &mine, &theirs), [None]);
         assert_eq!(shared(&video, &mine, &theirs, &[Some(0)]).times, 0);
-        // Two such lines are as far apart as they are, not both at the last frame an i64 counts.
-        let late = [event("Sign", i64::MAX - 1, i64::MAX)];
+        // Two such lines 20 s apart are as far apart as they are, not both at the last frame an
+        // i64 counts.
+        let late = [event("Sign", i64::MAX - 20_000, i64::MAX - 19_000)];
         assert_eq!(twins(&video, &theirs, &late), [None]);
     }
 }

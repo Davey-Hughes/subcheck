@@ -2,8 +2,8 @@
 //! by its own times against the cuts or by the lines it shares with another track.
 
 use super::shared::Lines;
-use super::{Analysis, Stretch, Verdict, Video, detail, frame_offset, nearest_keyframe};
-use super::{frames_way, shift_label, verdict_label};
+use super::{Analysis, Stretch, Verdict, Video, detail, frame_offset_at, measured_from};
+use super::{frames_way, rival_words, shift_label, verdict_label};
 use crate::store::{Basis, Finding, FixStretch, LineRef, TimingFix};
 use crate::text::{self, Event, Occurrence};
 
@@ -18,7 +18,8 @@ pub struct Track<'a> {
 }
 
 /// The file's timing findings, numbered 0 for the run to number, and a note for each track whose
-/// own verdict its shared lines contradict (it gets no finding).
+/// own verdict its shared lines contradict, or whose times point two ways and that follows no
+/// other track (neither gets a finding).
 pub fn findings(file: &str, video: &Video, tracks: &[Track]) -> (Vec<Finding>, Vec<String>) {
     let mut out = Vec::new();
     let mut notes = Vec::new();
@@ -58,6 +59,14 @@ pub fn findings(file: &str, video: &Video, tracks: &[Track]) -> (Vec<Finding>, V
                     },
                 )
             }
+            // A track that follows another gets that verdict's finding, or none, and no note: its
+            // shared lines settle it.
+            (Verdict::Unclear, None) => {
+                if let Some(r) = &a.rival {
+                    notes.push(format!("track {}: unclear: {}", t.id, rival_words(r)));
+                }
+                continue;
+            }
             _ => continue,
         };
         let stretches = match verdict {
@@ -74,7 +83,7 @@ pub fn findings(file: &str, video: &Video, tracks: &[Track]) -> (Vec<Finding>, V
             .iter()
             .enumerate()
             .map(|(k, s)| {
-                let (fixed, shown) = fix_stretch(video, t.events, each, k, s);
+                let (fixed, shown) = fix_stretch(video, t.events, each, k, s, centre(a, &basis, s));
                 occurrences.extend(shown.map(|e| Occurrence {
                     track: t.id,
                     start_ms: e.start_ms,
@@ -151,14 +160,24 @@ fn reason(a: &Analysis, verdict: &Verdict, basis: &Basis) -> String {
     }
 }
 
+/// What a stretch's times are measured around: on the track's own cuts, the centre its analysis
+/// counted them around; off another track's lines, the stretch's shift, all there is to go by.
+fn centre(a: &Analysis, basis: &Basis, s: &Stretch) -> i64 {
+    match basis {
+        Basis::Cuts { .. } => a.centre,
+        Basis::Lines { .. } => s.frames,
+    }
+}
+
 /// A stretch with its first and last lines and the frame that shows its error, when it moves any;
-/// and the line that frame belongs to.
+/// and the line that frame belongs to. Times are measured around `centre`.
 fn fix_stretch<'e>(
     video: &Video,
     events: &'e [Event],
     each: &[Option<usize>],
     k: usize,
     s: &Stretch,
+    centre: i64,
 ) -> (FixStretch, Option<&'e Event>) {
     let mine: Vec<&Event> = events
         .iter()
@@ -169,22 +188,28 @@ fn fix_stretch<'e>(
     let moves = s.frames != 0;
     let first = mine.iter().min_by_key(|e| (e.start_ms, e.end_ms));
     let last = mine.iter().max_by_key(|e| (e.end_ms, e.start_ms));
-    let shown = moves.then(|| evidence(video, &mine, s)).flatten();
+    let shown = moves.then(|| evidence(video, &mine, s, centre)).flatten();
     let fixed = FixStretch {
         from_ms: s.from_ms,
         to_ms: s.to_ms,
         frames: s.frames,
         first: first.filter(|_| moves).map(|e| line_ref(e)),
         last: last.filter(|_| moves).map(|e| line_ref(e)),
-        frame_ms: shown.map(|(_, time_ms)| shown_frame_ms(video, time_ms, s.frames)),
+        frame_ms: shown.map(|(_, time_ms)| shown_frame_ms(video, time_ms, s.frames, centre)),
     };
     (fixed, shown.map(|(e, _)| e))
 }
 
 /// The line that shows a stretch's error best, and the time of it on a cut: of the lines with an
 /// end at the stretch's offset (a late one still on the new shot's first frame), the one starting
-/// nearest the stretch's middle; failing that, a start at the offset.
-fn evidence<'e>(video: &Video, mine: &[&'e Event], s: &Stretch) -> Option<(&'e Event, i64)> {
+/// nearest the stretch's middle; failing that, a start at the offset. Each time is measured from
+/// the keyframe nearest the point `centre` frames before it.
+fn evidence<'e>(
+    video: &Video,
+    mine: &[&'e Event],
+    s: &Stretch,
+    centre: i64,
+) -> Option<(&'e Event, i64)> {
     let from = s
         .from_ms
         .or_else(|| mine.iter().map(|e| e.start_ms).min())?;
@@ -195,17 +220,18 @@ fn evidence<'e>(video: &Video, mine: &[&'e Event], s: &Stretch) -> Option<(&'e E
     let middle = i64::try_from(a + (b - a) / 2).expect("between from and to");
     let nearest = |times: &dyn Fn(&Event) -> i64| {
         mine.iter()
-            .filter(|e| frame_offset(video, times(e)) == i128::from(s.frames))
+            .filter(|e| frame_offset_at(video, times(e), centre) == i128::from(s.frames))
             .min_by_key(|e| (e.start_ms.abs_diff(middle), e.start_ms))
             .map(|e| (*e, times(e)))
     };
     nearest(&|e| e.end_ms).or_else(|| nearest(&|e| e.start_ms))
 }
 
-/// The frame that shows the error of a time `frames` off the nearest cut, in ms: the cut's own
-/// frame for a late time (the line still showing, or not yet), the frame before it for an early one.
-fn shown_frame_ms(video: &Video, time_ms: i64, frames: i64) -> i64 {
-    let cut = nearest_keyframe(video, time_ms);
+/// The frame that shows the error of a time `frames` after its cut, the keyframe nearest the point
+/// `centre` frames before it, in ms: the cut's own frame for a late time (the line still showing,
+/// or not yet), the frame before it for an early one.
+fn shown_frame_ms(video: &Video, time_ms: i64, frames: i64, centre: i64) -> i64 {
+    let cut = measured_from(video, time_ms, centre);
     let ns = if frames > 0 {
         cut
     } else {
@@ -273,14 +299,12 @@ fn apart(gap: i64) -> String {
 mod tests {
     use super::*;
     use crate::timing::shared::{Follow, Shared};
-    use crate::timing::{OFFSETS, analyse};
+    use crate::timing::wide::Rival;
+    use crate::timing::{OFFSETS, analyse, shared, synthetic};
 
     /// 25 fps, a keyframe every 2 s.
     fn video() -> Video {
-        Video {
-            frame_ns: 40_000_000,
-            keyframes_ns: (0..=900).map(|i| i * 2_000_000_000).collect(),
-        }
+        Video::unjudged(40_000_000, (0..=900).map(|i| i * 2_000_000_000).collect())
     }
 
     /// `frames` frames after keyframe `n`, in ms.
@@ -379,6 +403,9 @@ mod tests {
             frame_ns: 40_000_000,
             each,
             unshifted: Vec::new(),
+            centre: 0,
+            rival: None,
+            peaks: Vec::new(),
         }
     }
 
@@ -484,7 +511,7 @@ mod tests {
             gap: 0,
             shared: Shared {
                 times: 34,
-                counts: [0, 0, 0, 34, 0, 0, 0],
+                counts: crate::timing::wide::Hits::from([(0, 34)]),
             },
             verdict: Verdict::Shifted(1),
             each: vec![Some(0)],
@@ -554,6 +581,211 @@ mod tests {
     }
 
     #[test]
+    fn an_unclear_track_whose_times_point_two_ways_gets_a_note_and_no_finding() {
+        let events: Vec<Event> = (0..20)
+            .map(|n| event(at(3 * n, 0), at(3 * n + 1, 0)))
+            .collect();
+        let mut a = analysis(Verdict::Unclear, vec![None; 20]);
+        a.rival = Some(Rival {
+            ours: (-2, 135),
+            theirs: (24, 134),
+            span: None,
+        });
+        let track = Track {
+            id: 3,
+            events: &events,
+            analysis: &a,
+            lines: None,
+        };
+        let (found, notes) = findings("/m/a.mkv", &video(), &[track]);
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(
+            notes,
+            ["track 3: unclear: 135 times on cuts at -2, 134 at +24"]
+        );
+    }
+
+    #[test]
+    fn a_track_a_second_off_on_short_shots_opens_on_the_cut_its_lines_are_timed_to() {
+        // Every shot under two seconds: a time a second off its cut is nearer another one.
+        let cuts = synthetic::short_cuts(1200);
+        let video = synthetic::yuru(&cuts);
+        let cut_ms: Vec<i64> = cuts.iter().map(|&c| synthetic::ms(c)).collect();
+        for late in [24, -24] {
+            let events = synthetic::track(&cuts, late);
+            let a = analyse(&video, &events);
+            let track = Track {
+                id: 3,
+                events: &events,
+                analysis: &a,
+                lines: None,
+            };
+            let (found, notes) = findings("/m/a.mkv", &video, &[track]);
+            assert!(notes.is_empty(), "{late}: {notes:?}");
+            let [f] = found.as_slice() else {
+                panic!("{late}: {found:?}")
+            };
+            let [s] = f.timing.as_ref().unwrap().stretches.as_slice() else {
+                panic!("{late}: {f:?}")
+            };
+            assert_eq!(s.frames, late);
+            let shown = s.frame_ms.expect("a line at the stretch's offset");
+            // Late, the cut's own frame; early, the frame before it.
+            let on_or_before_a_cut = if late > 0 {
+                cut_ms.contains(&shown)
+            } else {
+                cut_ms.iter().any(|&c| (c - 42 - shown).abs() <= 1)
+            };
+            assert!(on_or_before_a_cut, "{late}: {shown}");
+            // From a line near the middle, where each time is nearer another cut than its own,
+            // not from an end of the track, where no other cut is.
+            let middle = cut_ms[0].midpoint(cut_ms[cut_ms.len() - 1]);
+            assert!(
+                (shown - middle).abs() < 5_000,
+                "{late}: {shown}, middle {middle}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_track_flagged_for_part_of_it_does_not_follow_its_twins_and_keeps_its_note() {
+        let cuts = synthetic::cuts(500);
+        let video = synthetic::yuru(&cuts);
+        // Shots from 9:00 to 15:00 five seconds late; the same lines in track 5 all on the cuts.
+        let flagged = synthetic::track_by(&cuts, |cut| {
+            if (540_000..900_000).contains(&synthetic::ms(cut)) {
+                120
+            } else {
+                0
+            }
+        });
+        let on = synthetic::track(&cuts, 0);
+        let (a3, a5) = (analyse(&video, &flagged), analyse(&video, &on));
+        assert_eq!(a3.verdict, Verdict::Unclear);
+        assert_eq!(a3.rival.and_then(|r| r.span), Some((540_000, 900_000)));
+        let said = shared::lines_of(&video, &[(3, &flagged, &a3), (5, &on, &a5)]);
+        assert_eq!(said[0], None);
+        let tracks = [
+            Track {
+                id: 3,
+                events: &flagged,
+                analysis: &a3,
+                lines: said[0].as_ref(),
+            },
+            Track {
+                id: 5,
+                events: &on,
+                analysis: &a5,
+                lines: said[1].as_ref(),
+            },
+        ];
+        let (found, notes) = findings("/m/a.mkv", &video, &tracks);
+        assert_eq!(found, []);
+        let [note] = notes.as_slice() else {
+            panic!("{notes:?}")
+        };
+        assert!(
+            note.starts_with("track 3: unclear: 0:09:00.00 – 0:15:00.00: "),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_track_a_second_late_after_its_first_third_says_where_and_follows_no_twins() {
+        let cuts = synthetic::cuts(500);
+        let video = synthetic::yuru(&cuts);
+        // Its twins in track 5 all on the cuts: following them would move the whole track.
+        let third = cuts[cuts.len() / 3];
+        let split = synthetic::track_by(&cuts, |cut| if cut < third { 0 } else { 24 });
+        let on = synthetic::track(&cuts, 0);
+        let (a3, a5) = (analyse(&video, &split), analyse(&video, &on));
+        assert_eq!(a3.verdict, Verdict::Unclear);
+        let r = a3.rival.expect("a rival");
+        assert!(r.span.is_some(), "{r:?}");
+        assert_eq!((r.ours.0, r.theirs.0), (0, 24), "{r:?}");
+        let said = shared::lines_of(&video, &[(3, &split, &a3), (5, &on, &a5)]);
+        assert_eq!(said[0], None);
+        let tracks = [
+            Track {
+                id: 3,
+                events: &split,
+                analysis: &a3,
+                lines: said[0].as_ref(),
+            },
+            Track {
+                id: 5,
+                events: &on,
+                analysis: &a5,
+                lines: said[1].as_ref(),
+            },
+        ];
+        let (found, notes) = findings("/m/a.mkv", &video, &tracks);
+        assert_eq!(found, []);
+        let [note] = notes.as_slice() else {
+            panic!("{notes:?}")
+        };
+        assert!(note.starts_with("track 3: unclear: "), "{note}");
+    }
+
+    #[test]
+    fn a_findings_evidence_is_measured_around_its_analysis_centre_or_off_shared_lines_its_shift() {
+        // A keyframe 3 frames after the one at 0:22.
+        let mut keyframes: Vec<u64> = (0..=900).map(|i| i * 2_000_000_000).collect();
+        keyframes.push(22_120_000_000);
+        keyframes.sort_unstable();
+        let video = Video::unjudged(40_000_000, keyframes);
+        let events = [
+            // Ends 2 frames after the keyframe at 0:04.
+            event(at(1, 10), at(2, 2)),
+            // Starts nearest the middle and ends 2 frames after the keyframe at 0:22, but a frame
+            // before the next one: measured around 0, as the analysis counted, it is a frame early.
+            event(at(10, 10), at(11, 2)),
+            // Ends 20 frames after a keyframe.
+            event(at(19, 10), at(19, 20)),
+        ];
+        let own = Analysis {
+            centre: 0,
+            ..analysis(Verdict::Shifted(2), vec![Some(0); 3])
+        };
+        let follows = Lines::Follows(Follow {
+            source: 2,
+            gap: 0,
+            shared: Shared {
+                times: 34,
+                counts: crate::timing::wide::Hits::from([(0, 34)]),
+            },
+            verdict: Verdict::Shifted(2),
+            each: vec![Some(0); 3],
+            unshifted: Vec::new(),
+        });
+        let too_few = analysis(Verdict::TooFew, vec![None; 3]);
+        let tracks = [
+            Track {
+                id: 3,
+                events: &events,
+                analysis: &own,
+                lines: None,
+            },
+            Track {
+                id: 4,
+                events: &events,
+                analysis: &too_few,
+                lines: Some(&follows),
+            },
+        ];
+        let (found, _) = findings("/m/a.mkv", &video, &tracks);
+        let shown: Vec<(i64, Option<i64>)> = found
+            .iter()
+            .map(|f| {
+                let fix = f.timing.as_ref().unwrap();
+                (f.occurrences[0].start_ms, fix.stretches[0].frame_ms)
+            })
+            .collect();
+        // Off shared lines, the stretch's own shift is all there is to measure around.
+        assert_eq!(shown, [(at(1, 10), Some(4000)), (at(10, 10), Some(22_000))]);
+    }
+
+    #[test]
     fn evidence_from_times_at_either_end_of_time_does_not_overflow() {
         // Ends a frame after keyframes 1 and 0.
         let late = event(at(1, 0), at(1, 1));
@@ -565,7 +797,7 @@ mod tests {
             to_ms: None,
             frames: 1,
         };
-        let got = evidence(&video(), &[&late, &corrupt], &whole);
+        let got = evidence(&video(), &[&late, &corrupt], &whole, whole.frames);
         assert_eq!(got, Some((&late, at(1, 1))));
         // A stretch at the end of time: its middle is i64::MAX, and a line starts before 0.
         let last = Stretch {
@@ -573,7 +805,7 @@ mod tests {
             to_ms: Some(i64::MAX),
             frames: 1,
         };
-        let got = evidence(&video(), &[&early, &late], &last);
+        let got = evidence(&video(), &[&early, &late], &last, last.frames);
         assert_eq!(got, Some((&late, at(1, 1))));
     }
 
@@ -587,7 +819,7 @@ mod tests {
             to_ms: Some(0),
             frames: 1,
         };
-        let got = evidence(&video(), &[&first, &second], &s);
+        let got = evidence(&video(), &[&first, &second], &s, s.frames);
         assert_eq!(got, Some((&first, at(0, 1))));
     }
 }

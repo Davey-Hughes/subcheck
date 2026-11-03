@@ -320,9 +320,9 @@ fn stretch_of(stretches: &[FixStretch], start_ms: i64) -> Option<&FixStretch> {
 }
 
 /// The stretch that moves a line of these times, if one does: not an unshifted line's. The scan
-/// leaves lines where they are a block of overlapping lines at a time, so an event at an unshifted
-/// line's times, whatever its text (a typo fixed since), is in that block. A drawing goes by its
-/// neighbours ([`stretches`]).
+/// leaves lines where they are a block of overlapping lines, or every line starting in a window,
+/// at a time, so an event at an unshifted line's times, whatever its text (a typo fixed since), is
+/// left with it. A drawing goes by its neighbours ([`stretches`]).
 fn moving(fix: &TimingFix, start_ms: i64, end_ms: i64) -> Option<&FixStretch> {
     let unshifted = fix
         .unshifted
@@ -628,10 +628,10 @@ mod tests {
     /// keyframes, the last stored at 20:51.458 where plain rounding of 30005 frames of 1001/24 ms
     /// (1251458.54) gives 20:51.459.
     fn e09() -> Video {
-        Video {
-            frame_ns: 41_708_333,
-            keyframes_ns: vec![0, 501_418_000_000, 1_091_924_000_000, 1_251_458_000_000],
-        }
+        Video::unjudged(
+            41_708_333,
+            vec![0, 501_418_000_000, 1_091_924_000_000, 1_251_458_000_000],
+        )
     }
 
     fn e09_grid() -> Grid<'static> {
@@ -677,6 +677,9 @@ mod tests {
         assert_eq!(grid.frame_of(grid.moved(x, -1, CS)), 26_182);
         // At the millisecond (SRT) it keeps its place in the frame to the millisecond.
         assert_eq!(ms_of(grid.moved(x, 1, 1_000_000)), 1_091_908);
+        // A second at 23.976 fps is 24 frames, either way.
+        assert_eq!(grid.frame_of(grid.moved(x, 24, CS)), 26_157);
+        assert_eq!(grid.frame_of(grid.moved(x, -24, CS)), 26_205);
     }
 
     #[test]
@@ -688,10 +691,7 @@ mod tests {
         // Frame 5, at 208.54 ms exactly, is stored at 208 ms, as in E09.
         assert_eq!(grid.at(5), 208_000_000);
         // Keyframes no one phase puts on frames: a cut 25 ms past a frame at 25 fps.
-        let off = Video {
-            frame_ns: 40_000_000,
-            keyframes_ns: vec![0, 2_025_000_000, 6_025_000_000],
-        };
+        let off = Video::unjudged(40_000_000, vec![0, 2_025_000_000, 6_025_000_000]);
         assert_eq!(
             Grid::fit(&off, 1_000_000).map(|_| ()),
             Err("the video's keyframes are on no one frame grid".into())
@@ -702,10 +702,7 @@ mod tests {
     /// is exactly half a millisecond past one, and stored a millisecond later up to 21:43 (frame
     /// 173, at 7215.5 ms, at 7216) and earlier after (frame 32933, at 1373580.5 ms, at 1373580).
     fn valentine() -> Video {
-        Video {
-            frame_ns: 41_708_333,
-            keyframes_ns: vec![0, 7_216_000_000, 1_373_580_000_000],
-        }
+        Video::unjudged(41_708_333, vec![0, 7_216_000_000, 1_373_580_000_000])
     }
 
     #[test]
@@ -805,14 +802,13 @@ mod tests {
         assert_eq!(grid.moved(0, 1, CS), 0);
         // A frame in, it moves to the start.
         assert_eq!(grid.moved(grid.at(1), 1, CS), 0);
+        // Moved further back than the start, it stops there.
+        assert_eq!(grid.moved(grid.at(10), 24, CS), 0);
     }
 
     /// 25 fps, a keyframe every 2 s.
     fn grid() -> Grid<'static> {
-        let video = Video {
-            frame_ns: 40_000_000,
-            keyframes_ns: (0..=100).map(|i| i * 2_000_000_000).collect(),
-        };
+        let video = Video::unjudged(40_000_000, (0..=100).map(|i| i * 2_000_000_000).collect());
         Grid::fit(&video, 1_000_000).unwrap()
     }
 
@@ -994,10 +990,7 @@ mod tests {
     fn a_shift_that_misses_the_frame_grid_is_left_for_a_hand_fix() {
         // At 120 fps frame 7 (50 to 58 ms) holds no centisecond: a line starting in frame 8, at
         // 60 ms, cannot be written a frame earlier.
-        let video = Video {
-            frame_ns: 8_333_333,
-            keyframes_ns: (0..=10).map(|i| i * 2_000_000_000).collect(),
-        };
+        let video = Video::unjudged(8_333_333, (0..=10).map(|i| i * 2_000_000_000).collect());
         let fast = Grid::fit(&video, 1_000_000).unwrap();
         let blocks = [block(0, 60, 2000, "One.")];
         let ends = (line(60, 2000, "One."), line(60, 2000, "One."));
@@ -1012,10 +1005,7 @@ mod tests {
     fn keyframes_that_leave_a_frame_a_millisecond_unsure_leave_its_times_for_a_hand_fix() {
         // A fixed GOP: a keyframe every 24 frames at 23.976 fps, each on a whole millisecond, so
         // any phase within half a millisecond fits, and frame 5 (208.54 ms) is at 208 or 209.
-        let video = Video {
-            frame_ns: 41_708_333,
-            keyframes_ns: (0..=40).map(|k| k * 1_001_000_000).collect(),
-        };
+        let video = Video::unjudged(41_708_333, (0..=40).map(|k| k * 1_001_000_000).collect());
         let gop = Grid::fit(&video, 1_000_000).unwrap();
         let whole = |start| {
             let blocks = [block(0, start, 2000, "One.")];
@@ -1344,10 +1334,7 @@ mod tests {
     fn a_time_at_the_end_of_i64_is_on_its_frame_however_short_the_frames() {
         // A corrupt BlockDuration ends a line at i64::MAX ms; at 1 µs a frame, no i64 counts its
         // frame.
-        let video = Video {
-            frame_ns: 1_000,
-            keyframes_ns: (0..10).map(|i| i * 1_000_000).collect(),
-        };
+        let video = Video::unjudged(1_000, (0..10).map(|i| i * 1_000_000).collect());
         let grid = Grid::fit(&video, 1_000_000).unwrap();
         let x = i128::from(i64::MAX) * 1_000_000;
         let n = grid.frame_of(x);
@@ -1358,10 +1345,7 @@ mod tests {
     fn a_line_to_the_end_of_i64_on_frames_shorter_than_a_millisecond_is_left_for_a_hand_fix() {
         // A corrupt BlockDuration: the line ends at i64::MAX ms. At 1 µs a frame, no centisecond
         // keeps a time on its frame, so the shift is a hand fix, as for any line on such a grid.
-        let video = Video {
-            frame_ns: 1_000,
-            keyframes_ns: (0..10).map(|i| i * 1_000_000).collect(),
-        };
+        let video = Video::unjudged(1_000, (0..10).map(|i| i * 1_000_000).collect());
         let grid = Grid::fit(&video, 1_000_000).unwrap();
         // From 0, which a shift earlier leaves where it is: the end decides.
         let blocks = [block(0, 0, i64::MAX, "One.")];
@@ -1381,10 +1365,7 @@ mod tests {
     fn a_frame_far_shorter_than_a_tick_is_found_at_once() {
         // 1 ns frames on 100 s ticks: a hundred billion frames share each stored time, and a time
         // between two is on the first frame stored at the later one.
-        let video = Video {
-            frame_ns: 1,
-            keyframes_ns: (0..10).map(|i| i * 100_000_000_000).collect(),
-        };
+        let video = Video::unjudged(1, (0..10).map(|i| i * 100_000_000_000).collect());
         let grid = Grid::fit(&video, 100_000_000_000).unwrap();
         let x = 40_000_000_000;
         let n = grid.frame_of(x);

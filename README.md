@@ -20,9 +20,12 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
 - `subcheck apply` makes a run's accepted fixes in the MKV files, keeping each original as
   `<name>.mkv.orig`: a file's typos and timing fixes in one remux, each shifted line moved by whole
   frames on the video's frame grid. Needs mkvtoolnix.
-- `subcheck timing` reports subtitle tracks shifted by whole frames against the video, with the
-  `mkvmerge --sync` that fixes a whole-track shift. A track with too few lines on cuts is timed by
-  the lines it shares with another track. No LLM, nothing recorded.
+- `subcheck timing` reports subtitle tracks shifted by whole frames against the video, up to 10 s
+  either way (3 frames for a clip of 100 keyframes or fewer), with the `mkvmerge --sync` that fixes
+  a whole-track shift. Keyframes stand in for cuts; those an encoder forces once a GOP runs long
+  are left out when looking for a shift, and a track whose times point two ways reads `unclear`
+  and says where. A track with too few lines on cuts is timed by the lines it shares with another
+  track. No LLM, nothing recorded.
 - `subcheck audio` reports whether audio tracks holding the same sound in different formats (a
   TrueHD and its AC-3, a FLAC and an AAC of it) line up, with the `mkvmerge --sync` that fixes a
   steady lag. Needs ffmpeg; nothing recorded.

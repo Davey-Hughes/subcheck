@@ -1049,10 +1049,7 @@ mod tests {
         use crate::store::{Basis, FixStretch, TimingFix};
         use crate::timing::Video;
         // 25 fps, a cut every 2 s; the line was found a frame after the cut at 2 s.
-        let video = Video {
-            frame_ns: 40_000_000,
-            keyframes_ns: (0..=10).map(|i| i * 2_000_000_000).collect(),
-        };
+        let video = Video::unjudged(40_000_000, (0..=10).map(|i| i * 2_000_000_000).collect());
         let grid = super::super::shift::Grid::fit(&video, 1_000_000).unwrap();
         let shift = TimingFix {
             track: 0,
@@ -1127,10 +1124,7 @@ mod tests {
         // 23.976 fps less 1/24 ms, keyframes half a millisecond past a frame stored both ways:
         // frames 29 and 53 are at 1209.5 and 2210.5 ms, so a line at 1.21 to 2.21 s moves to
         // where the file has them.
-        let video = Video {
-            frame_ns: 41_708_333,
-            keyframes_ns: vec![0, 7_216_000_000, 1_373_580_000_000],
-        };
+        let video = Video::unjudged(41_708_333, vec![0, 7_216_000_000, 1_373_580_000_000]);
         let grid = super::super::shift::Grid::fit(&video, 1_000_000).unwrap();
         let shift = TimingFix {
             track: 0,

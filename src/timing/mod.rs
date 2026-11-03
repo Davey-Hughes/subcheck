@@ -1,8 +1,12 @@
 //! `subcheck timing`: whether a subtitle track is shifted by whole frames against the video.
 //!
 //! A line timed to the picture starts and stops on cuts, and the video's keyframes stand in for
-//! the cuts. Counting the frames between each line's start or end and the nearest keyframe piles a
-//! timed style up at one offset: 0 when in sync, +1 when every line is a frame late. Pure functions
+//! the cuts. Counting the frames between each line's start or end and the nearest keyframe piles
+//! a timed style up at one offset: 0 when in sync, +1 when every line is a frame late. An encoder
+//! also forces keyframes where a GOP runs long, and a line a GOP off lands next to one of those:
+//! counted from it, a one-second shift reads as a frame or two. So those are left out when looking
+//! for the track's shift (the wide scan); around the shift it finds, the ±MAX_OFFSET analysis
+//! measures from every keyframe, the background its thresholds are set against. Pure functions
 //! over plain data; `main` reads the file.
 
 use std::collections::{BTreeMap, HashSet};
@@ -14,10 +18,13 @@ use crate::text::{self, Event};
 pub mod lines;
 pub mod record;
 pub mod shared;
+#[cfg(test)]
+pub(crate) mod synthetic;
+pub mod wide;
 
 /// The version of these rules, kept with each file `scan` checks: a file checked by other rules is
 /// checked again. Bump it when a rule or threshold changes what a track's verdict would be.
-pub const RULES_VERSION: u32 = 1;
+pub const RULES_VERSION: u32 = 2;
 
 /// Fewer keyframe Cues than this and there is nothing to measure against.
 const MIN_KEYFRAMES: usize = 10;
@@ -31,6 +38,23 @@ const MAX_KEYFRAME_GAP_NS: u64 = 10_000_000_000;
 /// (all-intra video, or a mux with `--cues 0:all`) averages 1, or 2 when DefaultDuration is a field,
 /// and would put every time at offset 0. K-On's keyframes are 24-26 frames apart.
 const MIN_KEYFRAME_GAP_FRAMES: u64 = 4;
+
+/// Fewer gaps between keyframes than this, and none is taken for a forced one: a spike in so few
+/// is as likely chance as an encoder's. The wide scan, which looks for the track's shift among the
+/// cuts, is skipped too, as forced keyframes left among them give it rival peaks a GOP apart; the
+/// ±MAX_OFFSET analysis measures from every keyframe either way.
+const MIN_GAPS_TO_JUDGE: usize = 100;
+
+/// An encoder that forces a keyframe once a GOP runs long puts most of them at its most common gap
+/// and a few frames either side, mostly where no cut is, while a cut can come at any gap. The spike
+/// reaches from the most common gap up to the largest gap within 1/FORCED_BAND of it that holds at
+/// least 1/FORCED_SPIKE as many keyframes; the gaps in the top 1/FORCED_BAND below that are taken
+/// for forced when they hold FORCED_MIN_PERCENT of all gaps. The longest gaps are no guide: a forced
+/// keyframe the encoder skipped, or the run from the last forced keyframe to the next cut, reach
+/// well past the spike while holding few keyframes.
+const FORCED_BAND: u64 = 8;
+const FORCED_SPIKE: usize = 8;
+const FORCED_MIN_PERCENT: usize = 25;
 
 /// Slack for times rounded to the millisecond: a frame at 1091.9243 s is stored as 1091.924 s.
 const SLACK_NS: i128 = 500_000;
@@ -65,13 +89,114 @@ const MIN_AT_OFFSET: usize = 10;
 pub struct Video {
     /// The video track's DefaultDuration.
     pub frame_ns: u64,
-    /// Sorted, distinct.
+    /// Sorted, distinct: every keyframe in the Cues. The frame grid is fitted to these, and the
+    /// ±MAX_OFFSET analysis measures from them.
     pub keyframes_ns: Vec<u64>,
+    /// The keyframes the wide scan measures shifts from: all but those at a forced gap. Sorted.
+    /// The first keyframe is always one, so this is empty only when `keyframes_ns` is.
+    pub cuts_ns: Vec<u64>,
+    /// The gaps, in whole frames, the encoder forced keyframes at.
+    pub forced_gaps: Vec<u64>,
+    /// Whether there were gaps enough to tell forced keyframes from cuts. When not, every
+    /// keyframe is taken for a cut and offsets are looked for within ±MAX_OFFSET only.
+    pub judged: bool,
 }
 
-/// The first video track's frame duration and keyframes (its Cues), or why they cannot stand in
-/// for cuts.
-pub fn video(layout: &Layout) -> Result<Video, String> {
+impl Video {
+    pub fn new(frame_ns: u64, keyframes_ns: Vec<u64>) -> Video {
+        let judged = keyframes_ns.len() > MIN_GAPS_TO_JUDGE;
+        let forced_gaps = if judged {
+            forced_gaps(frame_ns, &keyframes_ns)
+        } else {
+            Vec::new()
+        };
+        let cuts_ns = keyframes_ns
+            .iter()
+            .enumerate()
+            .filter(|&(i, &k)| {
+                i == 0 || !forced_gaps.contains(&gap_frames(frame_ns, keyframes_ns[i - 1], k))
+            })
+            .map(|(_, &k)| k)
+            .collect();
+        Video {
+            frame_ns,
+            keyframes_ns,
+            cuts_ns,
+            forced_gaps,
+            judged,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Video {
+    /// Every keyframe a cut, and offsets looked for within ±MAX_OFFSET only, as for a short clip.
+    pub(crate) fn unjudged(frame_ns: u64, keyframes_ns: Vec<u64>) -> Video {
+        Video {
+            frame_ns,
+            cuts_ns: keyframes_ns.clone(),
+            keyframes_ns,
+            forced_gaps: Vec::new(),
+            judged: false,
+        }
+    }
+
+    /// Every keyframe a cut, and the wide scan run.
+    pub(crate) fn all_cuts(frame_ns: u64, keyframes_ns: Vec<u64>) -> Video {
+        Video {
+            judged: true,
+            ..Video::unjudged(frame_ns, keyframes_ns)
+        }
+    }
+}
+
+/// The whole frames from keyframe `a` to keyframe `b` (`a <= b`), rounded: Cues are rounded to
+/// the millisecond.
+fn gap_frames(frame_ns: u64, a: u64, b: u64) -> u64 {
+    let frame = u128::from(frame_ns.max(1));
+    u64::try_from((u128::from(b - a) + frame / 2) / frame).unwrap_or(u64::MAX)
+}
+
+/// The gaps between keyframes, in whole frames, an encoder forced keyframes at: every gap value in
+/// the top 1/FORCED_BAND below the top of the spike at the most common gap, when that band holds
+/// FORCED_MIN_PERCENT of them.
+fn forced_gaps(frame_ns: u64, keyframes_ns: &[u64]) -> Vec<u64> {
+    let mut gaps: Vec<u64> = keyframes_ns
+        .windows(2)
+        .map(|w| gap_frames(frame_ns, w[0], w[1]))
+        .collect();
+    gaps.sort_unstable();
+    let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
+    for &g in &gaps {
+        *counts.entry(g).or_default() += 1;
+    }
+    // The most common gap; on a tie, the shorter.
+    let Some((mode, most)) = counts
+        .iter()
+        .map(|(&g, &n)| (g, n))
+        .max_by_key(|&(g, n)| (n, std::cmp::Reverse(g)))
+    else {
+        return Vec::new();
+    };
+    let top = counts
+        .range(mode..=mode.saturating_add(mode / FORCED_BAND))
+        .filter(|&(_, &n)| n * FORCED_SPIKE >= most)
+        .map(|(&g, _)| g)
+        .max()
+        .expect("the most common gap passes");
+    let band = top - top / FORCED_BAND..=top;
+    let in_band: Vec<u64> = gaps.iter().copied().filter(|g| band.contains(g)).collect();
+    if in_band.len() * 100 < FORCED_MIN_PERCENT * gaps.len() {
+        return Vec::new();
+    }
+    let mut forced = in_band;
+    forced.dedup();
+    forced
+}
+
+/// The first video track's frame duration and keyframes (its Cues), or why they are no frame
+/// grid to count on.
+pub fn frames(layout: &Layout) -> Result<Video, String> {
     let track = layout
         .tracks
         .iter()
@@ -108,18 +233,49 @@ pub fn video(layout: &Layout) -> Result<Video, String> {
             over()
         ));
     }
-    Ok(Video {
-        frame_ns,
-        keyframes_ns,
-    })
+    Ok(Video::new(frame_ns, keyframes_ns))
+}
+
+/// [`frames`], or why its cuts cannot stand in for the picture's: too few keyframes are cuts.
+pub fn video(layout: &Layout) -> Result<Video, String> {
+    let video = frames(layout)?;
+    if video.cuts_ns.len() < MIN_KEYFRAMES {
+        return Err(format!(
+            "only {} of {} video keyframes are cuts",
+            video.cuts_ns.len(),
+            video.keyframes_ns.len()
+        ));
+    }
+    Ok(video)
+}
+
+/// [`frame_offset_at`], counted from the nearest keyframe.
+#[cfg(test)]
+pub fn frame_offset(video: &Video, time_ms: i64) -> i128 {
+    frame_offset_at(video, time_ms, 0)
 }
 
 /// The frame on which a line starting or ending at `time_ms` starts or stops showing, counted from
-/// the nearest keyframe: 0 on the keyframe, +1 one frame after it. mpv shows a line on a frame when
+/// the keyframe nearest the point `centre` frames before it, where a track about `centre` frames
+/// late has its cut: 0 on it, +1 one frame after it. mpv shows a line on a frame when
 /// `start <= frame time < end`, so that frame is the first one at or after the time. An i128, as
 /// [`frame_index`].
-pub fn frame_offset(video: &Video, time_ms: i64) -> i128 {
-    frames_from(video, time_ms, nearest_keyframe(video, time_ms))
+pub fn frame_offset_at(video: &Video, time_ms: i64, centre: i64) -> i128 {
+    frames_from(video, time_ms, measured_from(video, time_ms, centre))
+}
+
+/// The keyframe a time `centre` frames late is measured from: the one nearest the point `centre`
+/// frames before `time_ms`, in nanoseconds.
+fn measured_from(video: &Video, time_ms: i64, centre: i64) -> i128 {
+    let x = i128::from(time_ms) * 1_000_000 - i128::from(centre) * i128::from(video.frame_ns);
+    let after = video.keyframes_ns.partition_point(|&k| i128::from(k) < x);
+    [after.checked_sub(1), Some(after)]
+        .into_iter()
+        .flatten()
+        .filter_map(|i| video.keyframes_ns.get(i))
+        .map(|&k| i128::from(k))
+        .min_by_key(|k| (k - x).abs())
+        .expect("frames() keeps MIN_KEYFRAMES keyframes")
 }
 
 /// The frame a line starting or ending at `time_ms` starts or stops showing on, counted from the
@@ -135,19 +291,6 @@ fn within(frames: i128) -> Option<i64> {
     i64::try_from(frames)
         .ok()
         .filter(|f| (-MAX_OFFSET..=MAX_OFFSET).contains(f))
-}
-
-/// The keyframe nearest `time_ms`, in nanoseconds.
-fn nearest_keyframe(video: &Video, time_ms: i64) -> i128 {
-    let x = i128::from(time_ms) * 1_000_000;
-    let after = video.keyframes_ns.partition_point(|&k| i128::from(k) < x);
-    [after.checked_sub(1), Some(after)]
-        .into_iter()
-        .flatten()
-        .filter_map(|i| video.keyframes_ns.get(i))
-        .map(|&k| i128::from(k))
-        .min_by_key(|k| (k - x).abs())
-        .expect("video() keeps at least MIN_KEYFRAMES keyframes")
 }
 
 /// The frame on which a line starting or ending at `time_ms` starts or stops showing, counted on
@@ -168,7 +311,8 @@ pub enum Verdict {
     Partial(Vec<Stretch>),
     /// Under 16 times, and they decide nothing.
     TooFew,
-    /// 16 or more, and no offset stands out.
+    /// 16 or more times and no offset stands out, or the times point two ways
+    /// ([`Analysis::rival`]).
     Unclear,
 }
 
@@ -184,7 +328,7 @@ pub struct Stretch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Analysis {
     pub verdict: Verdict,
-    /// The timed styles' times.
+    /// The timed styles' times, but for those in windows the wide scan puts far from the centre.
     pub times: usize,
     /// How many of them sit at each offset.
     pub pool: [usize; OFFSETS],
@@ -199,37 +343,91 @@ pub struct Analysis {
     /// one stretch, 0); `None` for an event that stays where it is, and for every event when no
     /// offset was decided.
     pub each: Vec<Option<usize>>,
-    /// A partial track's blocks of lines that stay where they are, (start, end) in ms: their times
-    /// point both ways.
+    /// The blocks of lines that stay where they are, (start, end) in ms, in time order: a partial
+    /// track's lines whose times point both ways, and any track's lines that start in a window the
+    /// wide scan puts far from the centre.
     pub unshifted: Vec<(i64, i64)>,
+    /// The shift the ±MAX_OFFSET analysis is centred on: 0, or a whole-track shift the wide scan
+    /// found further off. `pool`, each style's counts and each `Time`'s offset are around it.
+    pub centre: i64,
+    /// Why the verdict is unclear, when the times point two ways.
+    pub rival: Option<wide::Rival>,
+    /// The wide scan's top shifts and their hits.
+    pub peaks: Vec<(i64, usize)>,
 }
 
 /// One track's events against the video.
 pub fn analyse(video: &Video, events: &[Event]) -> Analysis {
-    let (styles, pool) = styles(video, events);
+    let scan = if video.judged {
+        wide::scan(video, events)
+    } else {
+        wide::Scan::default()
+    };
+    let wide_windows = wide::windows(&scan);
+    let (centre, rival) = match wide::centre(&scan.hits) {
+        wide::Centre::At(c) => (c, None),
+        // The whole track's peaks say only that its times point two ways; windows at the other
+        // shift, when there are any, say where.
+        wide::Centre::Rival(r) => (0, Some(wide::flag(&wide_windows, 0).unwrap_or(r))),
+    };
+    let (styles, pool) = styles(video, events, centre);
+    // Among the several hundred shifts the scan reaches, one stands out over a handful of times by
+    // chance, over the whole track or over a few windows of it: under MANY_TIMES times, a track is
+    // too thin for a far peak to doubt what the analysis, or its twins, make of it. Counted before
+    // far windows leave the pool, as a track with most of its times at a far shift is not thin.
+    let thin = pool.len() < MANY_TIMES;
+    // Read around the centre, a far window's times are an alias wherever they are counted: in
+    // their window, in the pool a verdict falls back on, or in where a stretch ends.
+    let far: HashSet<usize> = wide::far_windows(&wide_windows, centre).collect();
+    let pool: Vec<Time> = pool
+        .into_iter()
+        .filter(|t| !far.contains(&window_of(t.ms)))
+        .collect();
     let counts = count(&pool);
     let windows = windows(&pool);
     let runs = runs(&windows);
     let (verdict, agreeing) = match runs.as_slice() {
         [] => {
             let verdict = match decided(&counts) {
-                Some(offset) => whole(offset),
+                Some(offset) => whole(centre + offset),
                 None if pool.len() < MANY_TIMES => Verdict::TooFew,
                 None => Verdict::Unclear,
             };
             (verdict, 0)
         }
-        [one] => (whole(one.offset), one.windows),
-        many => (Verdict::Partial(stretches(&pool, many)), 0),
+        [one] => (whole(centre + one.offset), one.windows),
+        many => (Verdict::Partial(stretches(&pool, many, centre)), 0),
     };
-    let (verdict, each, unshifted) = match verdict {
+    let rival = if thin {
+        None
+    } else {
+        rival.or_else(|| wide::flag(&wide_windows, centre))
+    };
+    let (verdict, agreeing) = if rival.is_some() {
+        (Verdict::Unclear, 0)
+    } else {
+        (verdict, agreeing)
+    };
+    let (verdict, mut each, mut left) = match verdict {
         Verdict::Partial(pooled) => {
-            let m = lines::line_exact(video, events, &pooled);
+            let m = lines::line_exact(video, events, &pooled, centre);
             (Verdict::Partial(m.stretches), m.each, m.unshifted)
         }
         v @ (Verdict::InSync | Verdict::Shifted(_)) => (v, vec![Some(0); events.len()], Vec::new()),
         v => (v, vec![None; events.len()], Vec::new()),
     };
+    // A far window's lines are at a shift the verdict does not see: moved by its stretch, they
+    // would be moved by the wrong amount.
+    for (e, stretch) in events.iter().zip(&mut each) {
+        if stretch.is_some() && far.contains(&window_of(e.start_ms)) {
+            *stretch = None;
+            left.push((e.start_ms, e.end_ms));
+        }
+    }
+    let unshifted = lines::blocks_of(&left)
+        .into_iter()
+        .map(|b| (b.start_ms, b.end_ms))
+        .collect();
     Analysis {
         verdict,
         times: pool.len(),
@@ -240,6 +438,9 @@ pub fn analyse(video: &Video, events: &[Event]) -> Analysis {
         frame_ns: video.frame_ns,
         each,
         unshifted,
+        centre,
+        rival,
+        peaks: wide::peaks(&scan.hits, 3),
     }
 }
 
@@ -314,13 +515,13 @@ fn runs(windows: &[Option<i64>]) -> Vec<Run> {
     out
 }
 
-fn stretches(pool: &[Time], runs: &[Run]) -> Vec<Stretch> {
+fn stretches(pool: &[Time], runs: &[Run], centre: i64) -> Vec<Stretch> {
     let mut out: Vec<Stretch> = runs
         .iter()
         .map(|r| Stretch {
             from_ms: None,
             to_ms: None,
-            frames: r.offset,
+            frames: centre + r.offset,
         })
         .collect();
     for (i, pair) in runs.windows(2).enumerate() {
@@ -358,14 +559,14 @@ fn change_point(pool: &[Time], a: &Run, b: &Run) -> (i64, i64) {
     (near[k - 1].ms, near[k].ms)
 }
 
-/// One line start or end, in ms, and its offset in frames.
+/// One line start or end, in ms, and its offset in frames from the analysis's centre.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Time {
     pub ms: i64,
     pub offset: i64,
 }
 
-/// How many of one style's times sit at each offset, -3 to +3.
+/// How many of one style's times sit at each offset, the centre - 3 to the centre + 3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyleCounts {
     pub style: String,
@@ -374,9 +575,10 @@ pub struct StyleCounts {
     pub timed: bool,
 }
 
-/// Each style's counts, by name, and the timed styles' times pooled in time order. A style's
-/// distinct starts and distinct ends are one time each; karaoke events are left out.
-pub fn styles(video: &Video, events: &[Event]) -> (Vec<StyleCounts>, Vec<Time>) {
+/// Each style's counts, by name, and the timed styles' times pooled in time order, offsets
+/// counted around `centre`. A style's distinct starts and distinct ends are one time each; karaoke
+/// events are left out.
+pub fn styles(video: &Video, events: &[Event], centre: i64) -> (Vec<StyleCounts>, Vec<Time>) {
     let mut seen = HashSet::new();
     let mut by_style: BTreeMap<&str, Vec<Time>> = BTreeMap::new();
     for e in events.iter().filter(|e| !e.karaoke) {
@@ -384,7 +586,7 @@ pub fn styles(video: &Video, events: &[Event]) -> (Vec<StyleCounts>, Vec<Time>) 
             if !seen.insert((e.style.as_str(), is_end, ms)) {
                 continue;
             }
-            if let Some(offset) = within(frame_offset(video, ms)) {
+            if let Some(offset) = within(frame_offset_at(video, ms, centre) - i128::from(centre)) {
                 by_style
                     .entry(e.style.as_str())
                     .or_default()
@@ -452,13 +654,17 @@ pub struct TrackReport {
     pub lines: Option<shared::Lines>,
 }
 
-/// One file's block: its name, a line per track, the fix or the stretches under a shifted or
-/// partial track, and with `verbose` each style's counts. Columns line up within the block.
-pub fn render(file: &str, tracks: &[TrackReport], verbose: bool) -> String {
+/// One file's block: its name, with `verbose` what its keyframes are taken for, a line per track,
+/// the fix or the stretches under a shifted or partial track, why an unclear one is unclear, and
+/// with `verbose` each style's counts and the wide scan's peaks. Columns line up within the block.
+pub fn render(file: &str, video: Option<&Video>, tracks: &[TrackReport], verbose: bool) -> String {
     let mut out = format!("{file}\n");
     if tracks.is_empty() {
         out.push_str("  no text subtitle tracks to check\n");
         return out;
+    }
+    if let (true, Some(v)) = (verbose, video) {
+        let _ = writeln!(out, "  {}", cuts_line(v));
     }
     let id_width = tracks
         .iter()
@@ -488,6 +694,9 @@ pub fn render(file: &str, tracks: &[TrackReport], verbose: bool) -> String {
             continue;
         };
         out.push_str(&fix(&indent, t.id, &a.verdict, a.frame_ns, &a.unshifted));
+        if let Some(r) = &a.rival {
+            let _ = writeln!(out, "{indent}{}", rival_words(r));
+        }
         match &t.lines {
             Some(shared::Lines::Follows(f)) => {
                 let _ = writeln!(
@@ -510,15 +719,69 @@ pub fn render(file: &str, tracks: &[TrackReport], verbose: bool) -> String {
             None => {}
         }
         if verbose {
-            out.push_str(&style_table(&indent, &a.styles));
+            out.push_str(&style_table(&indent, &a.styles, a.centre));
+            if !a.peaks.is_empty() {
+                let peaks: Vec<String> = a
+                    .peaks
+                    .iter()
+                    .map(|&(s, n)| format!("{} {n}", signed(s)))
+                    .collect();
+                let _ = writeln!(out, "{indent}wide: {}", peaks.join(", "));
+            }
         }
     }
     out
 }
 
-/// Under a shifted or partial verdict: the `mkvmerge --sync` fix, or the stretches.
+/// Which ways an unclear track's times point: "40 times on cuts at -2, 38 at +24", or for part
+/// of the track "0:09:00.00 – 0:15:00.00: 2 times on cuts at 0, 259 at +120".
+pub fn rival_words(r: &wide::Rival) -> String {
+    let both = format!(
+        "{} times on cuts at {}, {} at {}",
+        r.ours.1,
+        signed(r.ours.0),
+        r.theirs.1,
+        signed(r.theirs.0)
+    );
+    match r.span {
+        None => both,
+        Some((from, to)) => format!(
+            "{} – {}: {both}",
+            text::timestamp(from),
+            text::timestamp(to)
+        ),
+    }
+}
+
+/// What the keyframes are taken for: "2000 keyframes, 900 of them cuts (forced gaps: 23, 24, 25,
+/// 26 frames)".
+pub fn cuts_line(v: &Video) -> String {
+    let n = v.keyframes_ns.len();
+    if !v.judged {
+        return format!("{n} keyframes, too few to tell forced ones from cuts: all taken for cuts");
+    }
+    let forced = if v.forced_gaps.is_empty() {
+        "no forced gaps".to_string()
+    } else {
+        let gaps: Vec<String> = v.forced_gaps.iter().map(u64::to_string).collect();
+        format!("forced gaps: {} frames", gaps.join(", "))
+    };
+    format!("{n} keyframes, {} of them cuts ({forced})", v.cuts_ns.len())
+}
+
+/// Under a shifted or partial verdict: the `mkvmerge --sync` fix, or the stretches; then the
+/// blocks of lines either leaves where they are.
 fn fix(indent: &str, id: usize, v: &Verdict, frame_ns: u64, unshifted: &[(i64, i64)]) -> String {
     match v {
+        // `--sync` moves every line, so with lines to leave alone it is no fix.
+        Verdict::Shifted(frames) if !unshifted.is_empty() => {
+            let whole = Stretch {
+                from_ms: None,
+                to_ms: None,
+                frames: *frames,
+            };
+            ranges(indent, &[whole], unshifted)
+        }
         Verdict::Shifted(frames) => {
             format!(
                 "{indent}fix: mkvmerge --sync {id}:{}\n",
@@ -586,6 +849,9 @@ fn detail(a: &Analysis) -> Option<String> {
         Verdict::Shifted(frames) => frames,
         Verdict::Partial(_) => return None,
         Verdict::TooFew => return Some(format!("({} times)", a.times)),
+        Verdict::Unclear if a.rival.is_some() => {
+            return Some(format!("({} times, they point two ways)", a.times));
+        }
         Verdict::Unclear => return Some(format!("({} times, no offset stands out)", a.times)),
     };
     Some(if a.agreeing > 0 {
@@ -600,14 +866,14 @@ fn detail(a: &Analysis) -> Option<String> {
         format!(
             "({} times, {} of them at {})",
             a.times,
-            a.pool[slot(offset)],
+            a.pool[slot(offset - a.centre)],
             signed(offset)
         )
     })
 }
 
-/// A partial track's stretches, one per line, `1 frame late  start      – 0:07:55.78`, then the
-/// blocks of lines that stay where they are.
+/// A track's stretches, one per line, `1 frame late  start      – 0:07:55.78`, then the blocks of
+/// lines that stay where they are.
 fn ranges(indent: &str, stretches: &[Stretch], unshifted: &[(i64, i64)]) -> String {
     let mut rows: Vec<(String, String, String)> = stretches
         .iter()
@@ -634,8 +900,8 @@ fn ranges(indent: &str, stretches: &[Stretch], unshifted: &[(i64, i64)]) -> Stri
     out
 }
 
-/// Each style's count at each offset, and whether its times were used.
-fn style_table(indent: &str, styles: &[StyleCounts]) -> String {
+/// Each style's count at each offset around `centre`, and whether its times were used.
+fn style_table(indent: &str, styles: &[StyleCounts], centre: i64) -> String {
     let name = |s: &StyleCounts| {
         if s.style.is_empty() {
             "(none)".to_string()
@@ -651,7 +917,7 @@ fn style_table(indent: &str, styles: &[StyleCounts]) -> String {
         .unwrap_or(0);
     let mut out = format!("{indent}{:<width$}", "style");
     for slot in 0..OFFSETS {
-        let _ = write!(out, " {:>4}", signed(offset_at(slot)));
+        let _ = write!(out, " {:>4}", signed(centre + offset_at(slot)));
     }
     out.push('\n');
     for s in styles {
@@ -683,10 +949,7 @@ mod tests {
 
     /// E09 18:14: the shot the motion-tracked sign belongs to, and the next one.
     fn e09() -> Video {
-        Video {
-            frame_ns: FRAME_NS,
-            keyframes_ns: vec![1_091_924_000_000, 1_094_927_000_000],
-        }
+        Video::unjudged(FRAME_NS, vec![1_091_924_000_000, 1_094_927_000_000])
     }
 
     #[test]
@@ -732,10 +995,7 @@ mod tests {
 
     /// 25 fps, a keyframe every 2 s for 30 minutes.
     fn video_2s() -> Video {
-        Video {
-            frame_ns: 40_000_000,
-            keyframes_ns: (0..=900).map(|i| i * 2_000_000_000).collect(),
-        }
+        Video::unjudged(40_000_000, (0..=900).map(|i| i * 2_000_000_000).collect())
     }
 
     /// `frames` frames after keyframe `n` of [`video_2s`], in ms.
@@ -768,7 +1028,7 @@ mod tests {
             // The same times in another style count there too.
             event("S", at(1, 1), at(2, 1)),
         ];
-        let (styles, _) = styles(&video_2s(), &events);
+        let (styles, _) = styles(&video_2s(), &events, 0);
         let counts: Vec<(&str, [usize; OFFSETS])> = styles
             .iter()
             .map(|s| (s.style.as_str(), s.counts))
@@ -785,7 +1045,7 @@ mod tests {
         song.karaoke = true;
         // Starts 20 frames from the nearest keyframe: nowhere near a cut.
         let far = event("D", at(1, 20), at(2, 0));
-        let (styles, _) = styles(&video_2s(), &[song, far]);
+        let (styles, _) = styles(&video_2s(), &[song, far], 0);
         assert_eq!(styles.len(), 1);
         assert_eq!(styles[0].counts, [0, 0, 0, 1, 0, 0, 0]);
     }
@@ -814,7 +1074,7 @@ mod tests {
             .collect();
         // Effects spread evenly over every offset.
         events.extend((0..21).map(|i| event("FX", at(100 + i, i % 7 - 3), at(100 + i, 30))));
-        let (styles, pool) = styles(&video_2s(), &events);
+        let (styles, pool) = styles(&video_2s(), &events, 0);
         let timed: Vec<(&str, bool)> = styles.iter().map(|s| (s.style.as_str(), s.timed)).collect();
         assert_eq!(timed, [("D", true), ("FX", false)]);
         let want: Vec<Time> = (0..10)
@@ -1012,6 +1272,9 @@ mod tests {
                 frame_ns: FRAME_NS,
                 each: Vec::new(),
                 unshifted: Vec::new(),
+                centre: 0,
+                rival: None,
+                peaks: Vec::new(),
             }),
             lines: None,
         }
@@ -1024,7 +1287,7 @@ mod tests {
             report(6, "English Signs/Songs [Semisu]", Verdict::Unclear, 26, 0),
         ];
         assert_eq!(
-            render("K-On!! - E09 - Finals.mkv", &tracks, false),
+            render("K-On!! - E09 - Finals.mkv", None, &tracks, false),
             "K-On!! - E09 - Finals.mkv
   track 5  English Full [Semisu]         1 frame late     (289 times, +1 in 7 of 9 windows)
            fix: mkvmerge --sync 5:-42
@@ -1064,13 +1327,46 @@ mod tests {
             a.unshifted = vec![(1_200_000, 1_203_500)];
         }
         assert_eq!(
-            render("K-On!! - E16 - Upperclassmen.mkv", &[track], false),
+            render("K-On!! - E16 - Upperclassmen.mkv", None, &[track], false),
             "K-On!! - E16 - Upperclassmen.mkv
   track 5  English Full [Semisu]  partial
            1 frame late  start      – 0:07:55.78
            in sync       0:08:03.51 – 0:15:39.00
            1 frame late  0:15:40.47 – end
            not shifted   0:20:00.00 – 0:20:03.50
+"
+        );
+    }
+
+    #[test]
+    fn a_shifted_track_prints_the_lines_its_fix_leaves_where_they_are() {
+        let mut track = report(3, "Full", Verdict::Shifted(24), 900, 7);
+        if let Ok(a) = &mut track.result {
+            a.unshifted = vec![(540_290, 541_910), (543_000, 719_500)];
+        }
+        assert_eq!(
+            render("a.mkv", None, &[track], false),
+            "a.mkv
+  track 3  Full  24 frames late   (900 times, +24 in 7 of 9 windows)
+           24 frames late  start      – end
+           not shifted     0:09:00.29 – 0:09:01.91
+           not shifted     0:09:03.00 – 0:11:59.50
+"
+        );
+    }
+
+    #[test]
+    fn a_shifted_track_with_lines_left_alone_prints_no_sync_that_would_move_them() {
+        let mut track = report(3, "Full", Verdict::Shifted(24), 900, 7);
+        if let Ok(a) = &mut track.result {
+            a.unshifted = vec![(540_000, 560_000)];
+        }
+        assert_eq!(
+            render("a.mkv", None, &[track], false),
+            "a.mkv
+  track 3  Full  24 frames late   (900 times, +24 in 7 of 9 windows)
+           24 frames late  start      – end
+           not shifted     0:09:00.00 – 0:09:20.00
 "
         );
     }
@@ -1093,7 +1389,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            render("a.mkv", &tracks, false),
+            render("a.mkv", None, &tracks, false),
             "a.mkv
   track 2   English Full [Tsundere]  in sync          (363 times, 0 in 8 of 9 windows)
   track 3   Songs                    too few lines    (9 times)
@@ -1101,6 +1397,89 @@ mod tests {
             fix: mkvmerge --sync 4:83
   track 12  (jpn)                    unsupported: no video track
 "
+        );
+    }
+
+    #[test]
+    fn a_verdict_from_the_pool_far_off_counts_its_times_around_the_centre() {
+        let mut pooled = report(4, "Signs", Verdict::Shifted(24), 40, 0);
+        if let Ok(a) = &mut pooled.result {
+            a.centre = 24;
+            a.pool[slot(0)] = 22;
+        }
+        assert_eq!(
+            render("a.mkv", None, &[pooled], false),
+            "a.mkv
+  track 4  Signs  24 frames late   (40 times, 22 of them at +24)
+           fix: mkvmerge --sync 4:-1001
+"
+        );
+    }
+
+    #[test]
+    fn an_unclear_track_says_which_ways_its_times_point() {
+        let mut whole = report(3, "Full", Verdict::Unclear, 402, 0);
+        if let Ok(a) = &mut whole.result {
+            a.rival = Some(wide::Rival {
+                ours: (-2, 135),
+                theirs: (24, 134),
+                span: None,
+            });
+        }
+        let mut part = report(4, "SDH", Verdict::Unclear, 300, 0);
+        if let Ok(a) = &mut part.result {
+            a.rival = Some(wide::Rival {
+                ours: (0, 2),
+                theirs: (120, 259),
+                span: Some((540_000, 900_000)),
+            });
+        }
+        assert_eq!(
+            render("a.mkv", None, &[whole, part], false),
+            "a.mkv
+  track 3  Full  unclear          (402 times, they point two ways)
+           135 times on cuts at -2, 134 at +24
+  track 4  SDH   unclear          (300 times, they point two ways)
+           0:09:00.00 – 0:15:00.00: 2 times on cuts at 0, 259 at +120
+"
+        );
+    }
+
+    #[test]
+    fn verbose_says_which_keyframes_are_cuts_and_where_the_wide_scan_peaks() {
+        let video = synthetic::yuru(&synthetic::cuts(500));
+        let mut r = report(3, "Full", Verdict::Shifted(24), 956, 8);
+        if let Ok(a) = &mut r.result {
+            a.centre = 24;
+            a.peaks = vec![(24, 956), (-168, 62), (-28, 58)];
+            a.styles = vec![StyleCounts {
+                style: "D".into(),
+                counts: [0, 1, 2, 478, 3, 0, 1],
+                timed: true,
+            }];
+        }
+        assert_eq!(
+            render("a.mkv", Some(&video), &[r], true),
+            format!(
+                "a.mkv
+  {} keyframes, {} of them cuts (forced gaps: 23, 24, 25, 26 frames)
+  track 3  Full  24 frames late   (956 times, +24 in 8 of 9 windows)
+           fix: mkvmerge --sync 3:-1001
+           style  +21  +22  +23  +24  +25  +26  +27
+           D        0    1    2  478    3    0    1  used
+           wide: +24 956, -168 62, -28 58
+",
+                video.keyframes_ns.len(),
+                video.cuts_ns.len()
+            )
+        );
+    }
+
+    #[test]
+    fn an_unjudged_video_says_its_keyframes_are_all_taken_for_cuts() {
+        assert_eq!(
+            cuts_line(&Video::new(FRAME_NS, vec![0, 1_001_000_000, 2_002_000_000])),
+            "3 keyframes, too few to tell forced ones from cuts: all taken for cuts"
         );
     }
 
@@ -1122,7 +1501,7 @@ mod tests {
             ];
         }
         assert_eq!(
-            render("a.mkv", &[r], true),
+            render("a.mkv", None, &[r], true),
             "a.mkv
   track 0  Full  in sync          (300 times, 0 in 8 of 9 windows)
            style     -3   -2   -1    0   +1   +2   +3
@@ -1139,7 +1518,7 @@ mod tests {
             gap: 0,
             shared: shared::Shared {
                 times: 11_268,
-                counts: [0, 0, 0, 11_268, 0, 0, 0],
+                counts: wide::Hits::from([(0, 11_268)]),
             },
             verdict: Verdict::Shifted(1),
             each: Vec::new(),
@@ -1158,7 +1537,7 @@ mod tests {
             sdh,
         ];
         assert_eq!(
-            render("K-On!! - E09 - Finals.mkv", &tracks, false),
+            render("K-On!! - E09 - Finals.mkv", None, &tracks, false),
             "K-On!! - E09 - Finals.mkv
   track 5  English Full [Semisu]         1 frame late     (345 times, +1 in 5 of 9 windows)
            fix: mkvmerge --sync 5:-42
@@ -1174,7 +1553,7 @@ mod tests {
     #[test]
     fn a_file_with_nothing_to_check_says_so() {
         assert_eq!(
-            render("a.mkv", &[], false),
+            render("a.mkv", None, &[], false),
             "a.mkv\n  no text subtitle tracks to check\n"
         );
     }
@@ -1316,13 +1695,10 @@ mod tests {
     fn a_time_the_smallest_i64_frames_from_its_keyframe_is_not_counted() {
         // At 1 ns a frame, 0 ms is i64::MIN frames before keyframes this far in.
         let first = 9_223_372_036_854_275_808;
-        let video = Video {
-            frame_ns: 1,
-            keyframes_ns: (0..10).map(|i| first + i * 1_000).collect(),
-        };
+        let video = Video::unjudged(1, (0..10).map(|i| first + i * 1_000).collect());
         assert_eq!(frame_offset(&video, 0), i128::from(i64::MIN));
         // Neither time is near a cut: no style has a time to count.
-        let (styles, pool) = styles(&video, &[event("D", 0, 1)]);
+        let (styles, pool) = styles(&video, &[event("D", 0, 1)], 0);
         assert!(styles.is_empty() && pool.is_empty());
     }
 
@@ -1331,14 +1707,118 @@ mod tests {
         // At 1 ns a frame, 0 ms is past i64::MIN frames before keyframes this far in, and the end
         // of i64 ms past i64::MAX frames after the last.
         let first = 10_000_000_000_000_000_000;
-        let video = Video {
-            frame_ns: 1,
-            keyframes_ns: (0..10).map(|i| first + i * 1_000).collect(),
-        };
+        let video = Video::unjudged(1, (0..10).map(|i| first + i * 1_000).collect());
         assert_eq!(frame_offset(&video, 0), -10_000_000_000_000_500_000);
         assert_eq!(
             frame_offset(&video, i64::MAX),
             9_223_362_036_854_775_806_491_000
+        );
+    }
+
+    #[test]
+    fn the_gaps_an_encoder_forces_keyframes_at_are_not_cuts() {
+        let cuts = synthetic::cuts(500);
+        let real: HashSet<u64> = synthetic::keyframes_ns(&cuts).into_iter().collect();
+        let cases: [(i64, &[i64], &[u64]); 5] = [
+            (26, &[24], &[23, 24, 25, 26]),
+            (18, &[20], &[18, 19, 20]),
+            (30, &[29, 30], &[27, 28, 29, 30]),
+            (24, &[23, 24, 24], &[21, 22, 23, 24]),
+            // Every third forced keyframe skipped: the gaps from the last forced keyframe to the
+            // next cut reach 47 frames, far above the spike.
+            (26, &[24, 24, 48], &[23, 24, 25, 26]),
+        ];
+        for (first, then, forced) in cases {
+            let keyframes = synthetic::keyframes(&cuts, first, then);
+            let v = Video::new(synthetic::FRAME_NS, synthetic::keyframes_ns(&keyframes));
+            assert!(v.judged);
+            assert_eq!(v.forced_gaps, forced, "{first} then {then:?}");
+            assert!(
+                v.cuts_ns.iter().all(|k| real.contains(k)),
+                "{first} then {then:?}"
+            );
+            // A cut at a forced gap is lost with the forced keyframes; most are not.
+            assert!(
+                v.cuts_ns.len() * 100 >= cuts.len() * 80,
+                "{first} then {then:?}: {} of {}",
+                v.cuts_ns.len(),
+                cuts.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_forced_gap_far_less_common_than_the_most_common_one_is_still_forced() {
+        // Shots three times as long: after the keyframe forced 26 frames after each cut, several
+        // more come 24 apart, so the 26s are a small share of the 24s.
+        let cuts: Vec<i64> = synthetic::cuts(500).iter().step_by(3).copied().collect();
+        let real: HashSet<u64> = synthetic::keyframes_ns(&cuts).into_iter().collect();
+        let v = Video::new(
+            synthetic::FRAME_NS,
+            synthetic::keyframes_ns(&synthetic::keyframes(&cuts, 26, &[24])),
+        );
+        assert!(v.judged);
+        assert_eq!(v.forced_gaps, [23, 24, 26]);
+        assert!(v.cuts_ns.iter().all(|k| real.contains(k)));
+    }
+
+    #[test]
+    fn an_encode_that_forces_no_keyframe_between_cuts_drops_none() {
+        // A GOP limit longer than any shot: every keyframe is a cut.
+        let cuts = synthetic::cuts(500);
+        let v = Video::new(
+            synthetic::FRAME_NS,
+            synthetic::keyframes_ns(&synthetic::keyframes(&cuts, 250, &[250])),
+        );
+        assert!(v.forced_gaps.is_empty(), "{:?}", v.forced_gaps);
+        assert_eq!(v.cuts_ns, v.keyframes_ns);
+    }
+
+    #[test]
+    fn too_few_keyframes_to_judge_are_all_cuts() {
+        // 100 keyframes, 99 gaps, every one 24 frames: a spike, but too few gaps to call it one.
+        let keyframes: Vec<i64> = (0..100).map(|i| i * 24).collect();
+        let v = Video::new(synthetic::FRAME_NS, synthetic::keyframes_ns(&keyframes));
+        assert!(!v.judged);
+        assert!(v.forced_gaps.is_empty(), "{:?}", v.forced_gaps);
+        assert_eq!(v.cuts_ns, v.keyframes_ns);
+    }
+
+    #[test]
+    fn the_wide_scan_measures_from_cuts_and_the_window_from_every_keyframe() {
+        let cuts = synthetic::cuts(500);
+        let v = synthetic::yuru(&cuts);
+        // A cut kept as one, with no other within 50 frames after it.
+        let i = (1..cuts.len() - 1)
+            .find(|&i| {
+                let ns = u64::try_from(synthetic::ms(cuts[i])).unwrap() * 1_000_000;
+                v.cuts_ns.contains(&ns) && cuts[i + 1] - cuts[i] > 50
+            })
+            .unwrap();
+        // 24 frames after it, 2 before the keyframe forced 26 after it: measured from the nearest
+        // keyframe it reads 2 frames early, and around a centre of 24 it is on its cut.
+        let t = synthetic::ms(cuts[i] + 24);
+        assert_eq!(frame_offset(&v, t), -2);
+        assert_eq!(frame_offset_at(&v, t, 24), 24);
+        // The wide scan sees only the cut.
+        let shifts = wide::shifts_of(&v, t, 240);
+        assert!(shifts.contains(&24) && !shifts.contains(&-2), "{shifts:?}");
+    }
+
+    #[test]
+    fn a_fixed_gop_with_too_few_cuts_is_a_frame_grid_but_not_a_cut_list() {
+        // 150 keyframes every 24 frames: all forced.
+        let times: Vec<u64> = (0..150)
+            .map(|i| synthetic::ms(i * 24).try_into().unwrap())
+            .collect();
+        let l = layout(
+            vec![track(1, TRACK_TYPE_VIDEO, Some(synthetic::FRAME_NS))],
+            &times,
+        );
+        assert_eq!(frames(&l).unwrap().keyframes_ns.len(), 150);
+        assert_eq!(
+            video(&l).unwrap_err(),
+            "only 1 of 150 video keyframes are cuts"
         );
     }
 }

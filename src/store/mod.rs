@@ -234,7 +234,8 @@ pub struct TimingFix {
     pub frame_ns: u64,
     /// One for a whole-track shift; a partial track's in time order, in-sync ones included.
     pub stretches: Vec<FixStretch>,
-    /// Lines of a partial track left where they are: their times point both ways.
+    /// Lines left where they are: a partial track's whose times point both ways, and any track's
+    /// in a window the scan puts at a shift the fix does not see.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unshifted: Vec<LineRef>,
     pub basis: Basis,

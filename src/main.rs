@@ -464,8 +464,8 @@ fn timing(paths: &[PathBuf], langs: &[String], verbose: bool) -> ExitCode {
     let (files, mut failed) = labelled_files(paths);
     for (file, name) in &files {
         match timing_file(file, langs) {
-            Ok((tracks, unread)) => {
-                print!("{}", timing::render(name, &tracks, verbose));
+            Ok((tracks, unread, video)) => {
+                print!("{}", timing::render(name, video.as_ref(), &tracks, verbose));
                 failed |= unread;
             }
             Err(e) => {
@@ -569,8 +569,12 @@ fn timing_labels(arg: &Path, root: Option<&Path>, file: &Path) -> (String, Strin
 /// A track's events and their analysis, or what to print in place of a verdict.
 type Analysed<'a> = (&'a Track, Result<(Vec<text::Event>, Analysis), String>);
 
-/// Every chosen text track of one file against its video, and whether a track could not be read.
-fn timing_file(file: &Path, langs: &[String]) -> Result<(Vec<TrackReport>, bool)> {
+/// Every chosen text track of one file against its video, whether a track could not be read, and
+/// the video, when it could stand in for the cuts.
+fn timing_file(
+    file: &Path,
+    langs: &[String],
+) -> Result<(Vec<TrackReport>, bool, Option<timing::Video>)> {
     let (r, layout) = mkv::open(file)?;
     if let Some(t) = layout.truncated {
         eprintln!("{}", t.warning(file));
@@ -594,7 +598,7 @@ fn timing_file(file: &Path, langs: &[String]) -> Result<(Vec<TrackReport>, bool)
                     lines: None,
                 })
                 .collect();
-            return Ok((tracks, false));
+            return Ok((tracks, false, None));
         }
     };
     let numbers: Vec<u64> = chosen.iter().map(|(t, _)| t.number).collect();
@@ -643,7 +647,7 @@ fn timing_file(file: &Path, langs: &[String]) -> Result<(Vec<TrackReport>, bool)
             lines: result.is_ok().then(|| said.next().flatten()).flatten(),
         })
         .collect();
-    Ok((tracks, unread))
+    Ok((tracks, unread, Some(video)))
 }
 
 /// One file's audio tracks, its windows' starts, and every pair's lag in each window.

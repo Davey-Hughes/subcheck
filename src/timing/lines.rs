@@ -3,7 +3,7 @@
 //! one-frame gap or overlap. The windows put each change of offset between two pooled times; a
 //! block between them goes with the stretch its own times point to.
 
-use super::{Stretch, Video, frame_offset};
+use super::{Stretch, Video, frame_offset_at};
 use crate::text::Event;
 
 /// Events that overlap or touch, earliest first.
@@ -43,12 +43,13 @@ pub fn blocks_of(times: &[(i64, i64)]) -> Vec<Block> {
     out
 }
 
-/// Whether a start or end in the block sits at `offset` from a cut.
-fn points_to(video: &Video, events: &[Event], block: &Block, offset: i64) -> bool {
+/// Whether a start or end in the block sits `offset` frames after its cut, each time measured from
+/// the keyframe nearest the point `centre` frames before it.
+fn points_to(video: &Video, events: &[Event], block: &Block, offset: i64, centre: i64) -> bool {
     let offset = i128::from(offset);
     block.events.iter().any(|&i| {
-        frame_offset(video, events[i].start_ms) == offset
-            || frame_offset(video, events[i].end_ms) == offset
+        frame_offset_at(video, events[i].start_ms, centre) == offset
+            || frame_offset_at(video, events[i].end_ms, centre) == offset
     })
 }
 
@@ -72,7 +73,10 @@ pub struct Moves {
 /// block points to a stretch when one of its times sits at that stretch's offset. Of the splits
 /// that agree as well, the one at the longest silence between blocks; a block with no evidence of
 /// its own is nowhere near a cut, so a frame either way does not show.
-pub fn line_exact(video: &Video, events: &[Event], stretches: &[Stretch]) -> Moves {
+///
+/// `centre` is the analysis's: each time is measured from the keyframe nearest the point `centre`
+/// frames before it; stretches' frames are whole shifts.
+pub fn line_exact(video: &Video, events: &[Event], stretches: &[Stretch], centre: i64) -> Moves {
     let blocks = blocks(events);
     let gaps: Vec<(i64, i64)> = stretches
         .windows(2)
@@ -95,8 +99,8 @@ pub fn line_exact(video: &Video, events: &[Event], stretches: &[Stretch]) -> Mov
             .iter()
             .map(|&k| {
                 (
-                    points_to(video, events, &blocks[k], a),
-                    points_to(video, events, &blocks[k], b),
+                    points_to(video, events, &blocks[k], a, centre),
+                    points_to(video, events, &blocks[k], b, centre),
                 )
             })
             .collect();
@@ -174,6 +178,7 @@ pub(super) fn moves(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timing::{Verdict, analyse, synthetic};
 
     fn event(start_ms: i64, end_ms: i64) -> Event {
         Event {
@@ -266,10 +271,10 @@ mod tests {
     ];
 
     fn e16() -> (Video, Vec<Event>) {
-        let video = Video {
-            frame_ns: 41_708_333,
-            keyframes_ns: E16_KEYFRAMES_MS.iter().map(|k| k * 1_000_000).collect(),
-        };
+        let video = Video::unjudged(
+            41_708_333,
+            E16_KEYFRAMES_MS.iter().map(|k| k * 1_000_000).collect(),
+        );
         let events = E16_LINES.iter().map(|&(s, e)| event(s, e)).collect();
         (video, events)
     }
@@ -293,7 +298,7 @@ mod tests {
         ];
         let Moves {
             stretches, each, ..
-        } = line_exact(&video, &events, &pooled);
+        } = line_exact(&video, &events, &pooled, 0);
         assert_eq!(
             stretches,
             [
@@ -315,10 +320,7 @@ mod tests {
 
     /// 25 fps, a keyframe every 2 s.
     fn video_2s() -> Video {
-        Video {
-            frame_ns: 40_000_000,
-            keyframes_ns: (0..=100).map(|i| i * 2_000_000_000).collect(),
-        }
+        Video::unjudged(40_000_000, (0..=100).map(|i| i * 2_000_000_000).collect())
     }
 
     /// `frames` frames after keyframe `n` of [`video_2s`], in ms.
@@ -340,7 +342,7 @@ mod tests {
             stretch(None, Some(at(11, 1)), 1),
             stretch(Some(at(15, 0)), None, 0),
         ];
-        let m = line_exact(&video_2s(), &events, &pooled);
+        let m = line_exact(&video_2s(), &events, &pooled, 0);
         assert_eq!(m.each, [Some(0), None, Some(1)]);
         assert_eq!(m.unshifted, [(at(12, 1), at(13, 0))]);
         assert_eq!(
@@ -366,7 +368,7 @@ mod tests {
             stretch(None, Some(at(11, 1)), 1),
             stretch(Some(at(17, 0)), None, 0),
         ];
-        let each = line_exact(&video_2s(), &events, &pooled).each;
+        let each = line_exact(&video_2s(), &events, &pooled, 0).each;
         // Splits after the first or the third line agree with three of four blocks; the silences
         // are equal, so the earlier split wins.
         assert_eq!(each, [Some(0), Some(1), None, Some(1)]);
@@ -381,8 +383,32 @@ mod tests {
             stretch(None, Some(-1000), 0),
             stretch(Some(i64::MAX), None, 1),
         ];
-        let each = line_exact(&video_2s(), &events, &pooled).each;
+        let each = line_exact(&video_2s(), &events, &pooled, 0).each;
         // Neither block points either way; an end of the track is a longer silence still.
         assert_eq!(each, [Some(1), Some(1)]);
+    }
+
+    #[test]
+    fn on_short_shots_a_time_a_second_late_is_measured_from_its_own_cut() {
+        let cuts = synthetic::short_cuts(1200);
+        let video = synthetic::yuru(&cuts);
+        let half = cuts[cuts.len() / 2];
+        let events = synthetic::track_by(&cuts, |cut| if cut < half { 24 } else { 25 });
+        let a = analyse(&video, &events);
+        let Verdict::Partial(stretches) = &a.verdict else {
+            panic!("{:?} {:?}", a.verdict, a.peaks)
+        };
+        let frames: Vec<i64> = stretches.iter().map(|s| s.frames).collect();
+        assert_eq!(frames, [24, 25]);
+        assert!([24, 25].contains(&a.centre), "{}", a.centre);
+        // Each shot's two lines go with its side of halfway.
+        let split: Vec<Option<usize>> = (0..events.len())
+            .map(|i| Some(usize::from(cuts[i / 2] >= half)))
+            .collect();
+        assert_eq!(line_exact(&video, &events, stretches, a.centre).each, split);
+        // Measured from the cut nearest it, a time a second late on a short shot is some frames
+        // before the next cut: the lines at the change point to neither stretch, and the split
+        // falls at a longer silence instead.
+        assert_ne!(line_exact(&video, &events, stretches, 0).each, split);
     }
 }

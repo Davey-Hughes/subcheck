@@ -318,8 +318,9 @@ fn prepare(path: &Path, langs: &[String], checks: &[Check]) -> Prepared {
 }
 
 /// The timing check of one file's tracks (mkvmerge ID and events each): its findings, numbered
-/// 0, and a note for each track its shared lines contradict. Err: why the video cannot stand in
-/// for the cuts, which is no failure of the file.
+/// 0, and a note for each track its shared lines contradict, or whose times point two ways and that
+/// follows no other track. Err: why the video cannot stand in for the cuts, which is no failure of
+/// the file.
 fn timing_findings(
     path: &Path,
     layout: &Layout,
