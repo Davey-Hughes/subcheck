@@ -39,18 +39,20 @@ pub struct FileProgress {
     /// Distinct lines checked, from its record.
     pub lines: Option<usize>,
     /// Checked for timing alone, with no LLM check to count lines for: by the scan, as the record
-    /// of what it made says, though the file's LLM check from an earlier scan stands; or, with no
-    /// scan, as the file's record says.
+    /// of what it made says, though the file's LLM check from an earlier scan stands; or, for a
+    /// file the screen has not scanned since this view was shown, as its record says.
     pub timing_only: bool,
     /// The scan checks it: a file of the run that the scan leaves alone is as recorded.
     pub queued: bool,
-    /// What the scan wrote to its log for it; for a file the screen did not scan, what its record
-    /// says.
+    /// What the scan wrote to its log for it; for a file the screen has not scanned since this view
+    /// was shown, what its record says.
     pub log: Vec<String>,
-    /// Where the screen's last apply or dry run is with it; `None` for a file it had no fixes in.
-    /// It takes the place of the scan's stage in the label.
+    /// Where the last apply or dry run since this view was shown is with it; `None` until that
+    /// apply queues the file, for a file it had no fixes in, and once a later scan checks the file
+    /// again. It takes the place of the scan's stage in the label.
     pub applying: Option<ApplyStage>,
-    /// What each apply and dry run of the screen wrote for it, oldest first.
+    /// What each apply and dry run of the screen wrote for it since this view was shown, oldest
+    /// first; a scan that checks the file again empties it.
     pub apply_log: Vec<String>,
     /// mkvmerge's warnings for it, until its block comes: they go after it.
     pub warned: Vec<String>,
@@ -59,8 +61,8 @@ pub struct FileProgress {
 impl FileProgress {
     /// Where the file is, in a few words: `queued`, `queued again`, `⠙ LLM 2/3`,
     /// `✓ 412 lines · 3 findings`, `✓ timing only · 1 finding`, `✗ FAILED: …`. `spinner` turns
-    /// beside a stage under way. Once apply has reached the file, its stage instead: queued,
-    /// ⠙ remux, ✓ swapped · 3 applied.
+    /// beside a stage under way. With `applying` set, apply's stage instead: queued, ⠙ remux,
+    /// ✓ swapped · 3 applied.
     pub fn label(&self, spinner: char) -> String {
         if let Some(stage) = &self.applying {
             return stage.label(spinner);
@@ -82,8 +84,8 @@ impl FileProgress {
     }
 
     /// [`FileProgress::label`] as the files list writes it. An apply failure names the file by
-    /// `name`, the row's name, and any other file in its folder by its file name, so the reason
-    /// fits on the row; the detail pane keeps the paths whole.
+    /// `name`, the row's name, and, unless its folder is the root, any other file there by its file
+    /// name, so the reason fits on the row; the detail pane keeps the paths whole.
     pub fn list_label(&self, spinner: char, name: &str) -> String {
         match &self.applying {
             Some(ApplyStage::Failed(e)) => failed_label(&short_paths(e, &self.path, name)),
@@ -92,8 +94,9 @@ impl FileProgress {
     }
 }
 
-/// `text` with `path` written as `name`, then every other path in `path`'s folder as its file
-/// name: `<path>.orig` reads `<name>.orig`, `<folder>/.<file>.subcheck` reads `.<file>.subcheck`.
+/// `text` with `path` written as `name`, then every other path in `path`'s folder, unless that
+/// is the root, as its file name: `<path>.orig` reads `<name>.orig`, `<folder>/.<file>.subcheck`
+/// reads `.<file>.subcheck`.
 fn short_paths(text: &str, path: &str, name: &str) -> String {
     let text = text.replace(path, name);
     match Path::new(path).parent().map(Path::to_string_lossy) {
@@ -300,7 +303,8 @@ enum Whereabouts<'p> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::struct_excessive_bools)] // each says a different thing the outro or status line needs
+// Each says a different thing the outro, the status line or the exit status needs.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Progress {
     /// The run's files, then any new ones the scan reads, in order.
     pub files: Vec<FileProgress>,
@@ -315,7 +319,7 @@ pub struct Progress {
     pub findings: usize,
     /// What the scan's LLM calls used.
     pub spent: Spent,
-    /// Quarter seconds the scan has run: the spinner's step.
+    /// The loop's ticks while a job runs (`Msg::Tick`): the spinner's step.
     pub ticks: usize,
     /// The run the scan records under, and the command that finishes it should it stop: for the
     /// outro. Empty before the first scan.
@@ -330,7 +334,8 @@ pub struct Progress {
     /// Files `c` queued while a scan ran, each with the run it is checked into, in the order
     /// queued: they start when the scan ends, a scan for each run.
     pub again: Vec<(String, String)>,
-    /// The screen's apply or dry run, as it runs or as the last ended; `None` before the first.
+    /// The screen's apply or dry run, as it runs or as the last ended; `None` before the first
+    /// since this view was shown.
     pub apply: Option<Applying>,
     /// What the screen's earlier applies and dry runs ended with, for the outro, oldest first.
     pub earlier_applies: Vec<String>,
@@ -871,9 +876,9 @@ impl Progress {
 
     /// What the screen's scans ended with, for the outro and for the next scan to keep: of this
     /// one, each file it checked that failed (a run's earlier failures elsewhere are not this
-    /// scan's, nor in its count), then what `scan` would have ended with; for a scan stopped or
-    /// failed, how far it got and the command that finishes it. What earlier scans ended with
-    /// comes first. Nothing with no scan.
+    /// scan's, nor in its count), then what `scan` would have ended with. A scan stopped says
+    /// instead how far it got, and one that failed, why, each with the command that finishes it.
+    /// What earlier scans ended with comes first; with no scan, nothing else.
     fn ended(&self) -> Vec<String> {
         let mut lines = self.earlier.clone();
         if self.scan == Scan::None {
@@ -975,7 +980,8 @@ fn findings_text(n: usize) -> String {
     }
 }
 
-/// What a file's record says, for the detail pane of a file the screen did not scan.
+/// What a file's record says, for the detail pane of a file the screen has not scanned since this
+/// view was shown.
 fn record_log(r: &FileRecord, findings: usize) -> Vec<String> {
     let mut log = vec![match &r.error {
         Some(e) => format!("FAILED: {e}"),

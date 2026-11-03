@@ -22,8 +22,8 @@ pub const PROMPT_VERSION: u32 = 1;
 pub const TIMEOUT: Duration = Duration::from_mins(10);
 
 /// Lines per chunk unless `--chunk-lines` says otherwise. Ollama defaults to a 4k context on
-/// cards under 24 GiB and truncates silently, and 150 lines (about 2.5k tokens with the
-/// instructions) fit it with room for the reply.
+/// cards under 24 GiB and truncates silently, and 150 lines with the instructions fit it with room
+/// for the reply.
 pub const CHUNK_LINES: usize = 400;
 pub const CHUNK_LINES_OLLAMA: usize = 150;
 
@@ -57,7 +57,7 @@ impl Backend {
     pub fn preset(name: &str) -> Result<Backend, String> {
         let (argv, output): (Vec<&str>, Output) = match name {
             // Without these flags a headless call loads the user's hooks, skills, CLAUDE.md and
-            // memory: 31,648 tokens of context per call, measured, against 605 with them.
+            // memory into its context.
             "claude" => (
                 vec![
                     "claude",
@@ -1424,8 +1424,7 @@ mod tests {
     #[test]
     fn run_kills_a_command_that_overruns() {
         // Two commands, so every shell forks `sleep` instead of exec'ing it: the grandchild
-        // outlives the killed shell and keeps stdout open. dash forks even a lone `sleep 5`,
-        // which is how CI (Debian's /bin/sh) caught this while bash on the desktop did not.
+        // outlives the killed shell and keeps stdout open. dash forks even a lone `sleep 5`.
         let argv = Backend::shell("sleep 5; echo late").argv;
         let started = Instant::now();
         let err = run(&argv, "", Duration::from_millis(200))

@@ -52,14 +52,14 @@ pub enum FileNote {
 pub enum Pane {
     #[default]
     Findings,
-    /// Each file of the run, with where the scan is with it (`Tab`).
+    /// Each file of the run, with where the scan, or apply, is with it (`Tab`).
     Files,
 }
 
 /// A question on the status line, waiting for `y`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confirm {
-    /// Quit, stopping the scan.
+    /// Quit, stopping the scan or apply.
     Quit,
     /// Check `path` again into run `run`, with its `backend`: `c` in the files view.
     Recheck {
@@ -71,8 +71,8 @@ pub enum Confirm {
     Apply,
 }
 
-/// What the screen's last apply or dry run said of a finding, for its mark ([`Model::mark`]). A
-/// fix apply made, or found made, has none: the store's `applied` speaks for it.
+/// What the screen's last apply or dry run said of a finding, for its mark ([`Model::mark`]).
+/// Outside a dry run, a fix apply made or found made has none: the store's `applied` speaks for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mark {
     /// Left for a fix by hand, and why.
@@ -90,8 +90,8 @@ pub enum Mark {
 }
 
 impl Mark {
-    /// The mark for what apply (with `dry_run`, a dry run) said of a fix; `None` for a fix it made
-    /// or found made.
+    /// The mark for what apply (with `dry_run`, a dry run) said of a fix; outside a dry run, `None`
+    /// for a fix it made or found made.
     pub fn of(outcome: &Outcome, dry_run: bool) -> Option<Mark> {
         Some(match (dry_run, outcome) {
             (false, Outcome::ByHand(why)) => Mark::ByHand(why.clone()),
@@ -163,7 +163,7 @@ enum Held {
     Member(u64),
 }
 
-#[allow(clippy::struct_excessive_bools)] // independent screen toggles
+#[allow(clippy::struct_excessive_bools)] // independent flags of the screen
 pub struct Model {
     pub run: Run,
     pub rows: Vec<Row>,
@@ -178,11 +178,11 @@ pub struct Model {
     pub editor: Option<Editor>,
     /// Decisions made in this session, oldest first.
     pub undo: Vec<UndoStep>,
-    /// Files that are not as they were scanned, by path.
+    /// Files with findings that are not as they were scanned, by path.
     pub notes: HashMap<String, FileNote>,
     pub status: Option<String>,
     /// Whether the status line, with no message of its own, says what the run's LLM calls cost:
-    /// from opening until the first key or click.
+    /// from opening until the first key, click or turn of the wheel.
     pub show_cost: bool,
     pub should_quit: bool,
     /// The name each file goes by in the list.
@@ -195,7 +195,7 @@ pub struct Model {
     pub detail_scroll: u16,
     /// The last click on the list, while it could still be the first of a double-click.
     pub last_click: Option<(Entry, Timestamp)>,
-    /// The scan under way, or as it ended; with no scan, the run's files as recorded.
+    /// The scan or apply under way, or as it ended; with neither, the run's files as recorded.
     pub progress: Progress,
     pub pane: Pane,
     /// Index into `progress.files`.
@@ -590,8 +590,8 @@ impl Model {
     }
 
     /// What the status line `status` says: the question waiting for `y`; else its message; else
-    /// how far the scan is, or how it ended; else what the run's LLM calls cost while
-    /// [`Model::show_cost`] holds, as much of it as fits beside `? help`.
+    /// how far the latest scan or apply is, or how it ended; else what the run's LLM calls cost
+    /// while [`Model::show_cost`] holds, as much of it as fits beside `? help`.
     pub fn status_text(&self, status: Rect) -> Option<String> {
         if let Some(confirm) = &self.confirm {
             return Some(match confirm {
@@ -939,9 +939,9 @@ fn folder_episode(path: &str) -> String {
     format!("{folder}/{}", long_episode(path))
 }
 
-/// A name per file of the run: the episode; when two files would share one (a run over two seasons
-/// has two E01s), the file name up to the episode, for every file; when even those collide, that
-/// with its folder.
+/// A name per file with findings in the run: the episode; when two files would share one (a run
+/// over two seasons has two E01s), the file name up to the episode, for every file; when even
+/// those collide, that with its folder.
 pub fn labels(run: &Run) -> HashMap<String, String> {
     let mut files: Vec<&str> = run.findings.iter().map(|f| f.file.as_str()).collect();
     files.sort_unstable();
@@ -1125,7 +1125,7 @@ pub mod tests_support {
     }
 
     /// A timing finding on episode `ep`'s English Full track (track 5): a frame late, or partial
-    /// (late, in sync, late) as K-On!! E16 is.
+    /// (late, in sync, late).
     pub fn timing(id: u64, ep: u32, partial: bool) -> Finding {
         let line = |start_ms: i64| LineRef {
             raw: format!("0,Dialogue,,0,0,0,,Line at {start_ms}."),

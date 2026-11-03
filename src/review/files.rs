@@ -36,12 +36,12 @@ pub fn files_pane(m: &Model, f: &mut Frame, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// A file's line: its name in the list and its stage (apply's once apply has reached it),
-/// coloured: done green, failed red, queued grey, under way the terminal's own.
+/// A file's line: its name in the list and its stage (apply's when `applying` is set), coloured:
+/// done green, failed red, queued grey, under way the terminal's own.
 /// An apply failure's paths are written short ([`FileProgress::list_label`]).
 fn line(m: &Model, file: &FileProgress, spinner: char) -> Line<'static> {
     let fg = |c| Style::default().fg(c);
-    // Apply's stage, once apply has reached the file, else the scan's.
+    // Apply's stage when `applying` is set, else the scan's.
     let style = match (&file.applying, &file.stage) {
         (Some(ApplyStage::Done { .. }), _) | (None, Stage::Done { .. }) => fg(Color::Green),
         (Some(ApplyStage::Failed(_)), _) | (None, Stage::Failed(_)) => fg(Color::Red),
@@ -57,8 +57,8 @@ fn line(m: &Model, file: &FileProgress, spinner: char) -> Line<'static> {
     Line::styled(format!("{name}  {stage}"), style)
 }
 
-/// The detail pane's lines for the selected file: its path, its stage, its log, then what each
-/// apply wrote for it.
+/// The detail pane's lines for the selected file: its path, its stage, its log, then its apply
+/// log ([`FileProgress::apply_log`]).
 pub fn detail_lines(m: &Model) -> Vec<Line<'static>> {
     let Some(file) = m.progress.files.get(m.file_selected) else {
         return Vec::new();

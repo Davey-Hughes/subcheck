@@ -237,7 +237,7 @@ impl Store {
     /// shorter than its Segment says, or of one with a track that could not be read, is never
     /// fresh: every scan says so, or tries the track again, until the copy is replaced. Nor is a
     /// check that a later failed attempt of the same kind followed: the file's views show it as
-    /// failed, so the next scan makes the check again, as scans did before the database.
+    /// failed, so the next scan makes the check again.
     pub fn is_fresh(
         &self,
         path: &str,
@@ -270,7 +270,7 @@ impl Store {
 
     /// Save the checks a scan made of one file, in one transaction: each replaces the file's
     /// current check of its kind, whatever made that, and the decisions on the replaced check's
-    /// findings carry over to the new ones of the same line and fix ([`carry`]). Returns the
+    /// findings carry over to the new ones of the same [`CarryKey`] ([`carry`]). Returns the
     /// findings with their IDs, and the decisions carried.
     pub fn save(&mut self, a: &Attempt, made: Vec<Made>) -> rusqlite::Result<Saved> {
         let tx = self.write()?;
@@ -659,7 +659,7 @@ pub(super) fn state_of(r: &Row, i: usize) -> rusqlite::Result<State> {
     }
 }
 
-/// Its helpers make the views' and the import's test data too.
+/// Its helpers make the views' test data too.
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -934,8 +934,7 @@ pub(super) mod tests {
             )
             .unwrap();
         store.decide(&[decision(1, State::Accepted, None)]).unwrap();
-        // As the import makes it: the new check and its finding, the finding's own decision, then
-        // the carry.
+        // The new check and its finding, the finding's own decision, then the carry.
         let tx = store.write().unwrap();
         let (new, old) = insert_check(&tx, &a, &llm(), 1, None).unwrap();
         let finding = insert_finding(&tx, new, &typo(A, "go trough it", "go through it")).unwrap();
@@ -1228,7 +1227,7 @@ pub(super) mod tests {
         assert!(store.is_fresh(A, new.0, new.1, &llm()).unwrap());
         assert!(store.is_fresh(A, new.0, new.1, &timing).unwrap());
         assert!(!store.is_fresh(A, old.0, old.1, &llm()).unwrap());
-        // No swap: the marks alone, as before.
+        // No swap: the marks alone.
         assert!(!store.mark_applied(&[fix], None).unwrap());
     }
 

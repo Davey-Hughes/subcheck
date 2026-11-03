@@ -378,7 +378,7 @@ fn apply_run(a: ApplyArgs) -> Result<ExitCode> {
     let state = store::state_dir()?;
     let mut db = Store::open()?;
     let run = db.view(&Selector::parse(&a.run)?)?;
-    // mkvmerge's warnings go to stderr as they come, as before the hook; the rest is on stdout.
+    // mkvmerge's warnings go to stderr as they come; the rest is on stdout.
     let warn = |event: apply::Event| {
         if let apply::Event::Warned { path, text } = event {
             eprintln!("subcheck: mkvmerge warned about {path}: {text}");

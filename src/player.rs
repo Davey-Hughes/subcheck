@@ -1,5 +1,5 @@
 //! Opening a moment in mpv. One window serves a whole review: the first `o` starts mpv with an IPC
-//! socket, and every later one loads the next file into that window. The playback keys go to the
+//! socket, and every later one opens its moment in that window. The playback keys go to the
 //! same socket, and `O` closes the window from there.
 
 use std::ffi::OsString;
@@ -20,7 +20,7 @@ use crate::text::timestamp_ms;
 const START_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long a frame step gets to land. A step back seeks from the keyframe before it, and until it
-/// has (70 ms on K-On!! E09, read over NFS) mpv still reports the old position.
+/// has, mpv still reports the old position.
 const FRAME_WAIT: Duration = Duration::from_secs(1);
 
 /// How long the mpvs this review started get to exit once `O` asked the one on the socket to
@@ -31,7 +31,7 @@ const QUIT_WAIT: Duration = Duration::from_secs(1);
 const HUNG_UP: &str = "mpv closed the connection without answering";
 
 /// The app id of mpv's window on Wayland, so that a window rule can match it and no other mpv
-/// (README, "Window focus").
+/// (README, "Keeping focus in the terminal").
 pub const APP_ID: &str = "subcheck-mpv";
 
 /// A moment to open: a file, where to start, and which subtitle track to show.
@@ -79,9 +79,9 @@ pub fn socket_path(state: &Path) -> PathBuf {
     socket_path_from(runtime.as_deref(), state)
 }
 
-/// The IPC command that loads `m` in place of whatever is playing. Named arguments, because mpv
-/// 0.38 put an `index` argument before `options`; `options` as an object, so no value needs
-/// escaping (both checked against mpv 0.41).
+/// The IPC command that loads `m` in place of whatever is playing. Named arguments, because
+/// mpv 0.38 put an `index` argument before `options`; `options` as an object, so no value
+/// needs escaping.
 pub fn loadfile_command(m: &Moment) -> Value {
     let mut options = serde_json::Map::new();
     options.insert("start".into(), timestamp_ms(m.start_ms).into());
@@ -90,7 +90,7 @@ pub fn loadfile_command(m: &Moment) -> Value {
     }
     options.insert("sub-visibility".into(), "yes".into());
     // Not `pause`: mpv puts a per-file option back when its file ends, which can be after the
-    // next file was loaded and unpaused (measured, mpv 0.41); `open` sets it before loading.
+    // next file was loaded and unpaused; `open` sets it before loading.
     json!({"name": "loadfile", "url": m.file, "flags": "replace", "options": options})
 }
 
@@ -132,10 +132,10 @@ impl Player {
         if m.paused {
             conn.request(&json!(["set_property", "pause", true]))?;
         }
-        // The file mpv has open already is sought, not reopened (6 GB over NFS), if this review
-        // loaded it and it is unchanged on disk since: a remux in place keeps the path, and after
-        // a fix of one letter even the size. One still loading cannot seek yet, so it is loaded
-        // again.
+        // The file mpv has open already is sought, not reopened (slow for a big file over NFS),
+        // if this review loaded it and it is unchanged on disk since: a remux in place keeps the
+        // path, and after a fix of one letter even the size. One still loading cannot seek yet,
+        // so it is loaded again.
         let stamp = file_stamp(Path::new(&m.file)).ok();
         let unchanged = matches!(
             (&self.loaded, stamp),
@@ -188,8 +188,8 @@ impl Player {
             Playback::PreviousFrame => json!(["frame-back-step"]),
         })?;
         let paused = conn.request(&json!(["get_property", "pause"]))?;
-        // Read straight after an exact seek or a step on, this is already the new position
-        // (checked against mpv 0.41); after a step back, only once mpv has sought.
+        // Read straight after an exact seek or a step on, this is already the new position; after
+        // a step back, only once mpv has sought.
         let mut secs = conn.request(&json!(["get_property", "time-pos"]))?;
         if p == Playback::PreviousFrame {
             let deadline = Instant::now() + FRAME_WAIT;
@@ -213,7 +213,7 @@ impl Player {
     /// say. The next `o` starts another.
     pub fn close(&mut self) -> Result<(), String> {
         self.reap();
-        // mpv 0.41 answers `quit` before it hangs up; one that hangs up first has quit too.
+        // An mpv that hangs up before it answers `quit` has quit too.
         let quit =
             Conn::connect(&self.socket)
                 .ok()

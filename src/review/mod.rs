@@ -1,6 +1,6 @@
 //! `subcheck review`: accept, reject or reword each finding of a run, with a key that opens the
-//! moment in mpv. A pure Elm-style core (`model`, `update`) with the store and mpv at the edges
-//! (`run_effect`), as in nudge's dashboard (daveyutils).
+//! moment in mpv. A pure Elm-style core (`model`, `update`) with the store and mpv at the
+//! edges (`run_effect`).
 
 pub mod files;
 pub mod jobs;
@@ -41,8 +41,7 @@ use progress::Scan;
 use update::{Effect, Job, Mouse, Msg, Switch};
 
 /// A terminal event as a `Msg`. Ctrl and Alt chords never reach the plain-key handlers, so Ctrl-C
-/// quits instead of reading as `c` (the lesson of nudge's `map_event`); with the mouse they are
-/// ignored.
+/// quits instead of reading as `c`; with the mouse they are ignored.
 pub fn map_event(ev: &Event) -> Option<Msg> {
     let k = match ev {
         Event::Key(k) => k,
@@ -90,10 +89,10 @@ fn next_msg(mut read: impl FnMut() -> io::Result<Event>) -> io::Result<Msg> {
     }
 }
 
-/// How each file of the run differs from when it was scanned, by path; files as they were are
-/// left out.
+/// How each of the run's files with findings differs from when it was scanned, by path; files as
+/// they were are left out.
 pub fn file_notes(run: &Run) -> HashMap<String, FileNote> {
-    // Only files with findings are ever shown, and on a network share each check is a round trip.
+    // Only files with findings ever show a note, and on a network share each check is a round trip.
     let shown: HashSet<&str> = run.findings.iter().map(|f| f.file.as_str()).collect();
     let mut notes = HashMap::new();
     // The newest record of each file wins: a file a run checked twice keeps its last stamp.
@@ -372,7 +371,7 @@ pub fn nothing_to_check(
     Ok((!run.findings.is_empty()).then_some(run))
 }
 
-/// How long the loop waits for a message while the scan runs before the spinner turns.
+/// How long the loop waits for a message while a job runs before the spinner turns.
 const TICK: Duration = Duration::from_millis(250);
 
 /// Open the screen on `open`, writing decisions through `store`. `state` is the state directory,
@@ -399,7 +398,7 @@ pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow:
     }
     let notes = file_notes(&run);
     let mut player = Player::new("mpv", player::socket_path(state));
-    // Else the status line opens on what the run's LLM calls cost (`Model::show_cost`).
+    // With no scan, the status line opens on what the run's LLM calls cost (`Model::show_cost`).
     let mut model = Model::new(run, notes);
     model.karaoke = karaoke;
     model.status = opening_status(&warnings);
@@ -418,9 +417,9 @@ pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow:
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let size = terminal.size()?;
     model.set_area(Rect::new(0, 0, size.width, size.height));
-    // The loop keeps a sender of its own, for the scans `c` starts: the channel no longer closes
-    // while the screen runs, and each job says why it ends before it does (`Msg::ScanEnded`,
-    // `Msg::Fatal`), as the input thread does.
+    // The loop keeps a sender of its own, for the jobs `c`, `A` and `D` start: the channel cannot
+    // close while the screen runs, and each job says why it ends before it does
+    // (`Msg::ScanEnded`, `Msg::ApplyEnded`, `Msg::Fatal`), as the input thread does.
     let (tx, rx) = mpsc::channel();
     if let Some((plan, opts, paths)) = scanning {
         // Running from the start, so a `q` before the scan's first word still asks.
@@ -538,10 +537,10 @@ fn screen_loop(
 }
 
 /// The loop's next message: the terminal's or a job's, or while a job runs a tick should none come
-/// for [`TICK`]. The loop holds a `Sender` of its own (for `c`'s scans), so the channel
-/// cannot close while the screen runs; a disconnect is fatal, a backstop: each job (the input
-/// thread, each scan) reports why it ends (`Msg::Fatal`, `Msg::ScanEnded`) before it does, and
-/// with the input thread gone no key can quit.
+/// for [`TICK`]. The loop holds a `Sender` of its own (for the jobs `c`, `A` and `D` start), so
+/// the channel cannot close while the screen runs; a disconnect is fatal, a backstop: each job
+/// (the input thread, each scan and apply) reports why it ends (`Msg::Fatal`, `Msg::ScanEnded`,
+/// `Msg::ApplyEnded`) before it does, and with the input thread gone no key can quit.
 fn receive(rx: &mpsc::Receiver<Msg>, busy: bool) -> Msg {
     let got = if busy {
         match rx.recv_timeout(TICK) {
@@ -682,7 +681,7 @@ mod tests {
             gone("gone.mkv"),
             gone("clean-and-gone.mkv"),
         ];
-        // Findings in the first three; the fourth had none, so it is never shown or checked.
+        // Findings in the first three; the fourth had none, so it is never checked.
         let findings = files[..3]
             .iter()
             .map(|f| crate::store::Finding {
@@ -808,7 +807,7 @@ mod tests {
         tx.send(Msg::Key(KeyCode::Char('j'))).unwrap();
         drop(tx);
         assert_eq!(receive(&rx, true), Msg::Key(KeyCode::Char('j')));
-        // Every job gone without a word: whether the scan runs or not, the screen cannot go on.
+        // Every job gone without a word: busy or not, the screen cannot go on.
         for running in [true, false] {
             assert_eq!(
                 receive(&rx, running),

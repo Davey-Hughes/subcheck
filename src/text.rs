@@ -43,7 +43,7 @@ pub struct Event {
     pub style: String,
     /// Text with tags stripped; empty is allowed (a karaoke space).
     pub text: String,
-    /// The (x, y) of the first `\pos`, if any.
+    /// The (x, y) of the first `\pos` that parses, if any.
     pub pos: Option<(i64, i64)>,
     /// Has a karaoke tag (`\k`, `\K`, `\kf`, `\ko`): timed to the music, not the picture.
     pub karaoke: bool,
@@ -145,8 +145,8 @@ struct Cleaned {
     karaoke: bool,
 }
 
-/// Text without markup, its first `\pos`, and whether it has a karaoke tag; `None` for an ASS
-/// drawing.
+/// Text without markup, its first `\pos` that parses, and whether it has a karaoke tag; `None`
+/// for an ASS drawing.
 fn clean(raw: &str, kind: Kind) -> Option<Cleaned> {
     let mut pos = None;
     let mut karaoke = false;
@@ -335,7 +335,7 @@ pub fn collapse(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// A style with at least this many lines, nearly all single tokens, is karaoke-effect debris.
+/// A style with at least this many occurrences, nearly all single tokens, is karaoke-effect debris.
 const FRAGMENT_STYLE_MIN_LINES: usize = 10;
 
 /// Events from every chosen track of one file, as distinct lines in time order: karaoke rebuilt,
@@ -344,9 +344,8 @@ const FRAGMENT_STYLE_MIN_LINES: usize = 10;
 ///
 /// Per-syllable karaoke effects (romaji and kanji tracks especially) stagger their events in time,
 /// so no grouping can rebuild them and they come out as "ya", "ba", "to". A style whose lines are
-/// at least 90% single tokens, over at least [`FRAGMENT_STYLE_MIN_LINES`] occurrences, is that debris.
-/// Measured on K-On!! E02: the four romaji/kanji styles are 100% single tokens, dialogue 11%, the
-/// English lyrics 0–6%; a one-line sign style survives on the minimum.
+/// at least 90% single tokens, over at least [`FRAGMENT_STYLE_MIN_LINES`] occurrences, is that
+/// debris; the minimum spares a small style of one-word signs.
 pub fn lines(events: Vec<Event>) -> Vec<Line> {
     // Karaoke: events of one track in one row (see `row_of`), so two lyric rows, or signs at
     // different heights, shown at once stay separate lines.
@@ -390,8 +389,8 @@ pub fn lines(events: Vec<Event>) -> Vec<Line> {
             }
         })
         .collect();
-    // Counted per occurrence, not per distinct line: debris repeats ("ya" appears dozens of
-    // times), so distinct lines would undercount it.
+    // Counted per occurrence, not per distinct line: debris repeats, so distinct lines would
+    // undercount it.
     let mut per_style: HashMap<&str, (usize, usize)> = HashMap::new();
     for l in &out {
         let (total, single) = per_style.entry(l.style.as_str()).or_default();

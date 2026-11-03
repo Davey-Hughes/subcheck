@@ -62,7 +62,7 @@ pub fn read_tracks(
             walk.insert(n);
         } else if layout.frame_counts.get(&track.uid) == Some(&0) {
             // The statistics say the track has no blocks. It has no Cues either, so without this
-            // the walk would read a whole file to confirm it: 372 s for a real 5.9 GB episode.
+            // the walk would read a whole file to confirm it.
             found.insert(n, (ReadPath::Empty, Vec::new()));
         } else if let Some(blocks) = via_cues(r, layout, track)? {
             found.insert(n, (ReadPath::Cues, blocks));
@@ -540,7 +540,7 @@ fn bytes_at<'a>(
     }
 }
 
-/// The largest Cluster read whole by [`each_cluster`]: real ones are a few MB.
+/// The largest Cluster read whole by [`each_cluster`]: real ones are far smaller.
 const MAX_CLUSTER: u64 = 512 << 20;
 
 /// Each Cluster from the element at `pos` on, read whole, in file order: `f` gets its data's
@@ -864,7 +864,7 @@ mod tests {
 
     #[test]
     fn lacing_is_undone_in_all_three_kinds() {
-        // Frames "ab", "c", "def".
+        // Frames "ab", "c", "def" (fixed-size lacing: "ab", "cd", "ef").
         let xiph = body(0x02, &[2, 2, 1, b'a', b'b', b'c', b'd', b'e', b'f']);
         let fixed = body(0x04, &[2, b'a', b'b', b'c', b'd', b'e', b'f']);
         // EBML: first size 2 (0x82), then 1 - 2 = -1 as a 1-byte signed vint: 0x80 | (0x3F - 1).
@@ -925,7 +925,7 @@ mod tests {
 
     #[test]
     fn laced_frames_are_timed_one_frame_duration_apart() {
-        // 8 MP3 frames of 24 ms, as mkvmerge laces them.
+        // MP3 frames of 24 ms, as mkvmerge laces them (eight to a block; three here).
         assert_eq!(
             lace_times(1_000, 3, Some(24_000_000), Some(1)),
             [Some(1_000), Some(24_001_000), Some(48_001_000)]
@@ -1215,7 +1215,7 @@ mod tests {
 
     #[test]
     fn a_cluster_timestamp_past_i64_is_no_time_for_a_wanted_frame() {
-        // 2^64 - 1 ticks, read before as 2^64 - 1 ms.
+        // 2^64 - 1 ticks: no i64 holds it, and an i128 would take it as a time of 2^64 - 1 ms.
         let (_dir, r) = one_cluster_file([0xFF; 8], 0);
         let (_, mut layout, track) = typos();
         assert_eq!(track.number, 1);

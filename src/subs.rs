@@ -310,8 +310,8 @@ fn srt_alone(duration_ns: i128, text: &str) -> bool {
 /// What a block's line, as [`write_track`] writes it, reads back as in mkvmerge: its start and
 /// duration in nanoseconds, at the format's precision (centiseconds for ASS and SSA, milliseconds
 /// for SRT). `None` where it comes back as no line of its own: an ASS or SSA block whose ReadOrder
-/// is no integer, an SRT block of no length or no text (none is written), or a time before 0
-/// (written, by mkvextract's arithmetic, as no time at all).
+/// is no integer, an SRT block of no length (it waits for the next block) or no text (none is
+/// written), or a time before 0 (written, by mkvextract's arithmetic, as no time at all).
 pub fn written_times(
     kind: Kind,
     block: &Block,

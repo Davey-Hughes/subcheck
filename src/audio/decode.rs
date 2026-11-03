@@ -9,11 +9,10 @@ use std::process::{Command, Stdio};
 use super::correlate::RATE;
 use crate::group;
 
-/// Resampled to RATE (which adds no delay: 44.1 and 96 kHz copies line up within 0.01 ms) and
-/// placed by timestamp, so a gap in a track (frames missing, as at the head of FMAB's TrueHD)
-/// stays silence instead of closing up into a shift, and a track whose first frame there comes
-/// late is padded at the front. min_hard_comp: Matroska stores times to the millisecond, so a
-/// timestamp that strays by less is rounding, not a gap.
+/// Resampled to RATE (which adds no delay) and placed by timestamp, so a gap in a track (frames
+/// missing) stays silence instead of closing up into a shift, and a track whose first frame in the
+/// window comes late is padded at the front. min_hard_comp: Matroska stores times to the
+/// millisecond, so a timestamp that strays by less is rounding, not a gap.
 fn filter() -> String {
     format!(
         "aresample={RATE}:async=1:min_hard_comp=0.001:first_pts=0,aformat=sample_fmts=flt:channel_layouts=mono"

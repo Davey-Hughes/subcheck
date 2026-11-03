@@ -68,7 +68,7 @@ pub enum Msg {
     /// Something the screen cannot go on without failed (a job's thread panicked, the terminal
     /// could not be read): it ends, with this error.
     Fatal(String),
-    /// A quarter of a second passed while the scan runs: the spinner turns.
+    /// No message came for a quarter of a second while a job runs: the spinner turns.
     Tick,
     /// What the screen's apply (or dry run) just did.
     Apply(apply::Event),
@@ -173,13 +173,13 @@ pub fn update(m: &mut Model, msg: Msg, now: Timestamp) -> Vec<Effect> {
         Msg::Key(_) | Msg::KillLine | Msg::Quit | Msg::Mouse(..)
     );
     // A double-click is two clicks with nothing the user did in between: a key or another click
-    // starts over. The scan's messages and the spinner's ticks come unasked, so they leave the
-    // first click be (`Model::refresh` keeps it on its entry as rows come and go).
+    // starts over. A job's messages and the spinner's ticks come unasked, so they leave the first
+    // click be (`Model::refresh` keeps it on its entry as rows come and go).
     let last_click = if input { m.last_click.take() } else { None };
     let effects = apply(m, msg, last_click, now);
-    // The cost line review opened with ends at the first key (Ctrl-U and Ctrl-C too), click or
-    // turn of the wheel, the box of keys open or not: once the message is handled, so a click
-    // lands on the status line as it was drawn.
+    // The cost line review opened with ends at the first key (Ctrl-U, Ctrl-C and Ctrl-D too),
+    // click or turn of the wheel, the box of keys open or not: once the message is handled, so a
+    // click lands on the status line as it was drawn.
     if input {
         m.show_cost = false;
     }
@@ -195,7 +195,7 @@ pub fn update(m: &mut Model, msg: Msg, now: Timestamp) -> Vec<Effect> {
     effects
 }
 
-#[allow(clippy::too_many_lines)] // one arm per message
+#[allow(clippy::too_many_lines)] // an arm for every message
 fn apply(
     m: &mut Model,
     msg: Msg,
@@ -613,8 +613,9 @@ fn undo(m: &mut Model, now: Timestamp) -> Vec<Effect> {
     }]
 }
 
-/// A write's result: on success the decisions take effect, and the selection moves on. A decision
-/// the store found on a replaced finding went to its new one, or nowhere: its file is read back.
+/// A write's result: on success the decisions take effect, and after `a` `r` `e` or `x` the
+/// selection moves on. A decision the store found on a replaced finding went to its new one, or
+/// nowhere: its file is read back.
 #[allow(clippy::too_many_lines)] // the write's every consequence for the view, in order
 fn written(
     m: &mut Model,
@@ -973,11 +974,11 @@ fn start_apply(m: &mut Model, dry_run: bool) -> Vec<Effect> {
     }]
 }
 
-/// A step of the screen's apply: the files view follows it. A file done marks its findings (a fix
-/// made, or found made, by the store's mark instead), takes the store's new `applied` marks, and
-/// its record takes the size and mtime its checks moved to, so the view matches the store. A file
-/// that failed marks the findings it was to fix `failed` (`would fail`), but for those the store
-/// has as applied: their fix is in the file.
+/// A step of the screen's apply: the files view follows it. A file done marks its findings (outside
+/// a dry run, a fix made, or found made, by the store's mark instead), takes the store's new
+/// `applied` marks, and its record takes the size and mtime its checks moved to, so the view
+/// matches the store. A file that failed marks the findings it was to fix `failed` (`would fail`),
+/// but for those the store has as applied: their fix is in the file.
 fn applied(m: &mut Model, event: apply::Event) -> Vec<Effect> {
     m.progress.apply_event(&event);
     let dry_run = m.progress.apply.as_ref().is_some_and(|a| a.dry_run);
@@ -1199,9 +1200,9 @@ fn started(
     effects
 }
 
-/// A question to stop the scan stays while a queued batch takes over: `effects` start it, and
+/// A question to stop a job stays while a queued batch takes over: `effects` start it, and
 /// effects run before the next key is read. With nothing left to run it goes, so the status line
-/// shows how the scan ended, or why the last batch did not start, and the next `q` quits at once.
+/// shows how the job ended, or why the last batch did not start, and the next `q` quits at once.
 fn settle_quit(m: &mut Model, effects: &[Effect]) {
     if m.confirm == Some(Confirm::Quit) && !m.progress.busy() && effects.is_empty() {
         m.confirm = None;
@@ -2531,7 +2532,7 @@ mod tests {
     #[test]
     fn a_double_click_survives_the_scans_messages_between_its_clicks() {
         let opens = |effects: Vec<Effect>| matches!(effects[..], [Effect::Open(_)]);
-        // The spinner's tick, which comes after 250 ms without a message.
+        // The spinner's tick, which comes after 250 ms without a message while a job runs.
         let mut m = on_screen();
         assert_eq!(click(&mut m, 5, 2, 0), []);
         update(&mut m, Msg::Tick, now());

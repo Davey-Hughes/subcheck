@@ -19,8 +19,8 @@ use rustfft::{Fft, FftPlanner};
 /// The rate every track is decoded at.
 pub const RATE: u32 = 48_000;
 
-/// Offsets up to this many samples either way are searched: a second. FMAB's AC-3 sits 27 ms off
-/// its TrueHD, and the head hole mkvmerge left in five of its episodes was 67 ms.
+/// Offsets up to this many samples either way are searched: a second, far wider than the lags
+/// seen in real files.
 pub const MAX_LAG: usize = RATE as usize;
 
 /// A window quieter than this (RMS, dBFS) holds too little sound to compare.

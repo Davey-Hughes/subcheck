@@ -642,8 +642,8 @@ fn parse_cues(data: &[u8], base: u64) -> Result<Vec<Cue>> {
 /// The statistics tags: `NUMBER_OF_FRAMES` and `NUMBER_OF_BYTES`, each by track UID, of the tags
 /// whose `_STATISTICS_WRITING_APP` is `wrote_file`, the file's WritingApp. Another program's may
 /// count a track that is no longer there: ffmpeg keeps the tags of a file it rewrites, so a track
-/// it re-encoded still has the counts mkvmerge took of the old one (Yuru Camp S2's FLAC, counted
-/// as the PCM it was). mkvpropedit's fresh counts go too, since ffmpeg would keep those as well.
+/// it re-encoded still has the counts mkvmerge took of the old one. mkvpropedit's fresh counts go
+/// too, since ffmpeg would keep those as well.
 fn parse_tags(
     data: &[u8],
     base: u64,
@@ -759,7 +759,6 @@ mod tests {
 
     #[test]
     fn truncation_reads_as_bytes_present_of_bytes_declared() {
-        // The copy of Tokyo Ghoul Root A E01 that found this: 4.2% of the file is there.
         let t = Truncated {
             declared_end: 7_976_268_468,
             file_size: 338_132_992,
@@ -854,7 +853,7 @@ mod tests {
         assert_eq!(named(b"  "), None);
         assert_eq!(named(b"Signs"), Some("Signs".into()));
         // Spaces and tabs around a name are not part of it; what else mkvmerge keeps, so does the
-        // parser (checked, mkvmerge v102.0: a newline, an ideographic or no-break space).
+        // parser: a newline, an ideographic or no-break space.
         assert_eq!(named(b" \tSigns \t"), Some("Signs".into()));
         assert_eq!(
             named("Signs\u{3000}".as_bytes()),

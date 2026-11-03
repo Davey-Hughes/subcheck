@@ -319,7 +319,7 @@ mod tests {
     /// $SUBCHECK_TEST_HOW says, writes `<path>.ready`, and waits.
     #[test]
     #[ignore = "the child of the signal tests"]
-    #[allow(clippy::too_many_lines)] // one arm per way the child registers
+    #[allow(clippy::too_many_lines)] // an arm for every way the child registers
     fn child_that_registers_a_file_and_waits() {
         let Some(path) = std::env::var_os("SUBCHECK_TEST_REMOVE") else {
             return;
@@ -348,7 +348,6 @@ mod tests {
                 setrlimit(Resource::Nproc, none).unwrap();
                 remove_on_signal(&path)
             }
-            // Held far longer: only a second signal ends it before the hold does.
             // A group running, which holds the test's pipe (stderr) until it ends, and another one
             // whose start is stuck for 10 s (its program on a stalled mount, say).
             "stuck-start" => {
@@ -413,7 +412,8 @@ mod tests {
                 finish();
                 return;
             }
-            // And a group running, which holds the test's pipe (stderr) until it ends.
+            // Held far longer: only a second signal ends it before the hold does. And a group
+            // running, which holds the test's pipe (stderr) until it ends.
             "hold" => {
                 let _running = spawn(Command::new("sleep").arg("20")).unwrap();
                 remove_on_signal(&path).forget_after(|| {

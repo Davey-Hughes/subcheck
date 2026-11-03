@@ -152,8 +152,8 @@ pub fn children(data: &[u8], base: u64) -> Result<Vec<(u32, u64, &[u8])>> {
     Ok(out)
 }
 
-/// The largest master element read whole (Tracks, Cues, Tags). A two-hour film's Cues come to a
-/// few hundred KB; anything near this is a corrupt size.
+/// The largest master element read whole (Tracks, Cues, Tags). A two-hour film's Cues are far
+/// smaller; anything near this is a corrupt size.
 pub const MAX_IN_MEMORY: u64 = 64 << 20;
 
 /// A file read with positioned reads only, counting the bytes it reads.
@@ -184,9 +184,9 @@ impl Reader {
     /// Ask the kernel to start fetching these `(offset, len)` ranges now, all at once.
     ///
     /// The reads that follow are small and scattered over a file that usually sits on a spinning
-    /// disk behind NFS. Issued one at a time, each waits out its own seek (about 15 ms measured).
-    /// Announced together, the NFS client sends them concurrently and the server's disk can serve
-    /// them in one sweep. A hint only: failure, or a platform without it, just means slower reads.
+    /// disk behind NFS. Issued one at a time, each waits out its own seek. Announced together, the
+    /// NFS client sends them concurrently and the server's disk can serve them in one sweep. A hint
+    /// only: failure, or a platform without it, just means slower reads.
     pub fn prefetch(&self, ranges: impl IntoIterator<Item = (u64, u64)>) {
         #[cfg(target_os = "linux")]
         for (offset, len) in ranges {

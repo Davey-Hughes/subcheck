@@ -1,5 +1,6 @@
 //! Everything subcheck keeps, in one SQLite database ([`Store`]): each scan, the checks it made of
-//! each file, their findings, and the decisions on them. Findings and decisions belong to files
+//! each file, their findings, the decisions on them, apply's marks of the fixes it made or found,
+//! and each scan's claude and codex calls ([`LlmCall`]). Findings and decisions belong to files
 //! and checks; a run is the record of one scan and a view of its files.
 //!
 //! The database is `subcheck.db` in the state directory unless `SUBCHECK_DB` names another
@@ -28,7 +29,7 @@ pub use view::Selector;
 pub use write::{Attempt, Decided, Made, Saved, ScanRow, Swapped, is_busy};
 
 /// The state directory, from explicit inputs. An empty or relative `XDG_STATE_HOME` is ignored,
-/// as the XDG spec says and as nudge does: a relative one would resolve against the cwd.
+/// as the XDG spec says: a relative one would resolve against the cwd.
 ///
 /// An absolute `XDG_STATE_HOME` wins on macOS too: macOS has no such convention, so one that is
 /// set was set on purpose (the tests rely on it to keep each run in a temporary directory).
@@ -161,7 +162,7 @@ pub struct Finding {
     pub original: String,
     pub suggestion: String,
     pub reason: String,
-    /// What produced it: `llm`.
+    /// What produced it: `llm` or `timing`.
     pub source: String,
     pub occurrences: Vec<Occurrence>,
     /// Up to two lines on either side, in time order, for context.
@@ -326,7 +327,7 @@ pub struct LlmCall {
 impl FileRecord {
     /// Take a later record of the same file, as a view puts a file's checks together: a failed
     /// attempt marks the file failed and leaves its checks standing; a check adds its kind and
-    /// the file as it read it, with the lines it read when it is the LLM's.
+    /// the file as it read it, with the lines it read, but a timing check keeps the LLM's lines.
     pub fn merge(&mut self, later: FileRecord) {
         if later.error.is_some() {
             if self.checks.is_empty() {
@@ -510,7 +511,7 @@ mod tests {
             Path::new("/home/u/Library/Application Support/subcheck")
         );
         // On macOS too, an XDG_STATE_HOME that is set wins: whoever set it meant it (the tests
-        // point it at a temporary directory, and a macOS CI runner was ignoring that).
+        // point it at a temporary directory).
         assert_eq!(
             state_dir_from(home, Some(Path::new("/x/state")), true),
             Path::new("/x/state/subcheck")

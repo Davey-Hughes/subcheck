@@ -17,25 +17,23 @@ use correlate::Lag;
 pub const WINDOW_NS: u64 = 10_000_000_000;
 
 /// A window where both tracks have sound matches when it scores at least this; one that scores
-/// less is unclear and says nothing of the lag. Lossy copies match in every window: the AAC copies
-/// of K-On's FLAC score 0.26 at worst (most windows 0.4-0.9), FMAB's AC-3 against its TrueHD 0.94.
-/// A dub shares the music and effects, so its OP and ED windows score up to 0.97, but in 10 of the
-/// 11 episodes measured (FMAB, K-On) at least two of six windows of dialogue scored 0.23 or less.
-/// Commentaries score below it everywhere.
+/// less is unclear and says nothing of the lag. The lossy copies seen match in every window, the
+/// worst only just. A dub shares the music and effects, so its OP and ED windows can match, but
+/// in most episodes seen at least two of six windows of dialogue scored below this. Commentaries
+/// score below it everywhere.
 pub const MATCH_SCORE: f64 = 0.25;
 
 /// Tracks tagged with different languages hold the same sound only when every window with sound
 /// in both scores at least this, as a copy in another codec does: the check is for one audio in
 /// two codecs, not a dub against its original. A dub shares the original's music and effects, so
-/// an episode of action can match in every window: FMAB's dubs score 0.37 at worst in their worst
-/// window (E61), its AC-3 copies 0.88 or more. A copy tagged with the wrong language is caught so
-/// when it is clean; a poor one (K-On's AAC copies of its FLAC, 0.26-0.49) is not.
+/// an episode of action can match in every window, but the dubs seen scored below this in their
+/// worst window and the clean copies seen well above it. A copy tagged with the wrong language is
+/// caught so when it is clean; a poor one is not.
 pub const COPY_SCORE: f64 = 0.5;
 
 /// How much less alike (median score) than the best match a track may be and still be the one
 /// reported against. Two copies of one sound match a third about as well as each other; a dub
-/// that matches through its music and effects (FMAB E61's AC-3 against the Japanese, 0.63 where
-/// both are tagged alike) does not come close to its own track (0.97).
+/// that matches through its music and effects does not come close to its own track.
 const ALIKE_SLACK: f64 = 0.05;
 
 /// How many of a pair's windows with sound may be unclear with the pair still the same audio:
@@ -54,13 +52,12 @@ pub const MIN_WINDOWS: usize = 3;
 pub const IN_SYNC_MS: f64 = 1.0;
 
 /// Clear windows whose lags spread wider than this (ms) drift. Each may carry the rounding above,
-/// and a lossy copy's lag wanders with its codec: K-On!!'s AAC copies, steadily 21 ms late, spread
-/// 0.7-2.2 ms over a file. Its steps of 8 ms (S00E05, S00E08) and FMAB's 67 ms head hole drift.
+/// and a lossy copy's lag wanders with its codec: the AAC copies seen spread less than this over a
+/// file, and the sync steps seen are wider.
 pub const STEADY_MS: f64 = 3.0;
 
 /// Where to decode a file of `duration_ns`: ten-second windows from 0:30, and at 20, 40, 60 and
-/// 80 % in, and a minute before the end. Spreading them catches a lag that changes over the file,
-/// like the hole FMAB's TrueHD had at its head, 67 ms early then and in sync by the end.
+/// 80 % in, and a minute before the end. Spreading them catches a lag that changes over the file.
 pub fn windows(duration_ns: u64) -> Vec<(u64, u64)> {
     spread(duration_ns, WINDOW_NS, 30_000_000_000)
 }
@@ -770,7 +767,7 @@ mod tests {
             panic!()
         };
         assert!((ms - 21.0).abs() < 1e-9, "{ms}");
-        // K-On!! S00E05's AAC: +21 ms, then +29 from 1:52 on.
+        // K-On!! S00E05's AAC: +21 ms, then +29.
         let stepped = [
             lag(20.7, 0.50),
             lag(21.7, 0.65),

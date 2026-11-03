@@ -93,8 +93,8 @@ impl Store {
     }
 
     /// One file as a view shows it (see [`Store::run_view`]), with no name, header or cost: what
-    /// review's screen reads back when a scan saves the file, or a decision followed one of its
-    /// findings. A file with nothing recorded has no record and no findings.
+    /// review's screen reads back when a scan saves the file, or a decision finds one of its
+    /// findings replaced. A file with nothing recorded has no record and no findings.
     pub fn file_view(&self, path: &str) -> rusqlite::Result<Run> {
         let tx = self.conn.unchecked_transaction()?;
         start_showing(&tx)?;

@@ -223,16 +223,17 @@ fn tabs(active: Pane) -> Vec<Span<'static>> {
 }
 
 /// The left pane's block, in either view: the tabs on the left of its top border and, on the
-/// right, how far a scan is while one runs, else the view's name (`Run::shown_name`). Each view
-/// puts what its list holds on the bottom border. `area` is the pane's: when the tabs, the right
-/// part and a column of border between them do not fit inside its corners, the right part is left
-/// off rather than drawn over the tabs, and the status line still says how far the scan is.
+/// right, how far a scan, apply or dry run is while one runs, else the view's name
+/// (`Run::shown_name`). Each view puts what its list holds on the bottom border. `area` is the
+/// pane's: when the tabs, the right part and a column of border between them do not fit inside
+/// its corners, the right part is left off rather than drawn over the tabs, and the status line
+/// still says how far the job is.
 pub(super) fn pane_block(m: &Model, active: Pane, area: Rect) -> Block<'static> {
     let tab_line = Line::from(tabs(active));
     let mut block = Block::default()
         .borders(Borders::ALL)
         .title_top(tab_line.clone());
-    // While a scan runs, how far it is; else the view's name.
+    // While a job runs (a scan, apply or dry run), how far it is; else the view's name.
     let right = m.progress.title().unwrap_or_else(|| m.run.shown_name());
     let right = Line::from(format!(" {right} ")).right_aligned();
     let needed = tab_line.width() + 1 + right.width();
@@ -261,7 +262,8 @@ fn counts_line(m: &Model, room: u16) -> Line<'static> {
         Filter::Only(state) => format!("showing {}", label(state)),
     };
     // Every candidate keeps the first `n` counts, for `n` from all three down to none; with the
-    // filter `all`, the whole one is also tried with `showing all` and the rest without it.
+    // filter `all`, the whole one is also tried with `showing all` and the rest without it, and
+    // `n` stops at one.
     let keep = |n: usize, with_showing: bool| {
         let mut parts = counts[..n].to_vec();
         if with_showing {
@@ -1194,7 +1196,7 @@ mod tests {
         assert!(screen.contains("─ scanning 1/2 ⠋ ┐"), "{screen}");
         assert!(screen.contains(" · showing all ┘"), "{screen}");
         // On a narrow pane the progress leaves the border rather than overwrite the tabs: at 60
-        // columns the pane is 30 wide, 28 inside its corners; the tabs take 18, the progress 16.
+        // columns the pane is 30 wide, 28 inside its corners; the tabs take 17, the progress 16.
         let screen = render(&m, 60, 20);
         let top: String = screen.lines().next().unwrap().chars().take(30).collect();
         assert!(top.starts_with("┌ findings  files "), "{top}");
@@ -1312,14 +1314,14 @@ mod tests {
         ] {
             assert!(screen.contains(text), "{text}\n{screen}");
         }
-        // The three groups side by side on 120 columns: one heading line holds them all.
+        // The first three groups side by side on 120 columns: one heading line holds them all.
         assert!(
             screen
                 .lines()
                 .any(|l| l.contains("decide") && l.contains("move") && l.contains("mpv")),
             "{screen}"
         );
-        // On 70 the last group goes under the others.
+        // On 70 the last two groups go under the first two.
         let screen = render(&m, 70, 24);
         let heading = |name: &str| screen.lines().position(|l| l.contains(name)).unwrap();
         assert_eq!(heading("decide"), heading("move"), "{screen}");
@@ -1488,7 +1490,7 @@ mod tests {
         assert_eq!(last_key, Some(at - 3), "{screen}");
         assert!(lines[at - 1].contains("│ LLM "), "{screen}");
         // Too narrow for one line, it wraps between the parts.
-        // (Taller: the apply group makes the box too tall for 30 lines at this width.)
+        // (Taller: at this width the box is too tall for 30 lines.)
         let screen = render(&m, 50, 40);
         assert!(
             screen.contains("│ 1 call · 1.23M in / 31.2k out tokens "),
