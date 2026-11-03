@@ -113,12 +113,18 @@ enum Command {
         #[arg(long)]
         karaoke: bool,
     },
-    /// Report subtitle tracks shifted by whole frames against the video. Reads only the index
-    /// and the subtitles; no LLM, nothing recorded.
+    /// Report subtitle tracks shifted by whole frames against the video, up to 10 s either way.
+    /// Reads only the index and the subtitles; no LLM, nothing recorded.
     ///
-    /// Counts the frames between each line's start or end and the nearest video keyframe, which
-    /// is where most cuts are: a track whose timed lines pile up at +1 is a frame late. Directories
-    /// are walked recursively.
+    /// Keyframes stand in for cuts, where a line timed to the picture starts or ends. Those an
+    /// encoder forces once a GOP runs long are left out, and the shift that puts the most times
+    /// on cuts is looked for up to 10 s either way (3 frames for a clip of 100 keyframes or
+    /// fewer). Around it, the frames between each line's start or end and the nearest keyframe
+    /// are counted: a track whose timed lines pile up at +1 is a frame late, and one late over
+    /// part of its length is partial, with its stretches. A whole-track shift gets the `mkvmerge
+    /// --sync` that fixes it. A track whose times point two ways reads unclear and says where; a
+    /// track with too few lines on cuts is timed by the lines it shares with another track.
+    /// Directories are walked recursively.
     Timing {
         /// MKV files, or directories to search for them.
         #[arg(required = true)]
@@ -127,7 +133,9 @@ enum Command {
         /// subtitle track.
         #[arg(long = "lang")]
         langs: Vec<String>,
-        /// Add each style's offset counts, and whether its times were used.
+        /// Add how many keyframes are taken for cuts and the gaps taken for forced ones; each
+        /// style's counts at the offsets around the shift, and whether its times were used; and
+        /// the shifts with the most times on cuts (`wide:`).
         #[arg(short, long)]
         verbose: bool,
     },
