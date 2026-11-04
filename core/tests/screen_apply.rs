@@ -16,7 +16,8 @@ use subcheck_core::llm::Backend;
 use subcheck_core::player::Player;
 use subcheck_core::review::model::Model;
 use subcheck_core::review::run_effect;
-use subcheck_core::review::update::{self, Msg};
+use subcheck_core::review::screen::{self, Msg};
+use subcheck_core::review::update::Input;
 use subcheck_core::scan::{self, Planned};
 use subcheck_core::store::{Decision, Selector, State, Store};
 
@@ -30,10 +31,10 @@ fn send(
     tx: &mpsc::Sender<Msg>,
 ) {
     let now = jiff::Timestamp::now();
-    let mut queue: VecDeque<_> = update::update(m, msg, now).into();
+    let mut queue: VecDeque<_> = screen::update(m, msg, now).into();
     while let Some(effect) = queue.pop_front() {
-        let msg = run_effect(effect, store, player, state, tx);
-        queue.extend(update::update(m, msg, now));
+        let input = run_effect(effect, store, player, state, tx);
+        queue.extend(screen::update(m, input.into(), now));
     }
 }
 
@@ -66,7 +67,7 @@ impl Screen {
                 .rx
                 .recv_timeout(Duration::from_mins(1))
                 .expect("apply goes on");
-            let ended = matches!(msg, Msg::ApplyEnded(_));
+            let ended = matches!(msg, Msg::Input(Input::ApplyEnded(_)));
             send(
                 &mut self.m,
                 msg,

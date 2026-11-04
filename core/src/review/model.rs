@@ -514,7 +514,7 @@ impl Model {
     }
 
     /// The list's scroll offset on a screen of `area`: `scroll`, moved just enough to show the
-    /// selection. The view draws with it and `update` keeps it.
+    /// selection. The view draws with it and `screen::update` keeps it.
     pub fn list_scroll(&self, area: Rect) -> usize {
         let rows = layout::list_rows(&layout::panes(area)).height;
         let len = self.entries().len();

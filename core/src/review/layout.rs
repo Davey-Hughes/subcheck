@@ -1,5 +1,5 @@
 //! Where each part of the screen is, and which key each button presses. Pure, so the view draws
-//! with the same numbers that `update` maps a click with.
+//! with the same numbers that `screen` maps a click with.
 
 use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};

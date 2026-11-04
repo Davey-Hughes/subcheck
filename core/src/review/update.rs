@@ -1,16 +1,14 @@
-//! Keys to state changes, and the effects the event loop runs for them. Pure: the store and mpv are
-//! touched only by the effects, so every rule here is tested without a terminal.
+//! What each action, and each result of a job or an effect, does to review's state, and the
+//! effects the event loop runs for it. Pure: the store and mpv are touched only by the effects, so
+//! every rule here is tested without a terminal. It takes actions, not keys or clicks, so that each
+//! UI maps its own to the same rules (the terminal's are in `keymap` and `screen`).
 
 use std::collections::HashMap;
 
-use crossterm::event::KeyCode;
-use jiff::{SignedDuration, Timestamp};
-use ratatui::layout::{Position, Rect};
+use jiff::Timestamp;
 
-use super::layout;
 use super::model::{Confirm, Editor, Entry, FileNote, Mark, Model, Pane, UndoStep};
 use super::progress::{Scan, Stage};
-use super::view;
 use crate::apply;
 use crate::list::{self, Filter, label};
 use crate::player::{Moment, PlayState, Playback};
@@ -18,16 +16,15 @@ use crate::scan;
 use crate::store::{Decided, Decision, Record, Run, State};
 use crate::text::{timestamp, timestamp_ms};
 
+/// What `update` takes: an action, or what a job or an effect has to say.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // a read-back is rare; boxing it would only add noise
-pub enum Msg {
-    Key(KeyCode),
-    /// Ctrl-U: in the editor, delete back to the start.
-    KillLine,
-    Quit,
+pub enum Input {
+    /// What the user asks for, by whatever key, button or click the UI maps to it.
+    Action(Action),
     /// A `Write` effect finished: what became of each decision, or why none was written.
     Written {
-        action: Action,
+        purpose: WriteFor,
         decisions: Vec<Decision>,
         result: Result<Vec<Decided>, String>,
     },
@@ -57,10 +54,6 @@ pub enum Msg {
     Played(Result<PlayState, String>),
     /// A `Close` effect finished.
     Closed(Result<(), String>),
-    /// The terminal's new size.
-    Resize(u16, u16),
-    /// A mouse action at a column and row of the screen.
-    Mouse(Mouse, u16, u16),
     /// What the scan under way just did.
     Scan(scan::Event),
     /// The scan ended: its summary, or why it failed.
@@ -68,8 +61,6 @@ pub enum Msg {
     /// Something the screen cannot go on without failed (a job's thread panicked, the terminal
     /// could not be read): it ends, with this error.
     Fatal(String),
-    /// No message came for a quarter of a second while a job runs: the spinner turns.
-    Tick,
     /// What the screen's apply (or dry run) just did.
     Apply(apply::Event),
     /// A `StartApply` effect finished: apply's thread started, or why it could not.
@@ -78,16 +69,9 @@ pub enum Msg {
     ApplyEnded(Result<apply::Summary, String>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mouse {
-    Click,
-    WheelUp,
-    WheelDown,
-}
-
 /// What a write was for, so its result can be applied.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Action {
+pub enum WriteFor {
     /// `a` `r` `e`, and `x`, which puts findings back to pending.
     Decide {
         entry: Entry,
@@ -98,6 +82,55 @@ pub enum Action {
     Inherit {
         before: UndoStep,
     },
+}
+
+/// What the user asks of review. Each UI maps its own keys, buttons and clicks to these, so the
+/// rules below are the same whichever drives them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Quit; while a job runs, ask first.
+    Quit,
+    /// As `Quit`, asking first while a job runs; but a second, with the question open, quits.
+    Interrupt,
+    /// Select the entry at this index of [`Model::entries`]; the UI works out which.
+    Select(usize),
+    /// Expand the selected row into its members, or collapse it (from the row or a member).
+    Toggle,
+    /// Show the findings under this filter, the selection kept on its finding's row.
+    SetFilter(Filter),
+    NextFile,
+    PreviousFile,
+    Accept,
+    Reject,
+    /// Put the selected entry's decided findings back to pending.
+    Clear,
+    Undo,
+    /// Open the editor on the selected entry's wording.
+    Edit,
+    /// Accept the edited entry with this wording.
+    Reword(String),
+    CancelEdit,
+    ShowPane(Pane),
+    /// Open the other view of the screen's findings.
+    SwitchView,
+    /// Apply the view's accepted fixes; with `dry_run`, say what would change and write nothing.
+    Apply {
+        dry_run: bool,
+    },
+    /// Open the focused finding in mpv.
+    Play,
+    ClosePlayer,
+    Playback(Playback),
+    /// Answer the open question: yes, or let it go.
+    Answer(bool),
+    /// Select the file at this index of the files view (`progress.files`).
+    SelectFile(usize),
+    /// The findings, on the first entry with one of the selected file's.
+    ShowFileFindings,
+    /// Check the selected file again, once asked.
+    Recheck,
+    /// A key with no action of its own: only the status message goes, as on any key in a pane.
+    Dismiss,
 }
 
 /// A scan `c` started.
@@ -122,29 +155,29 @@ pub enum Switch {
 pub enum Effect {
     /// Record these decisions in the store.
     Write {
-        action: Action,
+        purpose: WriteFor,
         decisions: Vec<Decision>,
     },
-    /// Read a file back from the store, as it is now ([`Msg::ReadBack`]).
+    /// Read a file back from the store, as it is now ([`Input::ReadBack`]).
     ReadBack(String),
     /// Find the run `c` checks a file again into: `run`, the one the screen shows, or with none (a
-    /// paths view) the newest that named the file ([`Msg::RunFound`]).
+    /// paths view) the newest that named the file ([`Input::RunFound`]).
     FindRun {
         path: String,
         run: Option<String>,
     },
-    /// Check `paths` again into `run`, as `subcheck scan --run <run> --force <paths>` does
-    /// ([`Msg::Started`]).
+    /// Check `paths` again into `run`, as `subcheck scan --run <run> --force <paths>`
+    /// does ([`Input::Started`]).
     Recheck {
         run: String,
         paths: Vec<String>,
     },
     /// Open the other view of the screen's findings (`v`), read from the store with each file's
-    /// note ([`Msg::Switched`]).
+    /// note ([`Input::Switched`]).
     Switch(Switch),
     /// Apply `run`'s accepted fixes on a thread of their own (with `dry_run`, say what would change
-    /// and write nothing); `karaoke` as `apply --karaoke` ([`Msg::ApplyStarted`], then
-    /// [`Msg::Apply`] for each step and [`Msg::ApplyEnded`]).
+    /// and write nothing); `karaoke` as `apply --karaoke` ([`Input::ApplyStarted`], then
+    /// [`Input::Apply`] for each step and [`Input::ApplyEnded`]).
     StartApply {
         run: Run,
         dry_run: bool,
@@ -157,121 +190,31 @@ pub enum Effect {
     Close,
 }
 
-/// Rows a PgUp or PgDn moves.
-const PAGE: usize = 10;
-
-/// Two clicks on one entry within this long are a double-click.
-const DOUBLE_CLICK: SignedDuration = SignedDuration::from_millis(500);
-
-/// Lines the detail pane scrolls per notch of the wheel.
-const WHEEL_LINES: u16 = 3;
-
-pub fn update(m: &mut Model, msg: Msg, now: Timestamp) -> Vec<Effect> {
-    let before = (m.selected_entry(), m.pane, m.file_selected);
-    let input = matches!(
-        msg,
-        Msg::Key(_) | Msg::KillLine | Msg::Quit | Msg::Mouse(..)
-    );
-    // A double-click is two clicks with nothing the user did in between: a key or another click
-    // starts over. A job's messages and the spinner's ticks come unasked, so they leave the first
-    // click be (`Model::refresh` keeps it on its entry as rows come and go).
-    let last_click = if input { m.last_click.take() } else { None };
-    let effects = apply(m, msg, last_click, now);
-    // The cost line review opened with ends at the first key (Ctrl-U, Ctrl-C and Ctrl-D too),
-    // click or turn of the wheel, the box of keys open or not: once the message is handled, so a
-    // click lands on the status line as it was drawn.
-    if input {
-        m.show_cost = false;
-    }
-    if (m.selected_entry(), m.pane, m.file_selected) != before {
-        m.detail_scroll = 0;
-    }
-    // No further than the detail's last line, however that moved: the wheel, a wider screen, a
-    // decision or a filter that shortened the text.
-    m.detail_scroll = m.detail_scroll.min(detail_last(m));
-    // The list scrolls no further than it takes to keep the selection in view.
-    m.scroll = m.list_scroll(m.area);
-    m.file_scroll = m.files_scroll(m.area);
-    effects
-}
-
-#[allow(clippy::too_many_lines)] // an arm for every message
-fn apply(
-    m: &mut Model,
-    msg: Msg,
-    last_click: Option<(Entry, Timestamp)>,
-    now: Timestamp,
-) -> Vec<Effect> {
-    match msg {
-        // Ctrl-C or Ctrl-D: while a job runs it asks first, as `q` does; a second one, with the
-        // question open, quits.
-        Msg::Quit => {
-            if m.progress.busy() && m.confirm != Some(Confirm::Quit) {
-                m.confirm = Some(Confirm::Quit);
-            } else {
-                m.should_quit = true;
-            }
-            Vec::new()
-        }
-        Msg::KillLine => {
-            if let Some(ed) = &mut m.editor {
-                ed.text = ed.text.chars().skip(ed.cursor).collect();
-                ed.cursor = 0;
-            }
-            Vec::new()
-        }
-        // The question takes the next key: `y` answers it, any other lets it go.
-        Msg::Key(key) if m.confirm.is_some() => {
-            let confirm = m.confirm.take().expect("checked above");
-            if key != KeyCode::Char('y') {
-                return Vec::new();
-            }
-            match confirm {
-                Confirm::Quit => {
-                    m.should_quit = true;
-                    Vec::new()
-                }
-                Confirm::Recheck { path, run, .. } => again(m, path, run),
-                Confirm::Apply => start_apply(m, false),
-            }
-        }
-        Msg::Key(key) if m.editor.is_some() => edit_key(m, key, now),
-        // Any key closes the box of keys and does nothing else; but `q` quits, as the box says.
-        Msg::Key(key) if m.help => {
-            m.help = false;
-            if key == KeyCode::Char('q') {
-                quit_or_ask(m);
-            }
-            Vec::new()
-        }
-        Msg::Key(key) => {
-            m.status = None;
-            match m.pane {
-                Pane::Findings => key_press(m, key, now),
-                Pane::Files => files_key(m, key, now),
-            }
-        }
-        Msg::Written {
-            action,
+/// What `input` does to `m`, and the effects to run for it.
+pub fn update(m: &mut Model, input: Input, now: Timestamp) -> Vec<Effect> {
+    match input {
+        Input::Action(action) => perform(m, action, now),
+        Input::Written {
+            purpose,
             decisions,
             result,
-        } => written(m, action, &decisions, result),
-        Msg::ReadBack { path, view } => read_back(m, &path, view, now),
-        Msg::RunFound { path, found } => run_found(m, path, found),
-        Msg::Started {
+        } => written(m, purpose, &decisions, result),
+        Input::ReadBack { path, view } => read_back(m, &path, view, now),
+        Input::RunFound { path, found } => run_found(m, path, found),
+        Input::Started {
             job,
             missing,
             paths: p,
         } => started(m, job, &missing, &p),
-        Msg::Switched(result) => switched(m, result),
-        Msg::Opened(result) => {
+        Input::Switched(result) => switched(m, result),
+        Input::Opened(result) => {
             m.status = Some(match result {
                 Ok(()) => "opened in mpv".into(),
                 Err(e) => e,
             });
             Vec::new()
         }
-        Msg::Played(result) => {
+        Input::Played(result) => {
             m.status = Some(match result {
                 Ok(p) => format!(
                     "{} {}",
@@ -282,249 +225,152 @@ fn apply(
             });
             Vec::new()
         }
-        Msg::Closed(result) => {
+        Input::Closed(result) => {
             m.status = Some(match result {
                 Ok(()) => "closed mpv".into(),
                 Err(e) => e,
             });
             Vec::new()
         }
-        Msg::Resize(width, height) => {
-            m.set_area(Rect::new(0, 0, width, height));
-            Vec::new()
-        }
-        Msg::Mouse(action, x, y) => mouse(m, action, Position::new(x, y), last_click, now),
-        Msg::Scan(event) => scanned(m, event),
-        Msg::ScanEnded(result) => {
+        Input::Scan(event) => scanned(m, event),
+        Input::ScanEnded(result) => {
             m.progress.scan = Scan::Ended(result);
             let effects = next_again(m);
             settle_quit(m, &effects);
             effects
         }
-        Msg::Apply(event) => applied(m, event),
-        Msg::ApplyStarted(Ok(())) => Vec::new(),
-        Msg::ApplyStarted(Err(e)) | Msg::ApplyEnded(Err(e)) => {
+        Input::Apply(event) => applied(m, event),
+        Input::ApplyStarted(Ok(())) => Vec::new(),
+        Input::ApplyStarted(Err(e)) | Input::ApplyEnded(Err(e)) => {
             m.progress.apply_ended(Err(e));
             settle_quit(m, &[]);
             Vec::new()
         }
-        Msg::ApplyEnded(Ok(summary)) => {
+        Input::ApplyEnded(Ok(summary)) => {
             m.progress.apply_ended(Ok(summary));
             settle_quit(m, &[]);
             Vec::new()
         }
-        Msg::Fatal(error) => {
+        Input::Fatal(error) => {
             m.fatal = Some(error);
             m.should_quit = true;
             Vec::new()
         }
-        Msg::Tick => {
-            m.progress.ticks += 1;
-            Vec::new()
-        }
     }
 }
 
-/// The furthest the detail pane scrolls: its last line, wrapped as drawn, on top.
-fn detail_last(m: &Model) -> u16 {
-    // Inside the border, where the lines wrap.
-    let width = layout::panes(m.area).detail.width.saturating_sub(2);
-    let lines = view::detail_height(m, width);
-    u16::try_from(lines.saturating_sub(1)).unwrap_or(u16::MAX)
-}
-
-/// A click does what its key does; the wheel moves the selection over the list and scrolls the
-/// detail pane. While the editor is open only its own buttons work, so a stray click cannot lose
-/// the edit; while the box of keys shows, a click closes it and the wheel does nothing.
-fn mouse(
-    m: &mut Model,
-    action: Mouse,
-    at: Position,
-    last_click: Option<(Entry, Timestamp)>,
-    now: Timestamp,
-) -> Vec<Effect> {
-    let p = layout::panes(m.area);
-    let press = |m: &mut Model, key: Option<KeyCode>| match key {
-        Some(key) => apply(m, Msg::Key(key), None, now),
-        None => Vec::new(),
-    };
-    if m.help {
-        m.help = !matches!(action, Mouse::Click);
-        return Vec::new();
-    }
-    if m.editor.is_some() {
-        return match action {
-            Mouse::Click => press(m, status_button(m, p.status, at)),
-            _ => Vec::new(),
-        };
+/// What `action` does to `m`, and the effects to run for it.
+fn perform(m: &mut Model, action: Action, now: Timestamp) -> Vec<Effect> {
+    // A message stays until the user does something else. An answer, the end of an edit and
+    // Ctrl-C leave it, so a message that came while a question or the editor held the line shows
+    // once they are done.
+    if !matches!(
+        action,
+        Action::Answer(_) | Action::Interrupt | Action::Reword(_) | Action::CancelEdit
+    ) {
+        m.status = None;
     }
     match action {
-        Mouse::WheelUp if p.list.contains(at) => press(m, Some(KeyCode::Up)),
-        Mouse::WheelDown if p.list.contains(at) => press(m, Some(KeyCode::Down)),
-        Mouse::WheelUp if p.detail.contains(at) => {
-            m.detail_scroll = m.detail_scroll.saturating_sub(WHEEL_LINES);
-            Vec::new()
-        }
-        Mouse::WheelDown if p.detail.contains(at) => {
-            // `update` stops it at the last line.
-            m.detail_scroll = m.detail_scroll.saturating_add(WHEEL_LINES);
-            Vec::new()
-        }
-        Mouse::Click if layout::list_rows(&p).contains(at) => {
-            let row = usize::from(at.y - layout::list_rows(&p).y);
-            match m.pane {
-                Pane::Findings => click_row(m, m.scroll + row, last_click, now),
-                Pane::Files => {
-                    if m.file_scroll + row < m.progress.files.len() {
-                        m.status = None;
-                        m.file_selected = m.file_scroll + row;
-                    }
-                    Vec::new()
-                }
+        Action::Quit => quit_or_ask(m),
+        // Ctrl-C or Ctrl-D: while a job runs it asks first, as `q` does; a second one, with the
+        // question open, quits.
+        Action::Interrupt => {
+            if m.progress.busy() && m.confirm != Some(Confirm::Quit) {
+                m.confirm = Some(Confirm::Quit);
+            } else {
+                m.should_quit = true;
             }
         }
-        Mouse::Click => press(m, status_button(m, p.status, at)),
-        _ => Vec::new(),
-    }
-}
-
-/// The key the button at `at` on the status line `status` presses, while the buttons show.
-fn status_button(m: &Model, status: Rect, at: Position) -> Option<KeyCode> {
-    let items = m.buttons(status).filter(|_| status.contains(at))?;
-    layout::bar_hit(items, layout::bar_left(status, items), at.x)
-}
-
-/// A click on the list's `index`th entry selects it; the second click of a double-click opens it.
-fn click_row(
-    m: &mut Model,
-    index: usize,
-    last_click: Option<(Entry, Timestamp)>,
-    now: Timestamp,
-) -> Vec<Effect> {
-    let Some(&entry) = m.entries().get(index) else {
-        return Vec::new();
-    };
-    m.status = None;
-    m.selected = index;
-    // The wall clock can step back between two clicks: a negative gap is not a short one.
-    let double = last_click.is_some_and(|(e, at)| {
-        e == entry && (SignedDuration::ZERO..=DOUBLE_CLICK).contains(&now.duration_since(at))
-    });
-    if double {
-        return open(m);
-    }
-    m.last_click = Some((entry, now));
-    Vec::new()
-}
-
-fn key_press(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
-    let last = m.entries().len().saturating_sub(1);
-    match key {
-        KeyCode::Char('q') => quit_or_ask(m),
-        KeyCode::Tab => m.pane = Pane::Files,
-        KeyCode::Char('v') => return switch_view(m),
-        KeyCode::Char('A') => return apply_key(m, false),
-        KeyCode::Char('D') => return apply_key(m, true),
-        KeyCode::Char('?') => m.help = true,
-        KeyCode::Down | KeyCode::Char('j') => m.selected = (m.selected + 1).min(last),
-        KeyCode::Up | KeyCode::Char('k') => m.selected = m.selected.saturating_sub(1),
-        KeyCode::PageDown => m.selected = (m.selected + PAGE).min(last),
-        KeyCode::PageUp => m.selected = m.selected.saturating_sub(PAGE),
-        KeyCode::Home | KeyCode::Char('g') => m.selected = 0,
-        KeyCode::End | KeyCode::Char('G') => m.selected = last,
-        KeyCode::Char('f') => cycle_filter(m),
-        KeyCode::Enter => toggle(m),
-        KeyCode::Char('n') => next_file(m),
-        KeyCode::Char('p') => previous_file(m),
-        KeyCode::Char('a') => {
+        Action::Select(index) => m.selected = index,
+        Action::Toggle => toggle(m),
+        Action::SetFilter(filter) => set_filter(m, filter),
+        Action::NextFile => next_file(m),
+        Action::PreviousFile => previous_file(m),
+        Action::Accept => {
             if let Some(entry) = m.selected_entry() {
                 return decide(m, entry, State::Accepted, None, now);
             }
         }
-        KeyCode::Char('r') => {
+        Action::Reject => {
             if let Some(entry) = m.selected_entry() {
                 return decide(m, entry, State::Rejected, None, now);
             }
         }
-        KeyCode::Char('e') => {
-            if let Some(entry) = m.selected_entry() {
-                let targets = m.to_decide(entry);
-                if targets.iter().any(|&i| m.finding(i).timing.is_some()) {
-                    m.status = Some("a timing fix is accepted or rejected, not edited".into());
-                    return Vec::new();
-                }
-                let text = m.wording(targets[0]).to_string();
-                let cursor = text.chars().count();
-                m.editor = Some(Editor {
-                    entry,
-                    text,
-                    cursor,
-                });
-            }
-        }
-        KeyCode::Char('x') => {
+        Action::Clear => {
             if let Some(entry) = m.selected_entry() {
                 return clear(m, entry, now);
             }
         }
-        KeyCode::Char('u') => return undo(m, now),
-        KeyCode::Char('o') => return open(m),
-        KeyCode::Char('O') => return vec![Effect::Close],
-        KeyCode::Char(' ') => return vec![Effect::Playback(Playback::Pause)],
-        KeyCode::Left => return vec![Effect::Playback(Playback::Seek(-5))],
-        KeyCode::Right => return vec![Effect::Playback(Playback::Seek(5))],
-        KeyCode::Char(',') => return vec![Effect::Playback(Playback::Seek(-1))],
-        KeyCode::Char('.') => return vec![Effect::Playback(Playback::Seek(1))],
-        KeyCode::Char('[') => return vec![Effect::Playback(Playback::PreviousFrame)],
-        KeyCode::Char(']') => return vec![Effect::Playback(Playback::NextFrame)],
-        _ => {}
+        Action::Undo => return undo(m, now),
+        Action::Edit => open_editor(m),
+        Action::Reword(text) => return reword(m, &text, now),
+        Action::CancelEdit => m.editor = None,
+        Action::ShowPane(pane) => m.pane = pane,
+        Action::SwitchView => return switch_view(m),
+        Action::Apply { dry_run } => return apply_key(m, dry_run),
+        Action::Play => return open(m),
+        Action::ClosePlayer => return vec![Effect::Close],
+        Action::Playback(p) => return vec![Effect::Playback(p)],
+        Action::Answer(yes) => return answer(m, yes),
+        Action::SelectFile(index) => m.file_selected = index,
+        Action::ShowFileFindings => file_findings(m),
+        Action::Recheck => return recheck(m),
+        Action::Dismiss => {}
     }
     Vec::new()
 }
 
-fn edit_key(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
-    let Some(ed) = &mut m.editor else {
+/// The open question's answer: yes does what it asked; no lets it go.
+fn answer(m: &mut Model, yes: bool) -> Vec<Effect> {
+    let Some(confirm) = m.confirm.take() else {
         return Vec::new();
     };
-    let at = |text: &str, cursor: usize| {
-        text.char_indices()
-            .nth(cursor)
-            .map_or(text.len(), |(i, _)| i)
-    };
-    match key {
-        KeyCode::Esc => m.editor = None,
-        KeyCode::Enter => {
-            let ed = m.editor.take().expect("checked above");
-            if ed.text.trim().is_empty() {
-                m.status = Some("the wording cannot be empty (Esc cancels)".into());
-                m.editor = Some(ed);
-                return Vec::new();
-            }
-            let reworded = ed.text != m.finding(m.to_decide(ed.entry)[0]).suggestion;
-            let edited = reworded.then_some(ed.text.as_str());
-            return decide(m, ed.entry, State::Accepted, edited, now);
-        }
-        KeyCode::Char(c) => {
-            let i = at(&ed.text, ed.cursor);
-            ed.text.insert(i, c);
-            ed.cursor += 1;
-        }
-        KeyCode::Backspace if ed.cursor > 0 => {
-            ed.cursor -= 1;
-            let i = at(&ed.text, ed.cursor);
-            ed.text.remove(i);
-        }
-        KeyCode::Delete if ed.cursor < ed.text.chars().count() => {
-            let i = at(&ed.text, ed.cursor);
-            ed.text.remove(i);
-        }
-        KeyCode::Left => ed.cursor = ed.cursor.saturating_sub(1),
-        KeyCode::Right => ed.cursor = (ed.cursor + 1).min(ed.text.chars().count()),
-        KeyCode::Home => ed.cursor = 0,
-        KeyCode::End => ed.cursor = ed.text.chars().count(),
-        _ => {}
+    if !yes {
+        return Vec::new();
     }
-    Vec::new()
+    match confirm {
+        Confirm::Quit => {
+            m.should_quit = true;
+            Vec::new()
+        }
+        Confirm::Recheck { path, run, .. } => again(m, path, run),
+        Confirm::Apply => start_apply(m, false),
+    }
+}
+
+/// `e`: the editor, on the selected entry's wording with the cursor at its end. A timing fix is
+/// accepted or rejected, never reworded.
+fn open_editor(m: &mut Model) {
+    let Some(entry) = m.selected_entry() else {
+        return;
+    };
+    let targets = m.to_decide(entry);
+    if targets.iter().any(|&i| m.finding(i).timing.is_some()) {
+        m.status = Some("a timing fix is accepted or rejected, not edited".into());
+        return;
+    }
+    let text = m.wording(targets[0]).to_string();
+    let cursor = text.chars().count();
+    m.editor = Some(Editor {
+        entry,
+        text,
+        cursor,
+    });
+}
+
+/// The edit's end: its entry accepted with `text`, or plainly when that is the suggestion. Empty
+/// text is refused, and the editor stays open on it.
+fn reword(m: &mut Model, text: &str, now: Timestamp) -> Vec<Effect> {
+    let Some(ed) = m.editor.take() else {
+        return Vec::new();
+    };
+    if text.trim().is_empty() {
+        m.status = Some("the wording cannot be empty (Esc cancels)".into());
+        m.editor = Some(ed);
+        return Vec::new();
+    }
+    let reworded = text != m.finding(m.to_decide(ed.entry)[0]).suggestion;
+    decide(m, ed.entry, State::Accepted, reworded.then_some(text), now)
 }
 
 /// Decisions putting each of `findings` at `state` with that wording, but those that already are;
@@ -569,7 +415,7 @@ fn decide(
         return Vec::new();
     }
     vec![Effect::Write {
-        action: Action::Decide { entry, before },
+        purpose: WriteFor::Decide { entry, before },
         decisions,
     }]
 }
@@ -587,7 +433,7 @@ fn clear(m: &mut Model, entry: Entry, now: Timestamp) -> Vec<Effect> {
         return Vec::new();
     }
     vec![Effect::Write {
-        action: Action::Decide { entry, before },
+        purpose: WriteFor::Decide { entry, before },
         decisions,
     }]
 }
@@ -608,7 +454,7 @@ fn undo(m: &mut Model, now: Timestamp) -> Vec<Effect> {
         })
         .collect();
     vec![Effect::Write {
-        action: Action::Undo,
+        purpose: WriteFor::Undo,
         decisions,
     }]
 }
@@ -619,7 +465,7 @@ fn undo(m: &mut Model, now: Timestamp) -> Vec<Effect> {
 #[allow(clippy::too_many_lines)] // the write's every consequence for the view, in order
 fn written(
     m: &mut Model,
-    action: Action,
+    purpose: WriteFor,
     decisions: &[Decision],
     result: Result<Vec<Decided>, String>,
 ) -> Vec<Effect> {
@@ -645,8 +491,8 @@ fn written(
     } else {
         format!("{n} findings")
     };
-    match action {
-        Action::Decide { entry, before } => {
+    match purpose {
+        WriteFor::Decide { entry, before } => {
             let state = decisions[0].state;
             m.status = Some(if state == State::Pending {
                 format!("cleared {what}")
@@ -683,7 +529,7 @@ fn written(
             m.undo.push(before);
             advance(m, entry, old, &shown);
         }
-        Action::Inherit { before } => {
+        WriteFor::Inherit { before } => {
             m.undo.push(before);
             // The decision can hide a row the new member showed under the filter, or show the
             // member under an expanded row: the selection stays on the entry it was on, wherever
@@ -716,7 +562,7 @@ fn written(
                 format!("{name}: {n} new findings took their rows' decisions (u undoes)")
             });
         }
-        Action::Undo => {
+        WriteFor::Undo => {
             m.undo.pop();
             // Name the episodes taken back, since the undone step may be a late join in a file
             // the user is not looking at.
@@ -815,14 +661,10 @@ fn advance(m: &mut Model, decided: Entry, old: usize, shown: &[Entry]) {
     };
 }
 
-fn cycle_filter(m: &mut Model) {
+/// The list under `filter`.
+fn set_filter(m: &mut Model, filter: Filter) {
     let focus = m.focus();
-    m.filter = match m.filter {
-        Filter::All => Filter::Only(State::Pending),
-        Filter::Only(State::Pending) => Filter::Only(State::Accepted),
-        Filter::Only(State::Accepted) => Filter::Only(State::Rejected),
-        Filter::Only(State::Rejected) => Filter::All,
-    };
+    m.filter = filter;
     // Stay on the same finding's row when it is still shown.
     let entries = m.entries();
     m.selected = focus
@@ -1023,33 +865,6 @@ fn applied(m: &mut Model, event: apply::Event) -> Vec<Effect> {
                 }
             }
         }
-        _ => {}
-    }
-    Vec::new()
-}
-
-/// A key in the files view: moving over the files, `⏎` to a file's findings, `Tab` back. The
-/// decision and mpv keys belong to the findings, except `u`: the status line of a late join
-/// says "u undoes" wherever the user is, so it undoes here too. `c` checks the selected file again.
-/// `A` and `D` apply, as in the findings.
-fn files_key(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
-    let last = m.progress.files.len().saturating_sub(1);
-    match key {
-        KeyCode::Char('u') => return undo(m, now),
-        KeyCode::Char('q') => quit_or_ask(m),
-        KeyCode::Char('?') => m.help = true,
-        KeyCode::Tab => m.pane = Pane::Findings,
-        KeyCode::Char('v') => return switch_view(m),
-        KeyCode::Char('A') => return apply_key(m, false),
-        KeyCode::Char('D') => return apply_key(m, true),
-        KeyCode::Down | KeyCode::Char('j') => m.file_selected = (m.file_selected + 1).min(last),
-        KeyCode::Up | KeyCode::Char('k') => m.file_selected = m.file_selected.saturating_sub(1),
-        KeyCode::PageDown => m.file_selected = (m.file_selected + PAGE).min(last),
-        KeyCode::PageUp => m.file_selected = m.file_selected.saturating_sub(PAGE),
-        KeyCode::Home | KeyCode::Char('g') => m.file_selected = 0,
-        KeyCode::End | KeyCode::Char('G') => m.file_selected = last,
-        KeyCode::Enter => file_findings(m),
-        KeyCode::Char('c') => return recheck(m),
         _ => {}
     }
     Vec::new()
@@ -1310,13 +1125,13 @@ fn inherit(m: &Model, new: &[usize], now: Timestamp) -> Vec<Effect> {
         return Vec::new();
     }
     vec![Effect::Write {
-        action: Action::Inherit { before },
+        purpose: WriteFor::Inherit { before },
         decisions,
     }]
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
 
@@ -1328,29 +1143,26 @@ mod tests {
     use crate::scan::Event;
     use crate::store::{Decided, Record};
 
-    fn now() -> Timestamp {
+    pub(crate) fn now() -> Timestamp {
         "2026-10-17T12:00:00Z".parse().unwrap()
     }
 
-    fn key(m: &mut Model, code: KeyCode) -> Vec<Effect> {
-        update(m, Msg::Key(code), now())
-    }
-
-    fn press(m: &mut Model, c: char) -> Vec<Effect> {
-        key(m, KeyCode::Char(c))
+    /// `action` done to `m`: the effects it asks for.
+    fn act(m: &mut Model, action: Action) -> Vec<Effect> {
+        update(m, Input::Action(action), now())
     }
 
     /// Run a Write effect as if the store took it, and feed the result back.
     fn written(m: &mut Model, effects: Vec<Effect>) {
-        let [Effect::Write { action, decisions }] = <[Effect; 1]>::try_from(effects).unwrap()
+        let [Effect::Write { purpose, decisions }] = <[Effect; 1]>::try_from(effects).unwrap()
         else {
             panic!("expected one write");
         };
         let n = decisions.len();
         update(
             m,
-            Msg::Written {
-                action,
+            Input::Written {
+                purpose,
                 decisions,
                 result: Ok(vec![Decided::Written; n]),
             },
@@ -1358,7 +1170,7 @@ mod tests {
         );
     }
 
-    fn decided(effects: &[Effect]) -> Vec<(u64, State, Option<&str>)> {
+    pub(crate) fn decided(effects: &[Effect]) -> Vec<(u64, State, Option<&str>)> {
         match effects {
             [Effect::Write { decisions, .. }] => decisions
                 .iter()
@@ -1369,15 +1181,15 @@ mod tests {
     }
 
     /// What `scan` appends for episode `ep`: its file record, then its findings.
-    fn appended(ep: u32, findings: Vec<crate::store::Finding>) -> Msg {
+    fn appended(ep: u32, findings: Vec<crate::store::Finding>) -> Input {
         let mut records = vec![Record::File(tests_support::file(ep))];
         records.extend(findings.into_iter().map(Record::Finding));
-        Msg::Scan(Event::Appended(records))
+        Input::Scan(Event::Appended(records))
     }
 
     /// Episode `ep` read back once `scan` saved `findings` for it (see `tests_support::read_back`).
-    fn saved(m: &Model, ep: u32, findings: Vec<crate::store::Finding>) -> Msg {
-        Msg::ReadBack {
+    pub(crate) fn saved(m: &Model, ep: u32, findings: Vec<crate::store::Finding>) -> Input {
+        Input::ReadBack {
             path: path(ep),
             view: Ok(tests_support::read_back(m, ep, findings)),
         }
@@ -1401,10 +1213,10 @@ mod tests {
     }
 
     /// The sample run with a scan of E04 and E05 under way.
-    fn scanning() -> Model {
+    pub(crate) fn scanning() -> Model {
         let mut m = sample();
         let queued = vec![PathBuf::from(path(4)), PathBuf::from(path(5))];
-        update(&mut m, Msg::Scan(Event::Queued(queued)), now());
+        update(&mut m, Input::Scan(Event::Queued(queued)), now());
         m
     }
 
@@ -1422,7 +1234,7 @@ mod tests {
             m.status.as_deref(),
             Some("E04: a new finding took its row's decision: accepted (u undoes)")
         );
-        let effects = press(&mut m, 'u');
+        let effects = act(&mut m, Action::Undo);
         assert_eq!(decided(&effects), [(5, State::Pending, None)]);
     }
 
@@ -1442,7 +1254,7 @@ mod tests {
         view.decisions.insert(5, carried);
         let effects = update(
             &mut m,
-            Msg::ReadBack {
+            Input::ReadBack {
                 path: path(4),
                 view: Ok(view),
             },
@@ -1530,7 +1342,7 @@ mod tests {
         let effects = update(&mut m, msg, now());
         written(&mut m, effects);
         m.pane = Pane::Files;
-        let effects = press(&mut m, 'u');
+        let effects = act(&mut m, Action::Undo);
         assert_eq!(decided(&effects), [(5, State::Pending, None)]);
         written(&mut m, effects);
         assert_eq!(m.run.state_of(5), State::Pending);
@@ -1550,7 +1362,7 @@ mod tests {
         written(&mut m, effects);
         // One step taking back findings of E05 and E04 at once.
         m.undo.push(vec![(6, None), (5, None)]);
-        let effects = press(&mut m, 'u');
+        let effects = act(&mut m, Action::Undo);
         written(&mut m, effects);
         assert_eq!(m.status.as_deref(), Some("undone: 2 findings · E05, E04"));
     }
@@ -1597,31 +1409,31 @@ mod tests {
     fn quitting_while_the_scan_runs_asks_first() {
         let status = |m: &Model| m.status_text(Rect::new(0, 0, 160, 1));
         let mut m = scanning();
-        press(&mut m, 'q');
+        act(&mut m, Action::Quit);
         assert!(!m.should_quit);
         assert_eq!(
             status(&m).as_deref(),
             Some("scan is on 0/2 — stop it and quit? y/n")
         );
-        press(&mut m, 'n');
+        act(&mut m, Action::Answer(false));
         assert!(!m.should_quit && m.confirm.is_none());
-        press(&mut m, 'q');
-        press(&mut m, 'y');
+        act(&mut m, Action::Quit);
+        act(&mut m, Action::Answer(true));
         assert!(m.should_quit && m.progress.running());
         // Ctrl-C asks too, and a second one quits.
         let mut m = scanning();
-        update(&mut m, Msg::Quit, now());
+        act(&mut m, Action::Interrupt);
         assert!(!m.should_quit);
-        update(&mut m, Msg::Quit, now());
+        act(&mut m, Action::Interrupt);
         assert!(m.should_quit);
         // Once the scan has ended, q quits at once.
         let mut m = scanning();
         update(
             &mut m,
-            Msg::ScanEnded(Ok(crate::scan::Summary::default())),
+            Input::ScanEnded(Ok(crate::scan::Summary::default())),
             now(),
         );
-        press(&mut m, 'q');
+        act(&mut m, Action::Quit);
         assert!(m.should_quit);
     }
 
@@ -1629,7 +1441,7 @@ mod tests {
     fn a_quit_question_goes_when_the_scan_ends() {
         let status = |m: &Model| m.status_text(Rect::new(0, 0, 160, 1));
         let mut m = scanning();
-        press(&mut m, 'q');
+        act(&mut m, Action::Quit);
         assert!(m.confirm.is_some());
         let summary = crate::scan::Summary {
             run: "r".into(),
@@ -1637,7 +1449,7 @@ mod tests {
             checked: 2,
             ..crate::scan::Summary::default()
         };
-        update(&mut m, Msg::ScanEnded(Ok(summary)), now());
+        update(&mut m, Input::ScanEnded(Ok(summary)), now());
         // Nothing left to stop: the line gives the summary, and `q` quits at once.
         assert_eq!(m.confirm, None);
         assert_eq!(
@@ -1646,7 +1458,7 @@ mod tests {
                 "run r: 2 files, 2 checked, 0 failed, 0 unchanged since an earlier scan; 0 findings"
             )
         );
-        press(&mut m, 'q');
+        act(&mut m, Action::Quit);
         assert!(m.should_quit);
     }
 
@@ -1660,10 +1472,14 @@ mod tests {
                 run: run.into(),
                 backend: "claude".into(),
             });
-            assert_eq!(press(&mut m, 'y'), []);
+            assert_eq!(act(&mut m, Action::Answer(true)), []);
         }
-        press(&mut m, 'q');
-        let ended = update(&mut m, Msg::ScanEnded(Ok(scan::Summary::default())), now());
+        act(&mut m, Action::Quit);
+        let ended = update(
+            &mut m,
+            Input::ScanEnded(Ok(scan::Summary::default())),
+            now(),
+        );
         assert_eq!(
             ended,
             [Effect::Recheck {
@@ -1678,7 +1494,7 @@ mod tests {
         };
         update(
             &mut m,
-            Msg::Started {
+            Input::Started {
                 job: Ok(job),
                 missing: vec![],
                 paths: vec![path(1)],
@@ -1687,7 +1503,7 @@ mod tests {
         );
         update(
             &mut m,
-            Msg::Scan(Event::Queued(vec![PathBuf::from(path(1))])),
+            Input::Scan(Event::Queued(vec![PathBuf::from(path(1))])),
             now(),
         );
         // The question now asks about the batch that took over.
@@ -1696,11 +1512,15 @@ mod tests {
             Some("scan is on 0/1 · 1 queued to check again — stop it and quit? y/n")
         );
         // r's batch ends and s's cannot start: nothing is left to stop, so the question goes.
-        update(&mut m, Msg::ScanEnded(Ok(scan::Summary::default())), now());
+        update(
+            &mut m,
+            Input::ScanEnded(Ok(scan::Summary::default())),
+            now(),
+        );
         assert_eq!(m.confirm, Some(Confirm::Quit));
         update(
             &mut m,
-            Msg::Started {
+            Input::Started {
                 job: Err("run s: no LLM is called gpt".into()),
                 missing: vec![],
                 paths: vec![path(2)],
@@ -1715,7 +1535,7 @@ mod tests {
                 .iter()
                 .any(|l| l.starts_with("Not checked again"))
         );
-        press(&mut m, 'q');
+        act(&mut m, Action::Quit);
         assert!(m.should_quit);
     }
 
@@ -1728,13 +1548,17 @@ mod tests {
                 run: run.into(),
                 backend: "claude".into(),
             });
-            assert_eq!(press(&mut m, 'y'), []);
+            assert_eq!(act(&mut m, Action::Answer(true)), []);
         }
-        press(&mut m, 'q');
-        update(&mut m, Msg::ScanEnded(Ok(scan::Summary::default())), now());
+        act(&mut m, Action::Quit);
+        update(
+            &mut m,
+            Input::ScanEnded(Ok(scan::Summary::default())),
+            now(),
+        );
         let effects = update(
             &mut m,
-            Msg::Started {
+            Input::Started {
                 job: Err("run r: no LLM is called gpt".into()),
                 missing: vec![],
                 paths: vec![path(1)],
@@ -1755,7 +1579,7 @@ mod tests {
         };
         update(
             &mut m,
-            Msg::Started {
+            Input::Started {
                 job: Ok(job),
                 missing: vec![],
                 paths: vec![path(2)],
@@ -1763,76 +1587,23 @@ mod tests {
             now(),
         );
         // `y` over it quits, stopping the batch that took over.
-        press(&mut m, 'y');
+        act(&mut m, Action::Answer(true));
         assert!(m.should_quit && m.progress.running());
-    }
-
-    #[test]
-    fn the_status_line_follows_the_scan_then_gives_its_summary() {
-        let status = |m: &Model| m.status_text(Rect::new(0, 0, 160, 1));
-        let mut m = scanning();
-        assert_eq!(status(&m).as_deref(), Some("scan 0/2 · 0 findings"));
-        let failed = Event::Finished {
-            path: path(4).into(),
-            error: Some("LLM: boom".into()),
-            findings: 0,
-            lines: vec![],
-        };
-        update(&mut m, Msg::Scan(failed), now());
-        assert_eq!(
-            status(&m).as_deref(),
-            Some("scan 1/2 · 0 findings · 1 failed")
-        );
-        // A message of its own takes the line until the next key.
-        m.status = Some("opened in mpv".into());
-        assert_eq!(status(&m).as_deref(), Some("opened in mpv"));
-        press(&mut m, 'j');
-        let summary = crate::scan::Summary {
-            run: "r".into(),
-            files: 2,
-            checked: 1,
-            failed: 1,
-            ..crate::scan::Summary::default()
-        };
-        update(&mut m, Msg::ScanEnded(Ok(summary)), now());
-        assert_eq!(
-            status(&m).as_deref(),
-            Some(
-                "run r: 2 files, 1 checked, 1 failed, 0 unchanged since an earlier scan; 0 findings"
-            )
-        );
-        update(&mut m, Msg::Tick, now());
-        assert_eq!(m.progress.ticks, 1);
-    }
-
-    #[test]
-    fn tab_shows_the_files_and_enter_goes_to_a_files_first_finding() {
-        let mut m = sample();
-        m.selected = 1;
-        key(&mut m, KeyCode::Tab);
-        assert_eq!(m.pane, Pane::Files);
-        press(&mut m, 'j');
-        assert_eq!(m.file_selected, 1);
-        // The decision and mpv keys belong to the findings.
-        assert_eq!(press(&mut m, 'a'), []);
-        assert_eq!(press(&mut m, 'o'), []);
-        // E02's first entry is the lyric's row, which has its finding.
-        key(&mut m, KeyCode::Enter);
-        assert_eq!((m.pane, m.selected), (Pane::Findings, 0));
-        key(&mut m, KeyCode::Tab);
-        key(&mut m, KeyCode::Tab);
-        assert_eq!(m.pane, Pane::Findings);
     }
 
     #[test]
     fn a_fatal_message_ends_the_screen_with_it() {
         let mut m = scanning();
-        update(&mut m, Msg::Fatal("the scan panicked: boom".into()), now());
+        update(
+            &mut m,
+            Input::Fatal("the scan panicked: boom".into()),
+            now(),
+        );
         assert!(m.should_quit);
         assert_eq!(m.fatal.as_deref(), Some("the scan panicked: boom"));
     }
 
-    fn states(m: &Model) -> Vec<State> {
+    pub(crate) fn states(m: &Model) -> Vec<State> {
         m.run
             .findings
             .iter()
@@ -1843,7 +1614,7 @@ mod tests {
     #[test]
     fn a_decision_on_a_group_covers_every_member_and_moves_on() {
         let mut m = sample();
-        let effects = press(&mut m, 'a');
+        let effects = act(&mut m, Action::Accept);
         assert_eq!(
             decided(&effects),
             [
@@ -1872,12 +1643,12 @@ mod tests {
     fn under_all_the_selection_moves_past_the_decided_row() {
         let mut m = sample();
         m.filter = Filter::All;
-        let effects = press(&mut m, 'r');
+        let effects = act(&mut m, Action::Reject);
         written(&mut m, effects);
         assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
         // Nothing left to change: no write.
         m.selected = 0;
-        assert_eq!(press(&mut m, 'r'), []);
+        assert_eq!(act(&mut m, Action::Reject), []);
         assert_eq!(m.status.as_deref(), Some("already rejected"));
     }
 
@@ -1885,16 +1656,16 @@ mod tests {
     fn after_a_decision_the_selection_skips_rows_already_decided() {
         let mut m = crate::review::model::tests_support::many(4);
         m.selected = 1;
-        let effects = press(&mut m, 'r');
+        let effects = act(&mut m, Action::Reject);
         written(&mut m, effects);
         assert_eq!(m.selected, 2, "E03, the next row");
         m.selected = 0;
-        let effects = press(&mut m, 'a');
+        let effects = act(&mut m, Action::Accept);
         written(&mut m, effects);
         assert_eq!(m.selected, 2, "past E02, decided");
         // Nothing pending below the last row: the selection stays on it.
         m.selected = 3;
-        let effects = press(&mut m, 'a');
+        let effects = act(&mut m, Action::Accept);
         written(&mut m, effects);
         assert_eq!(m.selected, 3);
     }
@@ -1915,7 +1686,7 @@ mod tests {
         }
         m.filter = Filter::Only(State::Rejected);
         m.selected = 1;
-        let effects = press(&mut m, 'a');
+        let effects = act(&mut m, Action::Accept);
         written(&mut m, effects);
         // Nothing here is pending: E02 left, and E03 took its place.
         assert_eq!(m.selected_entry(), Some(Entry::Row(2)));
@@ -1935,10 +1706,10 @@ mod tests {
             ));
         let mut m = Model::new(run, std::collections::HashMap::new());
         assert_eq!(m.rows.len(), 3);
-        key(&mut m, KeyCode::Enter);
+        act(&mut m, Action::Toggle);
         m.selected = 1;
         for _ in 0..3 {
-            let effects = press(&mut m, 'a');
+            let effects = act(&mut m, Action::Accept);
             written(&mut m, effects);
         }
         // The last member took its row with it; the row after the group is next, not skipped.
@@ -1949,7 +1720,7 @@ mod tests {
     fn a_timing_fix_is_accepted_or_rejected_not_edited() {
         let mut m = crate::review::model::tests_support::with_timing();
         m.selected = 1;
-        assert_eq!(press(&mut m, 'e'), []);
+        assert_eq!(act(&mut m, Action::Edit), []);
         assert_eq!(m.editor, None);
         assert_eq!(
             m.status.as_deref(),
@@ -1957,7 +1728,7 @@ mod tests {
         );
         // Accepting the row accepts each member's own fix.
         assert_eq!(
-            decided(&press(&mut m, 'a')),
+            decided(&act(&mut m, Action::Accept)),
             [
                 (11, State::Accepted, None),
                 (12, State::Accepted, None),
@@ -1970,17 +1741,13 @@ mod tests {
     fn accepting_over_a_rewording_says_the_wording_went() {
         let mut m = sample();
         m.selected = 1;
-        press(&mut m, 'e');
-        update(&mut m, Msg::KillLine, now());
-        for c in "Snacks every day!".chars() {
-            press(&mut m, c);
-        }
-        let effects = key(&mut m, KeyCode::Enter);
+        act(&mut m, Action::Edit);
+        let effects = act(&mut m, Action::Reword("Snacks every day!".into()));
         written(&mut m, effects);
         assert_eq!(m.status.as_deref(), Some("accepted 1 finding"));
         m.filter = Filter::All;
         m.selected = 1;
-        let effects = press(&mut m, 'a');
+        let effects = act(&mut m, Action::Accept);
         assert_eq!(decided(&effects), [(3, State::Accepted, None)]);
         written(&mut m, effects);
         assert_eq!(
@@ -1992,9 +1759,9 @@ mod tests {
     #[test]
     fn undo_puts_back_every_member_and_selects_the_row() {
         let mut m = sample();
-        let effects = press(&mut m, 'a');
+        let effects = act(&mut m, Action::Accept);
         written(&mut m, effects);
-        let effects = press(&mut m, 'u');
+        let effects = act(&mut m, Action::Undo);
         assert_eq!(
             decided(&effects),
             [
@@ -2010,17 +1777,17 @@ mod tests {
             m.status.as_deref(),
             Some("undone: 3 findings · E01, E02, E03")
         );
-        assert_eq!(press(&mut m, 'u'), []);
+        assert_eq!(act(&mut m, Action::Undo), []);
         assert_eq!(m.status.as_deref(), Some("nothing to undo"));
     }
 
     #[test]
     fn x_clears_an_entry_back_to_pending_and_u_puts_it_back() {
         let mut m = sample();
-        let effects = press(&mut m, 'a');
+        let effects = act(&mut m, Action::Accept);
         written(&mut m, effects);
         m.selected = 0;
-        let effects = press(&mut m, 'x');
+        let effects = act(&mut m, Action::Clear);
         assert_eq!(
             decided(&effects),
             [
@@ -2037,9 +1804,9 @@ mod tests {
             Some(Entry::Row(1)),
             "on to the next pending row, as after a and r"
         );
-        assert_eq!(press(&mut m, 'x'), []);
+        assert_eq!(act(&mut m, Action::Clear), []);
         assert_eq!(m.status.as_deref(), Some("nothing to clear"));
-        let effects = press(&mut m, 'u');
+        let effects = act(&mut m, Action::Undo);
         assert_eq!(
             decided(&effects),
             [
@@ -2053,18 +1820,18 @@ mod tests {
     #[test]
     fn x_on_a_member_clears_it_alone_and_on_a_row_only_the_decided() {
         let mut m = sample();
-        let effects = press(&mut m, 'a');
+        let effects = act(&mut m, Action::Accept);
         written(&mut m, effects);
         m.selected = 0;
-        key(&mut m, KeyCode::Enter);
+        act(&mut m, Action::Toggle);
         m.selected = 2;
         assert_eq!(m.selected_entry(), Some(Entry::Member(0, 1)));
-        let effects = press(&mut m, 'x');
+        let effects = act(&mut m, Action::Clear);
         assert_eq!(decided(&effects), [(2, State::Pending, None)]);
         written(&mut m, effects);
         m.selected = 0;
         assert_eq!(
-            decided(&press(&mut m, 'x')),
+            decided(&act(&mut m, Action::Clear)),
             [(1, State::Pending, None), (4, State::Pending, None)]
         );
     }
@@ -2073,18 +1840,14 @@ mod tests {
     fn undo_restores_an_earlier_wording() {
         let mut m = sample();
         m.selected = 1;
-        press(&mut m, 'e');
-        update(&mut m, Msg::KillLine, now());
-        for c in "Snacks every day!".chars() {
-            press(&mut m, c);
-        }
-        let effects = key(&mut m, KeyCode::Enter);
+        act(&mut m, Action::Edit);
+        let effects = act(&mut m, Action::Reword("Snacks every day!".into()));
         written(&mut m, effects);
         m.filter = Filter::All;
         m.selected = 1;
-        let effects = press(&mut m, 'r');
+        let effects = act(&mut m, Action::Reject);
         written(&mut m, effects);
-        let effects = press(&mut m, 'u');
+        let effects = act(&mut m, Action::Undo);
         assert_eq!(
             decided(&effects),
             [(3, State::Accepted, Some("Snacks every day!"))]
@@ -2095,7 +1858,7 @@ mod tests {
     fn a_member_is_decided_alone_and_the_row_decides_the_rest() {
         let mut m = sample();
         m.filter = Filter::Only(State::Pending);
-        key(&mut m, KeyCode::Enter);
+        act(&mut m, Action::Toggle);
         assert_eq!(
             m.entries(),
             [
@@ -2107,14 +1870,14 @@ mod tests {
             ]
         );
         m.selected = 2;
-        let effects = press(&mut m, 'r');
+        let effects = act(&mut m, Action::Reject);
         assert_eq!(decided(&effects), [(2, State::Rejected, None)]);
         written(&mut m, effects);
         // E02's member left the pending list; E03's took its place.
         assert_eq!(m.selected_entry(), Some(Entry::Member(0, 3)));
         assert_eq!(m.row_state(0), None, "mixed");
         m.selected = 0;
-        let effects = press(&mut m, 'a');
+        let effects = act(&mut m, Action::Accept);
         assert_eq!(
             decided(&effects),
             [(1, State::Accepted, None), (4, State::Accepted, None)],
@@ -2126,13 +1889,13 @@ mod tests {
     fn a_row_decision_keeps_a_member_decided_alone() {
         let mut m = sample();
         m.filter = Filter::All;
-        key(&mut m, KeyCode::Enter);
+        act(&mut m, Action::Toggle);
         m.selected = 2;
-        let effects = press(&mut m, 'r');
+        let effects = act(&mut m, Action::Reject);
         written(&mut m, effects);
         // The row shows E02's rejection too, but its key decides only the pending members.
         m.selected = 0;
-        let effects = press(&mut m, 'a');
+        let effects = act(&mut m, Action::Accept);
         assert_eq!(
             decided(&effects),
             [(1, State::Accepted, None), (4, State::Accepted, None)]
@@ -2144,7 +1907,7 @@ mod tests {
         );
         // None pending: the row flips as a whole.
         m.selected = 0;
-        let effects = press(&mut m, 'r');
+        let effects = act(&mut m, Action::Reject);
         assert_eq!(
             decided(&effects),
             [(1, State::Rejected, None), (4, State::Rejected, None)]
@@ -2169,73 +1932,43 @@ mod tests {
             .iter()
             .position(|&e| e == Entry::Member(row, 1))
             .unwrap();
-        let effects = press(&mut m, 'r');
+        let effects = act(&mut m, Action::Reject);
         written(&mut m, effects);
         m.selected = m
             .entries()
             .iter()
             .position(|&e| e == Entry::Row(row))
             .unwrap();
-        press(&mut m, 'e');
-        update(&mut m, Msg::KillLine, now());
-        for c in "Snacks every day!".chars() {
-            press(&mut m, c);
-        }
+        act(&mut m, Action::Edit);
         assert_eq!(
-            decided(&key(&mut m, KeyCode::Enter)),
+            decided(&act(&mut m, Action::Reword("Snacks every day!".into()))),
             [(3, State::Accepted, Some("Snacks every day!"))]
         );
-    }
-
-    #[test]
-    fn editing_accepts_with_the_new_wording() {
-        let mut m = sample();
-        m.selected = 1;
-        press(&mut m, 'e');
-        assert_eq!(
-            m.editor.as_ref().map(|e| e.text.as_str()),
-            Some("Let's have snacks together every day.")
-        );
-        // Typed keys are text, `q` included.
-        key(&mut m, KeyCode::Home);
-        key(&mut m, KeyCode::Delete);
-        press(&mut m, 'q');
-        assert!(!m.should_quit);
-        key(&mut m, KeyCode::Backspace);
-        press(&mut m, 'l');
-        let effects = key(&mut m, KeyCode::Enter);
-        assert_eq!(
-            decided(&effects),
-            [(
-                3,
-                State::Accepted,
-                Some("let's have snacks together every day.")
-            )]
-        );
-        assert!(m.editor.is_none());
     }
 
     #[test]
     fn an_edit_equal_to_the_suggestion_is_a_plain_accept() {
         let mut m = sample();
         m.selected = 1;
-        press(&mut m, 'e');
-        let effects = key(&mut m, KeyCode::Enter);
+        act(&mut m, Action::Edit);
+        let effects = act(
+            &mut m,
+            Action::Reword("Let's have snacks together every day.".into()),
+        );
         assert_eq!(decided(&effects), [(3, State::Accepted, None)]);
     }
 
     #[test]
     fn an_empty_edit_is_refused_and_esc_cancels() {
         let mut m = sample();
-        press(&mut m, 'e');
-        update(&mut m, Msg::KillLine, now());
-        assert_eq!(key(&mut m, KeyCode::Enter), []);
+        act(&mut m, Action::Edit);
+        assert_eq!(act(&mut m, Action::Reword(String::new())), []);
         assert!(m.editor.is_some());
         assert_eq!(
             m.status.as_deref(),
             Some("the wording cannot be empty (Esc cancels)")
         );
-        key(&mut m, KeyCode::Esc);
+        act(&mut m, Action::CancelEdit);
         assert!(m.editor.is_none());
         assert_eq!(states(&m), [State::Pending; 4]);
     }
@@ -2243,13 +1976,13 @@ mod tests {
     #[test]
     fn a_failed_write_changes_nothing() {
         let mut m = sample();
-        let Some(Effect::Write { action, decisions }) = press(&mut m, 'a').pop() else {
+        let Some(Effect::Write { purpose, decisions }) = act(&mut m, Action::Accept).pop() else {
             panic!("expected a write");
         };
         update(
             &mut m,
-            Msg::Written {
-                action,
+            Input::Written {
+                purpose,
                 decisions,
                 result: Err("disk full".into()),
             },
@@ -2265,14 +1998,14 @@ mod tests {
         let mut m = sample();
         assert_eq!(m.filter, Filter::All);
         m.selected = 1;
-        press(&mut m, 'f');
+        act(&mut m, Action::SetFilter(Filter::Only(State::Pending)));
         assert_eq!(m.filter, Filter::Only(State::Pending));
         assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
-        press(&mut m, 'f');
+        act(&mut m, Action::SetFilter(Filter::Only(State::Accepted)));
         assert_eq!(m.filter, Filter::Only(State::Accepted));
         assert_eq!(m.entries(), []);
-        press(&mut m, 'f');
-        press(&mut m, 'f');
+        act(&mut m, Action::SetFilter(Filter::Only(State::Rejected)));
+        act(&mut m, Action::SetFilter(Filter::All));
         assert_eq!(m.filter, Filter::All);
     }
 
@@ -2301,20 +2034,20 @@ mod tests {
     #[test]
     fn n_and_p_jump_between_files() {
         let mut m = sample();
-        press(&mut m, 'n');
+        act(&mut m, Action::NextFile);
         assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
-        press(&mut m, 'n');
+        act(&mut m, Action::NextFile);
         assert_eq!(m.status.as_deref(), Some("last file"));
-        press(&mut m, 'p');
+        act(&mut m, Action::PreviousFile);
         assert_eq!(m.selected_entry(), Some(Entry::Row(0)));
-        press(&mut m, 'p');
+        act(&mut m, Action::PreviousFile);
         assert_eq!(m.status.as_deref(), Some("first file"));
         // Expanded, the group's members are in their own files.
-        key(&mut m, KeyCode::Enter);
-        press(&mut m, 'n');
+        act(&mut m, Action::Toggle);
+        act(&mut m, Action::NextFile);
         assert_eq!(m.selected_entry(), Some(Entry::Member(0, 1)));
-        key(&mut m, KeyCode::End);
-        press(&mut m, 'p');
+        act(&mut m, Action::Select(4));
+        act(&mut m, Action::PreviousFile);
         assert_eq!(
             m.selected_entry(),
             Some(Entry::Member(0, 3)),
@@ -2325,9 +2058,9 @@ mod tests {
     #[test]
     fn enter_on_a_member_collapses_its_group() {
         let mut m = sample();
-        key(&mut m, KeyCode::Enter);
-        key(&mut m, KeyCode::Down);
-        key(&mut m, KeyCode::Enter);
+        act(&mut m, Action::Toggle);
+        act(&mut m, Action::Select(1));
+        act(&mut m, Action::Toggle);
         assert_eq!(m.entries(), [Entry::Row(0), Entry::Row(1)]);
         assert_eq!(m.selected_entry(), Some(Entry::Row(0)));
     }
@@ -2336,7 +2069,7 @@ mod tests {
     fn o_opens_two_seconds_early_on_the_default_track() {
         let mut m = sample();
         assert_eq!(
-            press(&mut m, 'o'),
+            act(&mut m, Action::Play),
             [Effect::Open(Moment {
                 file: path(1),
                 start_ms: 163_060,
@@ -2345,7 +2078,7 @@ mod tests {
             })]
         );
         assert_eq!(m.status.as_deref(), Some("opening E01 at 0:02:43.06"));
-        update(&mut m, Msg::Opened(Err("mpv not found".into())), now());
+        update(&mut m, Input::Opened(Err("mpv not found".into())), now());
         assert_eq!(m.status.as_deref(), Some("mpv not found"));
     }
 
@@ -2354,7 +2087,7 @@ mod tests {
         let mut m = crate::review::model::tests_support::with_timing();
         m.selected = 1;
         assert_eq!(
-            press(&mut m, 'o'),
+            act(&mut m, Action::Play),
             [Effect::Open(Moment {
                 file: path(1),
                 start_ms: 763_763,
@@ -2379,7 +2112,7 @@ mod tests {
             }
         }
         m.selected = 1;
-        assert_eq!(press(&mut m, 'o'), []);
+        assert_eq!(act(&mut m, Action::Play), []);
         assert_eq!(
             m.status.as_deref(),
             Some("nothing to open: no line of this track moves")
@@ -2390,7 +2123,7 @@ mod tests {
     fn a_missing_file_is_not_opened() {
         let mut m = sample();
         m.notes.insert(path(1), FileNote::Missing);
-        assert_eq!(press(&mut m, 'o'), []);
+        assert_eq!(act(&mut m, Action::Play), []);
         assert_eq!(
             m.status.as_deref(),
             Some(format!("file missing: {}", path(1)).as_str())
@@ -2401,13 +2134,28 @@ mod tests {
     fn playback_keys_ask_mpv_and_show_where_it_is() {
         let mut m = sample();
         let playback = |p| vec![Effect::Playback(p)];
-        assert_eq!(press(&mut m, ' '), playback(Playback::Pause));
-        assert_eq!(key(&mut m, KeyCode::Left), playback(Playback::Seek(-5)));
-        assert_eq!(key(&mut m, KeyCode::Right), playback(Playback::Seek(5)));
-        assert_eq!(press(&mut m, ','), playback(Playback::Seek(-1)));
-        assert_eq!(press(&mut m, '.'), playback(Playback::Seek(1)));
+        assert_eq!(
+            act(&mut m, Action::Playback(Playback::Pause)),
+            playback(Playback::Pause)
+        );
+        assert_eq!(
+            act(&mut m, Action::Playback(Playback::Seek(-5))),
+            playback(Playback::Seek(-5))
+        );
+        assert_eq!(
+            act(&mut m, Action::Playback(Playback::Seek(5))),
+            playback(Playback::Seek(5))
+        );
+        assert_eq!(
+            act(&mut m, Action::Playback(Playback::Seek(-1))),
+            playback(Playback::Seek(-1))
+        );
+        assert_eq!(
+            act(&mut m, Action::Playback(Playback::Seek(1))),
+            playback(Playback::Seek(1))
+        );
         let at = |paused| {
-            Msg::Played(Ok(PlayState {
+            Input::Played(Ok(PlayState {
                 paused,
                 at_ms: 171_060,
             }))
@@ -2418,7 +2166,7 @@ mod tests {
         assert_eq!(m.status.as_deref(), Some("▶ 0:02:51.060"));
         update(
             &mut m,
-            Msg::Played(Err("mpv is not open (o opens it)".into())),
+            Input::Played(Err("mpv is not open (o opens it)".into())),
             now(),
         );
         assert_eq!(m.status.as_deref(), Some("mpv is not open (o opens it)"));
@@ -2427,220 +2175,57 @@ mod tests {
     #[test]
     fn capital_o_closes_mpv_and_says_so() {
         let mut m = sample();
-        assert_eq!(press(&mut m, 'O'), [Effect::Close]);
-        update(&mut m, Msg::Closed(Ok(())), now());
+        assert_eq!(act(&mut m, Action::ClosePlayer), [Effect::Close]);
+        update(&mut m, Input::Closed(Ok(())), now());
         assert_eq!(m.status.as_deref(), Some("closed mpv"));
-        update(&mut m, Msg::Closed(Err("mpv is not open".into())), now());
+        update(&mut m, Input::Closed(Err("mpv is not open".into())), now());
         assert_eq!(m.status.as_deref(), Some("mpv is not open"));
-    }
-
-    #[test]
-    fn in_the_editor_playback_keys_edit() {
-        let mut m = sample();
-        m.selected = 1;
-        press(&mut m, 'e');
-        assert_eq!(key(&mut m, KeyCode::Left), []);
-        assert_eq!(press(&mut m, ' '), []);
-        assert_eq!(press(&mut m, '.'), []);
-        assert_eq!(
-            m.editor.as_ref().map(|e| e.text.as_str()),
-            Some("Let's have snacks together every day ..")
-        );
-    }
-
-    /// `sample()` on a 110×20 screen: the list's rows are y 1 to 17 from x 1, the detail pane is
-    /// x 55 on, and the status line y 19, with `? help` from x 104.
-    fn on_screen() -> Model {
-        let mut m = sample();
-        update(&mut m, Msg::Resize(110, 20), now());
-        m
-    }
-
-    /// A click at `x`, `y`, `ms` milliseconds after `now()`.
-    fn click(m: &mut Model, x: u16, y: u16, ms: i64) -> Vec<Effect> {
-        let at = now() + SignedDuration::from_millis(ms);
-        update(m, Msg::Mouse(Mouse::Click, x, y), at)
-    }
-
-    fn wheel(m: &mut Model, action: Mouse, x: u16, y: u16) {
-        assert_eq!(update(m, Msg::Mouse(action, x, y), now()), []);
-    }
-
-    #[test]
-    fn a_click_selects_the_entry_under_it() {
-        let mut m = on_screen();
-        key(&mut m, KeyCode::Enter);
-        // Row 0, its members E01 E02 E03, then row 1: y 3 is E02's member.
-        assert_eq!(click(&mut m, 5, 3, 0), []);
-        assert_eq!(m.selected_entry(), Some(Entry::Member(0, 1)));
-        // The border, the title, below the last entry, the detail pane: nothing.
-        for (x, y) in [(0, 2), (5, 0), (5, 9), (70, 2)] {
-            click(&mut m, x, y, 1000);
-            assert_eq!(m.selected_entry(), Some(Entry::Member(0, 1)), "{x},{y}");
-        }
-    }
-
-    #[test]
-    fn a_click_lands_on_the_entry_drawn_there_when_the_list_is_scrolled() {
-        let mut m = crate::review::model::tests_support::many(30);
-        update(&mut m, Msg::Resize(110, 20), now());
-        key(&mut m, KeyCode::End);
-        // 17 rows, ending at entry 29: entry 13 is on the first row.
-        assert_eq!(m.scroll, 13);
-        click(&mut m, 5, 1, 0);
-        assert_eq!(m.selected, 13);
-        click(&mut m, 5, 17, 1000);
-        assert_eq!(m.selected, 29);
-    }
-
-    #[test]
-    fn the_first_click_lands_on_the_row_drawn_there_when_review_opens_scrolled() {
-        // Review opened on the first pending row, entry 25, before any message: the screen it
-        // first draws is scrolled to show it.
-        let mut m = crate::review::model::tests_support::many(30);
-        m.selected = 25;
-        m.set_area(Rect::new(0, 0, 110, 20));
-        assert_eq!(m.scroll, 9);
-        click(&mut m, 5, 1, 0);
-        assert_eq!(m.selected, 9);
-    }
-
-    #[test]
-    fn a_double_click_opens_and_a_slow_or_moved_one_does_not() {
-        let mut m = on_screen();
-        let opens = |effects: Vec<Effect>| matches!(effects[..], [Effect::Open(_)]);
-        assert_eq!(click(&mut m, 5, 2, 0), []);
-        assert!(opens(click(&mut m, 5, 2, 500)), "within 500 ms");
-        assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
-        // A third click starts over.
-        assert_eq!(click(&mut m, 5, 2, 600), []);
-        // Too slow.
-        assert_eq!(click(&mut m, 5, 2, 2000), []);
-        assert_eq!(click(&mut m, 5, 2, 2501), []);
-        // Two rows.
-        assert_eq!(click(&mut m, 5, 1, 4000), []);
-        assert_eq!(click(&mut m, 5, 2, 4100), []);
-        // Something in between.
-        assert_eq!(click(&mut m, 5, 2, 6000), []);
-        key(&mut m, KeyCode::Char('f'));
-        assert_eq!(click(&mut m, 5, 2, 6100), []);
-        // The clock stepped back between them (NTP, a resume): not a double-click.
-        assert_eq!(click(&mut m, 5, 2, 8000), []);
-        assert_eq!(click(&mut m, 5, 2, 7000), []);
-    }
-
-    #[test]
-    fn a_double_click_survives_the_scans_messages_between_its_clicks() {
-        let opens = |effects: Vec<Effect>| matches!(effects[..], [Effect::Open(_)]);
-        // The spinner's tick, which comes after 250 ms without a message while a job runs.
-        let mut m = on_screen();
-        assert_eq!(click(&mut m, 5, 2, 0), []);
-        update(&mut m, Msg::Tick, now());
-        assert!(opens(click(&mut m, 5, 2, 300)), "a tick in between");
-        // A file's findings, a row of them above the snacks row, which moves down a line: the
-        // second click lands on it there.
-        let mut m = on_screen();
-        assert_eq!(click(&mut m, 5, 2, 0), []);
-        let msg = saved(
-            &m,
-            1,
-            vec![finding(5, 1, "An erly line.", "An early line.", 1000)],
-        );
-        update(&mut m, msg, now());
-        assert_eq!(m.entries()[2], Entry::Row(2));
-        assert!(opens(click(&mut m, 5, 3, 300)), "a row in above it");
-    }
-
-    #[test]
-    fn the_wheel_moves_the_selection_over_the_list_and_scrolls_the_detail() {
-        let mut m = on_screen();
-        wheel(&mut m, Mouse::WheelDown, 10, 5);
-        assert_eq!(m.selected, 1);
-        wheel(&mut m, Mouse::WheelUp, 10, 5);
-        assert_eq!(m.selected, 0);
-        // The ×3 row's detail is 11 lines: the wheel stops with the last one on top.
-        for _ in 0..5 {
-            wheel(&mut m, Mouse::WheelDown, 70, 5);
-        }
-        assert_eq!(m.detail_scroll, 10);
-        wheel(&mut m, Mouse::WheelUp, 70, 5);
-        assert_eq!(m.detail_scroll, 7);
-        // A new selection starts at the top.
-        key(&mut m, KeyCode::Down);
-        assert_eq!(m.detail_scroll, 0);
-    }
-
-    #[test]
-    fn a_detail_that_got_shorter_is_scrolled_back_to_its_last_line() {
-        let mut m = on_screen();
-        // Scrolled for a longer text: a decision or a filter can shorten it while the same entry
-        // stays selected.
-        m.detail_scroll = 100;
-        update(&mut m, Msg::Played(Err("mpv is not open".into())), now());
-        assert_eq!(
-            m.detail_scroll, 10,
-            "the ×3 row's 11 lines, the last on top"
-        );
-    }
-
-    #[test]
-    fn question_mark_shows_the_keys_and_any_key_closes_them() {
-        let mut m = on_screen();
-        assert!(!m.help);
-        press(&mut m, '?');
-        assert!(m.help);
-        // Closing is all the key does: no decision.
-        assert_eq!(press(&mut m, 'a'), []);
-        assert!(!m.help);
-        assert_eq!(states(&m), [State::Pending; 4]);
-        press(&mut m, '?');
-        key(&mut m, KeyCode::Esc);
-        assert!(!m.help);
-        // But `q` quits, as the box says.
-        press(&mut m, '?');
-        press(&mut m, 'q');
-        assert!(m.should_quit);
-        m.should_quit = false;
-        // `? help` at the end of the status line opens them; a click anywhere closes them, and the
-        // wheel does nothing under them.
-        click(&mut m, 105, 19, 0);
-        assert!(m.help);
-        wheel(&mut m, Mouse::WheelDown, 10, 5);
-        assert_eq!(m.selected, 0);
-        click(&mut m, 5, 2, 1000);
-        assert!(!m.help);
-        assert_eq!(m.selected, 0, "the click only closed them");
-    }
-
-    #[test]
-    fn while_editing_only_the_editors_buttons_work() {
-        let mut m = on_screen();
-        m.selected = 1;
-        press(&mut m, 'e');
-        assert_eq!(click(&mut m, 5, 1, 0), []);
-        wheel(&mut m, Mouse::WheelUp, 5, 1);
-        assert_eq!(click(&mut m, 50, 19, 1000), [], "the text");
-        assert_eq!(click(&mut m, 98, 19, 1500), [], "the separator");
-        assert_eq!(m.selected, 1);
-        assert!(m.editor.is_some());
-        // "⏎ accept · Esc cancel" at the end of the status line: Esc from x 100.
-        click(&mut m, 100, 19, 2000);
-        assert!(m.editor.is_none());
-        press(&mut m, 'e');
-        assert_eq!(
-            decided(&click(&mut m, 89, 19, 3000)),
-            [(3, State::Accepted, None)]
-        );
     }
 
     #[test]
     fn q_and_ctrl_c_quit() {
         let mut m = sample();
-        press(&mut m, 'q');
+        act(&mut m, Action::Quit);
         assert!(m.should_quit);
         let mut m = sample();
-        update(&mut m, Msg::Quit, now());
+        act(&mut m, Action::Interrupt);
         assert!(m.should_quit);
+    }
+
+    #[test]
+    fn an_action_clears_the_status_message_but_an_answer_an_edits_end_and_ctrl_c_leave_it() {
+        let said = || Some("opened in mpv".to_string());
+        for action in [
+            Action::Select(1),
+            Action::Toggle,
+            Action::ShowPane(Pane::Files),
+            Action::Dismiss,
+        ] {
+            let mut m = sample();
+            m.status = said();
+            act(&mut m, action.clone());
+            assert_eq!(m.status, None, "{action:?}");
+        }
+        let mut m = sample();
+        m.selected = 1;
+        act(&mut m, Action::Edit);
+        m.status = said();
+        act(&mut m, Action::CancelEdit);
+        assert_eq!(m.status, said(), "CancelEdit");
+        act(&mut m, Action::Edit);
+        assert_eq!(m.status, None, "Edit");
+        m.status = said();
+        assert_eq!(
+            decided(&act(&mut m, Action::Reword("Snacks!".into()))),
+            [(3, State::Accepted, Some("Snacks!"))]
+        );
+        assert_eq!(m.status, said(), "Reword");
+        m.confirm = Some(Confirm::Apply);
+        act(&mut m, Action::Answer(false));
+        assert_eq!(m.status, said(), "Answer");
+        act(&mut m, Action::Interrupt);
+        assert!(m.should_quit);
+        assert_eq!(m.status, said(), "Interrupt");
     }
 
     #[test]
@@ -2663,7 +2248,7 @@ mod tests {
         };
         let effects = update(
             &mut m,
-            Msg::Scan(Event::Appended(vec![Record::File(failed)])),
+            Input::Scan(Event::Appended(vec![Record::File(failed)])),
             now(),
         );
         assert_eq!(effects, []);
@@ -2675,13 +2260,13 @@ mod tests {
     fn a_decision_the_store_found_replaced_reads_its_file_back_and_says_so() {
         let mut m = sample();
         m.selected = 1;
-        let effects = press(&mut m, 'a');
-        let [Effect::Write { action, decisions }] = <[Effect; 1]>::try_from(effects).unwrap()
+        let effects = act(&mut m, Action::Accept);
+        let [Effect::Write { purpose, decisions }] = <[Effect; 1]>::try_from(effects).unwrap()
         else {
             panic!("expected one write");
         };
-        let followed = Msg::Written {
-            action: action.clone(),
+        let followed = Input::Written {
+            purpose: purpose.clone(),
             decisions: decisions.clone(),
             result: Ok(vec![Decided::Followed(vec![9])]),
         };
@@ -2690,8 +2275,8 @@ mod tests {
             m.status.as_deref(),
             Some("E02 was checked again; your decision went to its new finding")
         );
-        let gone = Msg::Written {
-            action,
+        let gone = Input::Written {
+            purpose,
             decisions,
             result: Ok(vec![Decided::Gone]),
         };
@@ -2707,7 +2292,7 @@ mod tests {
         let mut m = sample();
         let effects = update(
             &mut m,
-            Msg::ReadBack {
+            Input::ReadBack {
                 path: path(2),
                 view: Err("database is locked".into()),
             },
@@ -2724,7 +2309,7 @@ mod tests {
     /// The sample run's files view, on E02.
     fn on_e02_in_files() -> Model {
         let mut m = sample();
-        update(&mut m, Msg::Key(KeyCode::Tab), now());
+        act(&mut m, Action::ShowPane(Pane::Files));
         m.file_selected = 1;
         m
     }
@@ -2733,13 +2318,13 @@ mod tests {
     fn c_on_a_file_finds_its_run_then_asks() {
         let mut m = on_e02_in_files();
         assert_eq!(
-            press(&mut m, 'c'),
+            act(&mut m, Action::Recheck),
             [Effect::FindRun {
                 path: path(2),
                 run: Some("2026-10-17T04-39-18".into()),
             }]
         );
-        let found = Msg::RunFound {
+        let found = Input::RunFound {
             path: path(2),
             found: Ok(("2026-10-17T04-39-18".into(), "claude".into())),
         };
@@ -2748,14 +2333,14 @@ mod tests {
             m.status_text(Rect::new(0, 0, 160, 1)).as_deref(),
             Some("check E02 again with claude? y/n")
         );
-        // Anything but `y` lets it go.
-        assert_eq!(press(&mut m, 'n'), []);
+        // A no lets it go.
+        assert_eq!(act(&mut m, Action::Answer(false)), []);
         assert_eq!(m.confirm, None);
         // A paths view has no run of its own: the store finds the newest that named the file.
         let mut m = on_e02_in_files();
         m.run.of_paths = true;
         assert_eq!(
-            press(&mut m, 'c'),
+            act(&mut m, Action::Recheck),
             [Effect::FindRun {
                 path: path(2),
                 run: None,
@@ -2772,7 +2357,7 @@ mod tests {
             backend: "claude".into(),
         });
         assert_eq!(
-            press(&mut m, 'y'),
+            act(&mut m, Action::Answer(true)),
             [Effect::Recheck {
                 run: "r".into(),
                 paths: vec![path(2)],
@@ -2784,7 +2369,7 @@ mod tests {
         };
         update(
             &mut m,
-            Msg::Started {
+            Input::Started {
                 job: Ok(job),
                 missing: vec![],
                 paths: vec![path(2)],
@@ -2804,7 +2389,7 @@ mod tests {
                 run: run.into(),
                 backend: "claude".into(),
             });
-            assert_eq!(press(&mut m, 'y'), []);
+            assert_eq!(act(&mut m, Action::Answer(true)), []);
         }
         assert_eq!(
             m.status.as_deref(),
@@ -2812,7 +2397,11 @@ mod tests {
         );
         let labels: Vec<String> = m.progress.files[..3].iter().map(|f| f.label('⠙')).collect();
         assert_eq!(labels, ["queued again"; 3]);
-        let ended = update(&mut m, Msg::ScanEnded(Ok(scan::Summary::default())), now());
+        let ended = update(
+            &mut m,
+            Input::ScanEnded(Ok(scan::Summary::default())),
+            now(),
+        );
         assert_eq!(
             ended,
             [Effect::Recheck {
@@ -2826,14 +2415,14 @@ mod tests {
     #[test]
     fn c_on_a_file_being_checked_or_queued_again_says_so() {
         let mut m = scanning();
-        update(&mut m, Msg::Key(KeyCode::Tab), now());
+        act(&mut m, Action::ShowPane(Pane::Files));
         m.file_selected = 3;
         assert_eq!(m.progress.files[3].path, path(4));
-        assert_eq!(press(&mut m, 'c'), []);
+        assert_eq!(act(&mut m, Action::Recheck), []);
         assert_eq!(m.status.as_deref(), Some("E04 is being checked now"));
         m.file_selected = 1;
         m.progress.queue_again(&path(2), "r");
-        assert_eq!(press(&mut m, 'c'), []);
+        assert_eq!(act(&mut m, Action::Recheck), []);
         assert_eq!(
             m.status.as_deref(),
             Some("E02 will be checked again when the scan is done")
@@ -2841,18 +2430,11 @@ mod tests {
     }
 
     #[test]
-    fn c_in_the_findings_does_nothing() {
-        let mut m = sample();
-        assert_eq!(press(&mut m, 'c'), []);
-        assert_eq!(m.confirm, None);
-    }
-
-    #[test]
     fn a_file_no_longer_on_disk_is_not_checked_and_the_status_line_says_so() {
         let mut m = on_e02_in_files();
         let effects = update(
             &mut m,
-            Msg::Started {
+            Input::Started {
                 job: Err("nothing to check".into()),
                 missing: vec![path(2)],
                 paths: vec![path(2)],
@@ -2874,9 +2456,13 @@ mod tests {
                 run: run.into(),
                 backend: "claude".into(),
             });
-            assert_eq!(press(&mut m, 'y'), []);
+            assert_eq!(act(&mut m, Action::Answer(true)), []);
         }
-        let ended = update(&mut m, Msg::ScanEnded(Ok(scan::Summary::default())), now());
+        let ended = update(
+            &mut m,
+            Input::ScanEnded(Ok(scan::Summary::default())),
+            now(),
+        );
         assert_eq!(
             ended,
             [Effect::Recheck {
@@ -2887,7 +2473,7 @@ mod tests {
         let why = "run r: no LLM is called gpt";
         let effects = update(
             &mut m,
-            Msg::Started {
+            Input::Started {
                 job: Err(why.into()),
                 missing: vec![],
                 paths: vec![path(1)],
@@ -2907,10 +2493,10 @@ mod tests {
             "the earlier scan's outro does not list a file its recheck never started"
         );
         assert_eq!(m.status.as_deref(), Some(why));
-        update(&mut m, Msg::Key(KeyCode::Tab), now());
+        act(&mut m, Action::ShowPane(Pane::Files));
         m.file_selected = 0;
         assert!(matches!(
-            press(&mut m, 'c').as_slice(),
+            act(&mut m, Action::Recheck).as_slice(),
             [Effect::FindRun { .. }]
         ));
     }
@@ -2923,10 +2509,10 @@ mod tests {
             run: "r".into(),
             backend: "claude".into(),
         });
-        update(&mut m, Msg::Quit, now());
+        act(&mut m, Action::Interrupt);
         assert!(!m.should_quit);
         assert_eq!(m.confirm, Some(Confirm::Quit));
-        update(&mut m, Msg::Quit, now());
+        act(&mut m, Action::Interrupt);
         assert!(m.should_quit);
     }
 
@@ -2934,21 +2520,21 @@ mod tests {
     fn v_asks_for_a_runs_folders_or_the_run_that_named_the_selected_file() {
         let mut m = sample();
         assert_eq!(
-            press(&mut m, 'v'),
+            act(&mut m, Action::SwitchView),
             [Effect::Switch(Switch::FoldersOf(m.run.name.clone()))]
         );
         // In a paths view, the selected row's first member's file.
         m.run.of_paths = true;
         m.selected = 0;
         assert_eq!(
-            press(&mut m, 'v'),
+            act(&mut m, Action::SwitchView),
             [Effect::Switch(Switch::RunNaming(path(1)))]
         );
         // In the files view, the selected file.
-        update(&mut m, Msg::Key(KeyCode::Tab), now());
+        act(&mut m, Action::ShowPane(Pane::Files));
         m.file_selected = 2;
         assert_eq!(
-            press(&mut m, 'v'),
+            act(&mut m, Action::SwitchView),
             [Effect::Switch(Switch::RunNaming(path(3)))]
         );
     }
@@ -2962,7 +2548,7 @@ mod tests {
         m.file_selected = 1;
         assert_eq!(m.selected_entry(), None);
         assert_eq!(
-            press(&mut m, 'v'),
+            act(&mut m, Action::SwitchView),
             [Effect::Switch(Switch::RunNaming(path(2)))]
         );
     }
@@ -2970,7 +2556,7 @@ mod tests {
     #[test]
     fn v_while_a_scan_runs_says_so_and_asks_for_nothing() {
         let mut m = scanning();
-        assert_eq!(press(&mut m, 'v'), []);
+        assert_eq!(act(&mut m, Action::SwitchView), []);
         assert_eq!(m.status.as_deref(), Some("the scan is still running"));
     }
 
@@ -2978,7 +2564,7 @@ mod tests {
     fn a_view_that_cannot_be_read_leaves_the_screen_as_it_was() {
         let mut m = sample();
         let before = m.run.clone();
-        update(&mut m, Msg::Switched(Err("disk I/O error".into())), now());
+        update(&mut m, Input::Switched(Err("disk I/O error".into())), now());
         assert_eq!(m.run, before);
         assert_eq!(
             m.status.as_deref(),
@@ -3010,8 +2596,8 @@ mod tests {
         outcomes: Vec<(u64, Outcome)>,
         marked: Vec<u64>,
         restamped: Option<(u64, Timestamp)>,
-    ) -> Msg {
-        Msg::Apply(apply::Event::Done {
+    ) -> Input {
+        Input::Apply(apply::Event::Done {
             path,
             outcomes,
             remuxed: restamped.is_some(),
@@ -3024,18 +2610,18 @@ mod tests {
     #[test]
     fn a_asks_with_the_counts_then_applies_the_view_as_it_stands() {
         let mut m = accepted();
-        assert_eq!(press(&mut m, 'A'), []);
+        assert_eq!(act(&mut m, Action::Apply { dry_run: false }), []);
         assert_eq!(m.confirm, Some(Confirm::Apply));
         assert_eq!(
             m.status_text(Rect::default()).as_deref(),
             Some("apply 2 fixes in 2 files (1 applied already), keeping each .orig? y/n")
         );
-        // Any key but y lets it go.
-        assert_eq!(press(&mut m, 'n'), []);
+        // A no lets it go.
+        assert_eq!(act(&mut m, Action::Answer(false)), []);
         assert_eq!(m.confirm, None);
         assert!(!m.progress.busy());
-        press(&mut m, 'A');
-        let effects = press(&mut m, 'y');
+        act(&mut m, Action::Apply { dry_run: false });
+        let effects = act(&mut m, Action::Answer(true));
         assert_eq!(
             effects,
             [Effect::StartApply {
@@ -3055,7 +2641,7 @@ mod tests {
     fn one_fix_in_one_file_is_asked_of_in_the_singular() {
         let mut m = accepted();
         m.run.decisions.remove(&3);
-        press(&mut m, 'A');
+        act(&mut m, Action::Apply { dry_run: false });
         assert_eq!(
             m.status_text(Rect::default()).as_deref(),
             Some("apply 1 fix in 1 file, keeping each .orig? y/n")
@@ -3066,7 +2652,7 @@ mod tests {
     fn d_starts_a_dry_run_at_once_with_the_screens_karaoke() {
         let mut m = accepted();
         m.karaoke = true;
-        let effects = press(&mut m, 'D');
+        let effects = act(&mut m, Action::Apply { dry_run: true });
         assert_eq!(
             effects,
             [Effect::StartApply {
@@ -3084,46 +2670,46 @@ mod tests {
     #[test]
     fn a_and_d_wait_for_the_scan_and_for_apply_and_need_an_accepted_fix() {
         let mut m = sample();
-        assert_eq!(press(&mut m, 'A'), []);
+        assert_eq!(act(&mut m, Action::Apply { dry_run: false }), []);
         assert_eq!(m.status.as_deref(), Some("no accepted fixes"));
         let mut m = accepted();
         m.progress
             .start("r", "subcheck scan --run r /m".into(), false);
-        for c in ['A', 'D'] {
-            assert_eq!(press(&mut m, c), []);
+        for dry_run in [false, true] {
+            assert_eq!(act(&mut m, Action::Apply { dry_run }), []);
             assert_eq!(m.status.as_deref(), Some("the scan is still running"));
         }
         let mut m = accepted();
-        press(&mut m, 'D');
-        for c in ['A', 'D'] {
-            assert_eq!(press(&mut m, c), []);
+        act(&mut m, Action::Apply { dry_run: true });
+        for dry_run in [false, true] {
+            assert_eq!(act(&mut m, Action::Apply { dry_run }), []);
             assert_eq!(m.status.as_deref(), Some("already applying"));
         }
         // From the files view too.
-        key(&mut m, KeyCode::Tab);
-        assert_eq!(press(&mut m, 'A'), []);
+        act(&mut m, Action::ShowPane(Pane::Files));
+        assert_eq!(act(&mut m, Action::Apply { dry_run: false }), []);
         assert_eq!(m.status.as_deref(), Some("already applying"));
     }
 
     #[test]
     fn v_and_c_wait_for_apply_and_q_asks_while_it_runs() {
         let mut m = accepted();
-        press(&mut m, 'D');
-        assert_eq!(press(&mut m, 'v'), []);
+        act(&mut m, Action::Apply { dry_run: true });
+        assert_eq!(act(&mut m, Action::SwitchView), []);
         assert_eq!(m.status.as_deref(), Some("apply is still running"));
-        key(&mut m, KeyCode::Tab);
-        assert_eq!(press(&mut m, 'c'), []);
+        act(&mut m, Action::ShowPane(Pane::Files));
+        assert_eq!(act(&mut m, Action::Recheck), []);
         assert_eq!(m.status.as_deref(), Some("apply is still running"));
-        press(&mut m, 'q');
+        act(&mut m, Action::Quit);
         assert_eq!(m.confirm, Some(Confirm::Quit));
         update(
             &mut m,
-            Msg::Apply(apply::Event::Queued(vec![path(1)])),
+            Input::Apply(apply::Event::Queued(vec![path(1)])),
             now(),
         );
         update(
             &mut m,
-            Msg::Apply(apply::Event::Stage(path(1), apply::Stage::Plan)),
+            Input::Apply(apply::Event::Stage(path(1), apply::Stage::Plan)),
             now(),
         );
         assert_eq!(
@@ -3133,7 +2719,7 @@ mod tests {
         // Apply ending lets the question go: nothing is left to stop.
         update(
             &mut m,
-            Msg::ApplyEnded(Ok(apply::Summary::default())),
+            Input::ApplyEnded(Ok(apply::Summary::default())),
             now(),
         );
         assert_eq!(m.confirm, None);
@@ -3142,50 +2728,50 @@ mod tests {
 
     #[test]
     fn ctrl_c_or_ctrl_d_while_applying_asks_as_q_does_and_y_stops_it() {
-        // Ctrl-C and Ctrl-D are both `Msg::Quit` (`map_event`).
+        // Ctrl-C and Ctrl-D are both `Action::Interrupt` (`map_event`, then `screen::update`).
         let applying = || {
             let mut m = accepted();
-            press(&mut m, 'A');
-            press(&mut m, 'y');
+            act(&mut m, Action::Apply { dry_run: false });
+            act(&mut m, Action::Answer(true));
             update(
                 &mut m,
-                Msg::Apply(apply::Event::Queued(vec![path(1)])),
+                Input::Apply(apply::Event::Queued(vec![path(1)])),
                 now(),
             );
             update(
                 &mut m,
-                Msg::Apply(apply::Event::Stage(path(1), apply::Stage::Remux)),
+                Input::Apply(apply::Event::Stage(path(1), apply::Stage::Remux)),
                 now(),
             );
             m
         };
         let mut m = applying();
-        update(&mut m, Msg::Quit, now());
+        act(&mut m, Action::Interrupt);
         assert!(!m.should_quit);
         assert_eq!(
             m.status_text(Rect::default()).as_deref(),
             Some("apply is on E01 (remux), 0/1 — stop it and quit? y/n")
         );
-        press(&mut m, 'n');
+        act(&mut m, Action::Answer(false));
         assert!(!m.should_quit && m.confirm.is_none());
-        update(&mut m, Msg::Quit, now());
-        press(&mut m, 'y');
+        act(&mut m, Action::Interrupt);
+        act(&mut m, Action::Answer(true));
         // Quitting while apply runs is what stops it (`review::run` ends its groups).
         assert!(m.should_quit && m.progress.applying());
         // A second one, with the question open, quits too.
         let mut m = applying();
-        update(&mut m, Msg::Quit, now());
-        update(&mut m, Msg::Quit, now());
+        act(&mut m, Action::Interrupt);
+        act(&mut m, Action::Interrupt);
         assert!(m.should_quit);
     }
 
     #[test]
     fn a_file_done_marks_its_findings_and_takes_the_stores_marks_and_stamp() {
         let mut m = accepted();
-        press(&mut m, 'D');
+        act(&mut m, Action::Apply { dry_run: true });
         update(
             &mut m,
-            Msg::Apply(apply::Event::Queued(vec![path(1), path(2)])),
+            Input::Apply(apply::Event::Queued(vec![path(1), path(2)])),
             now(),
         );
         update(
@@ -3204,15 +2790,15 @@ mod tests {
         assert_eq!(m.mark(2), Some("already applied"));
         update(
             &mut m,
-            Msg::ApplyEnded(Ok(apply::Summary::default())),
+            Input::ApplyEnded(Ok(apply::Summary::default())),
             now(),
         );
         // Then for real: E01's fix made, E02's left by hand.
-        press(&mut m, 'A');
-        press(&mut m, 'y');
+        act(&mut m, Action::Apply { dry_run: false });
+        act(&mut m, Action::Answer(true));
         update(
             &mut m,
-            Msg::Apply(apply::Event::Queued(vec![path(1), path(2)])),
+            Input::Apply(apply::Event::Queued(vec![path(1), path(2)])),
             now(),
         );
         let stamp: (u64, Timestamp) = (123, "2026-10-30T09:00:00Z".parse().unwrap());
@@ -3240,8 +2826,8 @@ mod tests {
     }
 
     /// Apply failed on the file at `path`, whose job was to fix `findings`: a backup in the way.
-    fn file_failed(path: String, findings: Vec<u64>) -> Msg {
-        Msg::Apply(apply::Event::Failed {
+    fn file_failed(path: String, findings: Vec<u64>) -> Input {
+        Input::Apply(apply::Event::Failed {
             error: format!("{path}.orig exists: an earlier backup is never overwritten"),
             path,
             text: String::new(),
@@ -3253,11 +2839,11 @@ mod tests {
     fn a_failed_file_marks_its_findings_but_those_applied_already() {
         // Findings 1 (E01) and 3 (E02) accepted; 3 is in its file already.
         let mut m = accepted();
-        press(&mut m, 'A');
-        press(&mut m, 'y');
+        act(&mut m, Action::Apply { dry_run: false });
+        act(&mut m, Action::Answer(true));
         update(
             &mut m,
-            Msg::Apply(apply::Event::Queued(vec![path(1), path(2)])),
+            Input::Apply(apply::Event::Queued(vec![path(1), path(2)])),
             now(),
         );
         update(&mut m, file_failed(path(1), vec![1]), now());
@@ -3280,24 +2866,24 @@ mod tests {
     #[test]
     fn a_dry_run_marks_a_failed_files_findings_would_fail_and_a_decision_drops_it() {
         let mut m = accepted();
-        press(&mut m, 'D');
+        act(&mut m, Action::Apply { dry_run: true });
         update(
             &mut m,
-            Msg::Apply(apply::Event::Queued(vec![path(1)])),
+            Input::Apply(apply::Event::Queued(vec![path(1)])),
             now(),
         );
         update(&mut m, file_failed(path(1), vec![1]), now());
         assert_eq!(m.mark(0), Some("would fail"));
         update(
             &mut m,
-            Msg::ApplyEnded(Ok(apply::Summary::default())),
+            Input::ApplyEnded(Ok(apply::Summary::default())),
             now(),
         );
         // Row 0 is the OP lyric (findings 1, 2 and 4): `r` rejects its pending 2 and 4, and a
         // dry run's mark on 2 goes with its old decision.
         m.marks.insert(2, Mark::WouldFail("disk full".into()));
         m.selected = 0;
-        let effects = press(&mut m, 'r');
+        let effects = act(&mut m, Action::Reject);
         written(&mut m, effects);
         assert_eq!(m.marks.get(&2), None);
     }
@@ -3310,11 +2896,11 @@ mod tests {
         // Row 0 is the OP lyric (findings 1, 2 and 4: `r` rejects the pending 2 and 4); row 1 the
         // snacks typo (3, accepted).
         m.selected = 0;
-        let effects = press(&mut m, 'r');
+        let effects = act(&mut m, Action::Reject);
         written(&mut m, effects);
         assert_eq!(m.marks.get(&2), None);
         m.selected = 1;
-        let effects = press(&mut m, 'r');
+        let effects = act(&mut m, Action::Reject);
         written(&mut m, effects);
         assert_eq!(m.marks.get(&3), Some(&Mark::ByHand("a karaoke row".into())));
     }
@@ -3323,10 +2909,10 @@ mod tests {
     fn a_dry_run_marks_a_fix_not_found_or_left_by_hand_as_would_be() {
         // Findings 1 (E01) and 3 (E02) accepted, at indexes 0 and 2.
         let mut m = accepted();
-        press(&mut m, 'D');
+        act(&mut m, Action::Apply { dry_run: true });
         update(
             &mut m,
-            Msg::Apply(apply::Event::Queued(vec![path(1), path(2)])),
+            Input::Apply(apply::Event::Queued(vec![path(1), path(2)])),
             now(),
         );
         update(
@@ -3356,8 +2942,8 @@ mod tests {
     #[test]
     fn an_apply_that_cannot_start_says_why() {
         let mut m = accepted();
-        press(&mut m, 'D');
-        update(&mut m, Msg::ApplyStarted(Err("no threads".into())), now());
+        act(&mut m, Action::Apply { dry_run: true });
+        update(&mut m, Input::ApplyStarted(Err("no threads".into())), now());
         assert!(!m.progress.busy());
         assert_eq!(
             m.status_text(Rect::default()).as_deref(),

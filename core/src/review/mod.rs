@@ -1,12 +1,15 @@
 //! `subcheck review`: accept, reject or reword each finding of a run, with a key that opens the
-//! moment in mpv. A pure Elm-style core (`model`, `update`) with the store and mpv at the
-//! edges (`run_effect`).
+//! moment in mpv. The store and mpv are at the edges (`run_effect`); between them is a pure
+//! Elm-style core (`model`, `update`), and `keymap` and `screen` turn the terminal's keys and
+//! clicks into its actions.
 
 pub mod files;
 pub mod jobs;
+pub mod keymap;
 pub mod layout;
 pub mod model;
 pub mod progress;
+pub mod screen;
 pub mod update;
 pub mod view;
 
@@ -38,7 +41,8 @@ use crate::scan::{self, file_stamp};
 use crate::store::{Run, Selector, Store};
 use model::{FileNote, Model};
 use progress::Scan;
-use update::{Effect, Job, Mouse, Msg, Switch};
+use screen::{Mouse, Msg};
+use update::{Effect, Input, Job, Switch};
 
 /// A terminal event as a `Msg`. Ctrl and Alt chords never reach the plain-key handlers, so Ctrl-C
 /// quits instead of reading as `c`; with the mouse they are ignored.
@@ -68,7 +72,7 @@ pub fn map_event(ev: &Event) -> Option<Msg> {
     }
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         return match k.code {
-            KeyCode::Char('c' | 'd') => Some(Msg::Quit),
+            KeyCode::Char('c' | 'd') => Some(Msg::Interrupt),
             KeyCode::Char('u') => Some(Msg::KillLine),
             _ => None,
         };
@@ -118,19 +122,19 @@ pub fn run_effect(
     player: &mut Player,
     state: &Path,
     tx: &Sender<Msg>,
-) -> Msg {
+) -> Input {
     match effect {
-        Effect::Write { action, decisions } => {
+        Effect::Write { purpose, decisions } => {
             let result = store.decide(&decisions).map_err(|e| e.to_string());
-            Msg::Written {
-                action,
+            Input::Written {
+                purpose,
                 decisions,
                 result,
             }
         }
         Effect::ReadBack(path) => {
             let view = store.file_view(&path).map_err(|e| e.to_string());
-            Msg::ReadBack { path, view }
+            Input::ReadBack { path, view }
         }
         Effect::FindRun { path, run } => {
             let found = match &run {
@@ -145,7 +149,7 @@ pub fn run_effect(
                 }),
                 Err(e) => Err(e.to_string()),
             };
-            Msg::RunFound { path, found }
+            Input::RunFound { path, found }
         }
         Effect::Recheck { run, paths } => {
             let (here, missing): (Vec<String>, Vec<String>) =
@@ -156,7 +160,7 @@ pub fn run_effect(
                 let files: Vec<PathBuf> = here.iter().map(PathBuf::from).collect();
                 recheck(store, tx, &run, &files)
             };
-            Msg::Started {
+            Input::Started {
                 job,
                 missing,
                 paths,
@@ -166,7 +170,7 @@ pub fn run_effect(
             run,
             dry_run,
             karaoke,
-        } => Msg::ApplyStarted(
+        } => Input::ApplyStarted(
             store
                 .reopen()
                 .map_err(|e| e.to_string())
@@ -182,7 +186,7 @@ pub fn run_effect(
                     .map_err(|e| e.to_string())
                 }),
         ),
-        Effect::Switch(to) => Msg::Switched(
+        Effect::Switch(to) => Input::Switched(
             other_view(store, &to)
                 .map(|run| {
                     let notes = file_notes(&run);
@@ -190,9 +194,9 @@ pub fn run_effect(
                 })
                 .map_err(|e| format!("{e:#}")),
         ),
-        Effect::Open(moment) => Msg::Opened(player.open(&moment)),
-        Effect::Playback(p) => Msg::Played(player.playback(p)),
-        Effect::Close => Msg::Closed(player.close()),
+        Effect::Open(moment) => Input::Opened(player.open(&moment)),
+        Effect::Playback(p) => Input::Played(player.playback(p)),
+        Effect::Close => Input::Closed(player.close()),
     }
 }
 
@@ -404,7 +408,7 @@ pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow:
     model.status = opening_status(&warnings);
 
     // The terminal is restored should the screen's own thread panic. A job's panic comes to the
-    // loop as `Msg::Fatal`, which ends the screen in order.
+    // loop as `Input::Fatal`, which ends the screen in order.
     let screen = std::thread::current().id();
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -419,7 +423,7 @@ pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow:
     model.set_area(Rect::new(0, 0, size.width, size.height));
     // The loop keeps a sender of its own, for the jobs `c`, `A` and `D` start: the channel cannot
     // close while the screen runs, and each job says why it ends before it does
-    // (`Msg::ScanEnded`, `Msg::ApplyEnded`, `Msg::Fatal`), as the input thread does.
+    // (`Input::ScanEnded`, `Input::ApplyEnded`, `Input::Fatal`), as the input thread does.
     let (tx, rx) = mpsc::channel();
     if let Some((plan, opts, paths)) = scanning {
         // Running from the start, so a `q` before the scan's first word still asks.
@@ -521,7 +525,7 @@ fn screen_loop(
     while !model.should_quit {
         terminal.draw(|f| view::view(model, f))?;
         let msg = receive(rx, model.progress.busy());
-        let effects = update::update(model, msg, jiff::Timestamp::now());
+        let effects = screen::update(model, msg, jiff::Timestamp::now());
         // Show what is about to happen (`opening E02 at …`) before an effect holds the loop:
         // starting mpv can take seconds.
         if !effects.is_empty() {
@@ -529,8 +533,8 @@ fn screen_loop(
         }
         let mut queue: VecDeque<Effect> = effects.into();
         while let Some(effect) = queue.pop_front() {
-            let msg = run_effect(effect, store, player, state, tx);
-            queue.extend(update::update(model, msg, jiff::Timestamp::now()));
+            let input = run_effect(effect, store, player, state, tx);
+            queue.extend(screen::update(model, input.into(), jiff::Timestamp::now()));
         }
     }
     Ok(())
@@ -539,8 +543,8 @@ fn screen_loop(
 /// The loop's next message: the terminal's or a job's, or while a job runs a tick should none come
 /// for [`TICK`]. The loop holds a `Sender` of its own (for the jobs `c`, `A` and `D` start), so
 /// the channel cannot close while the screen runs; a disconnect is fatal, a backstop: each job
-/// (the input thread, each scan and apply) reports why it ends (`Msg::Fatal`, `Msg::ScanEnded`,
-/// `Msg::ApplyEnded`) before it does, and with the input thread gone no key can quit.
+/// (the input thread, each scan and apply) reports why it ends before it does (`Input::Fatal`,
+/// `Input::ScanEnded`, `Input::ApplyEnded`), and with the input thread gone no key can quit.
 fn receive(rx: &mpsc::Receiver<Msg>, busy: bool) -> Msg {
     let got = if busy {
         match rx.recv_timeout(TICK) {
@@ -550,7 +554,7 @@ fn receive(rx: &mpsc::Receiver<Msg>, busy: bool) -> Msg {
     } else {
         rx.recv().ok()
     };
-    got.unwrap_or_else(|| Msg::Fatal("the screen's input stopped".into()))
+    got.unwrap_or_else(|| Input::Fatal("the screen's input stopped".into()).into())
 }
 
 #[cfg(test)]
@@ -568,11 +572,11 @@ mod tests {
         );
         assert_eq!(
             map_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Some(Msg::Quit)
+            Some(Msg::Interrupt)
         );
         assert_eq!(
             map_event(&key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
-            Some(Msg::Quit)
+            Some(Msg::Interrupt)
         );
         assert_eq!(
             map_event(&key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
@@ -715,7 +719,7 @@ mod tests {
             Some("warning: /m/locked: skipped: Permission denied (os error 13) · +1 more")
         );
         // A message as others are: the next key ends it, and the scan's progress shows.
-        update::update(&mut m, Msg::Key(KeyCode::Char('j')), jiff::Timestamp::now());
+        screen::update(&mut m, Msg::Key(KeyCode::Char('j')), jiff::Timestamp::now());
         assert_eq!(status(&m).as_deref(), Some("scan 0/2 · 0 findings"));
         // One warning alone, or none.
         assert_eq!(opening_status(&warnings[..1]), Some(warnings[0].clone()));
@@ -811,7 +815,7 @@ mod tests {
         for running in [true, false] {
             assert_eq!(
                 receive(&rx, running),
-                Msg::Fatal("the screen's input stopped".into())
+                Msg::Input(Input::Fatal("the screen's input stopped".into()))
             );
         }
         let (_tx, rx) = mpsc::channel();

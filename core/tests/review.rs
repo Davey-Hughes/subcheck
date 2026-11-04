@@ -9,7 +9,7 @@ use subcheck_core::list::{self, Filter};
 use subcheck_core::player::Player;
 use subcheck_core::review::model::Model;
 use subcheck_core::review::run_effect;
-use subcheck_core::review::update::{self, Msg};
+use subcheck_core::review::screen::{self, Msg};
 use subcheck_core::store::{
     Attempt, CheckedWith, Finding, Made, RunHeader, ScanRow, State, Store, TrackRecord,
 };
@@ -78,10 +78,10 @@ fn send(m: &mut Model, msg: Msg, store: &mut Store, player: &mut Player) {
     let (tx, _rx) = std::sync::mpsc::channel();
     // Where apply would write its tracks: no test here starts apply, so nothing goes there.
     let state = Path::new("/no-state");
-    let mut queue: VecDeque<_> = update::update(m, msg, now).into();
+    let mut queue: VecDeque<_> = screen::update(m, msg, now).into();
     while let Some(effect) = queue.pop_front() {
-        let msg = run_effect(effect, store, player, state, &tx);
-        queue.extend(update::update(m, msg, now));
+        let input = run_effect(effect, store, player, state, &tx);
+        queue.extend(screen::update(m, input.into(), now));
     }
 }
 
