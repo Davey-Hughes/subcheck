@@ -1,18 +1,18 @@
 //! What `scan` tells its hook (`scan::execute`), as review's screen reads it, checked against the
-//! run as the store shows it. tests/fake-llm.sh is the LLM.
+//! run as the store shows it. core/tests/fake-llm.sh is the LLM.
 
-mod common;
+use subcheck_core::test_support as common;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use common::fixture;
-use subcheck::llm::Backend;
-use subcheck::scan::{self, Event, Planned};
-use subcheck::store::{Run, Selector, Store};
+use subcheck_core::llm::Backend;
+use subcheck_core::scan::{self, Event, Planned};
+use subcheck_core::store::{Run, Selector, Store};
 
 fn options() -> scan::Options {
-    let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
+    let fake = common::fake_llm();
     let backend = Backend::shell(&format!("'{}'", fake.display()));
     scan::Options {
         chunk_lines: backend.chunk_lines,

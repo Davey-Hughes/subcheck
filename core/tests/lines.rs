@@ -1,10 +1,10 @@
 //! `text::lines` on the typos fixture: what `scan` would send for a file.
 
-mod common;
+use subcheck_core::test_support as common;
 
 use common::fixture;
-use subcheck::subs::Kind;
-use subcheck::{blocks, mkv, text};
+use subcheck_core::subs::Kind;
+use subcheck_core::{blocks, mkv, text};
 
 #[test]
 fn typos_fixture_comes_out_as_four_clean_lines() {

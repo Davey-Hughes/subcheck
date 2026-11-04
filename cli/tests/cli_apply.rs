@@ -2,7 +2,7 @@
 //! findings are accepted; and `apply::run`'s hook, in process, on the same setup. The tests that
 //! remux need mkvmerge and are skipped without it.
 
-mod common;
+use subcheck_core::test_support as common;
 
 use std::cell::RefCell;
 use std::ffi::OsStr;
@@ -10,13 +10,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use common::{fixture, have_mkvmerge, patch, script};
-use subcheck::apply::patch::Outcome;
-use subcheck::apply::{self, Event, Mode, Stage};
-use subcheck::scan::file_stamp;
-use subcheck::store::{
+use subcheck_core::apply::patch::Outcome;
+use subcheck_core::apply::{self, Event, Mode, Stage};
+use subcheck_core::scan::file_stamp;
+use subcheck_core::store::{
     Attempt, Check, CheckedWith, Decision, Finding, Made, Run, RunHeader, Selector, State, Store,
 };
-use subcheck::text::Occurrence;
+use subcheck_core::text::Occurrence;
 
 /// A finding: style, original, fix, and occurrences as (track, start ms, end ms).
 type Line<'a> = (&'a str, &'a str, &'a str, &'a [(usize, i64, i64)]);
@@ -196,9 +196,9 @@ impl Setup {
         s
     }
 
-    /// `subcheck scan` of the file, with tests/fake-llm.sh as its LLM.
+    /// `subcheck scan` of the file, with core/tests/fake-llm.sh as its LLM.
     fn scan(&self) -> Output {
-        let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
+        let fake = common::fake_llm();
         Command::new(env!("CARGO_BIN_EXE_subcheck"))
             .arg("scan")
             .arg(&self.file)
@@ -218,7 +218,7 @@ impl Setup {
         let mut store = self.store();
         let scan = store.newest_scan().unwrap().unwrap();
         let path = path.to_string_lossy();
-        let (size, mtime) = subcheck::scan::file_stamp(Path::new(path.as_ref())).unwrap();
+        let (size, mtime) = subcheck_core::scan::file_stamp(Path::new(path.as_ref())).unwrap();
         let with = match check {
             Check::Llm => CheckedWith::new("claude", &["eng".into()], 1),
             Check::Timing => CheckedWith::timing(&["eng".into()], 1),
@@ -305,9 +305,9 @@ impl Setup {
 
 /// Track `id` of `file` now, as extract writes it.
 fn track(file: &Path, id: usize) -> String {
-    let (r, layout) = subcheck::mkv::open(file).unwrap();
+    let (r, layout) = subcheck_core::mkv::open(file).unwrap();
     let mut out = Vec::new();
-    subcheck::subs::extract(&r, &layout, &layout.tracks[id], false, &mut out).unwrap();
+    subcheck_core::subs::extract(&r, &layout, &layout.tracks[id], false, &mut out).unwrap();
     String::from_utf8(out).unwrap()
 }
 
@@ -455,7 +455,11 @@ fn a_failed_files_hook_gets_why_its_block_and_the_findings_it_was_to_fix() {
     let s = Setup::scanned("timing.mkv");
     s.add(&s.file, LATE_TYPO);
     let path = s.file.to_string_lossy().into_owned();
-    std::fs::write(subcheck::apply::backup_path(&s.file), "an earlier backup").unwrap();
+    std::fs::write(
+        subcheck_core::apply::backup_path(&s.file),
+        "an earlier backup",
+    )
+    .unwrap();
     let (out, events, summary) = hooked(
         &s,
         &Mode::Apply {
@@ -640,7 +644,7 @@ fn apply_remuxes_checks_and_swaps_keeping_the_original() {
             .replace("tehre", "there")
             .replace("acros ", "across ")
     );
-    assert!(!subcheck::apply::remux_path(&s.file).exists());
+    assert!(!subcheck_core::apply::remux_path(&s.file).exists());
     assert_eq!(s.run().applied, [1, 2, 3, 4, 5, 7, 8].into());
 
     // Again: every fix is in already, so nothing is remuxed, and the backup is no obstacle.
@@ -708,7 +712,7 @@ fn header_values_mkvmerge_writes_its_own_way_are_no_difference() {
         "{text}"
     );
     // mkvmerge did write them its own way, and the check took that as no change.
-    let (_, layout) = subcheck::mkv::open(&s.file).unwrap();
+    let (_, layout) = subcheck_core::mkv::open(&s.file).unwrap();
     let header = |id: usize| {
         let t = &layout.tracks[id];
         (t.language.clone(), t.language_bcp47.clone(), t.name.clone())
@@ -858,10 +862,10 @@ fn a_track_whose_every_time_is_whole_ms_past_the_centisecond_is_written_early_an
     assert_eq!(track(&s.file, 0), fixed);
     // Every line starts and lasts as it did.
     let times = |file: &Path| -> Vec<(i64, Option<u64>)> {
-        let (r, layout) = subcheck::mkv::open(file).unwrap();
+        let (r, layout) = subcheck_core::mkv::open(file).unwrap();
         assert_eq!(layout.timestamp_scale, 1_000_000);
         let number = layout.tracks[0].number;
-        subcheck::blocks::read_tracks(&r, &layout, &[number], true).unwrap()[0]
+        subcheck_core::blocks::read_tracks(&r, &layout, &[number], true).unwrap()[0]
             .blocks
             .iter()
             .map(|b| (b.timestamp, b.duration))
@@ -973,7 +977,7 @@ fn karaoke_is_re_spaced_with_the_flag() {
     let o = s.apply(&["--check", "--karaoke"]);
     assert!(o.status.success(), "{}", stdout(&o));
     assert_eq!(s.apply(&["--check"]).status.code(), Some(1));
-    std::fs::remove_file(subcheck::apply::remux_path(&s.file)).unwrap();
+    std::fs::remove_file(subcheck_core::apply::remux_path(&s.file)).unwrap();
     let o = s.apply(&["--karaoke"]);
     let text = stdout(&o);
     assert!(
@@ -1019,13 +1023,13 @@ fn no_backup_keeps_nothing_and_checks_every_frame() {
         text.contains("  remuxed, verified (full), swapped; no backup kept\n"),
         "{text}"
     );
-    assert!(!subcheck::apply::backup_path(&s.file).exists());
+    assert!(!subcheck_core::apply::backup_path(&s.file).exists());
 }
 
 #[test]
 fn a_dry_run_says_a_file_with_an_earlier_backup_in_the_way_would_fail() {
     let s = Setup::new();
-    let backup = subcheck::apply::backup_path(&s.file);
+    let backup = subcheck_core::apply::backup_path(&s.file);
     std::fs::write(&backup, "an earlier backup").unwrap();
     let o = s.apply(&["--dry-run"]);
     let text = stdout(&o);
@@ -1060,7 +1064,7 @@ fn a_dry_run_after_apply_finds_the_fixes_in_and_does_not_fail_on_their_backup() 
     let s = Setup::new();
     let o = s.apply(&[]);
     assert!(o.status.success(), "{}", stdout(&o));
-    assert!(subcheck::apply::backup_path(&s.file).exists());
+    assert!(subcheck_core::apply::backup_path(&s.file).exists());
     let o = s.apply(&["--dry-run"]);
     let text = stdout(&o);
     assert!(o.status.success(), "{text}");
@@ -1074,7 +1078,7 @@ fn an_earlier_backup_is_never_overwritten() {
         return;
     }
     let s = Setup::new();
-    let backup = subcheck::apply::backup_path(&s.file);
+    let backup = subcheck_core::apply::backup_path(&s.file);
     std::fs::write(&backup, "an earlier backup").unwrap();
     let o = s.apply(&[]);
     let text = stdout(&o);
@@ -1135,8 +1139,8 @@ fn a_bad_remux_leaves_the_original_and_no_remux_behind() {
         std::fs::read(&s.file).unwrap(),
         std::fs::read(fixture("apply.mkv")).unwrap()
     );
-    assert!(!subcheck::apply::remux_path(&s.file).exists());
-    assert!(!subcheck::apply::backup_path(&s.file).exists());
+    assert!(!subcheck_core::apply::remux_path(&s.file).exists());
+    assert!(!subcheck_core::apply::backup_path(&s.file).exists());
     let tracks = s.root.join("state/subcheck/apply");
     assert_eq!(
         std::fs::read_dir(&tracks).unwrap().count(),
@@ -1204,8 +1208,8 @@ fn a_stop_during_the_remux_leaves_no_track_file_behind() {
         .map(|e| e.unwrap().file_name())
         .collect();
     assert!(left.is_empty(), "left in {}: {left:?}", tracks.display());
-    assert!(!subcheck::apply::remux_path(&s.file).exists());
-    assert!(!subcheck::apply::backup_path(&s.file).exists());
+    assert!(!subcheck_core::apply::remux_path(&s.file).exists());
+    assert!(!subcheck_core::apply::backup_path(&s.file).exists());
     assert_eq!(
         std::fs::read(&s.file).unwrap(),
         std::fs::read(fixture("apply.mkv")).unwrap()
@@ -1309,7 +1313,7 @@ fn tracks_only_then_a_remux_elsewhere_then_check_then_apply_records() {
     let o = s.apply(&["--check"]);
     let text = stdout(&o);
     assert!(o.status.success(), "{text}");
-    let remuxed = subcheck::apply::remux_path(&s.file);
+    let remuxed = subcheck_core::apply::remux_path(&s.file);
     assert!(
         text.contains(&format!("  {} checked (quick): OK\n", remuxed.display())),
         "{text}"
@@ -1581,7 +1585,7 @@ fn a_probe_left_by_an_interrupted_run_is_no_obstacle() {
         return;
     }
     let s = Setup::new();
-    let mut probe = subcheck::apply::remux_path(&s.file).into_os_string();
+    let mut probe = subcheck_core::apply::remux_path(&s.file).into_os_string();
     probe.push(".link");
     std::fs::write(&probe, "left behind").unwrap();
     let o = s.apply(&[]);
@@ -1696,7 +1700,7 @@ fn shifted_tracks_written_remuxed_elsewhere_then_checked() {
     let o = s.apply(&["--check"]);
     let text = stdout(&o);
     assert!(o.status.success(), "{text}");
-    let remuxed = subcheck::apply::remux_path(&s.file);
+    let remuxed = subcheck_core::apply::remux_path(&s.file);
     assert!(
         text.contains(&format!("  {} checked (quick): OK\n", remuxed.display())),
         "{text}"
@@ -1787,7 +1791,7 @@ fn a_timing_fix_that_cannot_be_made_is_left_for_a_hand_fix() {
     let mut late = Setup::scanned("timing.mkv").run().findings.remove(0);
     late.file = s.file.to_string_lossy().into_owned();
     // Its one stretch's ends: apply.mkv's first line on track 2, where the scan found it.
-    let first = subcheck::store::LineRef {
+    let first = subcheck_core::store::LineRef {
         raw: "0,Default,,0,0,0,,We should leave befor it rains.".into(),
         start_ms: 1000,
         end_ms: 2500,
@@ -1945,8 +1949,8 @@ fn a_timing_fix_landing_a_track_timed_to_the_millisecond_on_centiseconds_is_made
 /// Make one line of track `id` of `file` Latin-1: its first block's last byte. The track must be
 /// stored uncompressed.
 fn latin1_line(file: &Path, id: usize) {
-    let (r, layout) = subcheck::mkv::open(file).unwrap();
-    let read = subcheck::blocks::read_tracks(&r, &layout, &[layout.tracks[id].number], false)
+    let (r, layout) = subcheck_core::mkv::open(file).unwrap();
+    let read = subcheck_core::blocks::read_tracks(&r, &layout, &[layout.tracks[id].number], false)
         .unwrap()
         .pop()
         .unwrap();

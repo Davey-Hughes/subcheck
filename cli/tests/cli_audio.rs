@@ -1,7 +1,7 @@
 //! `subcheck audio` end to end: the real binary and the real ffmpeg, run in the fixtures
 //! directory. Skipped (and said so) without ffmpeg.
 
-mod common;
+use subcheck_core::test_support as common;
 
 use std::process::{Command, Output};
 

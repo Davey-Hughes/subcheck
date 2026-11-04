@@ -3,10 +3,10 @@
 //! keeps its findings until then, and rows decided before a file's findings arrive pass their
 //! decisions on, to the store too. And `scan --no-tui`, which keeps to the log.
 
-mod common;
+use subcheck_core::test_support as common;
 
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -14,14 +14,14 @@ use std::time::Duration;
 use common::fixture;
 use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
-use subcheck::llm::Backend;
-use subcheck::player::Player;
-use subcheck::review::model::Model;
-use subcheck::review::progress::{Scan, Stage};
-use subcheck::review::update::{self, Msg};
-use subcheck::review::{jobs, opening, run_effect};
-use subcheck::scan::{self, Event, Planned};
-use subcheck::store::{Decision, Selector, State, Store};
+use subcheck_core::llm::Backend;
+use subcheck_core::player::Player;
+use subcheck_core::review::model::Model;
+use subcheck_core::review::progress::{Scan, Stage};
+use subcheck_core::review::update::{self, Msg};
+use subcheck_core::review::{jobs, opening, run_effect};
+use subcheck_core::scan::{self, Event, Planned};
+use subcheck_core::store::{Decision, Selector, State, Store};
 
 /// The loop's inner part: a message, then every effect it leads to, run for real.
 fn send(m: &mut Model, msg: Msg, store: &mut Store, player: &mut Player, tx: &mpsc::Sender<Msg>) {
@@ -53,7 +53,7 @@ fn a_scan_on_the_screen_fills_the_list_and_passes_decisions_on() {
     for f in [&e01, &e02] {
         std::fs::copy(fixture("typos.mkv"), f).unwrap();
     }
-    let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
+    let fake = common::fake_llm();
     let backend = Backend::shell(&format!("'{}'", fake.display()));
     let opts = scan::Options {
         chunk_lines: backend.chunk_lines,
@@ -129,7 +129,7 @@ fn a_scan_on_the_screen_fills_the_list_and_passes_decisions_on() {
 fn a_file_whose_llm_check_stands_shows_the_timing_check_alone() {
     let (_db, mut store) = store();
     let (_dir, file) = common::copied("timing.mkv");
-    let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
+    let fake = common::fake_llm();
     let options = |into| {
         let backend = Backend::shell(&format!("'{}'", fake.display()));
         scan::Options {
@@ -167,7 +167,7 @@ fn a_file_whose_llm_check_stands_shows_the_timing_check_alone() {
     // `--run` makes the timing check again, on the screen.
     let opts = options(Some(name));
     let adding = plan(&mut store, &opts);
-    assert_eq!(adding.todo()[0].1, [subcheck::store::Check::Timing]);
+    assert_eq!(adding.todo()[0].1, [subcheck_core::store::Check::Timing]);
     let mut model = Model::new(opening(&store, &adding).unwrap(), HashMap::new());
     assert_eq!(
         model.run.findings.len(),
@@ -202,7 +202,7 @@ fn a_skipped_files_findings_are_on_the_screen_from_the_start() {
         dir.path().join("Show - E02.mkv"),
     );
     std::fs::copy(fixture("typos.mkv"), &e01).unwrap();
-    let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
+    let fake = common::fake_llm();
     let opts = || {
         let backend = Backend::shell(&format!("'{}'", fake.display()));
         scan::Options {
@@ -249,10 +249,10 @@ fn a_skipped_files_findings_are_on_the_screen_from_the_start() {
     assert!(run.findings.iter().all(|f| Path::new(&f.file) == e01));
 }
 
-/// `subcheck scan` as a process, stdout and stderr pipes, with tests/fake-llm.sh as its LLM,
+/// `subcheck scan` as a process, stdout and stderr pipes, with core/tests/fake-llm.sh as its LLM,
 /// `state` as XDG_STATE_HOME and `state/subcheck.db` as SUBCHECK_DB.
 fn scan_cli(state: &Path, args: &[&str]) -> Output {
-    let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
+    let fake = common::fake_llm();
     Command::new(env!("CARGO_BIN_EXE_subcheck"))
         .arg("scan")
         .args(args)
@@ -298,7 +298,7 @@ fn no_tui_prints_the_log_a_scan_on_a_pipe_prints() {
 }
 
 fn fake_llm() -> Backend {
-    let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
+    let fake = common::fake_llm();
     Backend::shell(&format!("'{}'", fake.display()))
 }
 
@@ -314,8 +314,9 @@ fn options(backend: Backend, force: bool) -> scan::Options {
     }
 }
 
-/// `file` scanned with tests/fake-llm.sh to the end, and its first finding rejected: that finding.
-fn scanned_and_rejected(store: &mut Store, file: &Path) -> subcheck::store::Finding {
+/// `file` scanned with core/tests/fake-llm.sh to the end, and its first finding
+/// rejected: that finding.
+fn scanned_and_rejected(store: &mut Store, file: &Path) -> subcheck_core::store::Finding {
     let opts = options(fake_llm(), false);
     let Planned::Scan(plan) =
         scan::plan(&[file.to_path_buf()], &opts, store, &mut std::io::sink()).unwrap()

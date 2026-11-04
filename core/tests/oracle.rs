@@ -1,10 +1,10 @@
 //! `subs::extract` against mkvextract's own output for every text track in the fixtures
-//! (`tests/fixtures/expected/`, made by dev/make-fixtures.sh), through both read paths.
+//! (`core/tests/fixtures/expected/`, made by dev/make-fixtures.sh), through both read paths.
 
-mod common;
+use subcheck_core::test_support as common;
 
 use common::{fixture, patched};
-use subcheck::{mkv, subs};
+use subcheck_core::{mkv, subs};
 
 /// (fixture, mkvmerge track ID, expected file) for every text track in the fixtures.
 const ORACLE: &[(&str, usize, &str)] = &[
@@ -89,18 +89,18 @@ fn every_text_track_in_the_fixtures_is_in_the_oracle() {
 fn a_track_is_written_with_edited_payloads_in_place_of_theirs() {
     let (r, layout) = mkv::open(&fixture("apply.mkv")).unwrap();
     let track = &layout.tracks[2];
-    let read = subcheck::blocks::read_tracks(&r, &layout, &[track.number], false)
+    let read = subcheck_core::blocks::read_tracks(&r, &layout, &[track.number], false)
         .unwrap()
         .pop()
         .unwrap();
     let write = |edits: &std::collections::BTreeMap<usize, Vec<u8>>| {
         let mut out = Vec::new();
         let kind = subs::Kind::of(track).unwrap();
-        let edits = subcheck::apply::patch::Edits {
+        let edits = subcheck_core::apply::patch::Edits {
             changed: edits.clone(),
             ..Default::default()
         };
-        let blocks = subcheck::apply::patch::edited(kind, &read.blocks, &edits);
+        let blocks = subcheck_core::apply::patch::edited(kind, &read.blocks, &edits);
         subs::write_track(track, kind, &blocks, layout.timestamp_scale, &mut out).unwrap();
         String::from_utf8(out).unwrap()
     };

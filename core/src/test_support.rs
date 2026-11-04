@@ -1,9 +1,25 @@
+//! Helpers the tests share. The library's own tests reach them through `cfg(test)`; integration
+//! tests, which see only what the library exports, through the `test-support` feature.
+
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// A file under core/tests/fixtures/, built by dev/make-fixtures.sh.
+pub fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+/// core/tests/fake-llm.sh, the stand-in LLM the tests scan with.
+pub fn fake_llm() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh")
+}
 
 /// A copy of fixture `name`, in a temporary directory, with `edit` applied to the first of the
 /// `count` places `pattern` occurs (the count is checked, so a regenerated fixture that moves the
 /// bytes fails loudly instead of patching the wrong place).
-#[allow(dead_code)] // only some test files patch fixtures
 pub fn patched(
     name: &str,
     pattern: &[u8],
@@ -21,7 +37,6 @@ pub fn patched(
 
 /// `bytes` with the first of the `count` places `from` occurs overwritten by `to`, which is as
 /// long (both checked, as in [`patched`]).
-#[allow(dead_code)] // only some test files patch files
 pub fn patch(bytes: &mut [u8], from: &[u8], count: usize, to: &[u8]) {
     assert_eq!(from.len(), to.len(), "a patch keeps the length");
     let at = first_of(bytes, from, count, "the bytes");
@@ -39,7 +54,6 @@ fn first_of(bytes: &[u8], pattern: &[u8], count: usize, what: &str) -> usize {
 }
 
 /// A copy of fixture `name`, in a temporary directory.
-#[allow(dead_code)] // only some test files copy fixtures
 pub fn copied(name: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(name);
@@ -48,7 +62,6 @@ pub fn copied(name: &str) -> (tempfile::TempDir, PathBuf) {
 }
 
 /// Cut the file at `path` to its first `len` bytes, as an interrupted copy leaves one.
-#[allow(dead_code)] // only some test files cut fixtures
 pub fn cut(path: &Path, len: u64) {
     std::fs::OpenOptions::new()
         .write(true)
@@ -61,7 +74,6 @@ pub fn cut(path: &Path, len: u64) {
 /// Whether mkvmerge can be run. The tests that need it pass without checking anything when it
 /// cannot (macOS CI has none), and say so; with SUBCHECK_NEED_MKVMERGE set (CI on Linux, and
 /// dev/check-all.sh) they fail instead, so a broken install cannot pass unseen.
-#[allow(dead_code)] // only the apply tests run mkvmerge
 pub fn have_mkvmerge() -> bool {
     let ok = std::process::Command::new("mkvmerge")
         .arg("--version")
@@ -80,7 +92,6 @@ pub fn have_mkvmerge() -> bool {
 
 /// Whether ffmpeg can be run, as [`have_mkvmerge`] asks of mkvmerge: the `audio` tests skip
 /// without it, and fail instead with SUBCHECK_NEED_FFMPEG set.
-#[allow(dead_code)] // only the audio tests run ffmpeg
 pub fn have_ffmpeg() -> bool {
     let ok = std::process::Command::new("ffmpeg")
         .arg("-version")
@@ -101,10 +112,7 @@ pub fn have_ffmpeg() -> bool {
 /// process. Tests run on threads that start processes, and a child forked while this process held
 /// the script open for writing keeps it open until that child execs. Running the script then fails
 /// with "Text file busy" (ETXTBSY).
-#[allow(dead_code)] // only some test files run scripts
 pub fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
     let path = dir.join(name);
     let mut sh = Command::new("sh")
         .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
@@ -119,11 +127,4 @@ pub fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         .unwrap();
     assert!(sh.wait().unwrap().success(), "writing {}", path.display());
     path
-}
-
-/// A file under tests/fixtures/, built by dev/make-fixtures.sh.
-pub fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name)
 }

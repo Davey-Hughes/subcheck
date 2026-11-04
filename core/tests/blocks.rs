@@ -1,10 +1,10 @@
 //! `blocks::read_tracks` on the committed fixtures: the Cues path, the walk, and their agreement.
 
-mod common;
+use subcheck_core::test_support as common;
 
 use common::{fixture, patched};
-use subcheck::blocks::{self, ReadPath};
-use subcheck::mkv;
+use subcheck_core::blocks::{self, ReadPath};
+use subcheck_core::mkv;
 
 #[test]
 fn cues_path_is_taken_when_the_index_covers_the_track() {

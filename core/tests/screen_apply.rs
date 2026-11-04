@@ -3,7 +3,7 @@
 //! confirmed, makes the fixes, shows them applied from the store, and moves the file's checks with
 //! it, so the next scan has nothing to check.
 
-mod common;
+use subcheck_core::test_support as common;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -12,13 +12,13 @@ use std::time::Duration;
 
 use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
-use subcheck::llm::Backend;
-use subcheck::player::Player;
-use subcheck::review::model::Model;
-use subcheck::review::run_effect;
-use subcheck::review::update::{self, Msg};
-use subcheck::scan::{self, Planned};
-use subcheck::store::{Decision, Selector, State, Store};
+use subcheck_core::llm::Backend;
+use subcheck_core::player::Player;
+use subcheck_core::review::model::Model;
+use subcheck_core::review::run_effect;
+use subcheck_core::review::update::{self, Msg};
+use subcheck_core::scan::{self, Planned};
+use subcheck_core::store::{Decision, Selector, State, Store};
 
 /// The loop's inner part: a message, then every effect it leads to, run for real.
 fn send(
@@ -100,7 +100,7 @@ fn d_then_a_on_the_screen() {
     std::fs::copy(common::fixture("typos.mkv"), &file).unwrap();
     // The fake LLM finds "befor" (a plain fix) and "trough" (in per-letter karaoke, left by hand
     // without --karaoke).
-    let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
+    let fake = common::fake_llm();
     let backend = Backend::shell(&format!("'{}'", fake.display()));
     let opts = scan::Options {
         chunk_lines: backend.chunk_lines,

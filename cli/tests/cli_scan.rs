@@ -1,15 +1,15 @@
-//! `subcheck scan` and `subcheck list` end to end, with tests/fake-llm.sh as the LLM, a temporary
-//! directory as XDG_STATE_HOME, and a database in it as SUBCHECK_DB.
+//! `subcheck scan` and `subcheck list` end to end, with core/tests/fake-llm.sh as the LLM, a
+//! temporary directory as XDG_STATE_HOME, and a database in it as SUBCHECK_DB.
 
-mod common;
+use subcheck_core::test_support as common;
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use common::fixture;
-use subcheck::list::shell_quote;
-use subcheck::llm::Usage;
-use subcheck::store::{self, Check, LlmCall, Selector, State, Store};
+use subcheck_core::list::shell_quote;
+use subcheck_core::llm::Usage;
+use subcheck_core::store::{self, Check, LlmCall, Selector, State, Store};
 
 struct Env {
     state: tempfile::TempDir,
@@ -24,7 +24,7 @@ impl Env {
     }
 
     fn subcheck(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-        let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
+        let fake = common::fake_llm();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_subcheck"));
         cmd.args(args)
             .env("XDG_STATE_HOME", self.state.path())
@@ -64,7 +64,7 @@ impl Env {
 
     /// A directory of links to the fake LLM named `claude` and `codex`.
     fn fake_bin(&self) -> PathBuf {
-        let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
+        let fake = common::fake_llm();
         let bin = self.state.path().join("bin");
         if !bin.exists() {
             std::fs::create_dir(&bin).unwrap();
@@ -145,7 +145,7 @@ fn scan_records_the_planted_typos() {
     let run = env.newest_run();
     assert_eq!(
         run.header.as_ref().unwrap().prompt_version,
-        subcheck::llm::PROMPT_VERSION
+        subcheck_core::llm::PROMPT_VERSION
     );
     let pairs: Vec<(&str, &str)> = run
         .findings
@@ -960,7 +960,7 @@ fn a_track_tagged_only_in_bcp_47_is_named_by_it() {
         [(3, "eng", Some("ja"))]
     );
     assert_eq!(
-        subcheck::list::track_name_in(tracks, 3),
+        subcheck_core::list::track_name_in(tracks, 3),
         Some(("(ja)".into(), false))
     );
 }
@@ -1084,10 +1084,7 @@ fn list_takes_a_run_or_the_files_under_some_paths() {
 
 /// The fake LLM's path, as `--llm-cmd` gives it.
 fn fake_llm() -> String {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fake-llm.sh")
-        .display()
-        .to_string()
+    common::fake_llm().display().to_string()
 }
 
 #[test]

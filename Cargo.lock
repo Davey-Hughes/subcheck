@@ -1692,6 +1692,22 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "jiff",
+ "libc",
+ "ratatui",
+ "rusqlite",
+ "rustix",
+ "serde_json",
+ "subcheck-core",
+ "tempfile",
+]
+
+[[package]]
+name = "subcheck-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
  "flate2",
  "jiff",
  "libc",
@@ -1702,6 +1718,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "subcheck-core",
  "tempfile",
  "thiserror 2.0.21",
 ]

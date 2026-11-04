@@ -48,9 +48,9 @@ jobs:
   # The `apply` tests remux with mkvmerge and the `audio` tests decode with
   # ffmpeg. They skip without them, so the job sets SUBCHECK_NEED_MKVMERGE and
   # SUBCHECK_NEED_FFMPEG to make a missing one fail them instead. The tests read
-  # MKV fixtures committed under tests/fixtures/; dev/make-fixtures.sh builds
-  # them, only when a fixture changes. dev/check-all.sh runs these same steps
-  # locally: change it with this file.
+  # MKV fixtures committed under core/tests/fixtures/; dev/make-fixtures.sh
+  # builds them, only when a fixture changes. dev/check-all.sh runs these same
+  # steps locally: change it with this file.
   subcheck:
     name: subcheck
     runs-on: docker
@@ -127,7 +127,7 @@ jobs:
       # The test step: `cargo llvm-cov` runs `cargo test` with the build
       # instrumented, and fails the job when the share of lines the tests reach
       # falls under the floor. The share counts test code too (the in-file test
-      # modules, src/test_support.rs), not only the code that ships.
+      # modules, core/src/test_support.rs), not only the code that ships.
       #
       # 90 is chosen, not derived. It leaves room for code the Rust tests reach
       # poorly, such as an FFI layer driven from another language or

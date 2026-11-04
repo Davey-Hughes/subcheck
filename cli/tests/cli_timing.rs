@@ -1,6 +1,6 @@
 //! `subcheck timing` end to end: the real binary, run in the fixtures directory.
 
-mod common;
+use subcheck_core::test_support as common;
 
 use std::path::Path;
 use std::process::{Command, Output};

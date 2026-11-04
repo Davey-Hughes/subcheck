@@ -1,9 +1,9 @@
 //! `mkv::read_layout` on the committed fixtures.
 
-mod common;
+use subcheck_core::test_support as common;
 
 use common::fixture;
-use subcheck::mkv::{self, Encoding};
+use subcheck_core::mkv::{self, Encoding};
 
 #[test]
 fn layout_of_a_mkvmerge_file() {

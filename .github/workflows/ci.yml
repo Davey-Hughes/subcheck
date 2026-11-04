@@ -23,9 +23,9 @@ jobs:
       # The `apply` tests remux with mkvmerge and the `audio` tests decode with
       # ffmpeg: both installed on Linux and required there (SUBCHECK_NEED_MKVMERGE,
       # SUBCHECK_NEED_FFMPEG), left out on macOS, where those tests skip. The
-      # other tests read MKV fixtures committed under tests/fixtures/. mkvtoolnix from
-      # MKVToolNix's own apt repository, pinned to the version the Forgejo
-      # job installs, its key checked the same way (see why there):
+      # other tests read MKV fixtures committed under core/tests/fixtures/.
+      # mkvtoolnix from MKVToolNix's own apt repository, pinned to the version the
+      # Forgejo job installs, its key checked the same way (see why there):
       # Ubuntu's own is years behind.
       - name: Install mkvtoolnix
         if: runner.os == 'Linux'

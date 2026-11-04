@@ -5,15 +5,15 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 use crossterm::event::KeyCode;
-use subcheck::list::{self, Filter};
-use subcheck::player::Player;
-use subcheck::review::model::Model;
-use subcheck::review::run_effect;
-use subcheck::review::update::{self, Msg};
-use subcheck::store::{
+use subcheck_core::list::{self, Filter};
+use subcheck_core::player::Player;
+use subcheck_core::review::model::Model;
+use subcheck_core::review::run_effect;
+use subcheck_core::review::update::{self, Msg};
+use subcheck_core::store::{
     Attempt, CheckedWith, Finding, Made, RunHeader, ScanRow, State, Store, TrackRecord,
 };
-use subcheck::text::Occurrence;
+use subcheck_core::text::Occurrence;
 
 const FILE: &str = "/m/K-On!/K-On! - E01 - Episode.mkv";
 const OTHER: &str = "/m/K-On!/K-On! - E02 - Episode.mkv";

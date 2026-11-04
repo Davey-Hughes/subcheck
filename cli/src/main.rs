@@ -6,20 +6,20 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
-use subcheck::apply::{self, Mode};
-use subcheck::audio::{self, correlate, decode};
-use subcheck::blocks::{self, ReadPath};
-use subcheck::ebml;
-use subcheck::group;
-use subcheck::list::{self, Filter};
-use subcheck::llm::Backend;
-use subcheck::mkv::{self, Track};
-use subcheck::review;
-use subcheck::scan::{self, Planned};
-use subcheck::store::{self, Selector, State, Store};
-use subcheck::subs::{self, Kind};
-use subcheck::text;
-use subcheck::timing::{self, Analysis, TrackReport};
+use subcheck_core::apply::{self, Mode};
+use subcheck_core::audio::{self, correlate, decode};
+use subcheck_core::blocks::{self, ReadPath};
+use subcheck_core::ebml;
+use subcheck_core::group;
+use subcheck_core::list::{self, Filter};
+use subcheck_core::llm::Backend;
+use subcheck_core::mkv::{self, Track};
+use subcheck_core::review;
+use subcheck_core::scan::{self, Planned};
+use subcheck_core::store::{self, Selector, State, Store};
+use subcheck_core::subs::{self, Kind};
+use subcheck_core::text;
+use subcheck_core::timing::{self, Analysis, TrackReport};
 
 #[derive(Parser)]
 #[command(
@@ -530,7 +530,9 @@ fn labelled_files(paths: &[PathBuf]) -> (Vec<(PathBuf, String)>, bool) {
                 for w in warnings {
                     eprintln!("warning: {w}");
                 }
-                let root = subcheck::store::absolute(p).ok().filter(|r| r.is_dir());
+                let root = subcheck_core::store::absolute(p)
+                    .ok()
+                    .filter(|r| r.is_dir());
                 files.extend(found.into_iter().map(|f| {
                     let (short, long) = timing_labels(p, root.as_deref(), &f);
                     (f, short, long)

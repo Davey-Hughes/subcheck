@@ -1,6 +1,6 @@
 //! `subcheck extract` end to end: the real binary, run in a temporary directory.
 
-mod common;
+use subcheck_core::test_support as common;
 
 use std::path::Path;
 use std::process::{Command, Output};

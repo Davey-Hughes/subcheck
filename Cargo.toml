@@ -1,21 +1,19 @@
-[package]
-name = "subcheck"
+# No package of its own: a cargo command run here covers every member, which is how CI and
+# dev/check-all.sh build, lint and test them all with the same commands.
+[workspace]
+members = ["core", "cli"]
+# A virtual root has no package edition to take the resolver from: without this line cargo uses
+# resolver 1, which lets dev-dependencies' features (core's `test-support`) into normal builds.
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 # `Duration::from_mins` in a const.
 rust-version = "1.91"
-description = "Proofread the text subtitles embedded in MKV files"
 license = "GPL-3.0-or-later"
 
-[[bin]]
-name = "subcheck"
-path = "src/main.rs"
-
-[lib]
-name = "subcheck"
-path = "src/lib.rs"
-
-[dependencies]
+[workspace.dependencies]
 # `group`'s read of a signal's disposition, which no safe crate offers, and its tests' `pre_exec`
 # calls; and libc's constants.
 libc = "0.2"
@@ -41,16 +39,12 @@ rustix = { version = "1", features = ["fs", "process"] }
 # the same on macOS; it needs a C compiler. `fallible_uint` lets a u64 or usize be a parameter,
 # refused rather than wrapped past i64::MAX.
 rusqlite = { version = "=0.40.2", features = ["bundled", "fallible_uint"] }
-
-[dev-dependencies]
 tempfile = "3"
-# `group`'s tests point a child's stderr elsewhere.
-rustix = { version = "1", features = ["stdio"] }
 
 # CI gates on `cargo clippy --all-targets -- -D warnings`, so pedantic is effectively deny. The
-# next three allows are library-author lints, off because `pub` here marks module seams inside
-# one binary, not an API anyone downstream calls.
-[lints.clippy]
+# next three allows are library-author lints, off because `pub` here marks the seams between this
+# workspace's crates and modules, not an API anyone outside it calls.
+[workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 must_use_candidate = "allow"
 missing_errors_doc = "allow"

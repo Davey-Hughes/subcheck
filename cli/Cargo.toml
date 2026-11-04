@@ -1,0 +1,26 @@
+[package]
+name = "subcheck"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Proofread the text subtitles embedded in MKV files"
+license.workspace = true
+
+[dependencies]
+subcheck-core = { path = "../core" }
+anyhow.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+subcheck-core = { path = "../core", features = ["test-support"] }
+crossterm.workspace = true
+jiff.workspace = true
+libc.workspace = true
+ratatui.workspace = true
+rusqlite.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

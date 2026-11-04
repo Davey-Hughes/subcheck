@@ -37,8 +37,12 @@ cargo build --release
 ln -s "$PWD/target/release/subcheck" ~/.local/bin/subcheck   # any directory on your PATH
 ```
 
-The link follows the build, so a later `cargo build --release` updates the command. Building needs
-a C compiler (SQLite is compiled in). At run time:
+The link follows the build, so a later `cargo build --release` updates the command.
+
+To install a copy instead, `cargo install --locked --path cli` builds it into cargo's bin directory
+(`~/.cargo/bin` by default); run it again after each update.
+
+Building needs a C compiler (SQLite is compiled in). At run time:
 
 | Needs | For |
 |---|---|
@@ -54,8 +58,9 @@ tests failing rather than skipping when mkvmerge or ffmpeg is missing. Run it be
 branch. The tests run under [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov), and the
 gate fails when they reach too few of the lines. So the script needs llvm-tools (`rustup component
 add llvm-tools`) and the cargo-llvm-cov version CI installs, and stops first, naming it, when either
-is missing. The tests read small MKVs committed under `tests/fixtures/`, with mkvextract's output
-for each as the oracle; `dev/make-fixtures.sh` rebuilds them, needed only to add or change one.
+is missing. The tests read small MKVs committed under `core/tests/fixtures/`, with
+mkvextract's output for each as the oracle; `dev/make-fixtures.sh` rebuilds them, needed only to
+add or change one.
 
 This repository's history before 2026-11-02 was in
 [daveyutils](https://github.com/Davey-Hughes/daveyutils): a `(daveyutils#N)` in a commit message is

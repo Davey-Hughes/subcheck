@@ -1,17 +1,17 @@
 //! `apply::verify` on real remuxes of the apply fixture: a good remux passes, and each kind of
 //! difference is caught on its own. Needs mkvmerge; skipped (and said so) without it.
 
-mod common;
+use subcheck_core::test_support as common;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use common::{fixture, have_mkvmerge};
-use subcheck::apply::remux::Replacement;
-use subcheck::apply::{patch, remux, verify};
-use subcheck::blocks::{self, Block};
-use subcheck::{mkv, subs};
+use subcheck_core::apply::remux::Replacement;
+use subcheck_core::apply::{patch, remux, verify};
+use subcheck_core::blocks::{self, Block};
+use subcheck_core::{mkv, subs};
 
 /// Patched blocks by track ID.
 type Fixed = BTreeMap<usize, Vec<Block>>;
