@@ -80,13 +80,13 @@ it ends, the status line gives its summary. What the scan warns of as it starts 
 read) stays on the terminal above the screen, and the first of it is on the status line as the
 screen opens. Files the scan skips as unchanged are in the list from the start.
 
-When a scan checks a file again, its earlier findings stay in the list until the new ones are
-saved, and you can decide them meanwhile: a decision carries over to the finding that comes back
-with the same line and fix. While it is checked, the file's name spins in the list, and the detail
-pane says where the check is (`checking again: LLM 1/3`). If the check fails, the findings stay. A
-decision on a finding that another subcheck checked again since the screen opened goes to the
-finding that came back in its place, and the status line says so; when none came back, nothing is
-written, and the status line says that too.
+When a scan checks a file again, its earlier findings stay in the list until the new ones are saved,
+and you can decide them meanwhile: a decision carries over to each finding that comes back as the
+same fix ([Where findings are kept](#where-findings-are-kept)). While it is checked, the file's name
+spins in the list, and the detail pane says where the check is (`checking again: LLM 1/3`). If the
+check fails, the findings stay. A decision on a finding that another subcheck checked again since
+the screen opened goes to each finding that came back in its place, and the status line says so;
+when none came back, nothing is written, and the status line says that too.
 
 `q` while the scan runs asks first, then stops it: the run keeps every file that was done, and the
 terminal gets the command that finishes it (`subcheck scan --run <run> <paths>`; after a `c`,
@@ -194,9 +194,9 @@ Everything subcheck records is in one SQLite database: `~/.local/state/subcheck/
 (under `$XDG_STATE_HOME` when that is set, `~/Library/Application Support/subcheck/` on macOS), or
 the absolute path in `SUBCHECK_DB`. Findings and decisions belong to files: each file has at most
 one current LLM check and one current timing check, and a check made again (the file changed, or
-`--force`) replaces the one before, whichever scan made it. A decision carries over to a finding
-that comes back with the same line and the same fix: a typo you rejected stays rejected when
-`apply` changes the file and the next scan reads it again.
+`--force`) replaces the one before, whichever scan made it. A decision carries over to each finding
+that comes back as the same fix. For a typo, that is the same line and the same correction: a typo
+you rejected stays rejected when the file is checked again after `apply` fixed other lines.
 A timing fix is the same fix when it moves the same track's stretches by the same frames: timing
 rules that change what a finding rests on keep your decision on it.
 
@@ -330,10 +330,10 @@ file:
 2. mkvmerge writes `.<name>.mkv.subcheck` beside the file: the same file with the fixed tracks
    replaced, each in its place, with its name, language, flags and compression.
 3. That remux is checked against the original: titles, chapters, attachments, every track's
-   header, frame counts, every subtitle event, and the times of the audio frames in six 5-second
-   spans (the head, 20 to 80 % in, a minute before the end): a frame moved more than 2 ms fails
-   it. With `--full` (or `--no-backup`), every frame of every track too, which reads both files end
-   to end.
+   header, frame counts, every subtitle event, and the times of the audio frames in up to six
+   5-second spans (the head, 20 to 80 % in, a minute before the end): a frame moved more than 2 ms
+   fails it. With `--full` (or `--no-backup`), every frame of every track too, which reads both
+   files end to end.
 4. The original becomes `<name>.mkv.orig` and the remux takes its name. The original is linked to
    that name first, so the file is never missing on the way; a filesystem without hard links
    needs `--no-backup`.
@@ -397,9 +397,12 @@ millisecond past one at either millisecond, both ways in one file. Where a line'
 such a frame, apply takes its time from the Cues if it is a keyframe, and otherwise reads it from
 the video around it; video there that does not read fails the file. A line still left a
 millisecond unsure leaves its fix for a hand fix, and so does a typo on it once the fix is in.
-A line the shift moves wholly before 0:00 leaves the fix for a hand fix too, naming it: apply
-leaves no line out. One whose start it moves a frame or more before 0:00 starts at 0:00, and the
-output names it (`cut short at 0:00`).
+A line the shift would leave on no frame leaves the fix for a hand fix too, naming it, and so does a
+line with no duration of its own, from its block or its track (such as an SRT line shown until the
+next), whose start it moves onto a frame before 0:00: apply leaves no line out. Any other line whose
+start it moves onto a frame before 0:00 starts at 0:00, and the output names it
+(`cut short at 0:00`). A line of duration 0 is on no frame wherever it is, and neither rule applies
+to it.
 
 `--no-backup` keeps no original. `--dry-run` shows each changed event before and after, and writes
 nothing. It also checks what stops apply before it writes, an earlier `.orig` in the way or too
@@ -407,11 +410,11 @@ little free space, and fails such a file as apply would (in review, `D` marks it
 fail`). Running apply again is safe: a fix already in its file is reported and left alone.
 
 Some fixes are left for a hand fix, with the reason: per-letter karaoke (one event per letter)
-without `--karaoke`, signs set letter by letter (a tag before nearly every letter), a change
-across a tag or a line break, two fixes on one line, a track whose times its text format cannot
-keep or whose header is not all UTF-8, every fix in a file with any text track (ASS, SSA, SRT,
-WebVTT, USF, ASCII) whose lines are not all UTF-8 (mkvmerge replaces those bytes in any remux),
-and a line that is not there any more.
+without `--karaoke`, signs set letter by letter (three characters or more besides spaces, half or
+more of them right after a tag), a change across a tag or a line break, two fixes on one line, a
+track whose times its text format cannot keep or whose header is not all UTF-8, every fix in a file
+with any text track (ASS, SSA, SRT, WebVTT, USF, ASCII) whose lines are not all UTF-8 (mkvmerge
+replaces those bytes in any remux), and a line that is not there any more.
 
 `--karaoke` makes per-letter karaoke fixes too. Each changed letter keeps its event (tags,
 colours, animation), and a new one is a copy of the letter beside it. The row is then re-spaced
