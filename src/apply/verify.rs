@@ -147,9 +147,9 @@ fn without_mkvmerges_own(
 
 /// A ChapterDisplay's children with its languages as players read them in place of its ChapLanguage
 /// and ChapLanguageBCP47 elements: its BCP 47 tags if it has any, else its ChapLanguages as BCP 47
-/// (`fr` for `fre` and `fra`, `haw` as it is), else Matroska's `en`; lowercase, as a set. mkvmerge
-/// writes ChapLanguage lowercase and bibliographic, `eng` where there was none, and adds the tag
-/// from it (checked, mkvmerge v103.0).
+/// (`fr` for `fre` and `fra`, `haw` as it is), else Matroska's `en`; lowercase, as a set. Every
+/// mkvmerge version checked writes ChapLanguage lowercase and bibliographic, `eng` where there was
+/// none, and adds the tag from it.
 fn display_languages(children: &mut Vec<(u32, Value)>) {
     let of = |id: u32| -> Vec<String> {
         children
@@ -194,8 +194,9 @@ fn text_of(v: &Value) -> String {
 /// One attached file as its elements, in order: (ID, data).
 type Attached = Vec<(u32, Vec<u8>)>;
 
-/// The attached files, each as its elements in order, the MIME type left out (mkvmerge 102
-/// rewrites `application/x-truetype-font` as `font/ttf`) and the data as its length and hash.
+/// The attached files, each as its elements in order, the MIME type left out (every mkvmerge
+/// version checked rewrites `application/x-truetype-font` as `font/ttf`) and the data as its
+/// length and hash.
 fn attachments(f: File) -> Result<Vec<Attached>> {
     f.layout
         .attachments_at
@@ -299,8 +300,8 @@ fn header(
     }
     // mkvmerge leaves a text track's DefaultDuration out of any remux and writes each block's
     // duration instead, which the events are compared with. It gives an audio track that had none
-    // (ffmpeg 7 wrote none) its codec's frame length, FLAC's 96 ms, AAC's 23.2: the frames are
-    // compared below, and their times, a frame laced behind its block's first timed by this.
+    // (ffmpeg 7 wrote none) its codec's frame length: the frames are compared below, and their
+    // times, a frame laced behind its block's first timed by this.
     if t.default_duration != u.default_duration
         && !(t.is_text_subtitle() && u.default_duration.is_none())
         && !(t.kind == mkv::TRACK_TYPE_AUDIO && t.default_duration.is_none())
@@ -348,8 +349,8 @@ fn flags(f: &Flags) -> [bool; 6] {
 
 /// An ASS header as mkvextract writes it and mkvmerge reads it back: its lines but the blank ones,
 /// with LF line ends, and nothing blank at its end. A section that followed `[Events]` (Aegisub's
-/// extradata, in K-On!! E09) is written after the events, and mkvmerge reads the blank line before
-/// it into the header. Bytes, not text: a rewrite that changed bytes that are not UTF-8 must show.
+/// extradata) is written after the events, and mkvmerge reads the blank line before it into the
+/// header. Bytes, not text: a rewrite that changed bytes that are not UTF-8 must show.
 fn script(private: &[u8]) -> Vec<u8> {
     let blank = |b: &u8| matches!(b, b' ' | b'\t' | b'\r');
     let lines: Vec<&[u8]> = subs::c_bytes(private)
@@ -406,10 +407,10 @@ enum Value {
 
 /// Whether a track's Video or Audio element in the remux (`now`) says what the original's (`was`)
 /// does: by value, each child Matroska would take as said when left out left out (see
-/// [`default_of`]); as bytes, if either does not parse. And mkvmerge 103 keeps no FlagInterlaced
-/// from a Matroska file (checked on progressive H.264, HEVC, MPEG-2 and VP9, each of which says in
-/// its stream whether it is interlaced): a 2, progressive, left out passes. A 1 left out changes
-/// what a player that goes by the flag does, and does not.
+/// [`default_of`]); as bytes, if either does not parse. And every mkvmerge version checked keeps no
+/// FlagInterlaced from a Matroska file of progressive H.264, HEVC, MPEG-2 or VP9 (each of which
+/// says in its stream whether it is interlaced): a 2, progressive, left out passes. A 1 left out
+/// changes what a player that goes by the flag does, and does not.
 fn same_properties(was: Option<&[u8]>, now: Option<&[u8]>) -> bool {
     match (was, now) {
         (None, None) => true,
@@ -623,8 +624,8 @@ pub fn must_walk(layout: &Layout, tracks: &[&Track]) -> bool {
 }
 
 /// A text track's DefaultDuration, in ns, as a remux at `scale` writes it in a block with no
-/// duration of its own: whole `scale` units, rounded to the nearest (mkvmerge 74, 82, 102 and 103
-/// make 42 ms of 41.708333; 102 makes 42 of 41.5 and 41 of 41.499999).
+/// duration of its own: whole `scale` units, rounded to the nearest (every mkvmerge version
+/// checked makes 42 ms of 41.708333 and of 41.5, 41 of 41.499999).
 pub fn as_remuxed(default_duration: Option<u64>, scale: u64) -> Option<i128> {
     let scale = i128::from(scale.max(1));
     default_duration.map(|d| (i128::from(d) + scale / 2) / scale * scale)
@@ -721,16 +722,16 @@ fn others(original: File, remuxed: File, full: bool, diffs: &mut Vec<String>) ->
 /// How long each span [`audio_times`] reads is.
 const SPAN_NS: u64 = 5_000_000_000;
 /// How far an audio frame's time may move in a remux: mkvmerge stores times to the millisecond,
-/// and a plain remux moves a few audio frames by 1-2 ms.
+/// and the plain remuxes seen moved a few audio frames by up to this.
 const MOVED_NS: i128 = 2_000_000;
 /// How far around its old time a frame is looked for in the remux.
 const SEARCH_NS: i128 = 1_000_000_000;
 
-/// Whether every audio track's frames kept their times, frame by frame, in six spans of the file:
-/// frame counts and bytes say nothing of times, and a remux can move a track. mkvmerge 102 stamped
-/// FMAB's TrueHD by frame count over a hole at its head, 67 ms early there. Only frames whose bytes
-/// occur once in their span count: digital silence repeats one frame, which would match anywhere.
-/// The first frame out of place is named, once per track.
+/// Whether every audio track's frames kept their times, frame by frame, in up to six spans of the
+/// file: frame counts and bytes say nothing of times, and a remux can move a track (stamping a
+/// track's frames by frame count over a hole at its head puts them early there). Only frames whose
+/// bytes occur once in their span count: digital silence repeats one frame, which would match
+/// anywhere. The first frame out of place is named, once per track.
 fn audio_times(original: File, remuxed: File, diffs: &mut Vec<String>) -> Result<()> {
     let (a, b) = (original.layout, remuxed.layout);
     let audio: Vec<(&Track, &Track)> = a
@@ -1131,8 +1132,8 @@ mod tests {
             diffs(&only, &track("jpn", Some("ja-JP"))),
             ["track 2: language differs"]
         );
-        // Nor is one the file gives: mkvmerge writes Language `eng` beside `ja` back as `jpn`
-        // (checked, mkvmerge v102.0).
+        // Nor is one the file gives: every mkvmerge version checked writes Language `eng` beside
+        // `ja` back as `jpn`.
         assert_eq!(
             diffs(&track("eng", Some("ja")), &track("jpn", Some("ja"))),
             [] as [String; 0]
@@ -1146,9 +1147,9 @@ mod tests {
 
     #[test]
     fn language_is_compared_as_mkvmerge_reads_the_original() {
-        // As `mkvmerge -J` reads the original, so the remux has it (checked, mkvmerge v102.0): a
-        // tagless Language lowercase and bibliographic (`fra`, `Fre`, `fr` as `fre`; `xyz` as
-        // `und`), and a tag in its canonical form (`iw` as `he`, `zh-yue` as `yue`).
+        // As `mkvmerge -J` reads the original, so the remux has it, in every mkvmerge version
+        // checked: a tagless Language lowercase and bibliographic (`fra`, `Fre`, `fr` as `fre`;
+        // `xyz` as `und`), and a tag in its canonical form (`iw` as `he`, `zh-yue` as `yue`).
         let read_as = |iso: &str, bcp47: Option<&str>| {
             bcp47.map_or_else(
                 || Language::Iso639_2(iso.into()),
@@ -1228,8 +1229,8 @@ mod tests {
         };
         assert_eq!(diffs(&timed(frame, &pgs), &pgs), differs);
         // A line with no duration of its own, as a remux writes it: its track's DefaultDuration in
-        // whole milliseconds, rounded to the nearest (mkvmerge 102 makes 42 ms of 41.708333 and of
-        // 41.5, 41 of 41.499999).
+        // whole milliseconds, rounded to the nearest (every mkvmerge version checked makes 42 ms
+        // of 41.708333 and of 41.5, 41 of 41.499999).
         let line = |duration| Block {
             track: 3,
             position: 0,
@@ -1449,8 +1450,8 @@ mod tests {
             )
         };
         let same = |was, now| same_chapters(was, now, false);
-        // ffmpeg writes ChapLanguage alone; mkvmerge writes it lowercase and bibliographic, and
-        // adds the tag from it (checked, mkvmerge v103.0).
+        // ffmpeg writes ChapLanguage alone; every mkvmerge version checked writes it lowercase and
+        // bibliographic, and adds the tag from it.
         assert!(same(display(&[b"und"], &[]), display(&[b"und"], &[b"und"])));
         assert!(same(display(&[b"eng"], &[]), display(&[b"eng"], &[b"en"])));
         assert!(same(display(&[b"fra"], &[]), display(&[b"fre"], &[b"fr"])));
@@ -1551,7 +1552,7 @@ mod tests {
             script(b"[Script Info]\r\nA: 1\r\n\r\n"),
             script(b"[Script Info]\nA: 1\n")
         );
-        // As K-On!! E09's header comes back: a blank line more before Aegisub's extradata.
+        // As a header comes back: a blank line more before Aegisub's extradata.
         assert_eq!(
             script(b"[Events]\r\nFormat: Text\r\n\r\n[Aegisub Extradata]\r\nData: 0\r\n"),
             script(b"[Events]\r\nFormat: Text\r\n\r\n\r\n[Aegisub Extradata]\r\nData: 0\r\n")

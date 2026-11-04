@@ -12,7 +12,8 @@ use crate::text::Event;
 /// How one track's lines sit against the same lines in another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shared {
-    /// Distinct times (per style, start or end) of lines with a twin.
+    /// Distinct times (per style, start or end) of lines with a twin: a start when within reach of
+    /// the twin's start, an end when within reach of its end.
     pub times: usize,
     /// How many of them sit at each gap, this track's frame less the other's.
     pub counts: wide::Hits,
@@ -109,7 +110,7 @@ pub struct Follow {
     pub source: usize,
     pub gap: i64,
     pub shared: Shared,
-    /// The other track's verdict, `gap` frames later.
+    /// The other track's verdict, `gap` frames later, for this track's events.
     pub verdict: Verdict,
     /// As [`Analysis::each`], for this track's events.
     pub each: Vec<Option<usize>>,
@@ -287,7 +288,7 @@ mod tests {
         }
     }
 
-    /// `n` signs, one every 10 s, each 3 s long, `frames` frames after the same signs of `lines(n, 0)`.
+    /// `n` signs, one every 10 s, each 3 s long, `frames` frames after those of `signs(n, 0)`.
     fn signs(n: i64, frames: i64) -> Vec<Event> {
         (0..n)
             .map(|i| {

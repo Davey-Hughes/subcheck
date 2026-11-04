@@ -1,7 +1,8 @@
 //! The wide scan: how many of a track's times land exactly on a cut once moved back by each whole
 //! number of frames, up to REACH_MS either way. [`super::analyse`] centres its ±MAX_OFFSET
 //! analysis on the shift the scan decides, leaves out of it the windows the scan puts far from
-//! that shift, and calls a track unclear when the scan's evidence points two ways.
+//! that shift, and calls a track unclear when the scan's evidence points two ways, unless the
+//! track has too few times for a far peak to doubt the rest.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
@@ -54,7 +55,7 @@ pub fn shifts_of(video: &Video, ms: i64, reach: i64) -> Vec<i64> {
 pub struct Scan {
     /// Hits at each shift, summed over the styles timed at their own best shift.
     pub hits: Hits,
-    /// Those styles' times, in ms, each with the shifts it hits; in time order.
+    /// Those styles' times that hit any shift, in ms, each with the shifts it hits; in time order.
     pub times: Vec<(i64, Vec<i64>)>,
 }
 
@@ -142,17 +143,18 @@ pub fn decisive(hits: &Hits) -> Option<(i64, usize)> {
 /// A track's times pointing two ways, (shift, hits) each way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rival {
-    /// The whole track: the best shift within MAX_OFFSET of 0, or the best of all when that is far
-    /// and fewer than MIN_AT_OFFSET hits are within MAX_OFFSET of 0. Part of it: the centre.
+    /// The whole track: the best shift within MAX_OFFSET of 0, or the best of all when that is
+    /// far, no shift within MAX_OFFSET of 0 has MIN_AT_OFFSET hits, and the best apart from it
+    /// rivals it. Part of it: the centre.
     pub ours: (i64, usize),
-    /// The best shift apart from `ours`; for the whole track with `ours` within MAX_OFFSET of 0,
-    /// outside ±MAX_OFFSET as well.
+    /// The whole track: the best shift apart from `ours`; with `ours` within MAX_OFFSET of 0,
+    /// outside ±MAX_OFFSET as well. Part of it: the shift the first flagged window decides.
     pub theirs: (i64, usize),
     /// For part of the track: from the first flagged window's start to the last one's end, in ms.
     pub span: Option<(i64, i64)>,
 }
 
-/// Where the ±MAX_OFFSET analysis is centred, or the rival that leaves the track unclear.
+/// Where the ±MAX_OFFSET analysis is centred, or the rival that can leave the track unclear.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Centre {
     At(i64),
@@ -163,9 +165,9 @@ pub enum Centre {
 /// Undecided, a shift outside ±MAX_OFFSET and apart from the best inside, with at least twice
 /// MIN_AT_OFFSET hits and at least three quarters of that one's, is a rival: the analysis at 0
 /// would read an alias of it as a shift of a frame or two. A GOP alias sits close to the true
-/// peak, holding most of its hits; a peak at half the best, or with a dozen hits, is a repeated
+/// peak, holding most of its hits; a peak well short of the best, or with few hits, is a repeated
 /// sequence or chance; a shift just past the edge, next to a best at it, is that peak's shoulder.
-/// When the best is far and fewer than MIN_AT_OFFSET hits are inside, nothing near 0 speaks for
+/// When the best is far and no shift inside has MIN_AT_OFFSET hits, nothing near 0 speaks for
 /// the track: the best and the best apart from it, when they are rivals by the same rule, are the
 /// two ways it points, and 0 is neither.
 /// Otherwise the scan has too little to say, and the analysis runs at 0.

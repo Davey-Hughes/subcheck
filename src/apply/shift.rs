@@ -20,10 +20,8 @@ pub fn fixes(run: &Run) -> Vec<&Finding> {
 
 /// The video's frames: frame n (counted from the first keyframe) at `phase + n * frame`, stored
 /// rounded to the timestamp scale, as mkvmerge stores them. `frame` is the exact duration the
-/// DefaultDuration stands for, and `phase` the one that puts every keyframe on a frame: K-On!!
-/// E09's frames are at 1001/24 ms each less 0.06 ms, so a frame whose exact time ends in .5 to .55
-/// ms is stored a millisecond lower than its plain rounding, and a time a millisecond past it reads
-/// as the frame before. In ticks of `1/den` ns.
+/// DefaultDuration stands for, and `phase` the offset that puts every keyframe on a frame. In
+/// ticks of `1/den` ns.
 #[derive(Debug, Clone, Copy)]
 pub struct Grid<'a> {
     phase: i128,
@@ -72,10 +70,9 @@ impl Grid<'_> {
         let scale = i128::from(scale.max(1));
         let first = video.keyframes_ns.first().map_or(0, |&k| i128::from(k));
         // Each keyframe stored at `k` was at a time in [k - scale/2, k + scale/2). Or at k +
-        // scale/2, where the keyframes show the mux stores such a time either way: S;G 0's
-        // Valentine's special has every 24th frame exactly half a millisecond past one, stored at
-        // the later up to 21:43 and at the earlier after. Keyframes that fit a range of phases
-        // say nothing of that, and the frames are taken to be rounded half up, as mkvmerge does.
+        // scale/2, where the keyframes show the mux stores such a time either way. Keyframes that
+        // fit a range of phases say nothing of that, and the frames are taken to be rounded half
+        // up, as mkvmerge does.
         let (mut lo, mut hi) = (i128::MIN, i128::MAX);
         for &k in &video.keyframes_ns {
             let k = i128::from(k);
@@ -581,8 +578,8 @@ pub fn plan(fix: &TimingFix, track: &Track, grid: &Grid) -> Plan {
             }
             continue;
         };
-        // The frames the line starts and stops showing on once moved. A time moved before the
-        // frame at 0 is held at 0.
+        // The frames the line would start and stop showing on once moved, if a time moved before
+        // the frame at 0 were not held at 0.
         let [to_start, to_end] = [start, end].map(|x| grid.frame_of(x) - i128::from(s.frames));
         // Rounded to the track's precision, a time in a frame shorter than that may land in
         // another; one held at 0 stays there.
@@ -679,7 +676,8 @@ mod tests {
         // The cut at 18:11.924 is frame 26180; the sign starting at 18:11.95 shows from 26181.
         assert_eq!(grid.at(26_180), 1_091_924_000_000);
         assert_eq!(grid.frame_of(1_091_950_000_000), 26_181);
-        // Moved a frame, it lands 16 ms before the cut, and shows from the cut.
+        // Moved a frame, it lands at 18:11.908, 16 ms before the cut, written 18:11.91 at the
+        // centisecond, and shows from the cut.
         let moved = grid.moved(1_091_950_000_000, 1, CS);
         assert_eq!(ms_of(moved), 1_091_910);
         assert_eq!(grid.frame_of(moved), 26_180);
@@ -728,8 +726,8 @@ mod tests {
     }
 
     /// 23.976 fps less 1/24 ms, as S;G 0's Valentine's special is: every 24th frame from frame 5
-    /// is exactly half a millisecond past one, and stored a millisecond later up to 21:43 (frame
-    /// 173, at 7215.5 ms, at 7216) and earlier after (frame 32933, at 1373580.5 ms, at 1373580).
+    /// is exactly half a millisecond past one, and stored a millisecond later up to a point (frame
+    /// 173, at 7215.5 ms, at 7216) and earlier after it (frame 32933, at 1373580.5 ms, at 1373580).
     fn valentine() -> Video {
         Video::unjudged(41_708_333, vec![0, 7_216_000_000, 1_373_580_000_000])
     }
@@ -1333,8 +1331,7 @@ mod tests {
 
     #[test]
     fn a_drawing_moves_with_the_lines_it_overlaps_though_it_starts_before_their_stretch() {
-        // K-On!! E16's ED: a drawing starts 0.6 s before the first line of the stretch it
-        // overlaps, and must move with it.
+        // A drawing starts before the first line of the stretch it overlaps, and must move with it.
         let mut blocks = late();
         blocks.push(drawing(3, 5500, 7000));
         let p = plan(&late_from_two(), &track(&blocks), &grid());

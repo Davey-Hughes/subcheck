@@ -41,11 +41,11 @@ pub enum Outcome {
     /// Its events get the new text.
     Patched,
     /// Its per-letter karaoke rows get the new letters and are re-spaced: `px` wider (its first
-    /// row; narrower when negative), with the widths of the characters in `guessed` measured in no
-    /// row's style.
+    /// row; narrower when negative), with the widths of the characters in `guessed` unmeasured in
+    /// some row's style.
     Respaced { px: i64, guessed: String },
     /// A timing fix: this many events move by whole frames, and those in `cut` start at 0 because
-    /// the shift moves their start a frame or more before it.
+    /// the shift moves their start before the frame at 0.
     Shifted { events: usize, cut: Vec<LineRef> },
     /// Its events read the fix already.
     AlreadyApplied,
@@ -787,9 +787,9 @@ fn respace_row(
     Ok(())
 }
 
-/// Whether most letters of an event have override tags of their own: a sign set along a curve,
-/// each letter rotated and spaced for where it sits. A letter added or removed would move the ones
-/// after it out of their places.
+/// Whether an event has three letters or more and half or more of them have override tags of their
+/// own: a sign set along a curve, each letter rotated and spaced for where it sits. A letter added
+/// or removed would move the ones after it out of their places.
 fn per_letter(raw: &str, kind: Kind) -> bool {
     if kind == Kind::Srt {
         return false;
@@ -1799,7 +1799,7 @@ mod tests {
 
     #[test]
     fn a_sign_with_tags_on_every_letter_is_left_for_a_hand_fix() {
-        // As typeset along a curve: each letter rotated for its place (K-On!! S00E05's title).
+        // As typeset along a curve: each letter rotated for its place.
         let sign = r"{\org(0,900)\frz6}S{\frz5}o{\frz4}u{\frz3}v{\frz2}e{\frz1}r{\frz0}n";
         let blocks = [block(1000, 0, "Sign", sign)];
         let f = finding(1, "Sign", "Souvern", &[(0, 1000)]);

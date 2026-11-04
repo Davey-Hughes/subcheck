@@ -30,13 +30,14 @@ pub const RULES_VERSION: u32 = 2;
 const MIN_KEYFRAMES: usize = 10;
 
 /// Cues sparser than one per this many nanoseconds of the span they cover do not index every
-/// keyframe: x264's default puts one at least every 250 frames (10.4 s at 23.976 fps), and K-On's
-/// encodes one every 24-26 frames.
+/// keyframe: x264's default puts one at least every 250 frames (10.4 s at 23.976 fps), and the
+/// encodes seen put one far more often.
 const MAX_KEYFRAME_GAP_NS: u64 = 10_000_000_000;
 
 /// Cues denser than one per this many frames, on average, are not cuts. An index of every frame
-/// (all-intra video, or a mux with `--cues 0:all`) averages 1, or 2 when DefaultDuration is a field,
-/// and would put every time at offset 0. K-On's keyframes are 24-26 frames apart.
+/// (all-intra video, or a mux with `--cues 0:all`) averages 1, or 2 when DefaultDuration is a
+/// field, and would put every time at offset 0. The encodes seen put their keyframes several times
+/// this far apart.
 const MIN_KEYFRAME_GAP_FRAMES: u64 = 4;
 
 /// Fewer gaps between keyframes than this, and none is taken for a forced one: a spike in so few
@@ -66,22 +67,21 @@ pub const MAX_OFFSET: i64 = 3;
 pub const OFFSETS: usize = 7;
 
 /// A style with at least this many times is timed when its top two offsets hold at least
-/// TOP_TWO_PERCENT of them. E09: dialogue keeps 54-68% of its times in its top two offsets,
-/// karaoke and effects about 30% (flat over seven offsets is 29%).
+/// TOP_TWO_PERCENT of them. In the tracks seen, dialogue keeps more than that share there, karaoke
+/// and effects about as few as a flat spread over seven offsets would (29%).
 const MANY_TIMES: usize = 16;
 const TOP_TWO_PERCENT: usize = 45;
 /// A style with 2 to 15 times is timed when its top offset holds at least this share.
 const FEW_TOP_PERCENT: usize = 50;
 
 /// The timed styles' times are cut into windows this long, so a shift over part of a track shows:
-/// E16's dialogue has 108 times at +1 and 72 at 0 over a background of ~30, which no whole-track
-/// threshold tells from noise, and in 3-minute windows reads `+1 +1 ? 0 0 ? +1 +1`.
+/// over the whole track its times are split between two offsets, which a whole-track threshold
+/// may not tell from noise.
 const WINDOW_MS: i64 = 180_000;
 /// An offset decides a window when at least this many times sit there, and twice as many as at any
-/// other offset; with no window decided, the same goes for the whole track. On the 36 K-On
-/// episodes, dialogue windows hold 11-53 times at their offset, while an OP's lyrics, timed to the
-/// beat a few frames off the cuts, hold 4-8 (K-On! E01: 8 at +2, K-On!! E01: 4 at -3), and so does
-/// the ED closing K-On!! E17 (4 at -3). A bar of 4 let those decide a window, and print a fix.
+/// other offset; with no window decided, the same goes for the whole track. The dialogue windows
+/// seen hold more than this at their offset; the OP lyrics seen and one ED's, timed to the beat a
+/// few frames off the cuts, fewer: a bar they reach can let them decide a window, and print a fix.
 const MIN_AT_OFFSET: usize = 10;
 
 /// What the video says about frames.
@@ -452,7 +452,7 @@ fn whole(offset: i64) -> Verdict {
     }
 }
 
-/// The offset most of `counts` sit at, if it has at least MIN_AT_OFFSET and twice the runner-up.
+/// The top offset in `counts`, if it has at least MIN_AT_OFFSET and twice the runner-up.
 fn decided(counts: &[usize; OFFSETS]) -> Option<i64> {
     let (top, &n) = counts.iter().enumerate().max_by_key(|&(_, &n)| n)?;
     let runner_up = counts
@@ -1725,7 +1725,7 @@ mod tests {
             (30, &[29, 30], &[27, 28, 29, 30]),
             (24, &[23, 24, 24], &[21, 22, 23, 24]),
             // Every third forced keyframe skipped: the gaps from the last forced keyframe to the
-            // next cut reach 47 frames, far above the spike.
+            // next cut reach 45 frames, far above the spike.
             (26, &[24, 24, 48], &[23, 24, 25, 26]),
         ];
         for (first, then, forced) in cases {

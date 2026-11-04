@@ -387,8 +387,8 @@ mod tests {
         // Each side moves by half the h's width (14.83) rounded to 15: the row grows 30.
         assert!((r.growth - 30.0).abs() < 1e-9, "{}", r.growth);
         let x = xs(&r);
-        // From this one row: t 627, h 653, r 679. All 25 OP rows of the track give 628, 653, 678,
-        // which is where the E02 hand fix put them.
+        // With widths fit to this one row alone (a fit over more rows can place the letters
+        // differently): t 627, h 653, r 679.
         assert_eq!(&x[14..17], [627, 653, 679]);
         assert_eq!(x[0], 315 - 15);
         assert_eq!(x[55], 1609 + 15);

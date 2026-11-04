@@ -59,7 +59,8 @@ pub struct Summary {
 /// hook prints mkvmerge's warnings and lets the rest go.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// The files with fixes, in the order apply does them: once, after mkvmerge is found.
+    /// The files with fixes, in the order apply does them: once, when the run has fixes, after
+    /// mkvmerge is found where the mode needs it.
     Queued(Vec<String>),
     /// A file starts: before its `{path}` line.
     File(String),
@@ -164,10 +165,11 @@ pub fn backup_path(file: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Make `run`'s accepted fixes, as `mode` says, marking each one made (or found made) in `store`;
-/// `state` is the state directory. `karaoke`: re-space per-letter karaoke rows rather than leave
-/// them for a hand fix. Each step is told to `report` as it happens. A file swapped in keeps its
-/// checks: they move to the swapped file with its marks ([`Store::mark_applied`]).
+/// Make `run`'s accepted fixes, as `mode` says; the default mode marks each one made (or
+/// found made) in `store`. `state` is the state directory. `karaoke`: re-space per-letter
+/// karaoke rows rather than leave them for a hand fix. Each step is told to `report` as it
+/// happens. A file swapped in keeps its checks: they move to the swapped file with its
+/// marks ([`Store::mark_applied`]).
 #[allow(clippy::too_many_arguments)] // the command's flags, and the screen's hook
 #[allow(clippy::too_many_lines)] // each file's job, its summary, then its event, in order
 pub fn run(

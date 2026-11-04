@@ -38,8 +38,9 @@ const MS: i128 = 1_000_000;
 /// Why a track cannot be written out exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unwritable {
-    /// A line of a text track, this one or another, is not UTF-8: mkvmerge replaces those bytes
-    /// in any remux (with U+FFFD, mkvmerge 102), so the check refuses it whichever track is fixed.
+    /// A line of a text track, this one or another, is not UTF-8: every mkvmerge version checked
+    /// replaces those bytes in any remux (with U+FFFD), so the check refuses it whichever track
+    /// is fixed.
     NotUtf8 { track: usize },
     /// Its header is not UTF-8: the writer would replace those bytes (a remux alone keeps them).
     HeaderNotUtf8 { track: usize },
@@ -174,15 +175,14 @@ fn remainder(track: &patch::Track, blocks: &[Block], default: Option<i128>) -> O
 }
 
 /// Whether mkvmerge rewrites `track`'s lines that are not UTF-8 in a remux: any `S_TEXT` subtitle
-/// track (measured on mkvmerge 102 for ASS, SRT, WebVTT, ASCII and USF, each with the same
-/// warning).
+/// track (every `S_TEXT` codec checked is rewritten, each with the same warning).
 pub fn rewritten(track: &mkv::Track) -> bool {
     track.kind == mkv::TRACK_TYPE_SUBTITLE && track.codec.starts_with("S_TEXT/")
 }
 
 /// Whether a file's tracks, with their blocks, can be remuxed as they are: a line that is not
-/// UTF-8, in any [`rewritten`] one, comes back changed (any other is not looked at). Their headers
-/// come back as they are (mkvmerge 102).
+/// UTF-8, in any [`rewritten`] one, comes back changed (any other is not looked at). Every mkvmerge
+/// version checked gives their headers back as they are.
 pub fn remuxable<'a>(
     tracks: impl IntoIterator<Item = (&'a mkv::Track, &'a [Block])>,
 ) -> Result<(), Unwritable> {
@@ -315,7 +315,7 @@ mod tests {
             verdict(Kind::Srt, block(0, None), Some(2_000_000_000)),
             Ok(0)
         );
-        // A line of no length: a remux writes it a BlockDuration of 0 (mkvmerge 102).
+        // A line of no length: every mkvmerge version checked writes it a BlockDuration of 0.
         assert_eq!(verdict(Kind::Ass, block(1000, Some(0)), None), Ok(0));
     }
 

@@ -91,8 +91,9 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// The remux's TimestampScale, which [`args`] sets: mkvmerge's default (mkvmerge 102 remuxes a file
-/// at 100 µs to 1 ms without it), so that the plan can count on it. The check reads the remux's own.
+/// The remux's TimestampScale, which [`args`] sets: mkvmerge's default (every mkvmerge version
+/// checked remuxes a file at 100 µs to 1 ms without it), so that the plan can count on it. The
+/// check reads the remux's own.
 pub const SCALE: u64 = 1_000_000;
 
 /// A replaced track's properties, as mkvmerge options for its file's track 0; its language as
