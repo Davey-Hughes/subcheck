@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use jiff::Timestamp;
 
-use super::model::{Confirm, Entry, EntryKey, FileNote, Mark, Pane, Review, UndoStep};
+use super::model::{Confirm, Edit, Entry, EntryKey, FileNote, Mark, Pane, Review, UndoStep};
 use super::progress::{Scan, Stage};
 use crate::apply;
 use crate::list::{self, Filter, label};
@@ -109,7 +109,7 @@ pub enum Action {
     Undo,
     /// Start rewording the selected entry: the UI opens its editor on [`Review::edit_wording`].
     Edit,
-    /// Accept the edited entry with this wording.
+    /// Accept the edit's findings ([`Edit::findings`]) with this wording.
     Reword(String),
     CancelEdit,
     ShowPane(Pane),
@@ -292,12 +292,14 @@ fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
         Action::PreviousFile => previous_file(m),
         Action::Accept => {
             if let Some(entry) = m.selected_entry() {
-                return decide(m, entry, State::Accepted, None, now);
+                let findings = m.to_decide(entry);
+                return decide(m, entry, findings, State::Accepted, None, now);
             }
         }
         Action::Reject => {
             if let Some(entry) = m.selected_entry() {
-                return decide(m, entry, State::Rejected, None, now);
+                let findings = m.to_decide(entry);
+                return decide(m, entry, findings, State::Rejected, None, now);
             }
         }
         Action::Clear => {
@@ -377,33 +379,32 @@ fn open_editor(m: &mut Review) {
         m.status = Some("a timing fix is accepted or rejected, not edited".into());
         return;
     }
-    m.editing = Some(m.entry_key(entry));
+    m.editing = Some(Edit {
+        entry: m.entry_key(entry),
+        findings: targets.iter().map(|&i| m.finding(i).id).collect(),
+    });
 }
 
-/// The edit's end: its entry accepted with `text`, or plainly when that is the suggestion. Empty
-/// text is refused, and the edit goes on; an entry no longer found, or a row the filter no longer
-/// shows, ends it, deciding nothing.
+/// The edit's end: its findings accepted with `text`, or plainly when that is the suggestion,
+/// wherever the filter shows them now. Empty text is refused, and the edit goes on.
 fn reword(m: &mut Review, text: &str, now: Timestamp) -> Vec<Effect> {
-    let Some(key) = m.editing.take() else {
-        return Vec::new();
-    };
-    if text.trim().is_empty() {
-        m.status = Some("the wording cannot be empty (Esc cancels)".into());
-        m.editing = Some(key);
+    if m.editing.is_none() {
         return Vec::new();
     }
-    // `refresh` ends an edit whose finding went, but a row is found by any of its findings, so
-    // one the filter hid while the editor was open (a re-check's finding taking the row's
-    // decision) has nothing to decide. Any other entry would be a guess: nothing is decided.
-    let found = m
-        .resolve(&key)
-        .and_then(|entry| Some((entry, *m.to_decide(entry).first()?)));
-    let Some((entry, first)) = found else {
-        m.status = Some("that finding changed; nothing was decided".into());
+    if text.trim().is_empty() {
+        m.status = Some("the wording cannot be empty (Esc cancels)".into());
+        return Vec::new();
+    }
+    let target = m.edit_target();
+    m.editing = None;
+    // `refresh` keeps an edit's findings in step with the rows and ends one left with none, so
+    // only a UI that set `editing` itself finds nothing here.
+    let Some((entry, findings)) = target else {
+        m.status = Some("the edit is out of date; nothing was decided".into());
         return Vec::new();
     };
-    let reworded = text != m.finding(first).suggestion;
-    decide(m, entry, State::Accepted, reworded.then_some(text), now)
+    let edited = (text != m.finding(findings[0]).suggestion).then_some(text);
+    decide(m, entry, findings, State::Accepted, edited, now)
 }
 
 /// Decisions putting each of `findings` at `state` with that wording, but those that already are;
@@ -434,15 +435,17 @@ fn changes(
     (before, decisions)
 }
 
-/// `a` `r` `e`: the findings `entry` decides ([`Review::to_decide`]) at `state`, with that wording.
+/// `a` `r` `e` on `entry`: `findings` at `state`, with that wording. For `a` and `r` they are what
+/// the entry decides ([`Review::to_decide`]), for `e` the edit's.
 fn decide(
     m: &mut Review,
     entry: Entry,
+    findings: Vec<usize>,
     state: State,
     edited: Option<&str>,
     now: Timestamp,
 ) -> Vec<Effect> {
-    let (before, decisions) = changes(m, m.to_decide(entry), state, edited, now);
+    let (before, decisions) = changes(m, findings, state, edited, now);
     if decisions.is_empty() {
         m.status = Some(format!("already {}", label(state)));
         return Vec::new();
@@ -546,7 +549,8 @@ fn written(
                 } else {
                     String::new()
                 };
-                // The members a row's key left alone, decided the other way on their own.
+                // The members a row's key left alone, decided the other way on their own (or, for
+                // an edit, joined the row after it opened).
                 let kept: Vec<State> = m
                     .targets(entry)
                     .into_iter()

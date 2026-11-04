@@ -225,8 +225,9 @@ pub fn update(m: &mut Review, s: &mut Screen, msg: Msg, now: Timestamp) -> Vec<E
             Vec::new()
         }
     };
-    // The editor shows while the review edits an entry: it opens on the entry's wording, the cursor
-    // at its end, and closes when the edit ends, however it ended (a refresh can end it).
+    // The editor shows while the review edits an entry: it opens on the edit's wording
+    // (`Review::edit_wording`), the cursor at its end, and closes when the edit ends, however it
+    // ended (a refresh can end it).
     match (m.editing.is_some(), s.editor.is_some()) {
         (true, false) => {
             s.editor = m.edit_wording().map(|text| Editor {
@@ -590,6 +591,29 @@ pub(crate) mod tests {
         assert!(s.editor.is_none());
     }
 
+    /// E02 as a re-check reads it back: its record, and `findings`.
+    fn e02(findings: Vec<crate::store::Finding>) -> Input {
+        Input::ReadBack {
+            path: path(2),
+            view: Ok(Run {
+                files: vec![tests_support::file(2)],
+                findings,
+                ..Run::default()
+            }),
+        }
+    }
+
+    /// E02's snacks line, as finding `id`.
+    fn snacks(id: u64) -> crate::store::Finding {
+        finding(
+            id,
+            2,
+            "Let's have snacks together everyday.",
+            "Let's have snacks together every day.",
+            894_190,
+        )
+    }
+
     #[test]
     fn a_refresh_keeps_the_editor_on_its_finding_and_closes_it_when_the_finding_went() {
         let mut m = sample();
@@ -598,23 +622,8 @@ pub(crate) mod tests {
         press(&mut m, &mut s, 'e');
         press(&mut m, &mut s, '!');
         // E02 checked again: its snacks line comes back as finding 9, and the edit goes on.
-        let snacks = finding(
-            9,
-            2,
-            "Let's have snacks together everyday.",
-            "Let's have snacks together every day.",
-            894_190,
-        );
-        let e02 = |findings| Input::ReadBack {
-            path: path(2),
-            view: Ok(Run {
-                files: vec![tests_support::file(2)],
-                findings,
-                ..Run::default()
-            }),
-        };
         let lyric = finding(2, 2, TYPO, FIXED, 165_060);
-        send(&mut m, &mut s, e02(vec![lyric.clone(), snacks]), now());
+        send(&mut m, &mut s, e02(vec![lyric.clone(), snacks(9)]), now());
         assert_eq!(
             s.editor.as_ref().map(|e| e.text.as_str()),
             Some("Let's have snacks together every day.!")
@@ -629,40 +638,155 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn enter_on_an_edit_whose_row_left_the_list_ends_it_and_decides_nothing() {
+    fn a_row_edit_decides_only_its_finding_once_a_recheck_decides_the_rest_of_its_row() {
+        let mut m = sample();
+        let mut s = Screen::default();
+        // E01's and E03's lyric accepted as written: `e` on the lyric row edits E02's 2.
+        decide_as(&mut m, &[1, 4], State::Accepted, None);
+        press(&mut m, &mut s, 'e');
+        press(&mut m, &mut s, '!');
+        // E02 checked again: 2 comes back as 9, which takes the row's decision, so no member of
+        // the row is pending.
+        let back = e02(vec![finding(9, 2, TYPO, FIXED, 165_060), snacks(3)]);
+        let effects = send(&mut m, &mut s, back, now());
+        send(&mut m, &mut s, taken(effects), now());
+        let reworded = format!("{FIXED}!");
+        assert_eq!(
+            decided(&key(&mut m, &mut s, KeyCode::Enter)),
+            [(9, State::Accepted, Some(reworded.as_str()))]
+        );
+    }
+
+    #[test]
+    fn a_row_edit_ends_when_its_finding_went_though_the_row_stays() {
+        let mut m = sample();
+        let mut s = Screen::default();
+        decide_as(&mut m, &[1, 4], State::Accepted, None);
+        press(&mut m, &mut s, 'e');
+        // E02 checked again without its lyric: E01's and E03's keep the row in the list.
+        send(&mut m, &mut s, e02(vec![snacks(3)]), now());
+        assert_eq!(m.entries(), [Entry::Row(0), Entry::Row(1)]);
+        assert_eq!((&m.editing, &s.editor), (&None, &None));
+        assert_eq!(
+            m.status.as_deref(),
+            Some("E02 was checked again; its finding changed")
+        );
+    }
+
+    #[test]
+    fn a_row_edit_leaves_out_a_finding_that_went_and_decides_the_rest() {
+        let mut m = sample();
+        let mut s = Screen::default();
+        // The lyric row pending in E01, E02 and E03: `e` edits all three.
+        press(&mut m, &mut s, 'e');
+        press(&mut m, &mut s, '!');
+        // E02 checked again without its lyric: the edit goes on with E01's and E03's.
+        send(&mut m, &mut s, e02(vec![snacks(3)]), now());
+        assert_eq!(
+            m.editing.as_ref().map(|e| e.findings.as_slice()),
+            Some(&[1, 4][..])
+        );
+        assert!(s.editor.is_some());
+        let reworded = format!("{FIXED}!");
+        assert_eq!(
+            decided(&key(&mut m, &mut s, KeyCode::Enter)),
+            [
+                (1, State::Accepted, Some(reworded.as_str())),
+                (4, State::Accepted, Some(reworded.as_str()))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_row_edit_leaves_a_member_that_joined_while_it_was_open_pending() {
+        let mut m = scanning();
+        let mut s = Screen::default();
+        press(&mut m, &mut s, 'e');
+        press(&mut m, &mut s, '!');
+        // The scan saves E04, whose lyric joins the row, pending like the rest.
+        let joined = saved(&m, 4, vec![finding(30, 4, TYPO, FIXED, 165_060)]);
+        assert_eq!(send(&mut m, &mut s, joined, now()), []);
+        let effects = key(&mut m, &mut s, KeyCode::Enter);
+        let reworded = format!("{FIXED}!");
+        assert_eq!(
+            decided(&effects),
+            [1, 2, 4].map(|id| (id, State::Accepted, Some(reworded.as_str())))
+        );
+        send(&mut m, &mut s, taken(effects), now());
+        assert_eq!(
+            m.status.as_deref(),
+            Some("accepted 3 findings, 1 kept as pending")
+        );
+    }
+
+    #[test]
+    fn a_row_edit_decides_its_finding_once_a_recheck_takes_the_row_out_of_the_list() {
         let mut m = sample();
         let mut s = Screen::default();
         // Under Pending, the lyric row shows for E02's finding 2 alone.
         decide_as(&mut m, &[1, 4], State::Accepted, None);
         m.filter = Filter::Only(State::Pending);
         press(&mut m, &mut s, 'e');
-        // E02 checked again while the editor is open: its lyric comes back as finding 9, which
-        // takes the row's decision, so the filter shows none of the row's members.
-        let snacks = finding(
-            3,
-            2,
-            "Let's have snacks together everyday.",
-            "Let's have snacks together every day.",
-            894_190,
-        );
-        let view = Run {
-            files: vec![tests_support::file(2)],
-            findings: vec![finding(9, 2, TYPO, FIXED, 165_060), snacks],
-            ..Run::default()
-        };
-        let back = Input::ReadBack {
-            path: path(2),
-            view: Ok(view),
-        };
+        press(&mut m, &mut s, '!');
+        // E02 checked again while the editor is open: 2 comes back as 9, which takes the row's
+        // decision, so the filter shows none of the row's members.
+        let back = e02(vec![finding(9, 2, TYPO, FIXED, 165_060), snacks(3)]);
         let effects = send(&mut m, &mut s, back, now());
         send(&mut m, &mut s, taken(effects), now());
         assert_eq!(m.entries(), [Entry::Row(1)]);
-        assert!(s.editor.is_some());
-        assert_eq!(key(&mut m, &mut s, KeyCode::Enter), []);
-        assert_eq!((&m.editing, &s.editor), (&None, &None));
+        let reworded = format!("{FIXED}!");
         assert_eq!(
-            m.status.as_deref(),
-            Some("that finding changed; nothing was decided")
+            decided(&key(&mut m, &mut s, KeyCode::Enter)),
+            [(9, State::Accepted, Some(reworded.as_str()))]
+        );
+        assert_eq!((&m.editing, &s.editor), (&None, &None));
+    }
+
+    #[test]
+    fn a_row_edit_decides_every_new_finding_of_its_findings_carry_key() {
+        let mut m = sample();
+        let mut s = Screen::default();
+        // E02 sings the lyric twice: 2 and 7 have one carry key.
+        let lyric = |id, ms| finding(id, 2, TYPO, FIXED, ms);
+        let twice = e02(vec![lyric(2, 165_060), lyric(7, 200_000), snacks(3)]);
+        send(&mut m, &mut s, twice, now());
+        decide_as(&mut m, &[1, 4], State::Accepted, None);
+        press(&mut m, &mut s, 'e');
+        press(&mut m, &mut s, '!');
+        // Checked again, both come back with new IDs, each the replacement of both.
+        let back = e02(vec![lyric(9, 165_060), lyric(10, 200_000), snacks(3)]);
+        let effects = send(&mut m, &mut s, back, now());
+        send(&mut m, &mut s, taken(effects), now());
+        let reworded = format!("{FIXED}!");
+        assert_eq!(
+            decided(&key(&mut m, &mut s, KeyCode::Enter)),
+            [
+                (9, State::Accepted, Some(reworded.as_str())),
+                (10, State::Accepted, Some(reworded.as_str()))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_member_edit_decides_its_findings_replacement_once_a_recheck_hides_it() {
+        let mut m = sample();
+        let mut s = Screen::default();
+        // Under Pending, the lyric row expanded shows E02's finding 2 as its one member.
+        decide_as(&mut m, &[1, 4], State::Accepted, None);
+        m.filter = Filter::Only(State::Pending);
+        m.expanded.insert(0);
+        m.selected = 1;
+        assert_eq!(m.selected_entry(), Some(Entry::Member(0, 1)));
+        press(&mut m, &mut s, 'e');
+        press(&mut m, &mut s, '!');
+        let back = e02(vec![finding(9, 2, TYPO, FIXED, 165_060), snacks(3)]);
+        let effects = send(&mut m, &mut s, back, now());
+        send(&mut m, &mut s, taken(effects), now());
+        assert_eq!(m.entries(), [Entry::Row(1)]);
+        let reworded = format!("{FIXED}!");
+        assert_eq!(
+            decided(&key(&mut m, &mut s, KeyCode::Enter)),
+            [(9, State::Accepted, Some(reworded.as_str()))]
         );
     }
 

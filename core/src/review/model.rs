@@ -151,6 +151,17 @@ pub enum EntryKey {
     Member(u64),
 }
 
+/// An edit under way ([`Review::editing`]): the entry it was opened on, and what it decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edit {
+    pub entry: EntryKey,
+    /// The findings `to_decide` gave the entry when the edit opened, or those a re-check put in
+    /// their place ([`Review::refresh`]), by ID. The edit decides these and no others: a re-check
+    /// can add members to the row or decide the others by inheritance while the editor is open,
+    /// and the text was written for these.
+    pub findings: Vec<u64>,
+}
+
 /// Review's state, whatever UI shows it: the run's findings in rows, the list as shown and its
 /// selection, what is under way, and what the status line says.
 pub struct Review {
@@ -162,9 +173,8 @@ pub struct Review {
     pub filter: Filter,
     /// Index into `entries()`.
     pub selected: usize,
-    /// The entry being reworded, from `Edit` until the edit ends. The UI holds the text, which
-    /// `Reword` brings.
-    pub editing: Option<EntryKey>,
+    /// The edit under way, from `Edit` to its end. The UI holds the text, which `Reword` brings.
+    pub editing: Option<Edit>,
     /// Decisions made in this session, oldest first.
     pub undo: Vec<UndoStep>,
     /// Files with findings that are not as they were scanned, by path.
@@ -246,12 +256,13 @@ impl Review {
 
     /// Take file `path` as the store shows it now (`view`, from `Store::file_view`): its record,
     /// findings, decisions and applied marks replace those the run had, and the rows are made
-    /// again. What pointed at a finding that went (the selection, the entry being edited, an
-    /// expanded row, the undo steps) moves to the new finding of its carry key, as a key does
-    /// ([`Review::resolve`]). Failing that, the selection goes to the nearest entry still shown,
-    /// the edit ends and the status line says why, and the rest let go of it; on a list that
-    /// was empty, the selection goes to the first row with a pending finding, as on opening. Where
-    /// it was is kept in `kept_from`, for a screen to keep it on its line. Returns the new
+    /// again. What pointed at a finding that went (the selection, the edit's findings, an expanded
+    /// row, the undo steps) moves to the new finding of its carry key, as a key does
+    /// ([`Review::resolve`]); the edit's findings and the undo steps' move to every new finding
+    /// of it. Failing that, the selection goes to the nearest entry still shown, an edit left with
+    /// none of its findings ends and the status line says why, and the rest let go of it; on a list
+    /// that was empty, the selection goes to the first row with a pending finding, as on opening.
+    /// Where it was is kept in `kept_from`, for a screen to keep it on its line. Returns the new
     /// findings' indexes.
     #[allow(clippy::too_many_lines)] // the swap, then each thing that pointed at the file, in order
     pub fn refresh(&mut self, path: &str, view: Run) -> Vec<usize> {
@@ -340,23 +351,36 @@ impl Review {
             .filter_map(|h| self.find(h, &now_at))
             .map(Entry::row)
             .collect();
-        match self.editing.take().map(|key| self.find(&key, &now_at)) {
-            Some(Some(e)) => self.editing = Some(self.entry_key(e)),
-            Some(None) => {
-                self.status = Some(format!(
-                    "{} was checked again; its finding changed",
-                    self.label(path)
-                ));
+        // A decision on a finding that went goes to every new finding of its carry key, as the
+        // store's write does (`Decided::Followed`), or nowhere when there is none.
+        let carry = |id: u64| moved.get(&id).cloned().unwrap_or_else(|| vec![id]);
+        if let Some(edit) = self.editing.take() {
+            let mut seen = HashSet::new();
+            let findings: Vec<u64> = edit
+                .findings
+                .iter()
+                .flat_map(|&id| carry(id))
+                .filter(|&id| seen.insert(id))
+                .collect();
+            match self.find(&edit.entry, &now_at) {
+                Some(e) if !findings.is_empty() => {
+                    self.editing = Some(Edit {
+                        entry: self.entry_key(e),
+                        findings,
+                    });
+                }
+                _ => {
+                    self.status = Some(format!(
+                        "{} was checked again; its finding changed",
+                        self.label(path)
+                    ));
+                }
             }
-            None => {}
         }
         for step in &mut self.undo {
             *step = std::mem::take(step)
                 .into_iter()
-                .flat_map(|(id, prior)| match moved.get(&id) {
-                    Some(to) => to.iter().map(|&n| (n, prior.clone())).collect(),
-                    None => vec![(id, prior)],
-                })
+                .flat_map(|(id, prior)| carry(id).into_iter().map(move |n| (n, prior.clone())))
                 .collect();
         }
         self.undo.retain(|step| !step.is_empty());
@@ -455,12 +479,27 @@ impl Review {
         }
     }
 
-    /// The wording an edit starts from: the edited entry's, as [`Review::wording`] gives it for
-    /// the first finding a decision on it takes; `None` with no edit, or when its entry is gone.
+    /// The edit's entry and its findings' indexes, as the rows are now; `None` with no edit, or
+    /// when its entry or one of its findings is gone. `refresh` keeps an edit's findings in step
+    /// with the rows, so one missing here is an edit it did not make: nothing of it is decided.
+    pub fn edit_target(&self) -> Option<(Entry, Vec<usize>)> {
+        let edit = self.editing.as_ref()?;
+        let findings: Vec<usize> = edit
+            .findings
+            .iter()
+            .map(|&id| self.index_of(id))
+            .collect::<Option<_>>()?;
+        if findings.is_empty() {
+            return None;
+        }
+        Some((self.resolve(&edit.entry)?, findings))
+    }
+
+    /// The wording an edit starts from: its first finding's, as [`Review::wording`] gives it;
+    /// `None` with no edit, or when what it edits is gone ([`Review::edit_target`]).
     pub fn edit_wording(&self) -> Option<&str> {
-        let entry = self.resolve(self.editing.as_ref()?)?;
-        let first = *self.to_decide(entry).first()?;
-        Some(self.wording(first))
+        let (_, findings) = self.edit_target()?;
+        Some(self.wording(findings[0]))
     }
 
     /// The selected entry's key; `None` with nothing selected.
@@ -1371,6 +1410,22 @@ mod tests {
     const FIXED: &str = "The beat gets through to our mind";
 
     #[test]
+    fn an_edits_target_is_all_its_findings_or_nothing() {
+        let mut m = tests_support::sample();
+        let entry = m.entry_key(Entry::Row(0));
+        m.editing = Some(Edit {
+            entry: entry.clone(),
+            findings: vec![1, 4],
+        });
+        assert_eq!(m.edit_target(), Some((Entry::Row(0), vec![0, 3])));
+        m.editing = Some(Edit {
+            entry,
+            findings: vec![1, 99, 4],
+        });
+        assert_eq!(m.edit_target(), None);
+    }
+
+    #[test]
     fn a_file_read_back_swaps_its_findings_and_what_pointed_at_one_that_went_moves_to_its_match() {
         use tests_support::{file, finding, path};
         let mut m = tests_support::sample();
@@ -1381,7 +1436,10 @@ mod tests {
         m.selected = 2;
         assert_eq!(m.selected_entry(), Some(Entry::Member(0, 1)));
         let clicked = m.entry_key(Entry::Member(0, 1));
-        m.editing = Some(m.entry_key(Entry::Row(1)));
+        m.editing = Some(Edit {
+            entry: m.entry_key(Entry::Row(1)),
+            findings: vec![3],
+        });
         m.undo = vec![vec![(2, None), (3, None)]];
         m.notes.insert(path(2), FileNote::Changed);
         // E02 checked again: the lyric comes back as 5, the snacks line does not, and a new line
