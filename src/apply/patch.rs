@@ -40,10 +40,9 @@ pub fn fixes(run: &Run) -> Vec<Fix<'_>> {
 pub enum Outcome {
     /// Its events get the new text.
     Patched,
-    /// Its per-letter karaoke rows get the new letters and are re-spaced: `px` wider (its first
-    /// row; narrower when negative), with the widths of the characters in `guessed` unmeasured in
-    /// some row's style.
-    Respaced { px: i64, guessed: String },
+    /// Its per-letter karaoke rows get the new letters and are re-spaced, each by widths of its own
+    /// track's style: one entry per row, never none.
+    Respaced { rows: Vec<RespacedRow> },
     /// A timing fix: this many events move by whole frames, and those in `cut` start at 0 because
     /// the shift moves their start before the frame at 0.
     Shifted { events: usize, cut: Vec<LineRef> },
@@ -125,6 +124,22 @@ pub struct KaraokeRow {
     pub moved: usize,
 }
 
+/// One karaoke row a fix re-spaced, told row by row: the rows of one fix can be in tracks whose
+/// styles measure different widths, so each grows by its own and guesses letters of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RespacedRow {
+    /// mkvmerge ID.
+    pub track: usize,
+    /// The start of the occurrence it is in, as the scan found it: the report tells every time as
+    /// the scan found it, and in a track remuxed with its timing fix the file has the row a shift
+    /// away.
+    pub start_ms: i64,
+    /// How much wider it is, in whole pixels; narrower when negative.
+    pub px: i64,
+    /// The characters its style never shows, whose widths are guesses, in char order.
+    pub guessed: String,
+}
+
 /// What applying a file's fixes comes to.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Plan {
@@ -199,8 +214,8 @@ struct Change {
     /// karaoke row it re-spaces.
     owned: BTreeSet<(usize, usize)>,
     rows: Vec<KaraokeRow>,
-    /// A karaoke fix's growth in pixels (its first row's), and every row's guessed characters.
-    karaoke: Option<(i64, BTreeSet<char>)>,
+    /// A karaoke fix's rows, as its outcome tells them; empty for any other fix.
+    karaoke: Vec<RespacedRow>,
 }
 
 /// What every fix of a file reads.
@@ -244,13 +259,13 @@ pub fn plan(tracks: &[Track], fixes: &[Fix], karaoke: bool) -> Plan {
         let (outcome, change) = match cx.one(fix) {
             Ok(c) if c.owned.is_empty() => (Outcome::AlreadyApplied, c),
             Ok(mut c) => {
-                let outcome =
-                    c.karaoke
-                        .take()
-                        .map_or(Outcome::Patched, |(px, guessed)| Outcome::Respaced {
-                            px,
-                            guessed: guessed.into_iter().collect(),
-                        });
+                let outcome = if c.karaoke.is_empty() {
+                    Outcome::Patched
+                } else {
+                    Outcome::Respaced {
+                        rows: std::mem::take(&mut c.karaoke),
+                    }
+                };
                 (outcome, c)
             }
             Err(outcome) => (outcome, Change::default()),
@@ -355,7 +370,15 @@ impl Context<'_> {
                             fit_style(track, events, style, size, align)
                         });
                     let row = (&letters[..], f.original.as_str());
-                    respace_row(track, row, &fix.text, widths, align, &mut change)?;
+                    respace_row(
+                        track,
+                        row,
+                        o.start_ms,
+                        &fix.text,
+                        widths,
+                        align,
+                        &mut change,
+                    )?;
                 }
                 // Worked out in full first: the hint is given only where --karaoke would do it.
                 if !self.karaoke {
@@ -678,10 +701,12 @@ impl Precision {
 }
 
 /// The edits that change one karaoke row to `fixed`, re-spaced. `row` is its letters as
-/// [`read_row`] reads them, and the line they were found reading.
+/// [`read_row`] reads them, and the line they were found reading; `start_ms` is the line's start
+/// as the scan found it.
 fn respace_row(
     track: &Track,
     (letters, original): (&[Read], &str),
+    start_ms: i64,
     fixed: &str,
     widths: &Widths,
     align: Align,
@@ -782,8 +807,12 @@ fn respace_row(
     });
     #[allow(clippy::cast_possible_truncation)] // a row's growth in pixels
     let px = respaced.growth.round() as i64;
-    let (_, guessed) = change.karaoke.get_or_insert_with(|| (px, BTreeSet::new()));
-    guessed.extend(&respaced.guessed);
+    change.karaoke.push(RespacedRow {
+        track: track.id,
+        start_ms,
+        px,
+        guessed: respaced.guessed.iter().collect(),
+    });
     Ok(())
 }
 
@@ -1096,6 +1125,23 @@ mod tests {
             block(2000, 0, "D", "teh end"),
         ]);
         assert_eq!(p.edits[&0].changed.keys().collect::<Vec<_>>(), [&1]);
+        // A karaoke row found there is told at the scan's time, as the fix's own line is.
+        let song = finding(2, "OP", "go trough", &[(0, 2040)]);
+        let letters = row(2000, 0, "OP", "", "go trough");
+        let t = Track {
+            timing: Timing::Moved(Shifts::new(&shift, grid, Kind::Ass)),
+            ..track(0, &letters)
+        };
+        let karaoke_fix = Fix {
+            finding: &song,
+            text: "go through".into(),
+        };
+        let p = plan(&[t], &[karaoke_fix], true);
+        let told = RespacedRow {
+            start_ms: 2040,
+            ..grown(0, 20, "")
+        };
+        assert_eq!(p.outcomes, [(2, Outcome::Respaced { rows: vec![told] })]);
         // A track whose timing fix reads as neither in nor to do: a line it moves could be at
         // either time, and is left for a hand fix.
         let blocks = [block(2040, 0, "D", "teh end")];
@@ -1229,6 +1275,16 @@ mod tests {
         vec![(1, Outcome::ByHand(why.into()))]
     }
 
+    /// A row of [`plan_one`]'s fix in `track`, `px` wider, the widths of `guessed` guessed.
+    fn grown(track: usize, px: i64, guessed: &str) -> RespacedRow {
+        RespacedRow {
+            track,
+            start_ms: 5000,
+            px,
+            guessed: guessed.into(),
+        }
+    }
+
     #[test]
     fn per_letter_karaoke_is_left_for_a_hand_fix_without_the_flag() {
         let letters = row(5000, 0, "OP", "", "go trough");
@@ -1261,8 +1317,7 @@ mod tests {
             [(
                 1,
                 Outcome::Respaced {
-                    px: 20,
-                    guessed: String::new()
+                    rows: vec![grown(2, 20, ""), grown(3, 20, ""), grown(3, 20, "")]
                 }
             )]
         );
@@ -1314,8 +1369,7 @@ mod tests {
                 [(
                     1,
                     Outcome::Respaced {
-                        px: -20,
-                        guessed: String::new()
+                        rows: vec![grown(0, -20, "")]
                     }
                 )]
             );
@@ -1342,8 +1396,7 @@ mod tests {
             [(
                 1,
                 Outcome::Respaced {
-                    px: 0,
-                    guessed: "q".into()
+                    rows: vec![grown(0, 0, "q")]
                 }
             )]
         );
@@ -1463,8 +1516,7 @@ mod tests {
             [(
                 1,
                 Outcome::Respaced {
-                    px: 20,
-                    guessed: String::new()
+                    rows: vec![grown(0, 20, "")]
                 }
             )]
         );
@@ -1496,8 +1548,7 @@ mod tests {
             [(
                 1,
                 Outcome::Respaced {
-                    px: 26,
-                    guessed: String::new()
+                    rows: vec![grown(0, 26, "")]
                 }
             )]
         );
@@ -1587,8 +1638,7 @@ mod tests {
             [(
                 1,
                 Outcome::Respaced {
-                    px: 20,
-                    guessed: String::new()
+                    rows: vec![grown(0, 20, "")]
                 }
             )]
         );
@@ -1596,10 +1646,22 @@ mod tests {
 
     #[test]
     fn a_width_guessed_in_any_row_of_the_fix_is_said() {
-        // Track 2's style shows an h elsewhere; track 3's never does, so its h is a guess.
+        // Track 2's style shows an h elsewhere; track 3's never does, so its h is a guess. Track 3
+        // spaces its letters wider, so its row grows by widths of its own.
         let mut full = row(5000, 0, "OP", "", "go troug");
         full.extend(row(9000, 0, "OP", "", "ha ha"));
-        let signs = row(5000, 0, "OP", "", "go troug");
+        let signs: Vec<Block> = row(5000, 0, "OP", "", "go troug")
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut b)| {
+                let p = String::from_utf8(b.payload).unwrap();
+                let x = 200 + 25 * i;
+                b.payload = p
+                    .replace(&format!("({},40)", 200 + 20 * i), &format!("({x},40)"))
+                    .into_bytes();
+                b
+            })
+            .collect();
         let p = plan_one(
             &[track(2, &full), track(3, &signs)],
             "OP",
@@ -1612,8 +1674,7 @@ mod tests {
             [(
                 1,
                 Outcome::Respaced {
-                    px: 20,
-                    guessed: "h".into()
+                    rows: vec![grown(2, 20, ""), grown(3, 26, "h")]
                 }
             )]
         );
@@ -1638,8 +1699,7 @@ mod tests {
         let respaced = [(
             1,
             Outcome::Respaced {
-                px: 20,
-                guessed: String::new(),
+                rows: vec![grown(0, 20, "")],
             },
         )];
         // Another row at twice the width, as its \fscx says: the fit leaves it out.

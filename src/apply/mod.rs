@@ -824,8 +824,8 @@ impl Job<'_> {
         }
     }
 
-    /// One line per fix: when, what changes, and what came of it. A dry run adds each patched
-    /// event's text before and after.
+    /// One line per fix: when, what changes, and what came of it. A karaoke fix of several rows
+    /// adds a line for each row. A dry run adds each patched event's text before and after.
     fn report(
         &self,
         plan: &patch::Plan,
@@ -840,6 +840,18 @@ impl Job<'_> {
             let (a, b) = changed(&f.original, &fix.text);
             let what = format!("{} → {}", &f.original[a], &fix.text[b]);
             writeln!(out, "  {}  {what}  {}", timestamp(when), status(outcome))?;
+            // One row's growth and guesses are in its status.
+            if let Outcome::Respaced { rows } = outcome
+                && rows.len() > 1
+            {
+                for r in rows {
+                    let view = views
+                        .iter()
+                        .find(|v| v.id == r.track)
+                        .expect("a re-spaced track was read");
+                    writeln!(out, "    {}", row_respaced(view.kind, r))?;
+                }
+            }
         }
         for (f, (_, outcome)) in self.timing.iter().zip(shifts) {
             let fix = timing_fix(f);
@@ -1264,22 +1276,47 @@ fn letter_counts(r: &patch::KaraokeRow) -> String {
     said.join(", ")
 }
 
-/// A karaoke fix's status: how much its rows grew, and which widths were guesses.
-fn respaced(px: i64, guessed: &str) -> String {
-    let guess = if guessed.is_empty() {
-        String::new()
-    } else {
-        let quoted: Vec<String> = guessed.chars().map(|c| format!("\"{c}\"")).collect();
-        format!(" (no {} in this style to measure)", quoted.join(", "))
+/// A karaoke fix's status: for one row, how much it grew and which widths were guesses. Rows of
+/// one fix in two tracks can grow by different widths and guess different letters, so a fix of
+/// several says only how many, and each row is said under it ([`row_respaced`]).
+fn respaced(rows: &[patch::RespacedRow]) -> String {
+    match rows {
+        [one] => format!("karaoke {}: check it (review, o)", growth_said(one)),
+        many => format!(
+            "karaoke re-spaced in {} rows: check it (review, o)",
+            many.len()
+        ),
+    }
+}
+
+/// One row of a karaoke fix of several, as the report says it under the fix: where the row is, to
+/// find it, and its own growth and guesses.
+fn row_respaced(kind: Kind, r: &patch::RespacedRow) -> String {
+    format!(
+        "track {} at {}: {}",
+        r.track,
+        time(kind, r.start_ms),
+        growth_said(r)
+    )
+}
+
+/// How much a row grew and which of its widths were guesses, one wording for a fix's status and
+/// for each row under it, so the two read alike.
+fn growth_said(r: &patch::RespacedRow) -> String {
+    let quoted: Vec<String> = r.guessed.chars().map(|c| format!("\"{c}\"")).collect();
+    let guess = match quoted.as_slice() {
+        [] => String::new(),
+        [one] => format!(" (width of {one} guessed)"),
+        many => format!(" (widths of {} guessed)", many.join(", ")),
     };
-    format!("karaoke re-spaced by {px:+} px{guess}: check it (review, o)")
+    format!("re-spaced by {:+} px{guess}", r.px)
 }
 
 /// What a fix came to, as its line ends.
 fn status(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Patched => "ok".to_string(),
-        Outcome::Respaced { px, guessed } => respaced(*px, guessed),
+        Outcome::Respaced { rows } => respaced(rows),
         Outcome::Shifted { events: 1, .. } => "ok (1 event moved)".into(),
         Outcome::Shifted { events, .. } => format!("ok ({events} events moved)"),
         Outcome::AlreadyApplied => "already applied".into(),
@@ -1498,16 +1535,123 @@ mod tests {
         );
     }
 
+    /// A re-spaced row at 5 s in `track`, `px` wider, the widths of `guessed` guessed.
+    fn grown(track: usize, px: i64, guessed: &str) -> patch::RespacedRow {
+        patch::RespacedRow {
+            track,
+            start_ms: 5000,
+            px,
+            guessed: guessed.into(),
+        }
+    }
+
     #[test]
-    fn a_karaoke_fix_says_how_much_its_row_grew_and_what_was_guessed() {
+    fn a_karaoke_fix_of_one_row_says_how_much_it_grew_and_what_was_guessed() {
+        let one = |px, guessed| {
+            status(&Outcome::Respaced {
+                rows: vec![grown(3, px, guessed)],
+            })
+        };
         assert_eq!(
-            respaced(29, ""),
+            one(29, ""),
             "karaoke re-spaced by +29 px: check it (review, o)"
         );
         assert_eq!(
-            respaced(-24, "qz"),
-            "karaoke re-spaced by -24 px (no \"q\", \"z\" in this style to measure): check it (review, o)"
+            one(20, "h"),
+            "karaoke re-spaced by +20 px (width of \"h\" guessed): check it (review, o)"
         );
+        assert_eq!(
+            one(-24, "qz"),
+            "karaoke re-spaced by -24 px (widths of \"q\", \"z\" guessed): check it (review, o)"
+        );
+    }
+
+    #[test]
+    fn a_karaoke_fix_of_several_rows_says_each_rows_growth_and_guesses_under_its_status() {
+        // The line in track 2, and on two layers in track 3, whose style shows no h.
+        let several = Outcome::Respaced {
+            rows: vec![grown(2, 20, ""), grown(3, 26, "h"), grown(3, 26, "h")],
+        };
+        let one = Outcome::Respaced {
+            rows: vec![grown(2, 20, "")],
+        };
+        let finding = |id, original: &str, track| Finding {
+            id,
+            file: "a.mkv".into(),
+            style: "OP".into(),
+            original: original.into(),
+            suggestion: String::new(),
+            reason: String::new(),
+            source: "llm".into(),
+            occurrences: vec![crate::text::Occurrence {
+                track,
+                start_ms: 5000,
+                end_ms: 7000,
+            }],
+            before: vec![],
+            after: vec![],
+            timing: None,
+        };
+        let (two_tracks, one_track) = (finding(1, "go troug", 2), finding(2, "go fa", 2));
+        let fixes = [
+            Fix {
+                finding: &two_tracks,
+                text: "go trough".into(),
+            },
+            Fix {
+                finding: &one_track,
+                text: "go far".into(),
+            },
+        ];
+        let plan = patch::Plan {
+            outcomes: vec![(1, several), (2, one)],
+            ..patch::Plan::default()
+        };
+        let view = |id| patch::Track {
+            id,
+            kind: Kind::Ass,
+            blocks: &[],
+            header: b"",
+            scale: 1_000_000,
+            default_duration: None,
+            timing: patch::Timing::AsScanned,
+            writable: Ok(exact::Early::NONE),
+        };
+        let views = [view(2), view(3)];
+        // Made or only shown, each row is one to check.
+        let modes = [
+            Mode::DryRun,
+            Mode::Apply {
+                backup: true,
+                full: false,
+            },
+        ];
+        for mode in &modes {
+            let job = Job {
+                path: Path::new("a.mkv"),
+                name: "a".into(),
+                fixes: &fixes,
+                timing: &[],
+                mode,
+                karaoke: true,
+                state: Path::new("state"),
+                mkvmerge: OsStr::new("mkvmerge"),
+                report: &|_| {},
+            };
+            let mut out = Vec::new();
+            job.report(&plan, &views, None, &mut out).unwrap();
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                concat!(
+                    "  0:00:05.00  troug → trough  karaoke re-spaced in 3 rows: check it (review, o)\n",
+                    "    track 2 at 0:00:05.00: re-spaced by +20 px\n",
+                    "    track 3 at 0:00:05.00: re-spaced by +26 px (width of \"h\" guessed)\n",
+                    "    track 3 at 0:00:05.00: re-spaced by +26 px (width of \"h\" guessed)\n",
+                    "  0:00:05.00  fa → far  karaoke re-spaced by +20 px: check it (review, o)\n",
+                ),
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]
