@@ -403,6 +403,7 @@ mod tests {
             frame_ns: 40_000_000,
             each,
             unshifted: Vec::new(),
+            far: Vec::new(),
             centre: 0,
             rival: None,
             peaks: Vec::new(),

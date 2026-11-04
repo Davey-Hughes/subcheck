@@ -109,6 +109,7 @@ pub struct Follow {
     /// The other track's mkvmerge ID.
     pub source: usize,
     pub gap: i64,
+    /// Over the twins the other track's verdict places.
     pub shared: Shared,
     /// The other track's verdict, `gap` frames later, for this track's events.
     pub verdict: Verdict,
@@ -129,10 +130,12 @@ pub enum Lines {
 
 /// What the file's tracks' shared lines say, track by track. Each track is compared with the
 /// other tracks that have a verdict, and the one it shares the most times with at an agreed gap
-/// is used (on a tie, the smaller gap, then the lower ID). A track with too few lines or an
-/// unclear verdict follows it, unless part of the track is flagged at another shift. A shifted or
-/// in-sync track is checked against it when that track is shifted or in sync too; a partial one is
-/// not checked.
+/// is used (on a tie, the smaller gap, then the lower ID). A verdict says nothing of a line it
+/// leaves where it is, so only twins the other track's verdict places count and, for a shifted or
+/// in-sync track, only its lines its own verdict places. A track with too few lines or an unclear
+/// verdict follows it, unless part of the track is flagged at another shift. A shifted or in-sync
+/// track is checked against it when that track is shifted or in sync too; a partial one is not
+/// checked.
 ///
 /// `tracks`: each track's mkvmerge ID, events and analysis.
 pub fn lines_of(video: &Video, tracks: &[(usize, &[Event], &Analysis)]) -> Vec<Option<Lines>> {
@@ -149,12 +152,27 @@ pub fn lines_of(video: &Video, tracks: &[(usize, &[Event], &Analysis)]) -> Vec<O
             {
                 return None;
             }
+            // A track with no verdict of its own places none of its lines: its twins' verdict
+            // alone says which of them count.
+            let own_places = matches!(own.verdict, Verdict::InSync | Verdict::Shifted(_));
             let (source, theirs, twins, shared, gap) = tracks
                 .iter()
                 .filter(|&&(other, _, a)| other != id && is_decided(&a.verdict))
                 .filter_map(|&(other, events, a)| {
                     let twins = twins(video, mine, events);
-                    let shared = shared(video, mine, events, &twins);
+                    // A line a verdict leaves where it is sits at a shift that verdict does not
+                    // see: neither it nor its twin says anything of the gap between the two
+                    // tracks. `follow` still gets every twin: one its source leaves where it is
+                    // leaves this track's copy where it is too.
+                    let counts = |j: usize, i: usize| {
+                        a.each[i].is_some() && (!own_places || own.each[j].is_some())
+                    };
+                    let placed: Vec<Option<usize>> = twins
+                        .iter()
+                        .enumerate()
+                        .map(|(j, t)| t.filter(|&i| counts(j, i)))
+                        .collect();
+                    let shared = shared(video, mine, events, &placed);
                     let gap = shared.gap()?;
                     Some((other, a, twins, shared, gap))
                 })
@@ -167,7 +185,7 @@ pub fn lines_of(video: &Video, tracks: &[(usize, &[Event], &Analysis)]) -> Vec<O
                 })?;
             match (&own.verdict, offset(&theirs.verdict)) {
                 (Verdict::TooFew | Verdict::Unclear, _) => {
-                    follow(source, mine, theirs, &twins, gap, shared).map(Lines::Follows)
+                    follow(video, source, mine, theirs, &twins, gap, shared).map(Lines::Follows)
                 }
                 (mine @ (Verdict::InSync | Verdict::Shifted(_)), Some(theirs)) => {
                     let says = super::whole(theirs + gap);
@@ -195,10 +213,14 @@ fn offset(v: &Verdict) -> Option<i64> {
     }
 }
 
-/// `source`'s verdict for a track whose events are `mine`, `gap` frames after it. Off a partial
-/// source, each of the track's blocks goes with its twins' stretch (twins that disagree leave it
-/// where it is), and a block without twins with the stretch it starts in.
+/// `source`'s verdict for a track whose events are `mine`, `gap` frames after it. That verdict does
+/// not see the shift of a line the source leaves where it is, nor of its twin, nor of any line in
+/// one of the source's far windows. So a block with a line starting in a far window, `gap` frames
+/// on, stays where it is, whatever its twins; any other block goes with its twins' stretch, and
+/// stays where it is when its twins do or disagree; a block without twins goes with the stretch it
+/// starts in. `None` when no block goes with a stretch.
 fn follow(
+    video: &Video,
     source: usize,
     mine: &[Event],
     theirs: &Analysis,
@@ -206,46 +228,68 @@ fn follow(
     gap: i64,
     shared: Shared,
 ) -> Option<Follow> {
-    let (verdict, each, unshifted) = match &theirs.verdict {
-        Verdict::InSync | Verdict::Shifted(_) => {
-            let frames = offset(&theirs.verdict)? + gap;
-            (super::whole(frames), vec![Some(0); mine.len()], Vec::new())
-        }
-        Verdict::Partial(stretches) => {
-            let blocks = lines::blocks(mine);
-            let of: Vec<Option<usize>> = blocks
-                .iter()
-                .map(|b| {
-                    let mut theirs_of = b
-                        .events
-                        .iter()
-                        .filter_map(|&i| twins[i])
-                        .map(|t| theirs.each[t]);
-                    match theirs_of.next() {
-                        Some(first) => theirs_of.all(|s| s == first).then_some(first).flatten(),
-                        None => stretches
-                            .iter()
-                            .rposition(|s| s.from_ms.is_none_or(|from| from <= b.start_ms)),
-                    }
-                })
-                .collect();
-            let moved: Vec<Stretch> = stretches
-                .iter()
-                .map(|s| Stretch {
-                    frames: s.frames + gap,
-                    ..*s
-                })
-                .collect();
-            let m = lines::moves(&blocks, &of, mine.len(), &moved);
-            // None of this track's lines in a stretch that moves: the track is in sync.
-            let shifts = |k: usize| m.stretches[k].frames != 0;
-            if m.each.iter().flatten().any(|&k| shifts(k)) {
-                (Verdict::Partial(m.stretches), m.each, m.unshifted)
-            } else {
-                (Verdict::InSync, vec![Some(0); mine.len()], Vec::new())
-            }
-        }
+    let whole_track = |frames: i64| Stretch {
+        from_ms: None,
+        to_ms: None,
+        frames: frames + gap,
+    };
+    let stretches: Vec<Stretch> = match &theirs.verdict {
+        Verdict::InSync => vec![whole_track(0)],
+        Verdict::Shifted(frames) => vec![whole_track(*frames)],
+        Verdict::Partial(stretches) => stretches
+            .iter()
+            .map(|s| Stretch {
+                frames: s.frames + gap,
+                ..*s
+            })
+            .collect(),
         Verdict::TooFew | Verdict::Unclear => return None,
+    };
+    let blocks = lines::blocks(mine);
+    // A line is in the window it starts in by the source's times, `gap` frames earlier. In a far
+    // window it stays where it is even when its twin is placed: a twin can sit up to `reach` away,
+    // in the next window, and moved with it the line would move by the wrong amount, unreported,
+    // where held it is listed as left where it is. In ns as an i128, as a corrupt time near either
+    // end of i64 ms is past an i64 in ns; `text::ms` truncates toward 0:00, and a time before 0:00
+    // is in the first window either way.
+    let far = |i: usize| {
+        let ns =
+            i128::from(mine[i].start_ms) * 1_000_000 - i128::from(gap) * i128::from(video.frame_ns);
+        theirs.far.contains(&super::window_of(crate::text::ms(ns)))
+    };
+    let of: Vec<Option<usize>> = blocks
+        .iter()
+        .map(|b| {
+            if b.events.iter().any(|&i| far(i)) {
+                return None;
+            }
+            let mut theirs_of = b
+                .events
+                .iter()
+                .filter_map(|&i| twins[i])
+                .map(|t| theirs.each[t]);
+            match theirs_of.next() {
+                Some(first) => theirs_of.all(|s| s == first).then_some(first).flatten(),
+                None => stretches
+                    .iter()
+                    .rposition(|s| s.from_ms.is_none_or(|from| from <= b.start_ms)),
+            }
+        })
+        .collect();
+    let m = lines::moves(&blocks, &of, mine.len(), &stretches);
+    // Every line left where it is: the source says nothing of this track's timing, not that it is
+    // in sync.
+    if m.each.iter().all(Option::is_none) {
+        return None;
+    }
+    // None of this track's lines in a stretch that moves: the track is in sync.
+    let shifts = |k: usize| m.stretches[k].frames != 0;
+    let (verdict, each, unshifted) = if !m.each.iter().flatten().any(|&k| shifts(k)) {
+        (Verdict::InSync, vec![Some(0); mine.len()], Vec::new())
+    } else if let [one] = m.stretches.as_slice() {
+        (super::whole(one.frames), m.each, m.unshifted)
+    } else {
+        (Verdict::Partial(m.stretches), m.each, m.unshifted)
     };
     Some(Follow {
         source,
@@ -464,6 +508,7 @@ mod tests {
             frame_ns: 40_000_000,
             each,
             unshifted: Vec::new(),
+            far: Vec::new(),
             centre: 0,
             rival: None,
             peaks: Vec::new(),
@@ -608,6 +653,319 @@ mod tests {
         want.push(Some(0));
         assert_eq!(f.each, want);
         assert_eq!(f.unshifted, [(150_500, 153_500)]);
+    }
+
+    /// `events` a frame late, as [`analyse`] makes it when the wide scan puts the window from 3:00
+    /// to 6:00 far from the centre: the lines starting there stay where they are.
+    fn late_but_3_to_6(events: &[Event]) -> Analysis {
+        let far = |e: &Event| (180_000..360_000).contains(&e.start_ms);
+        let each = events.iter().map(|e| (!far(e)).then_some(0)).collect();
+        let left: Vec<(i64, i64)> = events
+            .iter()
+            .filter(|e| far(e))
+            .map(|e| (e.start_ms, e.end_ms))
+            .collect();
+        let mut a = analysis(Verdict::Shifted(1), each);
+        a.unshifted = lines::blocks_of(&left)
+            .into_iter()
+            .map(|b| (b.start_ms, b.end_ms))
+            .collect();
+        a.far = vec![1];
+        a
+    }
+
+    #[test]
+    fn off_a_shifted_source_a_line_whose_twin_stays_where_it_is_stays_too() {
+        let v = video();
+        let full = signs(20, 0);
+        let late = late_but_3_to_6(&full);
+        // This track has the signs and one line of its own at 0:55, between the 6th and 7th.
+        let mut thin = full.clone();
+        thin.push(event("Own", 55_000, 56_000));
+        let unclear = analysis(Verdict::Unclear, vec![None; 21]);
+        let out = lines_of(&v, &[(5, &full, &late), (6, &thin, &unclear)]);
+        let Some(Lines::Follows(f)) = &out[1] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(f.verdict, Verdict::Shifted(1));
+        let mut want = vec![Some(0); 21];
+        want[18] = None;
+        want[19] = None;
+        assert_eq!(f.each, want);
+        assert_eq!(f.unshifted, [(180_500, 183_500), (190_500, 193_500)]);
+    }
+
+    #[test]
+    fn off_a_shifted_source_a_block_whose_twins_disagree_stays_where_it_is() {
+        let v = video();
+        // A line from 2:55 to 3:05 the source moves, under the 19th sign, which starts after 3:00
+        // and stays where it is.
+        let mut full = signs(20, 0);
+        full.push(event("Long", 175_000, 185_000));
+        let late = late_but_3_to_6(&full);
+        let thin = full.clone();
+        let unclear = analysis(Verdict::Unclear, vec![None; 21]);
+        let out = lines_of(&v, &[(5, &full, &late), (6, &thin, &unclear)]);
+        let Some(Lines::Follows(f)) = &out[1] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(f.verdict, Verdict::Shifted(1));
+        // The two show together: neither moves.
+        let mut want = vec![Some(0); 21];
+        want[18] = None;
+        want[19] = None;
+        want[20] = None;
+        assert_eq!(f.each, want);
+        assert_eq!(f.unshifted, [(175_000, 185_000), (190_500, 193_500)]);
+    }
+
+    #[test]
+    fn a_track_whose_twins_all_stay_where_they_are_follows_no_one() {
+        let v = video();
+        let full = signs(40, 0);
+        let late = late_but_3_to_6(&full);
+        // This track has only the signs from 3:00 to 6:00: its twins say nothing of its timing.
+        let thin = full[18..36].to_vec();
+        let unclear = analysis(Verdict::Unclear, vec![None; 18]);
+        let out = lines_of(&v, &[(5, &full, &late), (6, &thin, &unclear)]);
+        assert_eq!(out[1], None);
+    }
+
+    #[test]
+    fn off_a_shifted_source_a_line_of_its_own_in_a_far_window_stays_where_it_is() {
+        let v = video();
+        let full = signs(20, 0);
+        let late = late_but_3_to_6(&full);
+        // This track has the signs and one line of its own at 3:20, after the last sign.
+        let mut thin = full.clone();
+        thin.push(event("Own", 200_000, 201_000));
+        let unclear = analysis(Verdict::Unclear, vec![None; 21]);
+        let out = lines_of(&v, &[(5, &full, &late), (6, &thin, &unclear)]);
+        let Some(Lines::Follows(f)) = &out[1] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(f.verdict, Verdict::Shifted(1));
+        let mut want = vec![Some(0); 21];
+        want[18] = None;
+        want[19] = None;
+        want[20] = None;
+        assert_eq!(f.each, want);
+        assert_eq!(
+            f.unshifted,
+            [(180_500, 183_500), (190_500, 193_500), (200_000, 201_000)]
+        );
+    }
+
+    #[test]
+    fn off_an_analysed_source_a_line_of_its_own_in_a_far_window_stays_where_it_is() {
+        let cuts = synthetic::cuts(500);
+        let video = synthetic::yuru(&cuts);
+        // A second late but for shots from 9:00 to 12:00, on the cuts.
+        let full = synthetic::track_by(&cuts, |cut| {
+            if (540_000..720_000).contains(&synthetic::ms(cut)) {
+                0
+            } else {
+                24
+            }
+        });
+        let late = analyse(&video, &full);
+        assert_eq!(
+            (late.verdict.clone(), late.far.clone()),
+            (Verdict::Shifted(24), vec![3])
+        );
+        // This track has the lines before 9:00 and one of its own at 10:00.
+        let mut thin: Vec<Event> = full
+            .iter()
+            .filter(|e| e.start_ms < 540_000)
+            .cloned()
+            .collect();
+        let own = thin.len();
+        thin.push(event("Own", 600_000, 601_000));
+        let unclear = analysis(Verdict::Unclear, vec![None; thin.len()]);
+        let out = lines_of(&video, &[(5, &full, &late), (6, &thin, &unclear)]);
+        let Some(Lines::Follows(f)) = &out[1] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(f.verdict, Verdict::Shifted(24));
+        let mut want = vec![Some(0); thin.len()];
+        want[own] = None;
+        assert_eq!(f.each, want);
+        assert_eq!(f.unshifted, [(600_000, 601_000)]);
+    }
+
+    #[test]
+    fn a_track_whose_twins_all_stay_where_they_are_and_a_line_of_its_own_follows_no_one() {
+        let v = video();
+        let full = signs(40, 0);
+        let late = late_but_3_to_6(&full);
+        // The signs from 3:00 to 6:00, which say nothing of its timing, and one line of its own at
+        // 0:55, which says nothing either.
+        let mut thin = full[18..36].to_vec();
+        thin.push(event("Own", 55_000, 56_000));
+        let unclear = analysis(Verdict::Unclear, vec![None; 19]);
+        let out = lines_of(&v, &[(5, &full, &late), (6, &thin, &unclear)]);
+        assert_eq!(out[1], None);
+    }
+
+    #[test]
+    fn a_track_every_block_of_which_reaches_a_far_window_follows_no_one() {
+        let v = video();
+        let full = signs(40, 0);
+        let late = late_but_3_to_6(&full);
+        // The signs from 1:40 to 3:00 the source moves, and the first one after 3:00, all under
+        // a line from 1:35 to 3:05: one block, starting a line in the far window.
+        let mut thin = full[10..19].to_vec();
+        thin.push(event("Long", 95_000, 185_000));
+        let unclear = analysis(Verdict::Unclear, vec![None; 10]);
+        let out = lines_of(&v, &[(5, &full, &late), (6, &thin, &unclear)]);
+        assert_eq!(out[1], None);
+    }
+
+    #[test]
+    fn a_track_whose_twins_all_stay_where_they_are_does_not_disagree_with_their_verdict() {
+        let v = video();
+        let full = signs(40, 0);
+        let late = late_but_3_to_6(&full);
+        // In sync by its own times, and sharing only the signs from 3:00 to 6:00, which the
+        // source's verdict says nothing of.
+        let thin = full[18..36].to_vec();
+        let in_sync = analysis(Verdict::InSync, vec![Some(0); 18]);
+        let out = lines_of(&v, &[(5, &full, &late), (6, &thin, &in_sync)]);
+        assert_eq!(out[1], None);
+    }
+
+    #[test]
+    fn a_track_follows_the_track_whose_verdict_places_its_twins_over_one_sharing_more() {
+        let v = video();
+        let full = signs(40, 0);
+        let late = late_but_3_to_6(&full);
+        // Track 7 has six of the signs from 3:00 to 6:00, in sync; track 5 has all of them, but
+        // leaves them where they are.
+        let few = full[18..24].to_vec();
+        let in_sync = analysis(Verdict::InSync, vec![Some(0); 6]);
+        let thin = full[18..36].to_vec();
+        let unclear = analysis(Verdict::Unclear, vec![None; 18]);
+        let out = lines_of(
+            &v,
+            &[(5, &full, &late), (6, &thin, &unclear), (7, &few, &in_sync)],
+        );
+        let Some(Lines::Follows(f)) = &out[1] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(
+            (f.source, f.gap, f.shared.times, f.verdict.clone()),
+            (7, 0, 12, Verdict::InSync)
+        );
+        // Nor does track 5's verdict disagree with track 7's: the lines they share are ones track
+        // 5 leaves where they are.
+        assert_eq!((&out[0], &out[2]), (&None, &None));
+    }
+
+    #[test]
+    fn a_line_in_a_far_window_stays_where_it_is_though_the_source_places_its_twin() {
+        let v = video();
+        // A line ending the window before 3:00, a frame before it starts, which the source moves.
+        let mut full = signs(20, 0);
+        full.push(event("Edge", 179_960, 180_400));
+        let late = late_but_3_to_6(&full);
+        // This track has the signs, and the line a frame later, a frame into the far window.
+        let mut thin = signs(20, 0);
+        thin.push(event("Edge", 180_000, 180_440));
+        let unclear = analysis(Verdict::Unclear, vec![None; 21]);
+        let out = lines_of(&v, &[(5, &full, &late), (6, &thin, &unclear)]);
+        let Some(Lines::Follows(f)) = &out[1] else {
+            panic!("{out:?}")
+        };
+        assert_eq!((f.gap, f.verdict.clone()), (0, Verdict::Shifted(1)));
+        let mut want = vec![Some(0); 21];
+        want[18] = None;
+        want[19] = None;
+        want[20] = None;
+        assert_eq!(f.each, want);
+        assert_eq!(
+            f.unshifted,
+            [(180_000, 180_440), (180_500, 183_500), (190_500, 193_500)]
+        );
+    }
+
+    #[test]
+    fn a_line_is_in_a_far_window_by_its_time_in_the_source() {
+        let v = judged();
+        let full = signs(20, 0);
+        let late = late_but_3_to_6(&full);
+        // This track has the signs a second (25 frames) later, and two lines of its own: one at
+        // 3:00.5, at 2:59.5 in the source's times, and one at 6:00.5, at 5:59.5 there.
+        let mut thin = signs(20, 25);
+        thin.push(event("Own", 180_500, 181_000));
+        thin.push(event("Own", 360_500, 361_000));
+        let unclear = analysis(Verdict::Unclear, vec![None; 22]);
+        let out = lines_of(&v, &[(5, &full, &late), (6, &thin, &unclear)]);
+        let Some(Lines::Follows(f)) = &out[1] else {
+            panic!("{out:?}")
+        };
+        assert_eq!((f.gap, f.verdict.clone()), (25, Verdict::Shifted(26)));
+        let mut want = vec![Some(0); 22];
+        want[18] = None;
+        want[19] = None;
+        want[21] = None;
+        assert_eq!(f.each, want);
+        assert_eq!(
+            f.unshifted,
+            [(181_500, 184_500), (191_500, 194_500), (360_500, 361_000)]
+        );
+    }
+
+    #[test]
+    fn off_an_analysed_source_a_line_before_0_00_is_in_its_first_window() {
+        let cuts = synthetic::cuts(500);
+        let video = synthetic::yuru(&cuts);
+        // A second late but for shots to 3:00, on the cuts.
+        let full = synthetic::track_by(
+            &cuts,
+            |cut| {
+                if synthetic::ms(cut) < 180_000 { 0 } else { 24 }
+            },
+        );
+        let late = analyse(&video, &full);
+        assert_eq!(
+            (late.verdict.clone(), late.far.clone()),
+            (Verdict::Shifted(24), vec![0])
+        );
+        // This track has the lines from 3:00 and one of its own before 0:00.
+        let mut thin: Vec<Event> = full
+            .iter()
+            .filter(|e| e.start_ms >= 180_000)
+            .cloned()
+            .collect();
+        let own = thin.len();
+        thin.push(event("Own", -1000, -500));
+        let unclear = analysis(Verdict::Unclear, vec![None; thin.len()]);
+        let out = lines_of(&video, &[(5, &full, &late), (6, &thin, &unclear)]);
+        let Some(Lines::Follows(f)) = &out[1] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(f.verdict, Verdict::Shifted(24));
+        let mut want = vec![Some(0); thin.len()];
+        want[own] = None;
+        assert_eq!(f.each, want);
+        assert_eq!(f.unshifted, [(-1000, -500)]);
+    }
+
+    #[test]
+    fn a_line_at_the_end_of_time_is_in_the_last_window_by_the_sources_times_too() {
+        // A line of its own at the end of i64 ms, 3 frames after its place in the source's times:
+        // past the end of i64 there, and in the window holding the end of i64.
+        let mine = [event("Own", i64::MAX - 10, i64::MAX)];
+        let mut theirs = analysis(Verdict::Shifted(1), Vec::new());
+        theirs.far = vec![crate::timing::window_of(i64::MAX)];
+        let shared = Shared {
+            times: 0,
+            counts: Hits::new(),
+        };
+        assert_eq!(
+            follow(&video(), 5, &mine, &theirs, &[None], -3, shared),
+            None
+        );
     }
 
     #[test]

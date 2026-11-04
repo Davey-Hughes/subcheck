@@ -347,6 +347,10 @@ pub struct Analysis {
     /// track's lines whose times point both ways, and any track's lines that start in a window the
     /// wide scan puts far from the centre.
     pub unshifted: Vec<(i64, i64)>,
+    /// The windows the wide scan puts far from the centre, in order: window n holds the times from
+    /// n × WINDOW_MS, and the first one the times before 0:00 too. A track following this one
+    /// leaves its own lines there where they are, as this one's are.
+    pub far: Vec<usize>,
     /// The shift the ±MAX_OFFSET analysis is centred on: 0, or a whole-track shift the wide scan
     /// found further off. `pool`, each style's counts and each `Time`'s offset are around it.
     pub centre: i64,
@@ -428,6 +432,8 @@ pub fn analyse(video: &Video, events: &[Event]) -> Analysis {
         .into_iter()
         .map(|b| (b.start_ms, b.end_ms))
         .collect();
+    let mut far: Vec<usize> = far.into_iter().collect();
+    far.sort_unstable();
     Analysis {
         verdict,
         times: pool.len(),
@@ -438,6 +444,7 @@ pub fn analyse(video: &Video, events: &[Event]) -> Analysis {
         frame_ns: video.frame_ns,
         each,
         unshifted,
+        far,
         centre,
         rival,
         peaks: wide::peaks(&scan.hits, 3),
@@ -1272,6 +1279,7 @@ mod tests {
                 frame_ns: FRAME_NS,
                 each: Vec::new(),
                 unshifted: Vec::new(),
+                far: Vec::new(),
                 centre: 0,
                 rival: None,
                 peaks: Vec::new(),

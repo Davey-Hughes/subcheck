@@ -134,7 +134,7 @@ pub fn text_field(kind: Kind, payload: &str) -> Option<usize> {
 }
 
 /// Nanoseconds as whole ms; past either end of i64 (a corrupt time), that end.
-fn ms(ns: i128) -> i64 {
+pub(crate) fn ms(ns: i128) -> i64 {
     i64::try_from(ns / 1_000_000).unwrap_or(if ns < 0 { i64::MIN } else { i64::MAX })
 }
 
