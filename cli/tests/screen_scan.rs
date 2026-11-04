@@ -13,26 +13,32 @@ use std::time::Duration;
 
 use common::fixture;
 use crossterm::event::KeyCode;
-use ratatui::layout::Rect;
 use subcheck_core::llm::Backend;
 use subcheck_core::player::Player;
-use subcheck_core::review::model::Model;
+use subcheck_core::review::model::Review;
 use subcheck_core::review::progress::{Scan, Stage};
-use subcheck_core::review::screen::{self, Msg};
+use subcheck_core::review::screen::{self, Msg, Screen};
 use subcheck_core::review::update::Input;
 use subcheck_core::review::{jobs, opening, run_effect};
 use subcheck_core::scan::{self, Event, Planned};
 use subcheck_core::store::{Decision, Selector, State, Store};
 
 /// The loop's inner part: a message, then every effect it leads to, run for real.
-fn send(m: &mut Model, msg: Msg, store: &mut Store, player: &mut Player, tx: &mpsc::Sender<Msg>) {
+fn send(
+    m: &mut Review,
+    s: &mut Screen,
+    msg: Msg,
+    store: &mut Store,
+    player: &mut Player,
+    tx: &mpsc::Sender<Msg>,
+) {
     let now = jiff::Timestamp::now();
     // Where apply would write its tracks: no test here starts apply, so nothing goes there.
     let state = Path::new("/no-state");
-    let mut queue: VecDeque<_> = screen::update(m, msg, now).into();
+    let mut queue: VecDeque<_> = screen::update(m, s, msg, now).into();
     while let Some(effect) = queue.pop_front() {
         let input = run_effect(effect, store, player, state, tx);
-        queue.extend(screen::update(m, input.into(), now));
+        queue.extend(screen::update(m, s, input.into(), now));
     }
 }
 
@@ -75,7 +81,8 @@ fn a_scan_on_the_screen_fills_the_list_and_passes_decisions_on() {
         panic!("nothing to check");
     };
     let name = plan.scan().name.clone();
-    let mut model = Model::new(opening(&store, &plan).unwrap(), HashMap::new());
+    let mut model = Review::new(opening(&store, &plan).unwrap(), HashMap::new());
+    let mut screen = Screen::default();
     let mut player = Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock"));
     let (tx, rx) = mpsc::channel();
     jobs::scan(plan, opts, store.reopen().unwrap(), tx.clone()).unwrap();
@@ -88,7 +95,7 @@ fn a_scan_on_the_screen_fills_the_list_and_passes_decisions_on() {
         let ended = matches!(msg, Msg::Input(Input::ScanEnded(_)));
         let e01_done =
             matches!(&msg, Msg::Input(Input::Scan(Event::Finished { path, .. })) if *path == e01);
-        send(&mut model, msg, &mut store, &mut player, &tx);
+        send(&mut model, &mut screen, msg, &mut store, &mut player, &tx);
         if e01_done {
             // E01's two findings are rows of their own: accept both before E02's arrive (they may
             // be in the channel already, behind this one). E01's alone so far: were E02's here too,
@@ -99,6 +106,7 @@ fn a_scan_on_the_screen_fills_the_list_and_passes_decisions_on() {
             for _ in 0..2 {
                 send(
                     &mut model,
+                    &mut screen,
                     Msg::Key(KeyCode::Char('a')),
                     &mut store,
                     &mut player,
@@ -170,7 +178,8 @@ fn a_file_whose_llm_check_stands_shows_the_timing_check_alone() {
     let opts = options(Some(name));
     let adding = plan(&mut store, &opts);
     assert_eq!(adding.todo()[0].1, [subcheck_core::store::Check::Timing]);
-    let mut model = Model::new(opening(&store, &adding).unwrap(), HashMap::new());
+    let mut model = Review::new(opening(&store, &adding).unwrap(), HashMap::new());
+    let mut screen = Screen::default();
     assert_eq!(
         model.run.findings.len(),
         2,
@@ -185,7 +194,7 @@ fn a_file_whose_llm_check_stands_shows_the_timing_check_alone() {
             .recv_timeout(Duration::from_mins(1))
             .expect("the scan goes on");
         let ended = matches!(msg, Msg::Input(Input::ScanEnded(_)));
-        send(&mut model, msg, &mut store, &mut player, &tx);
+        send(&mut model, &mut screen, msg, &mut store, &mut player, &tx);
         if ended {
             break;
         }
@@ -345,15 +354,16 @@ fn checked_again(
     store: &mut Store,
     file: &Path,
     before_job: impl FnOnce(),
-    mut on_msg: impl FnMut(&Model, &Msg),
-) -> (Model, Vec<u64>) {
+    mut on_msg: impl FnMut(&Review, &Msg),
+) -> (Review, Vec<u64>) {
     let opts = options(fake_llm(), true);
     let Planned::Scan(plan) =
         scan::plan(&[file.to_path_buf()], &opts, store, &mut std::io::sink()).unwrap()
     else {
         panic!("nothing to check");
     };
-    let mut model = Model::new(opening(store, &plan).unwrap(), HashMap::new());
+    let mut model = Review::new(opening(store, &plan).unwrap(), HashMap::new());
+    let mut screen = Screen::default();
     let opened: Vec<u64> = model.run.findings.iter().map(|f| f.id).collect();
     before_job();
     let dir = tempfile::tempdir().unwrap();
@@ -366,7 +376,7 @@ fn checked_again(
             .expect("the scan goes on");
         let ended = matches!(msg, Msg::Input(Input::ScanEnded(_)));
         let seen = msg.clone();
-        send(&mut model, msg, store, &mut player, &tx);
+        send(&mut model, &mut screen, msg, store, &mut player, &tx);
         on_msg(&model, &seen);
         if ended {
             break;
@@ -441,20 +451,29 @@ fn c_checks_a_file_again_and_a_decision_on_a_finding_that_comes_back_is_kept() {
     let (_dir, file) = common::copied("typos.mkv");
     let first = scanned_and_rejected(&mut store, &file);
     let run = store.view(&Selector::Newest).unwrap();
-    let mut model = Model::new(run, HashMap::new());
+    let mut model = Review::new(run, HashMap::new());
+    let mut screen = Screen::default();
     let dir = tempfile::tempdir().unwrap();
     let mut player = Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock"));
     let (tx, rx) = mpsc::channel();
     for key in [KeyCode::Tab, KeyCode::Char('c')] {
-        send(&mut model, Msg::Key(key), &mut store, &mut player, &tx);
+        send(
+            &mut model,
+            &mut screen,
+            Msg::Key(key),
+            &mut store,
+            &mut player,
+            &tx,
+        );
     }
-    let asked = model.status_text(Rect::new(0, 0, 200, 1)).unwrap();
+    let asked = model.status_text().unwrap();
     assert!(
         asked.starts_with("check ") && asked.ends_with("? y/n"),
         "{asked}"
     );
     send(
         &mut model,
+        &mut screen,
         Msg::Key(KeyCode::Char('y')),
         &mut store,
         &mut player,
@@ -466,7 +485,7 @@ fn c_checks_a_file_again_and_a_decision_on_a_finding_that_comes_back_is_kept() {
             .recv_timeout(Duration::from_mins(1))
             .expect("the check goes on");
         let ended = matches!(msg, Msg::Input(Input::ScanEnded(_)));
-        send(&mut model, msg, &mut store, &mut player, &tx);
+        send(&mut model, &mut screen, msg, &mut store, &mut player, &tx);
         if ended {
             break;
         }

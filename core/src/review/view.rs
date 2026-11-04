@@ -1,4 +1,4 @@
-//! Pure render of the review `Model` into a ratatui frame.
+//! Pure render of a `Review` and its `Screen` into a ratatui frame.
 
 use std::fmt::Write;
 use std::ops::Range;
@@ -13,22 +13,23 @@ use ratatui::widgets::{
 
 use super::files;
 use super::layout;
-use super::model::{Entry, FileNote, Mark, Model, Pane, changed, fix_label};
+use super::model::{Entry, FileNote, Mark, Pane, Review, changed, fix_label};
+use super::screen::Screen;
 use crate::list::{self, Filter, label};
 use crate::llm::Spent;
 use crate::store::{State, TimingFix};
 use crate::text::{timestamp, timestamp_ms};
 use crate::timing::shift_label;
 
-pub fn view(m: &Model, f: &mut Frame) {
+pub fn view(m: &Review, s: &Screen, f: &mut Frame) {
     let p = layout::panes(f.area());
     match m.pane {
-        Pane::Findings => list_pane(m, f, p.list),
-        Pane::Files => files::files_pane(m, f, p.list),
+        Pane::Findings => list_pane(m, s, f, p.list),
+        Pane::Files => files::files_pane(m, s, f, p.list),
     }
-    detail_pane(m, f, p.detail);
-    status_line(m, f, p.status);
-    if m.help {
+    detail_pane(m, s, f, p.detail);
+    status_line(m, s, f, p.status);
+    if s.help {
         keys_box(m, f, f.area());
     }
 }
@@ -170,7 +171,7 @@ fn spent_lines(spent: &Spent, columns: usize) -> Vec<Line<'static>> {
 /// The box of keys `?` opens, over the middle of `area`, with how to leave it in its bottom
 /// border: on a screen too short for every key that still shows. A blank row keeps it apart from
 /// the last line, so it reads as the border's and not as one more line that ran out of the box.
-fn keys_box(m: &Model, f: &mut Frame, area: Rect) {
+fn keys_box(m: &Review, f: &mut Frame, area: Rect) {
     const LEAVE: &str = " q quits · any other key closes this ";
     // Inside a border and a column of padding each side.
     let columns = usize::from(area.width.saturating_sub(4));
@@ -223,18 +224,21 @@ fn tabs(active: Pane) -> Vec<Span<'static>> {
 }
 
 /// The left pane's block, in either view: the tabs on the left of its top border and, on the
-/// right, how far a scan, apply or dry run is while one runs, else the view's name
-/// (`Run::shown_name`). Each view puts what its list holds on the bottom border. `area` is the
-/// pane's: when the tabs, the right part and a column of border between them do not fit inside
-/// its corners, the right part is left off rather than drawn over the tabs, and the status line
-/// still says how far the job is.
-pub(super) fn pane_block(m: &Model, active: Pane, area: Rect) -> Block<'static> {
+/// right, how far a scan, apply or dry run is while one runs, `spinner` after the counts, else the
+/// view's name (`Run::shown_name`). Each view puts what its list holds on the bottom border. `area`
+/// is the pane's: when the tabs, the right part and a column of border between them do not fit
+/// inside its corners, the right part is left off rather than drawn over the tabs, and the status
+/// line still says how far the job is.
+pub(super) fn pane_block(m: &Review, spinner: char, active: Pane, area: Rect) -> Block<'static> {
     let tab_line = Line::from(tabs(active));
     let mut block = Block::default()
         .borders(Borders::ALL)
         .title_top(tab_line.clone());
     // While a job runs (a scan, apply or dry run), how far it is; else the view's name.
-    let right = m.progress.title().unwrap_or_else(|| m.run.shown_name());
+    let right = m
+        .progress
+        .title(spinner)
+        .unwrap_or_else(|| m.run.shown_name());
     let right = Line::from(format!(" {right} ")).right_aligned();
     let needed = tab_line.width() + 1 + right.width();
     if needed <= usize::from(block.inner(area).width) {
@@ -250,7 +254,7 @@ pub(super) fn pane_block(m: &Model, active: Pane, area: Rect) -> Block<'static> 
 /// then without the rejected count, then without the accepted count, which leaves ` {p} pending `
 /// as the last. With any other filter the counts go rejected, accepted, then pending, leaving
 /// ` showing {f} `.
-fn counts_line(m: &Model, room: u16) -> Line<'static> {
+fn counts_line(m: &Review, room: u16) -> Line<'static> {
     let (pending, accepted, rejected) = m.counts();
     let counts = [
         format!("{pending} pending"),
@@ -289,8 +293,9 @@ fn counts_line(m: &Model, room: u16) -> Line<'static> {
 
 /// The findings view of the left pane: one line per finding, grouped, with the counts and the
 /// filter on the bottom border, or a hint when the filter leaves nothing to list.
-fn list_pane(m: &Model, f: &mut Frame, area: Rect) {
-    let block = pane_block(m, Pane::Findings, area);
+fn list_pane(m: &Review, s: &Screen, f: &mut Frame, area: Rect) {
+    let spinner = s.spinner();
+    let block = pane_block(m, spinner, Pane::Findings, area);
     let block = block
         .clone()
         .title_bottom(counts_line(m, block.inner(area).width));
@@ -308,7 +313,7 @@ fn list_pane(m: &Model, f: &mut Frame, area: Rect) {
     }
     let items: Vec<ListItem> = entries
         .iter()
-        .map(|&e| ListItem::new(entry_line(m, e)))
+        .map(|&e| ListItem::new(entry_line(m, e, spinner)))
         .collect();
     let list = List::new(items)
         .block(block)
@@ -316,7 +321,7 @@ fn list_pane(m: &Model, f: &mut Frame, area: Rect) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default()
         .with_selected(Some(m.selected))
-        .with_offset(m.list_scroll(f.area()));
+        .with_offset(s.list_scroll(m, f.area()));
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -341,22 +346,22 @@ fn mark(state: Option<State>) -> &'static str {
     }
 }
 
-fn entry_line(m: &Model, e: Entry) -> Line<'static> {
+fn entry_line(m: &Review, e: Entry, spinner: char) -> Line<'static> {
     // A row with anything pending is still to do, however its decided members differ.
     let state = match e {
         Entry::Row(_) if m.has_pending(e) => Some(State::Pending),
         Entry::Row(r) => m.shown_state(r),
         Entry::Member(_, i) => Some(m.state(i)),
     };
-    entry_text(m, e).style(colour(state))
+    entry_text(m, e, spinner).style(colour(state))
 }
 
-fn entry_text(m: &Model, e: Entry) -> Line<'static> {
+fn entry_text(m: &Review, e: Entry, spinner: char) -> Line<'static> {
     // A file the scan is checking again has the spinner on its name: its findings here are the
     // earlier check's until the new ones are saved.
     let spin = |file: &str| {
         if m.progress.checking(file).is_some() {
-            m.progress.spinner().to_string()
+            spinner.to_string()
         } else {
             String::new()
         }
@@ -376,15 +381,15 @@ fn entry_text(m: &Model, e: Entry) -> Line<'static> {
                     let checking = shown
                         .iter()
                         .any(|&i| m.progress.checking(&m.finding(i).file).is_some());
-                    let spinner = if checking {
-                        m.progress.spinner().to_string()
+                    let turning = if checking {
+                        spinner.to_string()
                     } else {
                         String::new()
                     };
                     if n == all {
-                        format!("×{all}{spinner}")
+                        format!("×{all}{turning}")
                     } else {
-                        format!("×{n}/{all}{spinner}")
+                        format!("×{n}/{all}{turning}")
                     }
                 }
             };
@@ -428,7 +433,7 @@ fn entry_text(m: &Model, e: Entry) -> Line<'static> {
     }
 }
 
-fn detail_pane(m: &Model, f: &mut Frame, area: Rect) {
+fn detail_pane(m: &Review, s: &Screen, f: &mut Frame, area: Rect) {
     let path = match m.pane {
         Pane::Findings => m.focus().map(|i| m.finding(i).file.as_str()),
         Pane::Files => m
@@ -446,26 +451,27 @@ fn detail_pane(m: &Model, f: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .title(format!(" {name} "));
     f.render_widget(
-        Paragraph::new(detail_lines(m))
+        Paragraph::new(detail_lines(m, s.spinner()))
             .block(block)
             .wrap(Wrap { trim: false })
-            .scroll((m.detail_scroll, 0)),
+            .scroll((s.detail_scroll, 0)),
         area,
     );
 }
 
 /// The detail pane's lines on screen at `width` columns, wrapped as drawn: `screen::update` stops
 /// the wheel at the last of them.
-pub fn detail_height(m: &Model, width: u16) -> usize {
-    Paragraph::new(detail_lines(m))
+pub fn detail_height(m: &Review, spinner: char, width: u16) -> usize {
+    Paragraph::new(detail_lines(m, spinner))
         .wrap(Wrap { trim: false })
         .line_count(width)
 }
 
-/// What the detail pane says about the selection; nothing when there is none.
-pub fn detail_lines(m: &Model) -> Vec<Line<'static>> {
+/// What the detail pane says about the selection, nothing when there is none; in the files view,
+/// `spinner` turns beside the file's stage under way.
+pub fn detail_lines(m: &Review, spinner: char) -> Vec<Line<'static>> {
     if m.pane == Pane::Files {
-        return files::detail_lines(m);
+        return files::detail_lines(m, spinner);
     }
     let Some(i) = m.focus() else {
         return Vec::new();
@@ -547,7 +553,7 @@ pub fn detail_lines(m: &Model) -> Vec<Line<'static>> {
 }
 
 /// For a row of several findings, what they are: a typo's files, a timing row's members' fixes.
-fn group_line(m: &Model) -> Option<Line<'static>> {
+fn group_line(m: &Review) -> Option<Line<'static>> {
     let Some(Entry::Row(r)) = m.selected_entry() else {
         return None;
     };
@@ -575,7 +581,7 @@ fn group_line(m: &Model) -> Option<Line<'static>> {
 }
 
 /// Where `o` opens timing finding `i`.
-fn opens_line(m: &Model, i: usize) -> Vec<Line<'static>> {
+fn opens_line(m: &Review, i: usize) -> Vec<Line<'static>> {
     let Some(at) = list::timing_moment(&m.run, m.finding(i)) else {
         return Vec::new();
     };
@@ -659,8 +665,8 @@ fn marked(prefix: &'static str, text: &str, span: Range<usize>, color: Color) ->
 /// The status line: the message, or the editor while it is open, with its buttons at the end
 /// while there is room (`? help`, or the editor's). A question waiting for `y` takes the line from
 /// the editor too, since the next key answers it.
-fn status_line(m: &Model, f: &mut Frame, area: Rect) {
-    let buttons = m.buttons(area);
+fn status_line(m: &Review, s: &Screen, f: &mut Frame, area: Rect) {
+    let buttons = s.buttons(m, area);
     // The text stops a column short of the buttons.
     let text = match buttons {
         Some(items) => Rect {
@@ -678,7 +684,7 @@ fn status_line(m: &Model, f: &mut Frame, area: Rect) {
         };
         f.render_widget(Paragraph::new(layout::bar_text(items)), at);
     }
-    if let Some(ed) = m.editor.as_ref().filter(|_| m.confirm.is_none()) {
+    if let Some(ed) = s.editor.as_ref().filter(|_| m.confirm.is_none()) {
         let prompt_len = layout::PROMPT.chars().count();
         // Scrolled so the cursor stays in view, with a column left for it after the text.
         let room = usize::from(text.width).saturating_sub(prompt_len).max(1);
@@ -689,7 +695,7 @@ fn status_line(m: &Model, f: &mut Frame, area: Rect) {
         f.set_cursor_position(Position::new(x.min(text.right().saturating_sub(1)), text.y));
         return;
     }
-    if let Some(status) = m.status_text(area) {
+    if let Some(status) = s.status_text(m, area) {
         f.render_widget(Paragraph::new(status), text);
     }
 }
@@ -704,17 +710,10 @@ mod tests {
     use crate::apply::{self, patch::Outcome};
     use crate::review::model::Mark;
     use crate::review::model::tests_support::{path, sample};
-    use crate::review::screen::{self, Msg};
-    use crate::review::update::{Effect, Input};
-
-    fn now() -> jiff::Timestamp {
-        "2026-10-17T12:00:00Z".parse().unwrap()
-    }
-
-    /// `msg` as the screen's loop takes it.
-    fn send(m: &mut Model, msg: impl Into<Msg>, now: jiff::Timestamp) -> Vec<Effect> {
-        screen::update(m, msg.into(), now)
-    }
+    use crate::review::screen::tests::send;
+    use crate::review::screen::{self, Editor, Msg};
+    use crate::review::update::Input;
+    use crate::review::update::tests::now;
 
     #[test]
     fn rows_and_members_carry_their_marks() {
@@ -746,7 +745,10 @@ mod tests {
         m.marks
             .insert(1, Mark::ByHand("per-letter karaoke (try --karaoke)".into()));
         m.selected = 0;
-        let text: Vec<String> = detail_lines(&m).iter().map(ToString::to_string).collect();
+        let text: Vec<String> = detail_lines(&m, '⠋')
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert!(
             text.iter().any(|l| l == "state: pending · by hand"),
             "{text:?}"
@@ -764,7 +766,10 @@ mod tests {
         m.marks
             .insert(1, Mark::WouldBeByHand("a karaoke row".into()));
         m.selected = 0;
-        let text: Vec<String> = detail_lines(&m).iter().map(ToString::to_string).collect();
+        let text: Vec<String> = detail_lines(&m, '⠋')
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert!(
             text.iter()
                 .any(|l| l == "state: pending · would be by hand"),
@@ -786,7 +791,10 @@ mod tests {
         );
         m.marks.insert(1, Mark::Failed(why.clone()));
         m.selected = 0;
-        let text: Vec<String> = detail_lines(&m).iter().map(ToString::to_string).collect();
+        let text: Vec<String> = detail_lines(&m, '⠋')
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert!(
             text.iter().any(|l| l == "state: pending · failed"),
             "{text:?}"
@@ -797,7 +805,10 @@ mod tests {
             "{text:?}"
         );
         m.marks.insert(1, Mark::WouldFail(why.clone()));
-        let text: Vec<String> = detail_lines(&m).iter().map(ToString::to_string).collect();
+        let text: Vec<String> = detail_lines(&m, '⠋')
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert!(
             text.iter()
                 .any(|l| *l == format!("⚠ apply would fail on its file: {why}")),
@@ -808,6 +819,7 @@ mod tests {
     #[test]
     fn the_files_view_shows_apply_on_each_file_and_its_block() {
         let mut m = sample();
+        let mut s = Screen::default();
         m.progress.start_apply(false, "subcheck apply r".into());
         m.progress
             .apply_event(&apply::Event::Queued(vec![path(1), path(2)]));
@@ -821,8 +833,8 @@ mod tests {
         });
         m.progress
             .apply_event(&apply::Event::Stage(path(2), apply::Stage::Remux));
-        key_into_files(&mut m);
-        let screen = render(&m, 140, 20);
+        key_into_files(&mut m, &mut s);
+        let screen = render_on(&m, &s, 140, 20);
         assert!(screen.contains("E01  ✓ swapped · 1 applied"), "{screen}");
         assert!(screen.contains("E02  ⠋ remux"), "{screen}");
         assert!(screen.contains("applying 1/2 ⠋"), "{screen}");
@@ -830,7 +842,7 @@ mod tests {
             screen.contains("applying 1/2 · 1 applied"),
             "the status line: {screen}"
         );
-        let text: Vec<String> = files::detail_lines(&m)
+        let text: Vec<String> = files::detail_lines(&m, s.spinner())
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -844,6 +856,7 @@ mod tests {
     #[test]
     fn the_files_list_writes_a_failures_paths_short() {
         let mut m = sample();
+        let mut s = Screen::default();
         m.progress.start_apply(false, "subcheck apply r".into());
         m.progress.apply_event(&apply::Event::Queued(vec![path(1)]));
         let error = format!(
@@ -856,13 +869,13 @@ mod tests {
             text: format!("{}\n  failed: {error}\n\n", path(1)),
             findings: vec![1],
         });
-        key_into_files(&mut m);
-        let screen = render(&m, 140, 20);
+        key_into_files(&mut m, &mut s);
+        let screen = render_on(&m, &s, 140, 20);
         assert!(
             screen.contains("E01  ✗ failed: E01.orig exists: an earlier backup is never"),
             "{screen}"
         );
-        let text: Vec<String> = files::detail_lines(&m)
+        let text: Vec<String> = files::detail_lines(&m, s.spinner())
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -874,9 +887,12 @@ mod tests {
 
     #[test]
     fn the_keys_box_lists_a_and_d() {
-        let mut m = sample();
-        m.help = true;
-        let screen = render(&m, 140, 30);
+        let m = sample();
+        let s = Screen {
+            help: true,
+            ..Screen::default()
+        };
+        let screen = render_on(&m, &s, 140, 30);
         assert!(screen.contains("A  apply the accepted fixes"), "{screen}");
         assert!(
             screen.contains("D  dry run: what apply would do"),
@@ -885,13 +901,19 @@ mod tests {
     }
 
     /// `Tab` to the files view.
-    fn key_into_files(m: &mut Model) {
-        send(m, Msg::Key(KeyCode::Tab), now());
+    fn key_into_files(m: &mut Review, s: &mut Screen) {
+        send(m, s, Msg::Key(KeyCode::Tab), now());
     }
 
-    fn render(m: &Model, width: u16, height: u16) -> String {
+    /// `m` drawn on a fresh screen of `width` by `height`, as text.
+    fn render(m: &Review, width: u16, height: u16) -> String {
+        render_on(m, &Screen::default(), width, height)
+    }
+
+    /// `m` drawn on its screen `s`, of `width` by `height`, as text.
+    fn render_on(m: &Review, s: &Screen, width: u16, height: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
-        term.draw(|f| view(m, f)).unwrap();
+        term.draw(|f| view(m, s, f)).unwrap();
         let buf = term.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
@@ -906,10 +928,11 @@ mod tests {
     #[test]
     fn the_title_marks_the_tab_you_are_on() {
         let mut m = sample();
+        let mut s = Screen::default();
         // The cells of `name` on the top border: its modifier is what tells the tabs apart.
-        let reversed = |m: &Model, name: &str| {
+        let reversed = |m: &Review, s: &Screen, name: &str| {
             let mut term = Terminal::new(TestBackend::new(200, 20)).unwrap();
-            term.draw(|f| view(m, f)).unwrap();
+            term.draw(|f| view(m, s, f)).unwrap();
             let buf = term.backend().buffer().clone();
             let row: Vec<&str> = (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect();
             let at = (0..row.len())
@@ -919,11 +942,11 @@ mod tests {
                 .modifier
                 .contains(Modifier::REVERSED)
         };
-        assert!(reversed(&m, "findings"));
-        assert!(!reversed(&m, "files"));
-        send(&mut m, Msg::Key(KeyCode::Tab), now());
-        assert!(!reversed(&m, "findings"));
-        assert!(reversed(&m, "files"));
+        assert!(reversed(&m, &s, "findings"));
+        assert!(!reversed(&m, &s, "files"));
+        send(&mut m, &mut s, Msg::Key(KeyCode::Tab), now());
+        assert!(!reversed(&m, &s, "findings"));
+        assert!(reversed(&m, &s, "files"));
     }
 
     #[test]
@@ -986,14 +1009,15 @@ mod tests {
     #[test]
     fn a_timing_row_shows_its_track_and_its_members_fixes() {
         let mut m = crate::review::model::tests_support::with_timing();
-        let screen = render(&m, 160, 20);
+        let mut s = Screen::default();
+        let screen = render_on(&m, &s, 160, 20);
         assert!(
             screen.contains("· ×3 English Full  −1 frame ×2 · partial ×1"),
             "{screen}"
         );
         m.selected = 1;
-        send(&mut m, Msg::Key(KeyCode::Enter), now());
-        let screen = render(&m, 160, 20);
+        send(&mut m, &mut s, Msg::Key(KeyCode::Enter), now());
+        let screen = render_on(&m, &s, 160, 20);
         assert!(screen.contains("    · E01 −1 frame"), "{screen}");
         assert!(screen.contains("    · E02 partial"), "{screen}");
     }
@@ -1001,8 +1025,9 @@ mod tests {
     #[test]
     fn the_detail_pane_shows_a_timing_rows_fixes_and_stretches() {
         let mut m = crate::review::model::tests_support::with_timing();
+        let mut s = Screen::default();
         m.selected = 1;
-        let screen = render(&m, 160, 24);
+        let screen = render_on(&m, &s, 160, 24);
         assert!(
             screen.contains("│E01 −1 frame · E02 partial · E03 −1 frame"),
             "{screen}"
@@ -1026,9 +1051,9 @@ mod tests {
             "{screen}"
         );
         // E02, the partial one.
-        send(&mut m, Msg::Key(KeyCode::Enter), now());
+        send(&mut m, &mut s, Msg::Key(KeyCode::Enter), now());
         m.selected = 3;
-        let screen = render(&m, 160, 24);
+        let screen = render_on(&m, &s, 160, 24);
         for line in [
             "│1 frame late  0:00:01.00 – 0:07:55.78",
             "│in sync       0:08:03.51 – 0:15:39.00",
@@ -1093,9 +1118,12 @@ mod tests {
 
     #[test]
     fn the_detail_pane_scrolls() {
-        let mut m = sample();
-        m.detail_scroll = 2;
-        let screen = render(&m, 160, 20);
+        let m = sample();
+        let s = Screen {
+            detail_scroll: 2,
+            ..Screen::default()
+        };
+        let screen = render_on(&m, &s, 160, 20);
         assert!(!screen.contains("3 files:"), "{screen}");
         assert!(
             screen.lines().nth(1).unwrap().contains("│state: pending"),
@@ -1106,12 +1134,18 @@ mod tests {
     #[test]
     fn the_wheel_reaches_the_end_of_a_wrapped_detail() {
         let mut m = sample();
+        let mut s = Screen::default();
         // 8 lines leave the detail pane 5 rows of 28 columns, so its lines wrap.
-        send(&mut m, Msg::Resize(60, 8), now());
+        send(&mut m, &mut s, Msg::Resize(60, 8), now());
         for _ in 0..20 {
-            send(&mut m, Msg::Mouse(screen::Mouse::WheelDown, 40, 2), now());
+            send(
+                &mut m,
+                &mut s,
+                Msg::Mouse(screen::Mouse::WheelDown, 40, 2),
+                now(),
+            );
         }
-        let screen = render(&m, 60, 8);
+        let screen = render_on(&m, &s, 60, 8);
         // It stops with the last line on top.
         assert!(
             screen.lines().nth(1).unwrap().contains("│The line after."),
@@ -1122,13 +1156,19 @@ mod tests {
     #[test]
     fn a_wider_screen_scrolls_a_detail_back_from_past_its_end() {
         let mut m = sample();
-        send(&mut m, Msg::Resize(60, 8), now());
+        let mut s = Screen::default();
+        send(&mut m, &mut s, Msg::Resize(60, 8), now());
         for _ in 0..20 {
-            send(&mut m, Msg::Mouse(screen::Mouse::WheelDown, 40, 2), now());
+            send(
+                &mut m,
+                &mut s,
+                Msg::Mouse(screen::Mouse::WheelDown, 40, 2),
+                now(),
+            );
         }
         // Wider, the lines wrap less: the last one is on top again, not off the end.
-        send(&mut m, Msg::Resize(160, 8), now());
-        let screen = render(&m, 160, 8);
+        send(&mut m, &mut s, Msg::Resize(160, 8), now());
+        let screen = render_on(&m, &s, 160, 8);
         assert!(
             screen.lines().nth(1).unwrap().contains("│The line after."),
             "{screen}"
@@ -1145,7 +1185,7 @@ mod tests {
         assert!(line.ends_with(" ? help"), "{screen}");
         // In the terminal's own colour, as the message is.
         let mut term = Terminal::new(TestBackend::new(110, 20)).unwrap();
-        term.draw(|f| view(&m, f)).unwrap();
+        term.draw(|f| view(&m, &Screen::default(), f)).unwrap();
         assert_eq!(term.backend().buffer()[(104, 19)].fg, Color::Reset);
         // A message that fits stops a column short of it.
         m.status = Some("x".repeat(103));
@@ -1186,36 +1226,44 @@ mod tests {
         use crate::review::model::tests_support::path;
         use crate::scan::Event;
         let mut m = sample();
+        let mut s = Screen::default();
         let queued = vec![path(3).into(), path(4).into()];
-        send(&mut m, Input::Scan(Event::Queued(queued)), now());
-        send(&mut m, Input::Scan(Event::Reading(path(4).into())), now());
+        send(&mut m, &mut s, Input::Scan(Event::Queued(queued)), now());
+        send(
+            &mut m,
+            &mut s,
+            Input::Scan(Event::Reading(path(4).into())),
+            now(),
+        );
         let done = Event::Finished {
             path: path(3).into(),
             error: None,
             findings: 1,
             lines: vec!["[1/2] K-On! - E03 - Episode.mkv: 400 lines, 1 findings".into()],
         };
-        send(&mut m, Input::Scan(done), now());
+        send(&mut m, &mut s, Input::Scan(done), now());
+        // A tick turns the spinner a step: the title and a stage under way draw the screen's frame.
+        send(&mut m, &mut s, Msg::Tick, now());
         // The scan's progress at the right of the top border, the counts on the bottom one.
-        let screen = render(&m, 160, 20);
+        let screen = render_on(&m, &s, 160, 20);
         assert!(screen.contains("┌ findings  files ─"), "{screen}");
-        assert!(screen.contains("─ scanning 1/2 ⠋ ┐"), "{screen}");
+        assert!(screen.contains("─ scanning 1/2 ⠙ ┐"), "{screen}");
         assert!(screen.contains(" · showing all ┘"), "{screen}");
         // On a narrow pane the progress leaves the border rather than overwrite the tabs: at 60
         // columns the pane is 30 wide, 28 inside its corners; the tabs take 17, the progress 16.
-        let screen = render(&m, 60, 20);
+        let screen = render_on(&m, &s, 60, 20);
         let top: String = screen.lines().next().unwrap().chars().take(30).collect();
         assert!(top.starts_with("┌ findings  files "), "{top}");
         assert!(!top.contains("scanning"), "{top}");
-        send(&mut m, Msg::Key(KeyCode::Tab), now());
+        send(&mut m, &mut s, Msg::Key(KeyCode::Tab), now());
         m.file_selected = 2;
-        let screen = render(&m, 160, 20);
+        let screen = render_on(&m, &s, 160, 20);
         assert!(screen.contains("┌ findings  files ─"), "{screen}");
-        assert!(screen.contains("─ scanning 1/2 ⠋ ┐"), "{screen}");
+        assert!(screen.contains("─ scanning 1/2 ⠙ ┐"), "{screen}");
         assert!(screen.contains("─ 4 files ┘"), "{screen}");
         assert!(screen.contains("E01  ✓ 400 lines · 1 finding"), "{screen}");
         assert!(screen.contains("E03  ✓ 1 finding"), "{screen}");
-        assert!(screen.contains("E04  ⠋ reading"), "{screen}");
+        assert!(screen.contains("E04  ⠙ reading"), "{screen}");
         assert!(
             screen.contains("│[1/2] K-On! - E03 - Episode.mkv: 400 lines, 1 findings"),
             "{screen}"
@@ -1224,10 +1272,11 @@ mod tests {
         // Once the scan ends, the view's name takes the progress's place.
         send(
             &mut m,
+            &mut s,
             Input::ScanEnded(Ok(crate::scan::Summary::default())),
             now(),
         );
-        let screen = render(&m, 160, 20);
+        let screen = render_on(&m, &s, 160, 20);
         let top: String = screen.lines().next().unwrap().chars().take(80).collect();
         let rest = top
             .strip_prefix("┌ findings  files ")
@@ -1242,9 +1291,11 @@ mod tests {
         use crate::review::model::tests_support::path;
         use crate::scan::Event;
         let mut m = sample();
+        let mut s = Screen::default();
         // E02 checked again: the lyric's row (E01, E02, E03) and E02's snacks row spin.
         send(
             &mut m,
+            &mut s,
             Input::Scan(Event::Queued(vec![path(2).into()])),
             now(),
         );
@@ -1253,20 +1304,22 @@ mod tests {
             answered: 1,
             chunks: 3,
         };
-        send(&mut m, Input::Scan(asking), now());
-        let screen = render(&m, 160, 20);
+        send(&mut m, &mut s, Input::Scan(asking), now());
+        // A tick turns the spinner a step: the rows being checked draw the screen's frame.
+        send(&mut m, &mut s, Msg::Tick, now());
+        let screen = render_on(&m, &s, 160, 20);
         assert!(
-            screen.contains("· ×3⠋ 0:02:45.06 trough → through  [OP en]"),
+            screen.contains("· ×3⠙ 0:02:45.06 trough → through  [OP en]"),
             "{screen}"
         );
         assert!(
-            screen.contains("· E02⠋ 0:14:54.19 everyday. → every day.  [Dialogue]"),
+            screen.contains("· E02⠙ 0:14:54.19 everyday. → every day.  [Dialogue]"),
             "{screen}"
         );
         // The lyric's row shows E01 in the detail pane, which is not being checked.
         assert!(!screen.contains("checking again"), "{screen}");
         m.selected = 1;
-        let screen = render(&m, 160, 20);
+        let screen = render_on(&m, &s, 160, 20);
         assert!(screen.contains("checking again: LLM 1/3"), "{screen}");
         let done = Event::Finished {
             path: path(2).into(),
@@ -1274,30 +1327,32 @@ mod tests {
             findings: 2,
             lines: vec![],
         };
-        send(&mut m, Input::Scan(done), now());
+        send(&mut m, &mut s, Input::Scan(done), now());
         // The scan has not ended, so the title still spins: the rows no longer do.
-        let screen = render(&m, 160, 20);
-        assert!(!screen.contains("E02⠋"), "{screen}");
-        assert!(!screen.contains("×3⠋"), "{screen}");
+        let screen = render_on(&m, &s, 160, 20);
+        assert!(!screen.contains("E02⠙"), "{screen}");
+        assert!(!screen.contains("×3⠙"), "{screen}");
         assert!(!screen.contains("checking again"), "{screen}");
     }
 
     #[test]
     fn an_empty_list_while_scanning_says_findings_are_coming() {
-        let mut m = Model::new(
+        let mut m = Review::new(
             crate::store::Run {
                 name: "r".into(),
                 ..crate::store::Run::default()
             },
             std::collections::HashMap::new(),
         );
+        let mut s = Screen::default();
         let queued = vec![crate::review::model::tests_support::path(1).into()];
         send(
             &mut m,
+            &mut s,
             Input::Scan(crate::scan::Event::Queued(queued)),
             now(),
         );
-        let screen = render(&m, 120, 12);
+        let screen = render_on(&m, &s, 120, 12);
         assert!(
             screen.contains("No findings yet · Tab shows the files"),
             "{screen}"
@@ -1306,9 +1361,12 @@ mod tests {
 
     #[test]
     fn question_mark_shows_every_key_in_a_box_over_the_panes() {
-        let mut m = sample();
-        m.help = true;
-        let screen = render(&m, 120, 24);
+        let m = sample();
+        let s = Screen {
+            help: true,
+            ..Screen::default()
+        };
+        let screen = render_on(&m, &s, 120, 24);
         for text in [
             "┌ keys ",
             "decide",
@@ -1332,12 +1390,12 @@ mod tests {
             "{screen}"
         );
         // On 70 the last two groups go under the first two.
-        let screen = render(&m, 70, 24);
+        let screen = render_on(&m, &s, 70, 24);
         let heading = |name: &str| screen.lines().position(|l| l.contains(name)).unwrap();
         assert_eq!(heading("decide"), heading("move"), "{screen}");
         assert!(heading("mpv") > heading("decide"), "{screen}");
         // Too short for every key, it still says how to leave.
-        let screen = render(&m, 50, 20);
+        let screen = render_on(&m, &s, 50, 20);
         assert!(
             screen.contains("q quits · any other key closes"),
             "{screen}"
@@ -1346,8 +1404,11 @@ mod tests {
 
     #[test]
     fn the_way_out_of_the_keys_box_has_a_blank_row_above_it() {
-        let mut m = with_cost();
-        m.help = true;
+        let m = with_cost();
+        let s = Screen {
+            help: true,
+            ..Screen::default()
+        };
         // The row above the bottom border, inside the box's corners.
         let above_the_way_out = |screen: &str| {
             let lines: Vec<Vec<char>> = screen.lines().map(|l| l.chars().collect()).collect();
@@ -1359,21 +1420,21 @@ mod tests {
             let right = left + lines[at][left..].iter().position(|&c| c == '┘').unwrap();
             String::from_iter(&lines[at - 1][left..=right])
         };
-        let screen = render(&m, 120, 24);
+        let screen = render_on(&m, &s, 120, 24);
         let row = above_the_way_out(&screen);
         assert!(
             row.starts_with('│') && row.ends_with('│') && row.trim_matches('│').trim().is_empty(),
             "{row:?}\n{screen}"
         );
         // A row short of the whole box, the blank row is what goes: the cost still shows.
-        let screen = render(&m, 120, 18);
+        let screen = render_on(&m, &s, 120, 18);
         assert!(
             above_the_way_out(&screen).contains("$3.21 at API prices"),
             "{screen}"
         );
     }
 
-    fn with_cost() -> Model {
+    fn with_cost() -> Review {
         let mut m = sample();
         m.run.spent.add(Some(&crate::llm::Usage {
             input_tokens: 1_234_567,
@@ -1387,38 +1448,45 @@ mod tests {
     #[test]
     fn review_opens_with_what_the_llm_calls_cost_beside_the_help_button() {
         let mut m = with_cost();
-        let last = |m: &Model, width| render(m, width, 20).lines().nth(19).unwrap().to_string();
+        let mut s = Screen::default();
+        let last = |m: &Review, s: &Screen, width| {
+            render_on(m, s, width, 20)
+                .lines()
+                .nth(19)
+                .unwrap()
+                .to_string()
+        };
         let full = "LLM: 1 call · 1.23M in / 31.2k out tokens · $3.21 at API prices";
-        let line = last(&m, 80);
+        let line = last(&m, &s, 80);
         assert!(
             line.starts_with(full) && line.ends_with(" ? help"),
             "{line}"
         );
         // Narrower, the tokens go, then the calls: the price stays, and so does `? help`.
-        let line = last(&m, 60);
+        let line = last(&m, &s, 60);
         assert!(
             line.starts_with("LLM: 1 call · $3.21 at API prices ") && line.ends_with(" ? help"),
             "{line}"
         );
-        let line = last(&m, 35);
+        let line = last(&m, &s, 35);
         assert!(
             line.starts_with("LLM: $3.21 at API prices ") && line.ends_with(" ? help"),
             "{line}"
         );
         // Too narrow for even that beside the button: the price, and the button gives way.
-        assert_eq!(last(&m, 20), "LLM: $3.21 at API pr");
+        assert_eq!(last(&m, &s, 20), "LLM: $3.21 at API pr");
         // A message of its own takes the line.
         m.status = Some("warning: /m/locked: skipped: Permission denied".into());
         assert!(
-            last(&m, 80).starts_with("warning: /m/locked"),
+            last(&m, &s, 80).starts_with("warning: /m/locked"),
             "{}",
-            last(&m, 80)
+            last(&m, &s, 80)
         );
         // Gone after the first key, whatever the width after.
         m.status = None;
-        send(&mut m, Msg::Key(KeyCode::Char('j')), now());
-        send(&mut m, Msg::Resize(80, 20), now());
-        assert_eq!(last(&m, 80).trim_start(), "? help");
+        send(&mut m, &mut s, Msg::Key(KeyCode::Char('j')), now());
+        send(&mut m, &mut s, Msg::Resize(80, 20), now());
+        assert_eq!(last(&m, &s, 80).trim_start(), "? help");
     }
 
     #[test]
@@ -1426,33 +1494,38 @@ mod tests {
         use screen::Mouse::{Click, WheelDown};
         // A row of the list, the wheel over the detail pane, an empty part of the status line,
         // and a click with the box of keys open.
-        for (action, x, y, help) in [
+        for (kind, x, y, help) in [
             (Click, 5, 2, false),
             (WheelDown, 70, 5, false),
             (Click, 30, 19, false),
             (Click, 30, 5, true),
         ] {
             let mut m = with_cost();
-            send(&mut m, Msg::Resize(80, 20), now());
-            m.help = help;
-            let status = layout::panes(m.area).status;
-            assert!(m.status_text(status).is_some());
-            send(&mut m, Msg::Mouse(action, x, y), now());
-            assert_eq!(m.status_text(status), None, "{action:?} at {x},{y}");
+            let mut s = Screen::default();
+            send(&mut m, &mut s, Msg::Resize(80, 20), now());
+            s.help = help;
+            let status = layout::panes(s.area).status;
+            assert!(s.status_text(&m, status).is_some());
+            send(&mut m, &mut s, Msg::Mouse(kind, x, y), now());
+            assert_eq!(s.status_text(&m, status), None, "{kind:?} at {x},{y}");
         }
     }
 
     #[test]
     fn a_key_with_the_box_of_keys_open_ends_the_cost_line_too() {
         let mut m = with_cost();
-        m.help = true;
-        send(&mut m, Msg::Key(KeyCode::Esc), now());
-        assert!(!m.help);
-        assert!(!m.show_cost);
+        let mut s = Screen {
+            help: true,
+            ..Screen::default()
+        };
+        send(&mut m, &mut s, Msg::Key(KeyCode::Esc), now());
+        assert!(!s.help);
+        assert!(!s.show_cost);
         // Ctrl-U, which comes as its own message.
         let mut m = with_cost();
-        send(&mut m, Msg::KillLine, now());
-        assert!(!m.show_cost);
+        let mut s = Screen::default();
+        send(&mut m, &mut s, Msg::KillLine, now());
+        assert!(!s.show_cost);
     }
 
     #[test]
@@ -1460,26 +1533,41 @@ mod tests {
         // 20 columns: the cost line leaves no room for `? help`, so a click where it would be
         // presses nothing, and only ends the cost line.
         let mut m = with_cost();
-        send(&mut m, Msg::Resize(20, 20), now());
-        send(&mut m, Msg::Mouse(screen::Mouse::Click, 17, 19), now());
-        assert!(!m.help);
-        assert!(!m.show_cost);
+        let mut s = Screen::default();
+        send(&mut m, &mut s, Msg::Resize(20, 20), now());
+        send(
+            &mut m,
+            &mut s,
+            Msg::Mouse(screen::Mouse::Click, 17, 19),
+            now(),
+        );
+        assert!(!s.help);
+        assert!(!s.show_cost);
     }
 
     #[test]
     fn the_help_button_is_clickable_beside_the_cost_on_a_narrow_screen() {
         let mut m = with_cost();
-        send(&mut m, Msg::Resize(60, 20), now());
-        send(&mut m, Msg::Mouse(screen::Mouse::Click, 57, 19), now());
-        assert!(m.help);
+        let mut s = Screen::default();
+        send(&mut m, &mut s, Msg::Resize(60, 20), now());
+        send(
+            &mut m,
+            &mut s,
+            Msg::Mouse(screen::Mouse::Click, 57, 19),
+            now(),
+        );
+        assert!(s.help);
     }
 
     #[test]
     fn the_keys_box_ends_with_what_the_runs_llm_calls_cost() {
         let mut m = sample();
-        m.help = true;
+        let s = Screen {
+            help: true,
+            ..Screen::default()
+        };
         // None recorded: nothing is said of them.
-        let screen = render(&m, 120, 30);
+        let screen = render_on(&m, &s, 120, 30);
         assert!(!screen.contains("LLM"), "{screen}");
         m.run.spent.add(Some(&crate::llm::Usage {
             input_tokens: 1_234_567,
@@ -1487,7 +1575,7 @@ mod tests {
             cost_usd: Some(3.21),
             ..crate::llm::Usage::default()
         }));
-        let screen = render(&m, 120, 30);
+        let screen = render_on(&m, &s, 120, 30);
         let lines: Vec<&str> = screen.lines().collect();
         let at = lines
             .iter()
@@ -1501,7 +1589,7 @@ mod tests {
         assert!(lines[at - 1].contains("│ LLM "), "{screen}");
         // Too narrow for one line, it wraps between the parts.
         // (Taller: at this width the box is too tall for 30 lines.)
-        let screen = render(&m, 50, 40);
+        let screen = render_on(&m, &s, 50, 40);
         assert!(
             screen.contains("│ 1 call · 1.23M in / 31.2k out tokens "),
             "{screen}"
@@ -1512,16 +1600,17 @@ mod tests {
     #[test]
     fn the_list_stays_put_while_the_selection_moves_inside_it() {
         let mut m = crate::review::model::tests_support::many(12);
+        let mut s = Screen::default();
         // 10 lines: 1 for the footer and 2 for the border leave 7 rows.
-        send(&mut m, Msg::Resize(110, 10), now());
+        send(&mut m, &mut s, Msg::Resize(110, 10), now());
         for _ in 0..8 {
-            send(&mut m, Msg::Key(KeyCode::Char('j')), now());
+            send(&mut m, &mut s, Msg::Key(KeyCode::Char('j')), now());
         }
         for _ in 0..2 {
-            send(&mut m, Msg::Key(KeyCode::Char('k')), now());
+            send(&mut m, &mut s, Msg::Key(KeyCode::Char('k')), now());
         }
-        assert_eq!((m.selected, m.scroll), (6, 2));
-        let screen = render(&m, 110, 10);
+        assert_eq!((m.selected, s.scroll), (6, 2));
+        let screen = render_on(&m, &s, 110, 10);
         let lines: Vec<&str> = screen.lines().collect();
         // Entries 2 to 8 show, E03 to E09, and the selection is on E07 inside them.
         assert!(lines[1].contains("E03 "), "{screen}");
@@ -1532,13 +1621,14 @@ mod tests {
     #[test]
     fn a_taller_screen_shows_the_entries_above_instead_of_blank_rows() {
         let mut m = crate::review::model::tests_support::many(12);
-        send(&mut m, Msg::Resize(110, 10), now());
-        send(&mut m, Msg::Key(KeyCode::End), now());
-        assert_eq!(m.scroll, 5);
+        let mut s = Screen::default();
+        send(&mut m, &mut s, Msg::Resize(110, 10), now());
+        send(&mut m, &mut s, Msg::Key(KeyCode::End), now());
+        assert_eq!(s.scroll, 5);
         // 20 lines leave 17 rows: all 12 entries fit, from the top.
-        send(&mut m, Msg::Resize(110, 20), now());
-        assert_eq!(m.scroll, 0);
-        let screen = render(&m, 110, 20);
+        send(&mut m, &mut s, Msg::Resize(110, 20), now());
+        assert_eq!(s.scroll, 0);
+        let screen = render_on(&m, &s, 110, 20);
         let lines: Vec<&str> = screen.lines().collect();
         assert!(lines[1].contains("E01 "), "{screen}");
         assert!(lines[12].contains("▶ · E12 "), "{screen}");
@@ -1569,9 +1659,9 @@ mod tests {
     }
 
     /// The colour of the list line holding `text`, on a 160×20 screen.
-    fn colour_of(m: &Model, text: &str) -> Color {
+    fn colour_of(m: &Review, text: &str) -> Color {
         let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
-        term.draw(|f| view(m, f)).unwrap();
+        term.draw(|f| view(m, &Screen::default(), f)).unwrap();
         let screen = render(m, 160, 20);
         let y = screen.lines().position(|l| l.contains(text)).expect(text);
         let line = screen.lines().nth(y).unwrap();
@@ -1582,7 +1672,7 @@ mod tests {
     #[test]
     fn decided_rows_stay_in_the_list_coloured_by_their_state() {
         let mut m = sample();
-        let decide = |m: &mut Model, id, state| {
+        let decide = |m: &mut Review, id, state| {
             m.run.decisions.insert(
                 id,
                 crate::store::Decision {
@@ -1614,14 +1704,16 @@ mod tests {
 
     #[test]
     fn a_long_edit_scrolls_to_keep_the_cursor_in_view() {
-        let mut m = sample();
-        m.editor = Some(super::super::model::Editor {
-            entry: Entry::Row(0),
-            text: "0123456789".repeat(4),
-            cursor: 40,
-        });
+        let m = sample();
+        let s = Screen {
+            editor: Some(Editor {
+                text: "0123456789".repeat(4),
+                cursor: 40,
+            }),
+            ..Screen::default()
+        };
         let mut term = Terminal::new(TestBackend::new(30, 10)).unwrap();
-        term.draw(|f| view(&m, f)).unwrap();
+        term.draw(|f| view(&m, &s, f)).unwrap();
         // The status line is the last, y 9; 30 columns leave no room for the editor's buttons.
         let status: String = (0..30)
             .map(|x| term.backend().buffer()[(x, 9)].symbol().to_string())
@@ -1633,13 +1725,15 @@ mod tests {
 
     #[test]
     fn the_editors_buttons_show_on_a_60_column_screen() {
-        let mut m = sample();
-        m.editor = Some(super::super::model::Editor {
-            entry: Entry::Row(0),
-            text: "abc".into(),
-            cursor: 3,
-        });
-        let screen = render(&m, 60, 20);
+        let m = sample();
+        let s = Screen {
+            editor: Some(Editor {
+                text: "abc".into(),
+                cursor: 3,
+            }),
+            ..Screen::default()
+        };
+        let screen = render_on(&m, &s, 60, 20);
         let line = screen.lines().nth(19).unwrap();
         assert!(line.starts_with("wording: abc "), "{screen}");
         assert!(line.ends_with(" ⏎ accept · Esc cancel"), "{screen}");
@@ -1660,18 +1754,20 @@ mod tests {
     fn the_quit_question_shows_over_the_editor() {
         use crate::review::model::tests_support::path;
         let mut m = sample();
+        let mut s = Screen::default();
         let queued = vec![path(4).into(), path(5).into()];
         send(
             &mut m,
+            &mut s,
             Input::Scan(crate::scan::Event::Queued(queued)),
             now(),
         );
         m.selected = 1;
-        send(&mut m, Msg::Key(KeyCode::Char('e')), now());
+        send(&mut m, &mut s, Msg::Key(KeyCode::Char('e')), now());
         // Ctrl-C mid-edit: the next key answers the question, so it shows, as it does outside
         // the editor.
-        send(&mut m, Msg::Interrupt, now());
-        let screen = render(&m, 160, 20);
+        send(&mut m, &mut s, Msg::Interrupt, now());
+        let screen = render_on(&m, &s, 160, 20);
         let line = screen.lines().nth(19).unwrap();
         assert!(
             line.starts_with("scan is on 0/2 — stop it and quit? y/n "),
@@ -1679,8 +1775,8 @@ mod tests {
         );
         assert!(line.ends_with(" ? help"), "{screen}");
         // `n` lets it go, and the edit is as it was.
-        send(&mut m, Msg::Key(KeyCode::Char('n')), now());
-        let screen = render(&m, 160, 20);
+        send(&mut m, &mut s, Msg::Key(KeyCode::Char('n')), now());
+        let screen = render_on(&m, &s, 160, 20);
         let line = screen.lines().nth(19).unwrap();
         assert!(
             line.starts_with("wording: Let's have snacks together every day. "),
@@ -1691,18 +1787,20 @@ mod tests {
 
     #[test]
     fn the_editor_takes_the_status_line_with_its_buttons() {
-        let mut m = sample();
-        m.editor = Some(super::super::model::Editor {
-            entry: Entry::Row(0),
-            text: "abc".into(),
-            cursor: 1,
-        });
+        let m = sample();
+        let s = Screen {
+            editor: Some(Editor {
+                text: "abc".into(),
+                cursor: 1,
+            }),
+            ..Screen::default()
+        };
         let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
-        term.draw(|f| view(&m, f)).unwrap();
+        term.draw(|f| view(&m, &s, f)).unwrap();
         let pos = term.get_cursor_position().unwrap();
         // The prompt is 9 characters, then one character of text before the cursor.
         assert_eq!((pos.x, pos.y), (10, 19));
-        let screen = render(&m, 160, 20);
+        let screen = render_on(&m, &s, 160, 20);
         let line = screen.lines().nth(19).unwrap();
         assert!(line.starts_with("wording: abc "), "{screen}");
         assert!(line.ends_with(" ⏎ accept · Esc cancel"), "{screen}");

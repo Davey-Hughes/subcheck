@@ -4,14 +4,9 @@ use std::collections::hash_map::Entry as Slot;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use jiff::Timestamp;
-use ratatui::layout::Rect;
-
-use super::layout::{self, EDIT_KEYS, HELP, Item};
 use super::progress::Progress;
 use crate::apply::patch::Outcome;
 use crate::list::{self, Filter};
-use crate::llm::Spent;
 use crate::store::{Decision, Finding, Run, State, TrackRecord};
 use crate::timing::frame_count;
 
@@ -71,7 +66,7 @@ pub enum Confirm {
     Apply,
 }
 
-/// What the screen's last apply or dry run said of a finding, for its mark ([`Model::mark`]).
+/// What the screen's last apply or dry run said of a finding, for its mark ([`Review::mark`]).
 /// Outside a dry run, a fix apply made or found made has none: the store's `applied` speaks for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mark {
@@ -144,64 +139,45 @@ impl Mark {
     }
 }
 
-/// The one-line editor that `e` opens.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Editor {
-    pub entry: Entry,
-    pub text: String,
-    /// In chars.
-    pub cursor: usize,
-}
-
 /// What one `u` takes back: each finding a decision changed, with the decision it had before.
 pub type UndoStep = Vec<(u64, Option<Decision>)>;
 
-/// An entry by its findings' IDs, which outlast a remake of the rows ([`Model::refresh`]): a row by
-/// every member's, so that any one still there finds it; a member by its own.
-enum Held {
+/// An entry by its findings' IDs, which outlast a remake of the rows ([`Review::refresh`]): a row
+/// by every member's, so that any one still there finds it; a member by its own. A UI names an
+/// entry by its key (`Action::Select`), since a scan can remake the rows before review takes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryKey {
     Row(Vec<u64>),
     Member(u64),
 }
 
-#[allow(clippy::struct_excessive_bools)] // independent flags of the screen
-pub struct Model {
+/// Review's state, whatever UI shows it: the run's findings in rows, the list as shown and its
+/// selection, what is under way, and what the status line says.
+pub struct Review {
     pub run: Run,
     pub rows: Vec<Row>,
     /// Each finding's [`track_name`], by index; the list draws them on every redraw.
     track_names: Vec<String>,
     pub expanded: HashSet<usize>,
     pub filter: Filter,
-    /// Whether the box of keys `?` opens is showing.
-    pub help: bool,
     /// Index into `entries()`.
     pub selected: usize,
-    pub editor: Option<Editor>,
+    /// The entry being reworded, from `Edit` until the edit ends. The UI holds the text, which
+    /// `Reword` brings.
+    pub editing: Option<EntryKey>,
     /// Decisions made in this session, oldest first.
     pub undo: Vec<UndoStep>,
     /// Files with findings that are not as they were scanned, by path.
     pub notes: HashMap<String, FileNote>,
     pub status: Option<String>,
-    /// Whether the status line, with no message of its own, says what the run's LLM calls cost:
-    /// from opening until the first key, click or turn of the wheel.
-    pub show_cost: bool,
     pub should_quit: bool,
     /// The name each file goes by in the list.
     pub labels: HashMap<String, String>,
-    /// The screen, as the terminal last reported it: where a click lands depends on it.
-    pub area: Rect,
-    /// The list's first shown entry.
-    pub scroll: usize,
-    /// How far the wheel has scrolled the detail pane, in lines; back to 0 on a new selection.
-    pub detail_scroll: u16,
-    /// The last click on the list, while it could still be the first of a double-click.
-    pub last_click: Option<(Entry, Timestamp)>,
     /// The scan or apply under way, or as it ended; with neither, the run's files as recorded.
     pub progress: Progress,
     pub pane: Pane,
     /// Index into `progress.files`.
     pub file_selected: usize,
-    /// The files list's first shown line.
-    pub file_scroll: usize,
     pub confirm: Option<Confirm>,
     /// The screen's apply re-spaces per-letter karaoke, as `apply --karaoke` does (`--karaoke` on
     /// `scan` and `review`).
@@ -211,9 +187,18 @@ pub struct Model {
     pub marks: HashMap<u64, Mark>,
     /// Why the screen ended early: a job's thread panicked, or the terminal could not be read.
     pub fatal: Option<String>,
+    /// Where the selection was before the last input that could remake the list around it: a file
+    /// read back, or a late join's decision while the selected entry stays in the list; `None`
+    /// after any other input. A UI whose list scrolls moves it as far as the selection moved, so
+    /// the selection keeps its line.
+    pub kept_from: Option<usize>,
+    /// Each finding a re-check replaced, by its ID, with the ID of the first that took its place
+    /// (one of its file's with the same carry key): a key that named it finds that one, as
+    /// `refresh` carries what pointed at it.
+    replaced_by: HashMap<u64, u64>,
 }
 
-impl Model {
+impl Review {
     /// What the terminal gets on leaving the screen: what its scans ended with, then its applies,
     /// files named as the list names them ([`Progress::outro`], [`Progress::apply_outro`]).
     pub fn outro(&self) -> Vec<String> {
@@ -224,37 +209,32 @@ impl Model {
 
     /// Every finding, decided or not, with the first row that has a pending one selected: a
     /// half-reviewed run opens where the work is.
-    pub fn new(run: Run, notes: HashMap<String, FileNote>) -> Model {
+    pub fn new(run: Run, notes: HashMap<String, FileNote>) -> Review {
         let (rows, track_names) = group(&run);
         let labels = labels(&run);
         let progress = Progress::of_run(&run);
-        let mut m = Model {
+        let mut m = Review {
             run,
             rows,
             track_names,
             labels,
             expanded: HashSet::new(),
             filter: Filter::All,
-            help: false,
             selected: 0,
-            editor: None,
+            editing: None,
             undo: Vec::new(),
             notes,
             status: None,
-            show_cost: true,
             should_quit: false,
-            area: Rect::default(),
-            scroll: 0,
-            detail_scroll: 0,
-            last_click: None,
             progress,
             pane: Pane::Findings,
             file_selected: 0,
-            file_scroll: 0,
             confirm: None,
             karaoke: false,
             marks: HashMap::new(),
             fatal: None,
+            kept_from: None,
+            replaced_by: HashMap::new(),
         };
         m.selected = m
             .entries()
@@ -266,23 +246,21 @@ impl Model {
 
     /// Take file `path` as the store shows it now (`view`, from `Store::file_view`): its record,
     /// findings, decisions and applied marks replace those the run had, and the rows are made
-    /// again. What pointed at a finding that went (the selection, the editor's entry, the last
-    /// click, an expanded row, the undo steps) moves to the new finding of its carry key. Failing
-    /// that, the selection goes to the nearest entry still shown, an open editor closes and the
-    /// status line says why, and the rest let go of it. The selection keeps its place on screen,
-    /// the list scrolled as far as entries came or went above it; on a list that was empty, it
-    /// goes to the first row with a pending finding, as on opening. Returns the new findings'
-    /// indexes.
+    /// again. What pointed at a finding that went (the selection, the entry being edited, an
+    /// expanded row, the undo steps) moves to the new finding of its carry key, as a key does
+    /// ([`Review::resolve`]). Failing that, the selection goes to the nearest entry still shown,
+    /// the edit ends and the status line says why, and the rest let go of it; on a list that
+    /// was empty, the selection goes to the first row with a pending finding, as on opening. Where
+    /// it was is kept in `kept_from`, for a screen to keep it on its line. Returns the new
+    /// findings' indexes.
     #[allow(clippy::too_many_lines)] // the swap, then each thing that pointed at the file, in order
     pub fn refresh(&mut self, path: &str, view: Run) -> Vec<usize> {
         let was_at = self.selected;
-        let selected = self.selected_entry().map(|e| self.hold(e));
-        let editor = self.editor.as_ref().map(|ed| self.hold(ed.entry));
-        let last_click = self.last_click.map(|(e, at)| (self.hold(e), at));
-        let expanded: Vec<Held> = self
+        let selected = self.selected_key();
+        let expanded: Vec<EntryKey> = self
             .expanded
             .iter()
-            .map(|&r| self.hold(Entry::Row(r)))
+            .map(|&r| self.entry_key(Entry::Row(r)))
             .collect();
 
         // What the file had, and for each finding that went, the new ones of its key.
@@ -309,6 +287,11 @@ impl Model {
                 (f.id, to)
             })
             .collect();
+        for (&id, to) in &moved {
+            if let Some(&first) = to.first() {
+                self.replaced_by.insert(id, first);
+            }
+        }
 
         self.run.findings.retain(|f| f.file != path);
         for id in &before {
@@ -357,15 +340,9 @@ impl Model {
             .filter_map(|h| self.find(h, &now_at))
             .map(Entry::row)
             .collect();
-        self.last_click = last_click.and_then(|(h, at)| Some((self.find(&h, &now_at)?, at)));
-        match editor.map(|h| self.find(&h, &now_at)) {
-            Some(Some(e)) => {
-                if let Some(ed) = &mut self.editor {
-                    ed.entry = e;
-                }
-            }
+        match self.editing.take().map(|key| self.find(&key, &now_at)) {
+            Some(Some(e)) => self.editing = Some(self.entry_key(e)),
             Some(None) => {
-                self.editor = None;
                 self.status = Some(format!(
                     "{} was checked again; its finding changed",
                     self.label(path)
@@ -397,8 +374,7 @@ impl Model {
                 .position(|&e| self.has_pending(e))
                 .unwrap_or(0),
         };
-        self.scroll = (self.scroll + self.selected).saturating_sub(was_at);
-        self.scroll = self.list_scroll(self.area);
+        self.kept_from = Some(was_at);
         (from..self.run.findings.len())
             .filter(|&i| !before.contains(&self.run.findings[i].id))
             .collect()
@@ -410,11 +386,11 @@ impl Model {
     /// the findings this view does not show (a step left empty goes). The filter and the pane stay.
     /// The files view shows the new view's files, the selected file kept where it is one of them.
     pub fn switch(&mut self, view: Run, notes: HashMap<String, FileNote>) {
-        let selected = self.selected_entry().map(|e| self.hold(e));
-        let expanded: Vec<Held> = self
+        let selected = self.selected_key();
+        let expanded: Vec<EntryKey> = self
             .expanded
             .iter()
-            .map(|&r| self.hold(Entry::Row(r)))
+            .map(|&r| self.entry_key(Entry::Row(r)))
             .collect();
         let file = self
             .progress
@@ -428,9 +404,7 @@ impl Model {
         self.progress.show(&view);
         self.run = view;
         self.notes = notes;
-        self.editor = None;
-        self.last_click = None;
-        self.detail_scroll = 0;
+        self.editing = None;
 
         let index: HashMap<u64, usize> = self
             .run
@@ -460,38 +434,65 @@ impl Model {
                     .position(|&e| self.has_pending(e))
                     .unwrap_or(0)
             });
-        self.scroll = 0;
-        self.scroll = self.list_scroll(self.area);
         self.file_selected = file
             .and_then(|p| self.progress.files.iter().position(|f| f.path == p))
             .unwrap_or(0);
-        self.file_scroll = 0;
     }
 
-    /// Entry `e` by its findings' IDs ([`Held`]).
-    fn hold(&self, e: Entry) -> Held {
+    /// Entry `e`'s key ([`EntryKey`]). `e` is an entry of the current rows, as `entries()` gives
+    /// them: one kept from before a refresh or a switch remade the rows names other findings, or
+    /// indexes past them and panics.
+    pub fn entry_key(&self, e: Entry) -> EntryKey {
         match e {
-            Entry::Row(r) => Held::Row(
+            Entry::Row(r) => EntryKey::Row(
                 self.rows[r]
                     .members
                     .iter()
                     .map(|&i| self.finding(i).id)
                     .collect(),
             ),
-            Entry::Member(_, i) => Held::Member(self.finding(i).id),
+            Entry::Member(_, i) => EntryKey::Member(self.finding(i).id),
         }
     }
 
-    /// Where `held` is among the rows as they are now; `at` gives a finding's index by its ID, or
-    /// `None` for one that went.
-    fn find(&self, held: &Held, at: &dyn Fn(u64) -> Option<usize>) -> Option<Entry> {
+    /// The wording an edit starts from: the edited entry's, as [`Review::wording`] gives it for
+    /// the first finding a decision on it takes; `None` with no edit, or when its entry is gone.
+    pub fn edit_wording(&self) -> Option<&str> {
+        let entry = self.resolve(self.editing.as_ref()?)?;
+        let first = *self.to_decide(entry).first()?;
+        Some(self.wording(first))
+    }
+
+    /// The selected entry's key; `None` with nothing selected.
+    pub fn selected_key(&self) -> Option<EntryKey> {
+        self.selected_entry().map(|e| self.entry_key(e))
+    }
+
+    /// Where `key`'s entry is among the rows as they are now: its findings found by ID, one a
+    /// re-check replaced by its replacement's (`replaced_by`); `None` when they all went.
+    pub fn resolve(&self, key: &EntryKey) -> Option<Entry> {
+        self.find(key, &|id| self.index_of(id))
+    }
+
+    /// Finding `id`'s index, or for one a re-check replaced, its replacement's.
+    fn index_of(&self, id: u64) -> Option<usize> {
+        // A finding a re-check replaced never comes back, so the chain ends; `take` bounds it
+        // should that ever not hold.
+        std::iter::successors(Some(id), |id| self.replaced_by.get(id).copied())
+            .take(self.replaced_by.len() + 1)
+            .find_map(|id| self.run.findings.iter().position(|f| f.id == id))
+    }
+
+    /// Where `key`'s entry is among the rows as they are now; `at` gives a finding's index by its
+    /// ID, or `None` for one that went.
+    fn find(&self, key: &EntryKey, at: &dyn Fn(u64) -> Option<usize>) -> Option<Entry> {
         let row_of = |i: usize| self.rows.iter().position(|r| r.members.contains(&i));
-        match held {
-            Held::Member(id) => {
+        match key {
+            EntryKey::Member(id) => {
                 let i = at(*id)?;
                 Some(Entry::Member(row_of(i)?, i))
             }
-            Held::Row(ids) => ids
+            EntryKey::Row(ids) => ids
                 .iter()
                 .find_map(|&id| at(id))
                 .and_then(row_of)
@@ -504,38 +505,6 @@ impl Model {
         self.targets(e)
             .iter()
             .any(|&i| self.state(i) == State::Pending)
-    }
-
-    /// A screen of `area`, scrolled to show the selection as the view will draw it: a click maps
-    /// rows with `scroll` before any message has moved it.
-    pub fn set_area(&mut self, area: Rect) {
-        self.area = area;
-        self.scroll = self.list_scroll(area);
-    }
-
-    /// The list's scroll offset on a screen of `area`: `scroll`, moved just enough to show the
-    /// selection. The view draws with it and `screen::update` keeps it.
-    pub fn list_scroll(&self, area: Rect) -> usize {
-        let rows = layout::list_rows(&layout::panes(area)).height;
-        let len = self.entries().len();
-        layout::keep_in_view(self.scroll, self.selected, usize::from(rows), len)
-    }
-
-    /// The buttons at the end of the status line `status`, when they show there: the editor's while
-    /// it is open, beside its prompt and [`layout::EDIT_FIELD`] columns of text; else, or while a
-    /// question takes the line from the editor, `? help`, beside the message.
-    pub fn buttons(&self, status: Rect) -> Option<&'static [Item]> {
-        let (items, left) = match &self.editor {
-            Some(_) if self.confirm.is_none() => (
-                EDIT_KEYS,
-                layout::width(layout::PROMPT) + layout::EDIT_FIELD,
-            ),
-            _ => (
-                HELP,
-                self.status_text(status).map_or(0, |s| layout::width(&s)),
-            ),
-        };
-        layout::right_shown(status, items, left).then_some(items)
     }
 
     /// Finding `i`'s mark: what the screen's last apply or dry run said of it, else `applied` when
@@ -589,10 +558,10 @@ impl Model {
         (fixes.len(), paths.len(), already)
     }
 
-    /// What the status line `status` says: the question waiting for `y`; else its message; else
-    /// how far the latest scan or apply is, or how it ended; else what the run's LLM calls cost
-    /// while [`Model::show_cost`] holds, as much of it as fits beside `? help`.
-    pub fn status_text(&self, status: Rect) -> Option<String> {
+    /// What review has for the status line: the question waiting for `y`; else its message; else
+    /// how far the latest scan or apply is, or how it ended. With none of these, a UI may show its
+    /// own there.
+    pub fn status_text(&self) -> Option<String> {
         if let Some(confirm) = &self.confirm {
             return Some(match confirm {
                 Confirm::Quit if self.progress.applying() => {
@@ -621,24 +590,8 @@ impl Model {
         }
         match &self.status {
             Some(message) => Some(message.clone()),
-            None => self.progress.line().or_else(|| {
-                self.show_cost
-                    .then(|| cost_status(&self.run.spent, status))
-                    .flatten()
-            }),
+            None => self.progress.line(),
         }
-    }
-
-    /// The files list's scroll offset on a screen of `area`, as [`Model::list_scroll`] is the
-    /// findings'.
-    pub fn files_scroll(&self, area: Rect) -> usize {
-        let rows = layout::list_rows(&layout::panes(area)).height;
-        layout::keep_in_view(
-            self.file_scroll,
-            self.file_selected,
-            usize::from(rows),
-            self.progress.files.len(),
-        )
     }
 
     /// The name a file goes by in the list (see [`labels`]).
@@ -1010,36 +963,11 @@ fn words(s: &str) -> Vec<Range<usize>> {
     out
 }
 
-/// What the run's LLM calls cost, for the status line `status`: all of it if it fits beside
-/// `? help`, else without the tokens, else the price alone, which is what it is there for. The
-/// shortest when none fits. `None` with no calls recorded.
-fn cost_status(spent: &Spent, status: Rect) -> Option<String> {
-    let calls = spent.calls_part()?;
-    let (tokens, price) = (spent.tokens_part(), spent.price_part());
-    let shapes = [
-        vec![Some(calls.clone()), tokens, price.clone()],
-        vec![Some(calls), price.clone()],
-        vec![price],
-    ];
-    let lines: Vec<String> = shapes
-        .into_iter()
-        .filter_map(|parts| {
-            let parts: Vec<String> = parts.into_iter().flatten().collect();
-            (!parts.is_empty()).then(|| format!("LLM: {}", parts.join(" · ")))
-        })
-        .collect();
-    lines
-        .iter()
-        .find(|line| layout::right_shown(status, HELP, layout::width(line)))
-        .or(lines.last())
-        .cloned()
-}
-
 /// A small run for the review's tests: the OP lyric "trough" in E01, E02 and E03, and one other
 /// finding in E02. Four findings, two rows.
 #[cfg(test)]
 pub mod tests_support {
-    use super::{Model, Row};
+    use super::{Review, Row};
     use crate::store::{
         Basis, Check, FileRecord, Finding, FixStretch, LineRef, Run, TimingFix, TrackRecord,
     };
@@ -1209,18 +1137,18 @@ pub mod tests_support {
 
     /// The sample run and timing findings on its English Full track: a frame late in E01 and E03,
     /// partial in E02.
-    pub fn with_timing() -> Model {
+    pub fn with_timing() -> Review {
         let mut run = run();
         run.findings.extend([
             timing(11, 1, false),
             timing(12, 2, true),
             timing(13, 3, false),
         ]);
-        Model::new(run, std::collections::HashMap::new())
+        Review::new(run, std::collections::HashMap::new())
     }
 
     /// `n` findings, one per episode, no two alike: `n` rows.
-    pub fn many(n: u32) -> Model {
+    pub fn many(n: u32) -> Review {
         let run = Run {
             name: "many".into(),
             files: (1..=n).map(file).collect(),
@@ -1233,11 +1161,11 @@ pub mod tests_support {
                 .collect(),
             ..Run::default()
         };
-        Model::new(run, std::collections::HashMap::new())
+        Review::new(run, std::collections::HashMap::new())
     }
 
-    pub fn sample() -> Model {
-        let m = Model::new(run(), std::collections::HashMap::new());
+    pub fn sample() -> Review {
+        let m = Review::new(run(), std::collections::HashMap::new());
         assert_eq!(
             m.rows,
             [
@@ -1252,7 +1180,7 @@ pub mod tests_support {
 
     /// Episode `ep` as the store would read it back once a scan saved `findings` for it: its record
     /// in `m` (else `file(ep)`), its findings so far with their decisions, then `findings`.
-    pub fn read_back(m: &Model, ep: u32, findings: Vec<Finding>) -> Run {
+    pub fn read_back(m: &Review, ep: u32, findings: Vec<Finding>) -> Run {
         let p = path(ep);
         let record = m
             .run
@@ -1446,17 +1374,14 @@ mod tests {
     fn a_file_read_back_swaps_its_findings_and_what_pointed_at_one_that_went_moves_to_its_match() {
         use tests_support::{file, finding, path};
         let mut m = tests_support::sample();
-        // The lyric's row expanded, its E02 member selected and last clicked; the editor open on
-        // E02's snacks row; an undo step over both of E02's findings; E02 changed on disk.
+        // The lyric's row expanded, its E02 member selected and its key held, as a click holds
+        // it; an edit under way on E02's snacks row; an undo step over both of E02's findings; E02
+        // changed on disk.
         m.expanded.insert(0);
         m.selected = 2;
         assert_eq!(m.selected_entry(), Some(Entry::Member(0, 1)));
-        m.last_click = Some((Entry::Member(0, 1), Timestamp::UNIX_EPOCH));
-        m.editor = Some(Editor {
-            entry: Entry::Row(1),
-            text: "x".into(),
-            cursor: 1,
-        });
+        let clicked = m.entry_key(Entry::Member(0, 1));
+        m.editing = Some(m.entry_key(Entry::Row(1)));
         m.undo = vec![vec![(2, None), (3, None)]];
         m.notes.insert(path(2), FileNote::Changed);
         // E02 checked again: the lyric comes back as 5, the snacks line does not, and a new line
@@ -1484,14 +1409,59 @@ mod tests {
         );
         assert_eq!(m.expanded, HashSet::from([0]));
         assert_eq!(m.selected_entry(), Some(Entry::Member(0, 2)));
-        assert_eq!(m.last_click.map(|(e, _)| e), Some(Entry::Member(0, 2)));
-        assert_eq!(m.editor, None);
+        assert_eq!(m.resolve(&clicked), Some(Entry::Member(0, 2)));
+        assert_eq!(m.editing, None);
         assert_eq!(
             m.status.as_deref(),
             Some("E02 was checked again; its finding changed")
         );
         assert_eq!(m.undo, [vec![(5, None)]]);
         assert_eq!(m.notes.get(&path(2)), None, "just checked as it is");
+    }
+
+    #[test]
+    fn an_entry_key_finds_its_entry_after_the_rows_are_remade() {
+        use tests_support::{file, finding, path};
+        let mut m = tests_support::sample();
+        // The lyric's row (findings 1, 2 and 4), its E02 member, and the snacks row (3).
+        let lyric = m.entry_key(Entry::Row(0));
+        let e02 = m.entry_key(Entry::Member(0, 1));
+        let snacks = m.entry_key(Entry::Row(1));
+        assert_eq!(lyric, EntryKey::Row(vec![1, 2, 4]));
+        // E01 read back with a line before its lyric: a row of its own comes first.
+        let e01 = Run {
+            files: vec![file(1)],
+            findings: vec![
+                finding(1, 1, LYRIC, FIXED, 165_060),
+                finding(6, 1, "Zero.", "Zero!", 500),
+            ],
+            ..Run::default()
+        };
+        m.refresh(&path(1), e01);
+        assert_eq!(m.resolve(&lyric), Some(Entry::Row(1)));
+        assert_eq!(m.resolve(&snacks), Some(Entry::Row(2)));
+        // The selection, on the lyric's row, went with it.
+        assert_eq!(m.selected_key(), Some(lyric.clone()));
+        // E02 checked again: its lyric comes back as 7, and the snacks line does not.
+        let e02_again = Run {
+            files: vec![file(2)],
+            findings: vec![finding(7, 2, LYRIC, FIXED, 165_060)],
+            ..Run::default()
+        };
+        m.refresh(&path(2), e02_again);
+        let seven = m.run.findings.iter().position(|f| f.id == 7).unwrap();
+        assert_eq!(m.resolve(&e02), Some(Entry::Member(1, seven)));
+        assert_eq!(m.resolve(&snacks), None);
+        assert_eq!(m.resolve(&lyric), Some(Entry::Row(1)));
+        // And once more: the lyric is 8 now, and the key that named 2 follows it through 7.
+        let e02_thrice = Run {
+            files: vec![file(2)],
+            findings: vec![finding(8, 2, LYRIC, FIXED, 165_060)],
+            ..Run::default()
+        };
+        m.refresh(&path(2), e02_thrice);
+        let eight = m.run.findings.iter().position(|f| f.id == 8).unwrap();
+        assert_eq!(m.resolve(&e02), Some(Entry::Member(1, eight)));
     }
 
     #[test]
@@ -1518,7 +1488,7 @@ mod tests {
 
     #[test]
     fn files_read_back_into_an_empty_list_select_the_first_pending_row() {
-        let mut m = Model::new(
+        let mut m = Review::new(
             Run {
                 name: "r".into(),
                 ..Run::default()
@@ -1546,39 +1516,10 @@ mod tests {
     }
 
     #[test]
-    fn the_selection_keeps_its_place_on_screen_as_entries_come_and_go_above_it() {
-        let mut m = tests_support::many(20);
-        // 12 lines: the status line and the list's border leave 9 rows.
-        m.set_area(Rect::new(0, 0, 120, 12));
-        m.selected = 15;
-        m.scroll = m.list_scroll(m.area);
-        let on_screen = m.selected - m.scroll;
-        let e01 = tests_support::path(1);
-        let first = m.run.findings[0].clone();
-        let zero = tests_support::finding(100, 1, "Zero.", "Zero!", 500);
-        let with_zero = Run {
-            files: vec![tests_support::file(1)],
-            findings: vec![first.clone(), zero],
-            ..Run::default()
-        };
-        m.refresh(&e01, with_zero);
-        assert_eq!(m.selected, 16);
-        assert_eq!(m.selected - m.scroll, on_screen);
-        let without = Run {
-            files: vec![tests_support::file(1)],
-            findings: vec![first],
-            ..Run::default()
-        };
-        m.refresh(&e01, without);
-        assert_eq!(m.selected, 15);
-        assert_eq!(m.selected - m.scroll, on_screen);
-    }
-
-    #[test]
     fn switching_views_keeps_what_points_at_findings_both_show() {
         use tests_support::{path, sample};
         // The other view: the sample without E02.
-        let without_e02 = |m: &Model| {
+        let without_e02 = |m: &Review| {
             let mut other = m.run.clone();
             other.of_paths = true;
             other.paths = vec!["/m/K-On!".into()];

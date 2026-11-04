@@ -11,19 +11,19 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crossterm::event::KeyCode;
-use ratatui::layout::Rect;
 use subcheck_core::llm::Backend;
 use subcheck_core::player::Player;
-use subcheck_core::review::model::Model;
+use subcheck_core::review::model::Review;
 use subcheck_core::review::run_effect;
-use subcheck_core::review::screen::{self, Msg};
+use subcheck_core::review::screen::{self, Msg, Screen};
 use subcheck_core::review::update::Input;
 use subcheck_core::scan::{self, Planned};
 use subcheck_core::store::{Decision, Selector, State, Store};
 
 /// The loop's inner part: a message, then every effect it leads to, run for real.
 fn send(
-    m: &mut Model,
+    m: &mut Review,
+    s: &mut Screen,
     msg: Msg,
     store: &mut Store,
     player: &mut Player,
@@ -31,16 +31,17 @@ fn send(
     tx: &mpsc::Sender<Msg>,
 ) {
     let now = jiff::Timestamp::now();
-    let mut queue: VecDeque<_> = screen::update(m, msg, now).into();
+    let mut queue: VecDeque<_> = screen::update(m, s, msg, now).into();
     while let Some(effect) = queue.pop_front() {
         let input = run_effect(effect, store, player, state, tx);
-        queue.extend(screen::update(m, input.into(), now));
+        queue.extend(screen::update(m, s, input.into(), now));
     }
 }
 
-/// The screen and what its loop works with.
-struct Screen {
-    m: Model,
+/// The review, its screen, and what their loop works with.
+struct Tui {
+    m: Review,
+    screen: Screen,
     store: Store,
     player: Player,
     state: PathBuf,
@@ -48,10 +49,11 @@ struct Screen {
     rx: mpsc::Receiver<Msg>,
 }
 
-impl Screen {
+impl Tui {
     fn key(&mut self, c: char) {
         send(
             &mut self.m,
+            &mut self.screen,
             Msg::Key(KeyCode::Char(c)),
             &mut self.store,
             &mut self.player,
@@ -70,6 +72,7 @@ impl Screen {
             let ended = matches!(msg, Msg::Input(Input::ApplyEnded(_)));
             send(
                 &mut self.m,
+                &mut self.screen,
                 msg,
                 &mut self.store,
                 &mut self.player,
@@ -135,8 +138,9 @@ fn d_then_a_on_the_screen() {
         .collect();
     store.decide(&accepted).unwrap();
     let (tx, rx) = mpsc::channel();
-    let mut s = Screen {
-        m: Model::new(store.view(&Selector::Newest).unwrap(), HashMap::new()),
+    let mut s = Tui {
+        m: Review::new(store.view(&Selector::Newest).unwrap(), HashMap::new()),
+        screen: Screen::default(),
         store,
         player: Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock")),
         state: dir.path().join("state"),
@@ -155,7 +159,7 @@ fn d_then_a_on_the_screen() {
     // A, then y: made, and shown applied from the store.
     s.key('A');
     assert_eq!(
-        s.m.status_text(Rect::default()).as_deref(),
+        s.m.status_text().as_deref(),
         Some("apply 2 fixes in 1 file, keeping each .orig? y/n")
     );
     s.key('y');

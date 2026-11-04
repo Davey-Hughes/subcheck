@@ -39,9 +39,9 @@ use crate::llm::Backend;
 use crate::player::{self, Player};
 use crate::scan::{self, file_stamp};
 use crate::store::{Run, Selector, Store};
-use model::{FileNote, Model};
+use model::{FileNote, Review};
 use progress::Scan;
-use screen::{Mouse, Msg};
+use screen::{Mouse, Msg, Screen};
 use update::{Effect, Input, Job, Switch};
 
 /// A terminal event as a `Msg`. Ctrl and Alt chords never reach the plain-key handlers, so Ctrl-C
@@ -56,13 +56,13 @@ pub fn map_event(ev: &Event) -> Option<Msg> {
             {
                 return None;
             }
-            let action = match me.kind {
+            let kind = match me.kind {
                 MouseEventKind::Down(MouseButton::Left) => Mouse::Click,
                 MouseEventKind::ScrollUp => Mouse::WheelUp,
                 MouseEventKind::ScrollDown => Mouse::WheelDown,
                 _ => return None,
             };
-            return Some(Msg::Mouse(action, me.column, me.row));
+            return Some(Msg::Mouse(kind, me.column, me.row));
         }
         Event::Resize(w, h) => return Some(Msg::Resize(*w, *h)),
         _ => return None,
@@ -350,7 +350,7 @@ fn opening_status(warnings: &[String]) -> Option<String> {
 }
 
 /// The run a scan's screen opens on: the run as the store shows it. A file the scan checks again
-/// keeps its findings in the list until the scan saves the new ones (see `Model::refresh`); a file
+/// keeps its findings in the list until the scan saves the new ones (see `Review::refresh`); a file
 /// it skips is there from the start.
 pub fn opening(store: &Store, plan: &scan::Plan) -> rusqlite::Result<Run> {
     store.run_view(plan.scan())
@@ -402,17 +402,16 @@ pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow:
     }
     let notes = file_notes(&run);
     let mut player = Player::new("mpv", player::socket_path(state));
-    // With no scan, the status line opens on what the run's LLM calls cost (`Model::show_cost`).
-    let mut model = Model::new(run, notes);
+    let mut model = Review::new(run, notes);
     model.karaoke = karaoke;
     model.status = opening_status(&warnings);
 
     // The terminal is restored should the screen's own thread panic. A job's panic comes to the
     // loop as `Input::Fatal`, which ends the screen in order.
-    let screen = std::thread::current().id();
+    let screen_thread = std::thread::current().id();
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if std::thread::current().id() == screen {
+        if std::thread::current().id() == screen_thread {
             leave();
         }
         prev_hook(info);
@@ -420,7 +419,9 @@ pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow:
     let guard = TerminalGuard::enter().context("entering the alternate screen")?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let size = terminal.size()?;
-    model.set_area(Rect::new(0, 0, size.width, size.height));
+    // With no scan, the status line opens on what the run's LLM calls cost (`Screen::show_cost`).
+    let mut screen = Screen::default();
+    screen.set_area(&model, Rect::new(0, 0, size.width, size.height));
     // The loop keeps a sender of its own, for the jobs `c`, `A` and `D` start: the channel cannot
     // close while the screen runs, and each job says why it ends before it does
     // (`Input::ScanEnded`, `Input::ApplyEnded`, `Input::Fatal`), as the input thread does.
@@ -443,6 +444,7 @@ pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow:
             screen_loop(
                 &mut terminal,
                 &mut model,
+                &mut screen,
                 &rx,
                 &tx,
                 &mut store,
@@ -474,7 +476,7 @@ pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow:
 /// command that finishes it. Otherwise the outro on `err`, then the decisions' counts on `out`:
 /// exit status 1 when any scan or apply the screen ran failed, or a file in it did.
 fn outcome(
-    model: &mut Model,
+    model: &mut Review,
     looped: anyhow::Result<()>,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -513,9 +515,11 @@ fn outcome(
 
 /// Draw, take the next message (the terminal's, a job's, or a tick while one runs), update, and
 /// run the effects, until the model quits.
+#[allow(clippy::too_many_arguments)] // called once, from `run`: a struct of them would save nothing
 fn screen_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    model: &mut Model,
+    model: &mut Review,
+    screen: &mut Screen,
     rx: &mpsc::Receiver<Msg>,
     tx: &Sender<Msg>,
     store: &mut Store,
@@ -523,18 +527,23 @@ fn screen_loop(
     state: &Path,
 ) -> anyhow::Result<()> {
     while !model.should_quit {
-        terminal.draw(|f| view::view(model, f))?;
+        terminal.draw(|f| view::view(model, screen, f))?;
         let msg = receive(rx, model.progress.busy());
-        let effects = screen::update(model, msg, jiff::Timestamp::now());
+        let effects = screen::update(model, screen, msg, jiff::Timestamp::now());
         // Show what is about to happen (`opening E02 at …`) before an effect holds the loop:
         // starting mpv can take seconds.
         if !effects.is_empty() {
-            terminal.draw(|f| view::view(model, f))?;
+            terminal.draw(|f| view::view(model, screen, f))?;
         }
         let mut queue: VecDeque<Effect> = effects.into();
         while let Some(effect) = queue.pop_front() {
             let input = run_effect(effect, store, player, state, tx);
-            queue.extend(screen::update(model, input.into(), jiff::Timestamp::now()));
+            queue.extend(screen::update(
+                model,
+                screen,
+                input.into(),
+                jiff::Timestamp::now(),
+            ));
         }
     }
     Ok(())
@@ -707,7 +716,7 @@ mod tests {
 
     #[test]
     fn a_scans_screen_opens_with_its_warnings_on_the_status_line() {
-        let status = |m: &Model| m.status_text(Rect::new(0, 0, 160, 1));
+        let status = |m: &Review| m.status_text();
         let warnings = vec![
             "warning: /m/locked: skipped: Permission denied (os error 13)".to_string(),
             "warning: /m/lost: skipped: Input/output error (os error 5)".to_string(),
@@ -719,7 +728,13 @@ mod tests {
             Some("warning: /m/locked: skipped: Permission denied (os error 13) · +1 more")
         );
         // A message as others are: the next key ends it, and the scan's progress shows.
-        screen::update(&mut m, Msg::Key(KeyCode::Char('j')), jiff::Timestamp::now());
+        let mut s = Screen::default();
+        screen::update(
+            &mut m,
+            &mut s,
+            Msg::Key(KeyCode::Char('j')),
+            jiff::Timestamp::now(),
+        );
         assert_eq!(status(&m).as_deref(), Some("scan 0/2 · 0 findings"));
         // One warning alone, or none.
         assert_eq!(opening_status(&warnings[..1]), Some(warnings[0].clone()));
@@ -823,7 +838,7 @@ mod tests {
     }
 
     /// The sample run with a scan of two files under way, as the loop leaves it on a stop.
-    fn scanning() -> Model {
+    fn scanning() -> Review {
         let mut m = model::tests_support::sample();
         m.progress.start(
             "2026-10-17T04-39-18",
@@ -839,7 +854,7 @@ mod tests {
 
     /// What `outcome` returns, and what it wrote to stdout and stderr.
     fn ended(
-        m: &mut Model,
+        m: &mut Review,
         looped: anyhow::Result<()>,
     ) -> (anyhow::Result<ExitCode>, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());

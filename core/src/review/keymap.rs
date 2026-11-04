@@ -4,7 +4,8 @@
 
 use crossterm::event::KeyCode;
 
-use super::model::{Model, Pane};
+use super::model::{Pane, Review};
+use super::screen::Screen;
 use super::update::Action;
 use crate::list::Filter;
 use crate::player::Playback;
@@ -27,14 +28,15 @@ pub enum Press {
     Type(KeyCode),
 }
 
-/// What `key` does as `m` stands: an open question takes it first, then the editor, then the box
-/// of keys; else the selected pane's map, where a key with no action only lets the message go.
-pub fn press(m: &Model, key: KeyCode) -> Press {
+/// What `key` does as `m` and its screen `s` stand: an open question takes it first, then the
+/// editor, then the box of keys; else the selected pane's map, where a key with no action only
+/// lets the message go.
+pub fn press(m: &Review, s: &Screen, key: KeyCode) -> Press {
     // The question takes the next key: `y` answers it, any other lets it go.
     if m.confirm.is_some() {
         return Press::Act(Action::Answer(key == KeyCode::Char('y')));
     }
-    if let Some(ed) = &m.editor {
+    if let Some(ed) = &s.editor {
         return match key {
             KeyCode::Enter => Press::Act(Action::Reword(ed.text.clone())),
             KeyCode::Esc => Press::Act(Action::CancelEdit),
@@ -44,7 +46,7 @@ pub fn press(m: &Model, key: KeyCode) -> Press {
     // Any key closes the box of keys and does nothing else; but `q` quits, as the box says.
     // With `Interrupt`, which leaves the status message as the other keys here do: no question is
     // open (it takes keys first), and with none `Interrupt` asks just as `Quit` does.
-    if m.help {
+    if s.help {
         return Press::CloseHelp((key == KeyCode::Char('q')).then_some(Action::Interrupt));
     }
     if key == KeyCode::Char('?') {
@@ -69,21 +71,29 @@ fn next_filter(filter: Filter) -> Filter {
 
 /// A key in the findings. A moving key's entry is worked out here, from the selection and the
 /// list as shown, so how far a page goes is the screen's to say.
-fn findings_key(m: &Model, key: KeyCode) -> Option<Action> {
+fn findings_key(m: &Review, key: KeyCode) -> Option<Action> {
+    let entries = m.entries();
     let selected = m.selected;
-    let last = m.entries().len().saturating_sub(1);
+    let last = entries.len().saturating_sub(1);
+    // The entry a moving key lands on, by its key. An empty list has none to land on: the key only
+    // lets the message go.
+    let to = |i: usize| {
+        entries
+            .get(i)
+            .map_or(Action::Dismiss, |&e| Action::Select(m.entry_key(e)))
+    };
     Some(match key {
         KeyCode::Char('q') => Action::Quit,
         KeyCode::Tab => Action::ShowPane(Pane::Files),
         KeyCode::Char('v') => Action::SwitchView,
         KeyCode::Char('A') => Action::Apply { dry_run: false },
         KeyCode::Char('D') => Action::Apply { dry_run: true },
-        KeyCode::Down | KeyCode::Char('j') => Action::Select((selected + 1).min(last)),
-        KeyCode::Up | KeyCode::Char('k') => Action::Select(selected.saturating_sub(1)),
-        KeyCode::PageDown => Action::Select((selected + PAGE).min(last)),
-        KeyCode::PageUp => Action::Select(selected.saturating_sub(PAGE)),
-        KeyCode::Home | KeyCode::Char('g') => Action::Select(0),
-        KeyCode::End | KeyCode::Char('G') => Action::Select(last),
+        KeyCode::Down | KeyCode::Char('j') => to((selected + 1).min(last)),
+        KeyCode::Up | KeyCode::Char('k') => to(selected.saturating_sub(1)),
+        KeyCode::PageDown => to((selected + PAGE).min(last)),
+        KeyCode::PageUp => to(selected.saturating_sub(PAGE)),
+        KeyCode::Home | KeyCode::Char('g') => to(0),
+        KeyCode::End | KeyCode::Char('G') => to(last),
         KeyCode::Char('f') => Action::SetFilter(next_filter(m.filter)),
         KeyCode::Enter => Action::Toggle,
         KeyCode::Char('n') => Action::NextFile,
@@ -110,9 +120,16 @@ fn findings_key(m: &Model, key: KeyCode) -> Option<Action> {
 /// decision and mpv keys belong to the findings, except `u`: the status line of a late join
 /// says "u undoes" wherever the user is, so it undoes here too. `c` checks the selected file again.
 /// `A` and `D` apply, as in the findings.
-fn files_key(m: &Model, key: KeyCode) -> Option<Action> {
+fn files_key(m: &Review, key: KeyCode) -> Option<Action> {
+    let files = &m.progress.files;
     let selected = m.file_selected;
-    let last = m.progress.files.len().saturating_sub(1);
+    let last = files.len().saturating_sub(1);
+    // The file a moving key lands on, by its path; with no files, none.
+    let to = |i: usize| {
+        files
+            .get(i)
+            .map_or(Action::Dismiss, |f| Action::SelectFile(f.path.clone()))
+    };
     Some(match key {
         KeyCode::Char('u') => Action::Undo,
         KeyCode::Char('q') => Action::Quit,
@@ -120,12 +137,12 @@ fn files_key(m: &Model, key: KeyCode) -> Option<Action> {
         KeyCode::Char('v') => Action::SwitchView,
         KeyCode::Char('A') => Action::Apply { dry_run: false },
         KeyCode::Char('D') => Action::Apply { dry_run: true },
-        KeyCode::Down | KeyCode::Char('j') => Action::SelectFile((selected + 1).min(last)),
-        KeyCode::Up | KeyCode::Char('k') => Action::SelectFile(selected.saturating_sub(1)),
-        KeyCode::PageDown => Action::SelectFile((selected + PAGE).min(last)),
-        KeyCode::PageUp => Action::SelectFile(selected.saturating_sub(PAGE)),
-        KeyCode::Home | KeyCode::Char('g') => Action::SelectFile(0),
-        KeyCode::End | KeyCode::Char('G') => Action::SelectFile(last),
+        KeyCode::Down | KeyCode::Char('j') => to((selected + 1).min(last)),
+        KeyCode::Up | KeyCode::Char('k') => to(selected.saturating_sub(1)),
+        KeyCode::PageDown => to((selected + PAGE).min(last)),
+        KeyCode::PageUp => to(selected.saturating_sub(PAGE)),
+        KeyCode::Home | KeyCode::Char('g') => to(0),
+        KeyCode::End | KeyCode::Char('G') => to(last),
         KeyCode::Enter => Action::ShowFileFindings,
         KeyCode::Char('c') => Action::Recheck,
         _ => return None,
@@ -135,35 +152,47 @@ fn files_key(m: &Model, key: KeyCode) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::review::model::tests_support::{many, sample};
-    use crate::review::model::{Confirm, Editor, Entry};
+    use crate::review::model::tests_support::{many, path, sample};
+    use crate::review::model::{Confirm, EntryKey};
+    use crate::review::screen::Editor;
 
     /// 30 rows, one per episode, the 16th selected: each move lands on an entry of its own.
-    fn mid_list() -> Model {
+    fn mid_list() -> Review {
         let mut m = many(30);
         m.selected = 15;
         m
     }
 
+    /// Selecting `many`'s row of episode `ep`, whose one finding has that ID.
+    fn row(ep: u64) -> Action {
+        Action::Select(EntryKey::Row(vec![ep]))
+    }
+
+    /// Selecting `many`'s file of episode `ep`.
+    fn file(ep: u32) -> Action {
+        Action::SelectFile(path(ep))
+    }
+
     #[test]
     fn each_findings_key_gives_its_action() {
         let m = mid_list();
+        let s = Screen::default();
         let keys = [
             (KeyCode::Char('q'), Action::Quit),
             (KeyCode::Tab, Action::ShowPane(Pane::Files)),
             (KeyCode::Char('v'), Action::SwitchView),
             (KeyCode::Char('A'), Action::Apply { dry_run: false }),
             (KeyCode::Char('D'), Action::Apply { dry_run: true }),
-            (KeyCode::Down, Action::Select(16)),
-            (KeyCode::Char('j'), Action::Select(16)),
-            (KeyCode::Up, Action::Select(14)),
-            (KeyCode::Char('k'), Action::Select(14)),
-            (KeyCode::PageDown, Action::Select(25)),
-            (KeyCode::PageUp, Action::Select(5)),
-            (KeyCode::Home, Action::Select(0)),
-            (KeyCode::Char('g'), Action::Select(0)),
-            (KeyCode::End, Action::Select(29)),
-            (KeyCode::Char('G'), Action::Select(29)),
+            (KeyCode::Down, row(17)),
+            (KeyCode::Char('j'), row(17)),
+            (KeyCode::Up, row(15)),
+            (KeyCode::Char('k'), row(15)),
+            (KeyCode::PageDown, row(26)),
+            (KeyCode::PageUp, row(6)),
+            (KeyCode::Home, row(1)),
+            (KeyCode::Char('g'), row(1)),
+            (KeyCode::End, row(30)),
+            (KeyCode::Char('G'), row(30)),
             (
                 KeyCode::Char('f'),
                 Action::SetFilter(Filter::Only(State::Pending)),
@@ -197,45 +226,43 @@ mod tests {
             (KeyCode::F(5), Action::Dismiss),
         ];
         for (key, action) in keys {
-            assert_eq!(press(&m, key), Press::Act(action), "{key:?}");
+            assert_eq!(press(&m, &s, key), Press::Act(action), "{key:?}");
         }
-        assert_eq!(press(&m, KeyCode::Char('?')), Press::OpenHelp);
+        assert_eq!(press(&m, &s, KeyCode::Char('?')), Press::OpenHelp);
     }
 
     #[test]
     fn moving_keys_stop_at_the_lists_ends() {
         let mut m = many(30);
+        let s = Screen::default();
         m.selected = 0;
         for key in [KeyCode::Up, KeyCode::Char('k'), KeyCode::PageUp] {
-            assert_eq!(press(&m, key), Press::Act(Action::Select(0)), "{key:?}");
+            assert_eq!(press(&m, &s, key), Press::Act(row(1)), "{key:?}");
         }
         m.selected = 29;
         for key in [KeyCode::Down, KeyCode::Char('j'), KeyCode::PageDown] {
-            assert_eq!(press(&m, key), Press::Act(Action::Select(29)), "{key:?}");
+            assert_eq!(press(&m, &s, key), Press::Act(row(30)), "{key:?}");
         }
         // Nothing in the sample is rejected: under that filter the list is empty.
         let mut m = sample();
+        let s = Screen::default();
         m.filter = Filter::Only(State::Rejected);
         for key in [KeyCode::Char('j'), KeyCode::Char('G'), KeyCode::PageDown] {
-            assert_eq!(press(&m, key), Press::Act(Action::Select(0)), "{key:?}");
+            assert_eq!(press(&m, &s, key), Press::Act(Action::Dismiss), "{key:?}");
         }
         let mut m = many(30);
+        let s = Screen::default();
         m.pane = Pane::Files;
         m.file_selected = 29;
-        assert_eq!(
-            press(&m, KeyCode::Char('j')),
-            Press::Act(Action::SelectFile(29))
-        );
+        assert_eq!(press(&m, &s, KeyCode::Char('j')), Press::Act(file(30)));
         m.file_selected = 0;
-        assert_eq!(
-            press(&m, KeyCode::Char('k')),
-            Press::Act(Action::SelectFile(0))
-        );
+        assert_eq!(press(&m, &s, KeyCode::Char('k')), Press::Act(file(1)));
     }
 
     #[test]
     fn each_files_key_gives_its_action() {
         let mut m = many(30);
+        let s = Screen::default();
         m.pane = Pane::Files;
         m.file_selected = 15;
         let keys = [
@@ -245,16 +272,16 @@ mod tests {
             (KeyCode::Char('v'), Action::SwitchView),
             (KeyCode::Char('A'), Action::Apply { dry_run: false }),
             (KeyCode::Char('D'), Action::Apply { dry_run: true }),
-            (KeyCode::Down, Action::SelectFile(16)),
-            (KeyCode::Char('j'), Action::SelectFile(16)),
-            (KeyCode::Up, Action::SelectFile(14)),
-            (KeyCode::Char('k'), Action::SelectFile(14)),
-            (KeyCode::PageDown, Action::SelectFile(25)),
-            (KeyCode::PageUp, Action::SelectFile(5)),
-            (KeyCode::Home, Action::SelectFile(0)),
-            (KeyCode::Char('g'), Action::SelectFile(0)),
-            (KeyCode::End, Action::SelectFile(29)),
-            (KeyCode::Char('G'), Action::SelectFile(29)),
+            (KeyCode::Down, file(17)),
+            (KeyCode::Char('j'), file(17)),
+            (KeyCode::Up, file(15)),
+            (KeyCode::Char('k'), file(15)),
+            (KeyCode::PageDown, file(26)),
+            (KeyCode::PageUp, file(6)),
+            (KeyCode::Home, file(1)),
+            (KeyCode::Char('g'), file(1)),
+            (KeyCode::End, file(30)),
+            (KeyCode::Char('G'), file(30)),
             (KeyCode::Enter, Action::ShowFileFindings),
             (KeyCode::Char('c'), Action::Recheck),
             // The decision and mpv keys belong to the findings.
@@ -276,17 +303,18 @@ mod tests {
             (KeyCode::Char('f'), Action::Dismiss),
         ];
         for (key, action) in keys {
-            assert_eq!(press(&m, key), Press::Act(action), "{key:?}");
+            assert_eq!(press(&m, &s, key), Press::Act(action), "{key:?}");
         }
-        assert_eq!(press(&m, KeyCode::Char('?')), Press::OpenHelp);
+        assert_eq!(press(&m, &s, KeyCode::Char('?')), Press::OpenHelp);
     }
 
     #[test]
     fn with_a_question_open_y_answers_and_any_other_key_lets_it_go() {
         let mut m = sample();
+        let mut s = Screen::default();
         m.confirm = Some(Confirm::Quit);
         assert_eq!(
-            press(&m, KeyCode::Char('y')),
+            press(&m, &s, KeyCode::Char('y')),
             Press::Act(Action::Answer(true))
         );
         let others = [
@@ -299,36 +327,44 @@ mod tests {
             KeyCode::Down,
         ];
         for key in others {
-            assert_eq!(press(&m, key), Press::Act(Action::Answer(false)), "{key:?}");
+            assert_eq!(
+                press(&m, &s, key),
+                Press::Act(Action::Answer(false)),
+                "{key:?}"
+            );
         }
         // The question takes the key before the editor does, and before the box of keys.
-        m.editor = Some(Editor {
-            entry: Entry::Row(1),
+        s.editor = Some(Editor {
             text: "Snacks!".into(),
             cursor: 7,
         });
-        assert_eq!(press(&m, KeyCode::Enter), Press::Act(Action::Answer(false)));
-        m.editor = None;
-        m.help = true;
         assert_eq!(
-            press(&m, KeyCode::Char('y')),
+            press(&m, &s, KeyCode::Enter),
+            Press::Act(Action::Answer(false))
+        );
+        s.editor = None;
+        s.help = true;
+        assert_eq!(
+            press(&m, &s, KeyCode::Char('y')),
             Press::Act(Action::Answer(true))
         );
     }
 
     #[test]
     fn in_the_editor_enter_rewords_esc_cancels_and_other_keys_type() {
-        let mut m = sample();
-        m.editor = Some(Editor {
-            entry: Entry::Row(1),
-            text: "Snacks!".into(),
-            cursor: 3,
-        });
+        let m = sample();
+        let s = Screen {
+            editor: Some(Editor {
+                text: "Snacks!".into(),
+                cursor: 3,
+            }),
+            ..Screen::default()
+        };
         assert_eq!(
-            press(&m, KeyCode::Enter),
+            press(&m, &s, KeyCode::Enter),
             Press::Act(Action::Reword("Snacks!".into()))
         );
-        assert_eq!(press(&m, KeyCode::Esc), Press::Act(Action::CancelEdit));
+        assert_eq!(press(&m, &s, KeyCode::Esc), Press::Act(Action::CancelEdit));
         // The panes' keys and `?` are text here.
         let typed = [
             KeyCode::Char('q'),
@@ -344,16 +380,19 @@ mod tests {
             KeyCode::Tab,
         ];
         for key in typed {
-            assert_eq!(press(&m, key), Press::Type(key), "{key:?}");
+            assert_eq!(press(&m, &s, key), Press::Type(key), "{key:?}");
         }
     }
 
     #[test]
     fn with_the_box_of_keys_open_a_key_closes_it_and_q_quits() {
-        let mut m = sample();
-        m.help = true;
+        let m = sample();
+        let s = Screen {
+            help: true,
+            ..Screen::default()
+        };
         assert_eq!(
-            press(&m, KeyCode::Char('q')),
+            press(&m, &s, KeyCode::Char('q')),
             Press::CloseHelp(Some(Action::Interrupt))
         );
         let others = [
@@ -364,7 +403,7 @@ mod tests {
             KeyCode::Down,
         ];
         for key in others {
-            assert_eq!(press(&m, key), Press::CloseHelp(None), "{key:?}");
+            assert_eq!(press(&m, &s, key), Press::CloseHelp(None), "{key:?}");
         }
     }
 

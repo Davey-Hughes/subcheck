@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use jiff::Timestamp;
 
-use super::model::{Confirm, Editor, Entry, FileNote, Mark, Model, Pane, UndoStep};
+use super::model::{Confirm, Entry, EntryKey, FileNote, Mark, Pane, Review, UndoStep};
 use super::progress::{Scan, Stage};
 use crate::apply;
 use crate::list::{self, Filter, label};
@@ -92,8 +92,10 @@ pub enum Action {
     Quit,
     /// As `Quit`, asking first while a job runs; but a second, with the question open, quits.
     Interrupt,
-    /// Select the entry at this index of [`Model::entries`]; the UI works out which.
-    Select(usize),
+    /// Select the entry this key names; the UI works out which. A member of a collapsed row
+    /// selects its row. A key whose findings all went, or whose entry the list does not show,
+    /// leaves the selection where it is and says so on the status line.
+    Select(EntryKey),
     /// Expand the selected row into its members, or collapse it (from the row or a member).
     Toggle,
     /// Show the findings under this filter, the selection kept on its finding's row.
@@ -105,7 +107,7 @@ pub enum Action {
     /// Put the selected entry's decided findings back to pending.
     Clear,
     Undo,
-    /// Open the editor on the selected entry's wording.
+    /// Start rewording the selected entry: the UI opens its editor on [`Review::edit_wording`].
     Edit,
     /// Accept the edited entry with this wording.
     Reword(String),
@@ -123,8 +125,9 @@ pub enum Action {
     Playback(Playback),
     /// Answer the open question: yes, or let it go.
     Answer(bool),
-    /// Select the file at this index of the files view (`progress.files`).
-    SelectFile(usize),
+    /// Select the file at this path in the files view (`progress.files`). A path the view does
+    /// not have leaves the selection where it is and says so on the status line.
+    SelectFile(String),
     /// The findings, on the first entry with one of the selected file's.
     ShowFileFindings,
     /// Check the selected file again, once asked.
@@ -191,7 +194,8 @@ pub enum Effect {
 }
 
 /// What `input` does to `m`, and the effects to run for it.
-pub fn update(m: &mut Model, input: Input, now: Timestamp) -> Vec<Effect> {
+pub fn update(m: &mut Review, input: Input, now: Timestamp) -> Vec<Effect> {
+    m.kept_from = None;
     match input {
         Input::Action(action) => perform(m, action, now),
         Input::Written {
@@ -260,7 +264,7 @@ pub fn update(m: &mut Model, input: Input, now: Timestamp) -> Vec<Effect> {
 }
 
 /// What `action` does to `m`, and the effects to run for it.
-fn perform(m: &mut Model, action: Action, now: Timestamp) -> Vec<Effect> {
+fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
     // A message stays until the user does something else. An answer, the end of an edit and
     // Ctrl-C leave it, so a message that came while a question or the editor held the line shows
     // once they are done.
@@ -281,7 +285,7 @@ fn perform(m: &mut Model, action: Action, now: Timestamp) -> Vec<Effect> {
                 m.should_quit = true;
             }
         }
-        Action::Select(index) => m.selected = index,
+        Action::Select(key) => select(m, &key),
         Action::Toggle => toggle(m),
         Action::SetFilter(filter) => set_filter(m, filter),
         Action::NextFile => next_file(m),
@@ -304,7 +308,7 @@ fn perform(m: &mut Model, action: Action, now: Timestamp) -> Vec<Effect> {
         Action::Undo => return undo(m, now),
         Action::Edit => open_editor(m),
         Action::Reword(text) => return reword(m, &text, now),
-        Action::CancelEdit => m.editor = None,
+        Action::CancelEdit => m.editing = None,
         Action::ShowPane(pane) => m.pane = pane,
         Action::SwitchView => return switch_view(m),
         Action::Apply { dry_run } => return apply_key(m, dry_run),
@@ -312,7 +316,7 @@ fn perform(m: &mut Model, action: Action, now: Timestamp) -> Vec<Effect> {
         Action::ClosePlayer => return vec![Effect::Close],
         Action::Playback(p) => return vec![Effect::Playback(p)],
         Action::Answer(yes) => return answer(m, yes),
-        Action::SelectFile(index) => m.file_selected = index,
+        Action::SelectFile(path) => select_file(m, &path),
         Action::ShowFileFindings => file_findings(m),
         Action::Recheck => return recheck(m),
         Action::Dismiss => {}
@@ -320,8 +324,33 @@ fn perform(m: &mut Model, action: Action, now: Timestamp) -> Vec<Effect> {
     Vec::new()
 }
 
+/// The entry `key` names, where the list shows it; for a member of a collapsed row, that row. One
+/// whose findings all went, or that the list no longer shows, is not selected, and the status line
+/// says so: the UI that named it saw the list before a scan remade it.
+fn select(m: &mut Review, key: &EntryKey) {
+    let entries = m.entries();
+    let shown = |e: Entry| entries.iter().position(|&n| n == e);
+    // A member whose row no longer expands is found by its row, as the selection is on a refresh.
+    match m
+        .resolve(key)
+        .and_then(|e| shown(e).or_else(|| shown(Entry::Row(e.row()))))
+    {
+        Some(at) => m.selected = at,
+        None => m.status = Some("that finding changed; the selection stays".into()),
+    }
+}
+
+/// The file at `path` in the files view. One not in it (another view's) is not selected, and the
+/// status line says so.
+fn select_file(m: &mut Review, path: &str) {
+    match m.progress.files.iter().position(|f| f.path == path) {
+        Some(at) => m.file_selected = at,
+        None => m.status = Some(format!("{} is not in this view", m.label(path))),
+    }
+}
+
 /// The open question's answer: yes does what it asked; no lets it go.
-fn answer(m: &mut Model, yes: bool) -> Vec<Effect> {
+fn answer(m: &mut Review, yes: bool) -> Vec<Effect> {
     let Some(confirm) = m.confirm.take() else {
         return Vec::new();
     };
@@ -338,9 +367,8 @@ fn answer(m: &mut Model, yes: bool) -> Vec<Effect> {
     }
 }
 
-/// `e`: the editor, on the selected entry's wording with the cursor at its end. A timing fix is
-/// accepted or rejected, never reworded.
-fn open_editor(m: &mut Model) {
+/// `e`: the edit, on the selected entry. A timing fix is accepted or rejected, never reworded.
+fn open_editor(m: &mut Review) {
     let Some(entry) = m.selected_entry() else {
         return;
     };
@@ -349,34 +377,39 @@ fn open_editor(m: &mut Model) {
         m.status = Some("a timing fix is accepted or rejected, not edited".into());
         return;
     }
-    let text = m.wording(targets[0]).to_string();
-    let cursor = text.chars().count();
-    m.editor = Some(Editor {
-        entry,
-        text,
-        cursor,
-    });
+    m.editing = Some(m.entry_key(entry));
 }
 
 /// The edit's end: its entry accepted with `text`, or plainly when that is the suggestion. Empty
-/// text is refused, and the editor stays open on it.
-fn reword(m: &mut Model, text: &str, now: Timestamp) -> Vec<Effect> {
-    let Some(ed) = m.editor.take() else {
+/// text is refused, and the edit goes on; an entry no longer found, or a row the filter no longer
+/// shows, ends it, deciding nothing.
+fn reword(m: &mut Review, text: &str, now: Timestamp) -> Vec<Effect> {
+    let Some(key) = m.editing.take() else {
         return Vec::new();
     };
     if text.trim().is_empty() {
         m.status = Some("the wording cannot be empty (Esc cancels)".into());
-        m.editor = Some(ed);
+        m.editing = Some(key);
         return Vec::new();
     }
-    let reworded = text != m.finding(m.to_decide(ed.entry)[0]).suggestion;
-    decide(m, ed.entry, State::Accepted, reworded.then_some(text), now)
+    // `refresh` ends an edit whose finding went, but a row is found by any of its findings, so
+    // one the filter hid while the editor was open (a re-check's finding taking the row's
+    // decision) has nothing to decide. Any other entry would be a guess: nothing is decided.
+    let found = m
+        .resolve(&key)
+        .and_then(|entry| Some((entry, *m.to_decide(entry).first()?)));
+    let Some((entry, first)) = found else {
+        m.status = Some("that finding changed; nothing was decided".into());
+        return Vec::new();
+    };
+    let reworded = text != m.finding(first).suggestion;
+    decide(m, entry, State::Accepted, reworded.then_some(text), now)
 }
 
 /// Decisions putting each of `findings` at `state` with that wording, but those that already are;
 /// and what each had before, for `u`.
 fn changes(
-    m: &Model,
+    m: &Review,
     findings: Vec<usize>,
     state: State,
     edited: Option<&str>,
@@ -401,9 +434,9 @@ fn changes(
     (before, decisions)
 }
 
-/// `a` `r` `e`: the findings `entry` decides ([`Model::to_decide`]) at `state`, with that wording.
+/// `a` `r` `e`: the findings `entry` decides ([`Review::to_decide`]) at `state`, with that wording.
 fn decide(
-    m: &mut Model,
+    m: &mut Review,
     entry: Entry,
     state: State,
     edited: Option<&str>,
@@ -421,7 +454,7 @@ fn decide(
 }
 
 /// `x`: each finding `entry` stands for back to pending, but those that are.
-fn clear(m: &mut Model, entry: Entry, now: Timestamp) -> Vec<Effect> {
+fn clear(m: &mut Review, entry: Entry, now: Timestamp) -> Vec<Effect> {
     let decided: Vec<usize> = m
         .targets(entry)
         .into_iter()
@@ -439,7 +472,7 @@ fn clear(m: &mut Model, entry: Entry, now: Timestamp) -> Vec<Effect> {
 }
 
 /// Decisions that put back what the last decision of this session changed.
-fn undo(m: &mut Model, now: Timestamp) -> Vec<Effect> {
+fn undo(m: &mut Review, now: Timestamp) -> Vec<Effect> {
     let Some(step) = m.undo.last() else {
         m.status = Some("nothing to undo".into());
         return Vec::new();
@@ -464,7 +497,7 @@ fn undo(m: &mut Model, now: Timestamp) -> Vec<Effect> {
 /// nowhere: its file is read back.
 #[allow(clippy::too_many_lines)] // the write's every consequence for the view, in order
 fn written(
-    m: &mut Model,
+    m: &mut Review,
     purpose: WriteFor,
     decisions: &[Decision],
     result: Result<Vec<Decided>, String>,
@@ -533,15 +566,12 @@ fn written(
             m.undo.push(before);
             // The decision can hide a row the new member showed under the filter, or show the
             // member under an expanded row: the selection stays on the entry it was on, wherever
-            // that is in the list now.
+            // that is in the list now, and `kept_from` says where it was.
             if let Some(at) = shown
                 .get(old)
                 .and_then(|e| m.entries().iter().position(|n| n == e))
             {
-                // `Model::refresh` raised the scroll to hold the row's screen line; the hidden row
-                // took a line from above it, so the scroll gives one back, and the row stays
-                // where the user was looking.
-                m.scroll = (m.scroll + at).saturating_sub(old);
+                m.kept_from = Some(old);
                 m.selected = at;
             }
             let first = &decisions[0];
@@ -589,7 +619,7 @@ fn written(
 
 /// The files whose findings a write found replaced: the store put each decision on its finding's
 /// new one, or on none. Each is read back, and the status line says which happened.
-fn replaced(m: &mut Model, decisions: &[Decision], outcomes: &[Decided]) -> Vec<Effect> {
+fn replaced(m: &mut Review, decisions: &[Decision], outcomes: &[Decided]) -> Vec<Effect> {
     let mut files: Vec<String> = Vec::new();
     let mut gone = false;
     for (d, outcome) in decisions.iter().zip(outcomes) {
@@ -616,7 +646,7 @@ fn replaced(m: &mut Model, decisions: &[Decision], outcomes: &[Decided]) -> Vec<
 }
 
 /// The episode labels of the files the decisions are on, each once, in order of first appearance.
-fn episodes(m: &Model, decisions: &[Decision]) -> String {
+fn episodes(m: &Review, decisions: &[Decision]) -> String {
     let mut names: Vec<String> = Vec::new();
     for d in decisions {
         let file = m
@@ -639,7 +669,7 @@ fn episodes(m: &Model, decisions: &[Decision]) -> String {
 /// row's members. Under a filter of accepted or rejected findings, where nothing shown is
 /// pending, the first one still shown. The decided entry may be gone, and with it more than
 /// itself: the last shown member of a group takes the group's row along.
-fn advance(m: &mut Model, decided: Entry, old: usize, shown: &[Entry]) {
+fn advance(m: &mut Review, decided: Entry, old: usize, shown: &[Entry]) {
     let now = m.entries();
     let to_do = matches!(m.filter, Filter::All | Filter::Only(State::Pending));
     let next = shown
@@ -662,7 +692,7 @@ fn advance(m: &mut Model, decided: Entry, old: usize, shown: &[Entry]) {
 }
 
 /// The list under `filter`.
-fn set_filter(m: &mut Model, filter: Filter) {
+fn set_filter(m: &mut Review, filter: Filter) {
     let focus = m.focus();
     m.filter = filter;
     // Stay on the same finding's row when it is still shown.
@@ -677,7 +707,7 @@ fn set_filter(m: &mut Model, filter: Filter) {
 }
 
 /// `⏎`: expand a group into its members, or collapse it (from the row or from a member).
-fn toggle(m: &mut Model) {
+fn toggle(m: &mut Review) {
     match m.selected_entry() {
         Some(Entry::Row(r)) if m.rows[r].members.len() > 1 => {
             if !m.expanded.remove(&r) {
@@ -694,7 +724,7 @@ fn toggle(m: &mut Model) {
     }
 }
 
-fn next_file(m: &mut Model) {
+fn next_file(m: &mut Review) {
     let entries = m.entries();
     let Some(current) = entries.get(m.selected).and_then(|&e| m.file_of(e)) else {
         return;
@@ -705,7 +735,7 @@ fn next_file(m: &mut Model) {
     }
 }
 
-fn previous_file(m: &mut Model) {
+fn previous_file(m: &mut Review) {
     let entries = m.entries();
     let file = |i: usize| m.file_of(entries[i]);
     let Some(current) = entries.get(m.selected).and_then(|&e| m.file_of(e)) else {
@@ -723,7 +753,7 @@ fn previous_file(m: &mut Model) {
     m.selected = i;
 }
 
-fn open(m: &mut Model) -> Vec<Effect> {
+fn open(m: &mut Review) -> Vec<Effect> {
     let Some(i) = m.focus() else {
         return Vec::new();
     };
@@ -766,7 +796,7 @@ fn open(m: &mut Model) -> Vec<Effect> {
 }
 
 /// `q`: quit; while a job runs, ask first.
-fn quit_or_ask(m: &mut Model) {
+fn quit_or_ask(m: &mut Review) {
     if m.progress.busy() {
         m.confirm = Some(Confirm::Quit);
     } else {
@@ -777,7 +807,7 @@ fn quit_or_ask(m: &mut Model) {
 /// `A` (or with `dry_run`, `D`): every accepted fix of the view on screen. Not while a scan runs
 /// (apply would contend with its reader for the disks, and findings are still coming) or apply
 /// does, nor with nothing accepted. `A` asks first; a dry run writes nothing, so it starts at once.
-fn apply_key(m: &mut Model, dry_run: bool) -> Vec<Effect> {
+fn apply_key(m: &mut Review, dry_run: bool) -> Vec<Effect> {
     if m.progress.running() {
         m.status = Some("the scan is still running".into());
         return Vec::new();
@@ -799,7 +829,7 @@ fn apply_key(m: &mut Model, dry_run: bool) -> Vec<Effect> {
 
 /// Start apply (or a dry run) on the view as it stands: decisions made meanwhile count from the
 /// next. Running from here, so a `q` before its first step still asks.
-fn start_apply(m: &mut Model, dry_run: bool) -> Vec<Effect> {
+fn start_apply(m: &mut Review, dry_run: bool) -> Vec<Effect> {
     // A view's name is its run's, or its paths quoted: `subcheck apply` takes either back.
     let mut resume = format!("subcheck apply {}", m.run.name);
     if dry_run {
@@ -821,7 +851,7 @@ fn start_apply(m: &mut Model, dry_run: bool) -> Vec<Effect> {
 /// `applied` marks, and its record takes the size and mtime its checks moved to, so the view
 /// matches the store. A file that failed marks the findings it was to fix `failed` (`would fail`),
 /// but for those the store has as applied: their fix is in the file.
-fn applied(m: &mut Model, event: apply::Event) -> Vec<Effect> {
+fn applied(m: &mut Review, event: apply::Event) -> Vec<Effect> {
     m.progress.apply_event(&event);
     let dry_run = m.progress.apply.as_ref().is_some_and(|a| a.dry_run);
     match event {
@@ -873,7 +903,7 @@ fn applied(m: &mut Model, event: apply::Event) -> Vec<Effect> {
 /// The other view `v` asked for has been read, or could not be: take it, or say why the screen is
 /// as it was.
 fn switched(
-    m: &mut Model,
+    m: &mut Review,
     result: Result<(Run, HashMap<String, FileNote>), String>,
 ) -> Vec<Effect> {
     match result {
@@ -887,7 +917,7 @@ fn switched(
 /// view, the newest run that named the selected file: the selected entry's (a row's first
 /// member's), or in the files view, or with nothing selected in the list, the selected file's. Not
 /// while a job runs: its progress belongs to the view it started in.
-fn switch_view(m: &mut Model) -> Vec<Effect> {
+fn switch_view(m: &mut Review) -> Vec<Effect> {
     if m.progress.running() {
         m.status = Some("the scan is still running".into());
         return Vec::new();
@@ -923,7 +953,7 @@ fn switch_view(m: &mut Model) -> Vec<Effect> {
 
 /// `c` on the selected file: find the run it is checked again into, then ask. A file the scan is
 /// checking is being checked already, and one `c` queued is queued already.
-fn recheck(m: &mut Model) -> Vec<Effect> {
+fn recheck(m: &mut Review) -> Vec<Effect> {
     // A check would read a file apply may be remuxing or swapping.
     if m.progress.applying() {
         m.status = Some("apply is still running".into());
@@ -950,7 +980,7 @@ fn recheck(m: &mut Model) -> Vec<Effect> {
 }
 
 /// `y` to checking `path` again into `run`: at once with no scan running, else once it ends.
-fn again(m: &mut Model, path: String, run: String) -> Vec<Effect> {
+fn again(m: &mut Review, path: String, run: String) -> Vec<Effect> {
     if !m.progress.running() {
         return vec![Effect::Recheck {
             run,
@@ -966,7 +996,7 @@ fn again(m: &mut Model, path: String, run: String) -> Vec<Effect> {
 }
 
 /// The run `c` checks a file again into, and its LLM, for the question; or why there is none.
-fn run_found(m: &mut Model, path: String, found: Result<(String, String), String>) -> Vec<Effect> {
+fn run_found(m: &mut Review, path: String, found: Result<(String, String), String>) -> Vec<Effect> {
     match found {
         Ok((run, backend)) => m.confirm = Some(Confirm::Recheck { path, run, backend }),
         Err(e) => m.status = Some(e),
@@ -975,7 +1005,7 @@ fn run_found(m: &mut Model, path: String, found: Result<(String, String), String
 }
 
 /// The files `c` queued into the first run among them, as one scan; the rest wait for it to end.
-fn next_again(m: &mut Model) -> Vec<Effect> {
+fn next_again(m: &mut Review) -> Vec<Effect> {
     m.progress
         .next_batch()
         .map(|(run, paths)| Effect::Recheck { run, paths })
@@ -987,7 +1017,7 @@ fn next_again(m: &mut Model) -> Vec<Effect> {
 /// the reason (so `c` works on them again), and the next run's queued files go. A file left out is
 /// no longer on disk.
 fn started(
-    m: &mut Model,
+    m: &mut Review,
     job: Result<Job, String>,
     missing: &[String],
     paths: &[String],
@@ -1018,7 +1048,7 @@ fn started(
 /// A question to stop a job stays while a queued batch takes over: `effects` start it, and
 /// effects run before the next key is read. With nothing left to run it goes, so the status line
 /// shows how the job ended, or why the last batch did not start, and the next `q` quits at once.
-fn settle_quit(m: &mut Model, effects: &[Effect]) {
+fn settle_quit(m: &mut Review, effects: &[Effect]) {
     if m.confirm == Some(Confirm::Quit) && !m.progress.busy() && effects.is_empty() {
         m.confirm = None;
     }
@@ -1026,7 +1056,7 @@ fn settle_quit(m: &mut Model, effects: &[Effect]) {
 
 /// `⏎` on a file: the findings, on the first entry with one of the file's, if the filter shows
 /// one.
-fn file_findings(m: &mut Model) {
+fn file_findings(m: &mut Review) {
     let Some(path) = m
         .progress
         .files
@@ -1051,7 +1081,7 @@ fn file_findings(m: &mut Model) {
 /// A step of the scan: its progress; and of the records it appended, its LLM calls' cost, and a
 /// failed attempt's record, which leaves the file's findings standing. A file it saved is read back
 /// from the store, which brings its findings with the decisions carried to them.
-fn scanned(m: &mut Model, event: scan::Event) -> Vec<Effect> {
+fn scanned(m: &mut Review, event: scan::Event) -> Vec<Effect> {
     m.progress.scan_event(&event);
     let scan::Event::Appended(records) = event else {
         return Vec::new();
@@ -1068,9 +1098,9 @@ fn scanned(m: &mut Model, event: scan::Event) -> Vec<Effect> {
     effects
 }
 
-/// A file read back from the store: its findings swapped in ([`Model::refresh`]), and the new ones
+/// A file read back from the store: its findings swapped in ([`Review::refresh`]), and the new ones
 /// taking their rows' decisions ([`inherit`]).
-fn read_back(m: &mut Model, path: &str, view: Result<Run, String>, now: Timestamp) -> Vec<Effect> {
+fn read_back(m: &mut Review, path: &str, view: Result<Run, String>, now: Timestamp) -> Vec<Effect> {
     match view {
         Ok(view) => {
             let new = m.refresh(path, view);
@@ -1088,7 +1118,7 @@ fn read_back(m: &mut Model, path: &str, view: Result<Run, String>, now: Timestam
 /// timing finding takes none: each episode's fix can differ. Nor does one that came with a
 /// decision carried over from the file's earlier check of the same line and fix. One undo step for
 /// them all.
-fn inherit(m: &Model, new: &[usize], now: Timestamp) -> Vec<Effect> {
+fn inherit(m: &Review, new: &[usize], now: Timestamp) -> Vec<Effect> {
     let mut before = Vec::new();
     let mut decisions = Vec::new();
     for &i in new {
@@ -1137,7 +1167,6 @@ pub(crate) mod tests {
 
     use crate::apply::patch::Outcome;
     use crate::review::model::Mark;
-    use ratatui::layout::Rect;
 
     use crate::review::model::tests_support::{self, finding, path, sample};
     use crate::scan::Event;
@@ -1148,26 +1177,27 @@ pub(crate) mod tests {
     }
 
     /// `action` done to `m`: the effects it asks for.
-    fn act(m: &mut Model, action: Action) -> Vec<Effect> {
+    fn act(m: &mut Review, action: Action) -> Vec<Effect> {
         update(m, Input::Action(action), now())
     }
 
-    /// Run a Write effect as if the store took it, and feed the result back.
-    fn written(m: &mut Model, effects: Vec<Effect>) {
+    /// What the store says to a Write effect when it takes every decision.
+    pub(crate) fn taken(effects: Vec<Effect>) -> Input {
         let [Effect::Write { purpose, decisions }] = <[Effect; 1]>::try_from(effects).unwrap()
         else {
             panic!("expected one write");
         };
         let n = decisions.len();
-        update(
-            m,
-            Input::Written {
-                purpose,
-                decisions,
-                result: Ok(vec![Decided::Written; n]),
-            },
-            now(),
-        );
+        Input::Written {
+            purpose,
+            decisions,
+            result: Ok(vec![Decided::Written; n]),
+        }
+    }
+
+    /// Run a Write effect as if the store took it, and feed the result back.
+    fn written(m: &mut Review, effects: Vec<Effect>) {
+        update(m, taken(effects), now());
     }
 
     pub(crate) fn decided(effects: &[Effect]) -> Vec<(u64, State, Option<&str>)> {
@@ -1188,17 +1218,17 @@ pub(crate) mod tests {
     }
 
     /// Episode `ep` read back once `scan` saved `findings` for it (see `tests_support::read_back`).
-    pub(crate) fn saved(m: &Model, ep: u32, findings: Vec<crate::store::Finding>) -> Input {
+    pub(crate) fn saved(m: &Review, ep: u32, findings: Vec<crate::store::Finding>) -> Input {
         Input::ReadBack {
             path: path(ep),
             view: Ok(tests_support::read_back(m, ep, findings)),
         }
     }
 
-    const TYPO: &str = "The beat gets trough to our mind";
-    const FIXED: &str = "The beat gets through to our mind";
+    pub(crate) const TYPO: &str = "The beat gets trough to our mind";
+    pub(crate) const FIXED: &str = "The beat gets through to our mind";
 
-    fn decide_as(m: &mut Model, ids: &[u64], state: State, edited: Option<&str>) {
+    pub(crate) fn decide_as(m: &mut Review, ids: &[u64], state: State, edited: Option<&str>) {
         for &id in ids {
             m.run.decisions.insert(
                 id,
@@ -1213,7 +1243,7 @@ pub(crate) mod tests {
     }
 
     /// The sample run with a scan of E04 and E05 under way.
-    pub(crate) fn scanning() -> Model {
+    pub(crate) fn scanning() -> Review {
         let mut m = sample();
         let queued = vec![PathBuf::from(path(4)), PathBuf::from(path(5))];
         update(&mut m, Input::Scan(Event::Queued(queued)), now());
@@ -1300,41 +1330,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_late_join_that_hides_a_row_above_the_selection_keeps_its_row_on_the_same_screen_line() {
-        // Ten more rows, pending: the list is taller than the five rows the screen shows.
-        let mut m = sample();
-        let more: Vec<crate::store::Finding> = (0..10_u64)
-            .map(|n| {
-                let line = format!("Line {n} has an erly typo.");
-                finding(
-                    10 + n,
-                    3,
-                    &line,
-                    "Fixed.",
-                    3_000_000 + 10_000 * i64::try_from(n).unwrap(),
-                )
-            })
-            .collect();
-        let view = tests_support::read_back(&m, 3, more);
-        m.refresh(&path(3), view);
-        decide_as(&mut m, &[1, 2, 4], State::Accepted, None);
-        m.filter = Filter::Only(State::Pending);
-        m.selected = 8;
-        m.set_area(Rect::new(0, 0, 100, 8));
-        let line = |m: &Model| m.selected - m.list_scroll(m.area);
-        let selected = m.selected_entry();
-        assert_eq!(line(&m), 4, "scrolled to the bottom of the screen");
-        // E04's lyric joins the decided lyric row: the row shows above the selection for a
-        // moment, then the inherited decision hides it again.
-        let msg = saved(&m, 4, vec![finding(30, 4, TYPO, FIXED, 165_060)]);
-        let effects = update(&mut m, msg, now());
-        written(&mut m, effects);
-        assert_eq!(m.selected_entry(), selected);
-        assert_eq!(m.selected, 8);
-        assert_eq!(line(&m), 4, "the selected row did not move on screen");
-    }
-
-    #[test]
     fn u_in_the_files_view_takes_a_late_join_back_and_names_its_episode() {
         let mut m = sample();
         decide_as(&mut m, &[1, 2, 4], State::Accepted, None);
@@ -1387,7 +1382,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_new_finding_stays_pending_in_a_row_accepted_in_two_wordings_or_with_one_pending() {
-        let join = |m: &mut Model| {
+        let join = |m: &mut Review| {
             let msg = saved(m, 4, vec![finding(5, 4, TYPO, FIXED, 165_060)]);
             update(m, msg, now())
         };
@@ -1407,7 +1402,7 @@ pub(crate) mod tests {
 
     #[test]
     fn quitting_while_the_scan_runs_asks_first() {
-        let status = |m: &Model| m.status_text(Rect::new(0, 0, 160, 1));
+        let status = |m: &Review| m.status_text();
         let mut m = scanning();
         act(&mut m, Action::Quit);
         assert!(!m.should_quit);
@@ -1439,7 +1434,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_quit_question_goes_when_the_scan_ends() {
-        let status = |m: &Model| m.status_text(Rect::new(0, 0, 160, 1));
+        let status = |m: &Review| m.status_text();
         let mut m = scanning();
         act(&mut m, Action::Quit);
         assert!(m.confirm.is_some());
@@ -1464,7 +1459,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_quit_question_stays_while_a_queued_batch_takes_over_and_goes_after_the_last() {
-        let status = |m: &Model| m.status_text(Rect::new(0, 0, 160, 1));
+        let status = |m: &Review| m.status_text();
         let mut m = scanning();
         for (ep, run) in [(1, "r"), (2, "s")] {
             m.confirm = Some(Confirm::Recheck {
@@ -1603,7 +1598,7 @@ pub(crate) mod tests {
         assert_eq!(m.fatal.as_deref(), Some("the scan panicked: boom"));
     }
 
-    pub(crate) fn states(m: &Model) -> Vec<State> {
+    pub(crate) fn states(m: &Review) -> Vec<State> {
         m.run
             .findings
             .iter()
@@ -1704,7 +1699,7 @@ pub(crate) mod tests {
                 "A later line!",
                 1_000_000,
             ));
-        let mut m = Model::new(run, std::collections::HashMap::new());
+        let mut m = Review::new(run, std::collections::HashMap::new());
         assert_eq!(m.rows.len(), 3);
         act(&mut m, Action::Toggle);
         m.selected = 1;
@@ -1721,7 +1716,7 @@ pub(crate) mod tests {
         let mut m = crate::review::model::tests_support::with_timing();
         m.selected = 1;
         assert_eq!(act(&mut m, Action::Edit), []);
-        assert_eq!(m.editor, None);
+        assert_eq!(m.editing, None);
         assert_eq!(
             m.status.as_deref(),
             Some("a timing fix is accepted or rejected, not edited")
@@ -1922,7 +1917,7 @@ pub(crate) mod tests {
         run.findings[1].original = "Let's have snacks together everyday.".into();
         run.findings[1].suggestion = "Let's have snacks together every day.".into();
         run.findings[1].occurrences[0].start_ms = 894_190;
-        let mut m = Model::new(run, std::collections::HashMap::new());
+        let mut m = Review::new(run, std::collections::HashMap::new());
         m.filter = Filter::All;
         // E02's two "everyday" findings are one row; reject the first alone.
         let row = m.rows.iter().position(|r| r.members == [1, 2]).unwrap();
@@ -1963,13 +1958,13 @@ pub(crate) mod tests {
         let mut m = sample();
         act(&mut m, Action::Edit);
         assert_eq!(act(&mut m, Action::Reword(String::new())), []);
-        assert!(m.editor.is_some());
+        assert!(m.editing.is_some());
         assert_eq!(
             m.status.as_deref(),
             Some("the wording cannot be empty (Esc cancels)")
         );
         act(&mut m, Action::CancelEdit);
-        assert!(m.editor.is_none());
+        assert!(m.editing.is_none());
         assert_eq!(states(&m), [State::Pending; 4]);
     }
 
@@ -2022,7 +2017,7 @@ pub(crate) mod tests {
             for &id in ids {
                 run.decisions.insert(id, accepted(id));
             }
-            Model::new(run, std::collections::HashMap::new())
+            Review::new(run, std::collections::HashMap::new())
         };
         let m = opened(&[1, 2, 4]);
         assert_eq!(m.entries(), [Entry::Row(0), Entry::Row(1)]);
@@ -2046,7 +2041,7 @@ pub(crate) mod tests {
         act(&mut m, Action::Toggle);
         act(&mut m, Action::NextFile);
         assert_eq!(m.selected_entry(), Some(Entry::Member(0, 1)));
-        act(&mut m, Action::Select(4));
+        act(&mut m, Action::Select(EntryKey::Row(vec![3])));
         act(&mut m, Action::PreviousFile);
         assert_eq!(
             m.selected_entry(),
@@ -2059,7 +2054,7 @@ pub(crate) mod tests {
     fn enter_on_a_member_collapses_its_group() {
         let mut m = sample();
         act(&mut m, Action::Toggle);
-        act(&mut m, Action::Select(1));
+        act(&mut m, Action::Select(EntryKey::Member(1)));
         act(&mut m, Action::Toggle);
         assert_eq!(m.entries(), [Entry::Row(0), Entry::Row(1)]);
         assert_eq!(m.selected_entry(), Some(Entry::Row(0)));
@@ -2196,7 +2191,7 @@ pub(crate) mod tests {
     fn an_action_clears_the_status_message_but_an_answer_an_edits_end_and_ctrl_c_leave_it() {
         let said = || Some("opened in mpv".to_string());
         for action in [
-            Action::Select(1),
+            Action::Select(EntryKey::Row(vec![3])),
             Action::Toggle,
             Action::ShowPane(Pane::Files),
             Action::Dismiss,
@@ -2226,6 +2221,52 @@ pub(crate) mod tests {
         act(&mut m, Action::Interrupt);
         assert!(m.should_quit);
         assert_eq!(m.status, said(), "Interrupt");
+    }
+
+    #[test]
+    fn selecting_an_entry_that_went_selects_nothing_and_says_so() {
+        let mut m = sample();
+        // From the snacks row, E02's lyric while its row is collapsed: its row, with nothing said.
+        act(&mut m, Action::Select(EntryKey::Row(vec![3])));
+        act(&mut m, Action::Select(EntryKey::Member(2)));
+        assert_eq!(m.selected_entry(), Some(Entry::Row(0)));
+        assert_eq!(m.status, None);
+        // The lyric's row expanded with its E03 member selected, and E02's file: neither at 0, so
+        // a selection that moved would show.
+        act(&mut m, Action::Toggle);
+        act(&mut m, Action::Select(EntryKey::Member(4)));
+        act(&mut m, Action::SelectFile(path(2)));
+        assert_eq!(m.selected_entry(), Some(Entry::Member(0, 3)));
+        assert_eq!(m.file_selected, 1);
+        let snacks = m.entry_key(Entry::Row(1));
+        // E02 checked again without its snacks line: that row went.
+        let view = Run {
+            files: vec![tests_support::file(2)],
+            findings: vec![finding(2, 2, TYPO, FIXED, 165_060)],
+            ..Run::default()
+        };
+        update(
+            &mut m,
+            Input::ReadBack {
+                path: path(2),
+                view: Ok(view),
+            },
+            now(),
+        );
+        // E03's member stays selected, its finding now at index 1.
+        let e03 = Some(Entry::Member(0, 1));
+        assert_eq!(m.selected_entry(), e03);
+        assert_eq!(act(&mut m, Action::Select(snacks)), []);
+        assert_eq!(m.selected_entry(), e03);
+        assert_eq!(
+            m.status.as_deref(),
+            Some("that finding changed; the selection stays")
+        );
+        // A file of another view, likewise.
+        let elsewhere = "/m/Other/Other - E07.mkv".to_string();
+        assert_eq!(act(&mut m, Action::SelectFile(elsewhere)), []);
+        assert_eq!(m.file_selected, 1);
+        assert_eq!(m.status.as_deref(), Some("E07 is not in this view"));
     }
 
     #[test]
@@ -2307,7 +2348,7 @@ pub(crate) mod tests {
     }
 
     /// The sample run's files view, on E02.
-    fn on_e02_in_files() -> Model {
+    fn on_e02_in_files() -> Review {
         let mut m = sample();
         act(&mut m, Action::ShowPane(Pane::Files));
         m.file_selected = 1;
@@ -2330,7 +2371,7 @@ pub(crate) mod tests {
         };
         update(&mut m, found, now());
         assert_eq!(
-            m.status_text(Rect::new(0, 0, 160, 1)).as_deref(),
+            m.status_text().as_deref(),
             Some("check E02 again with claude? y/n")
         );
         // A no lets it go.
@@ -2573,7 +2614,7 @@ pub(crate) mod tests {
     }
 
     /// The sample with findings 1 (E01) and 3 (E02) accepted, 3's fix in its file already.
-    fn accepted() -> Model {
+    fn accepted() -> Review {
         let mut m = sample();
         for id in [1, 3] {
             m.run.decisions.insert(
@@ -2613,7 +2654,7 @@ pub(crate) mod tests {
         assert_eq!(act(&mut m, Action::Apply { dry_run: false }), []);
         assert_eq!(m.confirm, Some(Confirm::Apply));
         assert_eq!(
-            m.status_text(Rect::default()).as_deref(),
+            m.status_text().as_deref(),
             Some("apply 2 fixes in 2 files (1 applied already), keeping each .orig? y/n")
         );
         // A no lets it go.
@@ -2643,7 +2684,7 @@ pub(crate) mod tests {
         m.run.decisions.remove(&3);
         act(&mut m, Action::Apply { dry_run: false });
         assert_eq!(
-            m.status_text(Rect::default()).as_deref(),
+            m.status_text().as_deref(),
             Some("apply 1 fix in 1 file, keeping each .orig? y/n")
         );
     }
@@ -2713,7 +2754,7 @@ pub(crate) mod tests {
             now(),
         );
         assert_eq!(
-            m.status_text(Rect::default()).as_deref(),
+            m.status_text().as_deref(),
             Some("dry run is on E01 (plan), 0/1 — stop it and quit? y/n")
         );
         // Apply ending lets the question go: nothing is left to stop.
@@ -2749,7 +2790,7 @@ pub(crate) mod tests {
         act(&mut m, Action::Interrupt);
         assert!(!m.should_quit);
         assert_eq!(
-            m.status_text(Rect::default()).as_deref(),
+            m.status_text().as_deref(),
             Some("apply is on E01 (remux), 0/1 — stop it and quit? y/n")
         );
         act(&mut m, Action::Answer(false));
@@ -2945,9 +2986,6 @@ pub(crate) mod tests {
         act(&mut m, Action::Apply { dry_run: true });
         update(&mut m, Input::ApplyStarted(Err("no threads".into())), now());
         assert!(!m.progress.busy());
-        assert_eq!(
-            m.status_text(Rect::default()).as_deref(),
-            Some("apply failed: no threads")
-        );
+        assert_eq!(m.status_text().as_deref(), Some("apply failed: no threads"));
     }
 }

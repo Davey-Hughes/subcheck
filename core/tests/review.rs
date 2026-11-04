@@ -7,9 +7,9 @@ use std::path::Path;
 use crossterm::event::KeyCode;
 use subcheck_core::list::{self, Filter};
 use subcheck_core::player::Player;
-use subcheck_core::review::model::Model;
+use subcheck_core::review::model::Review;
 use subcheck_core::review::run_effect;
-use subcheck_core::review::screen::{self, Msg};
+use subcheck_core::review::screen::{self, Msg, Screen};
 use subcheck_core::store::{
     Attempt, CheckedWith, Finding, Made, RunHeader, ScanRow, State, Store, TrackRecord,
 };
@@ -72,16 +72,16 @@ fn checked(store: &mut Store, scan: &ScanRow, path: &str, findings: Vec<Finding>
 }
 
 /// The event loop's inner part: a message, then every effect it leads to, run for real.
-fn send(m: &mut Model, msg: Msg, store: &mut Store, player: &mut Player) {
+fn send(m: &mut Review, s: &mut Screen, msg: Msg, store: &mut Store, player: &mut Player) {
     let now = jiff::Timestamp::now();
     // None of these effects starts a scan: the channel is only there to be passed.
     let (tx, _rx) = std::sync::mpsc::channel();
     // Where apply would write its tracks: no test here starts apply, so nothing goes there.
     let state = Path::new("/no-state");
-    let mut queue: VecDeque<_> = screen::update(m, msg, now).into();
+    let mut queue: VecDeque<_> = screen::update(m, s, msg, now).into();
     while let Some(effect) = queue.pop_front() {
         let input = run_effect(effect, store, player, state, &tx);
-        queue.extend(screen::update(m, input.into(), now));
+        queue.extend(screen::update(m, s, input.into(), now));
     }
 }
 
@@ -115,19 +115,27 @@ fn decisions_made_in_review_are_in_the_store() {
             finding(OTHER, "befor it", "before it"),
         ],
     );
-    let mut model = Model::new(store.run_view(&scan).unwrap(), HashMap::new());
+    let mut model = Review::new(store.run_view(&scan).unwrap(), HashMap::new());
+    let mut screen = Screen::default();
     let mut player = Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock"));
     let key = |c| Msg::Key(KeyCode::Char(c));
 
     // Accept the group of two, then reword the other finding.
-    send(&mut model, key('a'), &mut store, &mut player);
-    send(&mut model, key('e'), &mut store, &mut player);
-    send(&mut model, Msg::KillLine, &mut store, &mut player);
+    send(&mut model, &mut screen, key('a'), &mut store, &mut player);
+    send(&mut model, &mut screen, key('e'), &mut store, &mut player);
+    send(
+        &mut model,
+        &mut screen,
+        Msg::KillLine,
+        &mut store,
+        &mut player,
+    );
     for c in "Before it.".chars() {
-        send(&mut model, key(c), &mut store, &mut player);
+        send(&mut model, &mut screen, key(c), &mut store, &mut player);
     }
     send(
         &mut model,
+        &mut screen,
         Msg::Key(KeyCode::Enter),
         &mut store,
         &mut player,
@@ -143,14 +151,14 @@ fn decisions_made_in_review_are_in_the_store() {
     );
 
     // Undo is a write too, and the newest decision wins on reading back.
-    send(&mut model, key('u'), &mut store, &mut player);
+    send(&mut model, &mut screen, key('u'), &mut store, &mut player);
     let run = store.run_view(&scan).unwrap();
     assert_eq!(run.state_of(3), State::Pending);
     assert_eq!(run.state_of(1), State::Accepted);
 
     // With no mpv to start, `o` says so in the status line.
     model.filter = Filter::All;
-    send(&mut model, key('o'), &mut store, &mut player);
+    send(&mut model, &mut screen, key('o'), &mut store, &mut player);
     assert!(
         model
             .status
@@ -176,7 +184,8 @@ fn a_decision_on_a_finding_checked_again_follows_it_through_the_loop() {
     let scan = store.begin_scan(&header, &[FILE.into()]).unwrap();
     let typo = || vec![finding(FILE, "gets trough", "gets through")];
     checked(&mut store, &scan, FILE, typo());
-    let mut model = Model::new(store.run_view(&scan).unwrap(), HashMap::new());
+    let mut model = Review::new(store.run_view(&scan).unwrap(), HashMap::new());
+    let mut screen = Screen::default();
     let old = model.run.findings[0].id;
     let mut player = Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock"));
     let key = |c| Msg::Key(KeyCode::Char(c));
@@ -188,7 +197,7 @@ fn a_decision_on_a_finding_checked_again_follows_it_through_the_loop() {
     let new = run.findings[0].id;
     assert_ne!(old, new);
 
-    send(&mut model, key('a'), &mut store, &mut player);
+    send(&mut model, &mut screen, key('a'), &mut store, &mut player);
     let run = store.run_view(&scan).unwrap();
     assert_eq!(run.state_of(new), State::Accepted);
     assert_eq!(run.state_of(old), State::Pending);
@@ -201,7 +210,7 @@ fn a_decision_on_a_finding_checked_again_follows_it_through_the_loop() {
         Some("E01 was checked again; your decision went to its new finding")
     );
 
-    send(&mut model, key('u'), &mut store, &mut player);
+    send(&mut model, &mut screen, key('u'), &mut store, &mut player);
     let run = store.run_view(&scan).unwrap();
     assert_eq!(run.state_of(new), State::Pending);
 }
@@ -246,24 +255,27 @@ fn v_switches_between_a_run_and_its_folders_through_the_store() {
         FILE,
         vec![finding(FILE, "gets trough", "gets through")],
     );
-    let mut model = Model::new(store.run_view(&forced).unwrap(), HashMap::new());
+    let mut model = Review::new(store.run_view(&forced).unwrap(), HashMap::new());
+    let mut screen = Screen::default();
     let mut player = Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock"));
     let key = |c| Msg::Key(KeyCode::Char(c));
 
-    // The forced run shows FILE alone; `v` opens its folder, OTHER's finding with it.
+    // The forced run shows FILE alone; `v` opens its folder, OTHER's finding with it, and the
+    // spinner, a tick along, starts over there.
     assert_eq!(model.run.files.len(), 1);
-    send(&mut model, key('v'), &mut store, &mut player);
+    send(&mut model, &mut screen, Msg::Tick, &mut store, &mut player);
+    send(&mut model, &mut screen, key('v'), &mut store, &mut player);
     assert!(model.run.of_paths, "{:?}", model.status);
     assert_eq!(model.run.shown_name(), "K-On!");
     let files: Vec<&str> = model.run.files.iter().map(|f| f.path.as_str()).collect();
-    assert_eq!(files, [FILE, OTHER]);
+    assert_eq!((files, screen.ticks), (vec![FILE, OTHER], 0));
     // On OTHER's finding, `v` opens the newest run that named OTHER: the season's.
     model.selected = model
         .entries()
         .iter()
         .position(|&e| model.run.findings[model.rows[e.row()].members[0]].file == OTHER)
         .unwrap();
-    send(&mut model, key('v'), &mut store, &mut player);
+    send(&mut model, &mut screen, key('v'), &mut store, &mut player);
     assert!(!model.run.of_paths, "{:?}", model.status);
     assert_eq!(model.run.name, season.name);
 }

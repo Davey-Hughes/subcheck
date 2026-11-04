@@ -10,9 +10,6 @@ use crate::llm::Spent;
 use crate::scan::{self, Event};
 use crate::store::{Check, FileRecord, Record, Run};
 
-/// The spinner beside a stage under way, a step per tick.
-const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
 /// Where a file is in the scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
@@ -319,8 +316,6 @@ pub struct Progress {
     pub findings: usize,
     /// What the scan's LLM calls used.
     pub spent: Spent,
-    /// The loop's ticks while a job runs (`Msg::Tick`): the spinner's step.
-    pub ticks: usize,
     /// The run the scan records under, and the command that finishes it should it stop: for the
     /// outro. Empty before the first scan.
     pub run: String,
@@ -378,7 +373,6 @@ impl Progress {
             failed: 0,
             findings: 0,
             spent: Spent::default(),
-            ticks: 0,
             run: String::new(),
             resume: String::new(),
             earlier: Vec::new(),
@@ -756,10 +750,6 @@ impl Progress {
         self.scan == Scan::Running
     }
 
-    pub fn spinner(&self) -> char {
-        SPINNER[self.ticks % SPINNER.len()]
-    }
-
     /// While the scan runs, where it is with `path`, in the files view's words: `queued`,
     /// `reading`, `LLM 1/3`. `None` once the scan has ended, even if it left the file queued or
     /// being read, and for a file it is not checking or is done with.
@@ -804,24 +794,13 @@ impl Progress {
     }
 
     /// For the list's title while a job runs: `scanning 7/24 ⠙`, `applying 3/9 ⠙`,
-    /// `dry run 3/9 ⠙`.
-    pub fn title(&self) -> Option<String> {
+    /// `dry run 3/9 ⠙`. The char after the counts is `spinner`.
+    pub fn title(&self, spinner: char) -> Option<String> {
         if self.running() {
-            return Some(format!(
-                "scanning {}/{} {}",
-                self.done,
-                self.queued,
-                self.spinner()
-            ));
+            return Some(format!("scanning {}/{} {spinner}", self.done, self.queued));
         }
         let a = self.apply.as_ref().filter(|a| a.ended.is_none())?;
-        Some(format!(
-            "{} {}/{} {}",
-            a.verb(),
-            a.done,
-            a.queued,
-            self.spinner()
-        ))
+        Some(format!("{} {}/{} {spinner}", a.verb(), a.done, a.queued))
     }
 
     /// The status line's own text: while the scan runs, how far it is (`scan 7/24 · 31 findings ·
@@ -1064,9 +1043,8 @@ mod tests {
             p.line().as_deref(),
             Some("scan 2/2 · 3 findings · 1 failed")
         );
-        assert_eq!(p.title().as_deref(), Some("scanning 2/2 ⠋"));
-        p.ticks += 1;
-        assert_eq!(p.title().as_deref(), Some("scanning 2/2 ⠙"));
+        assert_eq!(p.title('⠋').as_deref(), Some("scanning 2/2 ⠋"));
+        assert_eq!(p.title('⠙').as_deref(), Some("scanning 2/2 ⠙"));
     }
 
     #[test]
@@ -1099,7 +1077,7 @@ mod tests {
                 "run r: 2 files, 2 checked, 0 failed, 0 unchanged since an earlier scan; 0 findings"
             )
         );
-        assert_eq!(p.title(), None);
+        assert_eq!(p.title('⠋'), None);
         p.scan = Scan::Ended(Err("disk full".into()));
         assert_eq!(p.line().as_deref(), Some("the scan failed: disk full"));
     }
@@ -1128,7 +1106,7 @@ mod tests {
         };
         let mut p = Progress::of_run(&run);
         assert!(!p.running());
-        assert_eq!((p.line(), p.title()), (None, None));
+        assert_eq!((p.line(), p.title('⠋')), (None, None));
         assert_eq!(p.files[0].label('⠙'), "✓ 400 lines · 1 finding");
         assert_eq!(p.files[1].label('⠙'), "✗ FAILED: cannot read");
         assert_eq!(p.files[0].log, ["400 lines, 1 finding"]);
@@ -1475,7 +1453,7 @@ mod tests {
             apply::Stage::Remux,
         ));
         assert_eq!(p.files[0].label('⠙'), "⠙ remux");
-        assert_eq!(p.title().as_deref(), Some("applying 0/2 ⠋"));
+        assert_eq!(p.title('⠋').as_deref(), Some("applying 0/2 ⠋"));
         p.apply_event(&apply::Event::Warned {
             path: "/m/E01.mkv".into(),
             text: "a warning".into(),
@@ -1513,7 +1491,7 @@ mod tests {
             failed: 0,
         }));
         assert!(!p.busy());
-        assert_eq!(p.title(), None);
+        assert_eq!(p.title('⠋'), None);
         assert_eq!(
             p.line().as_deref(),
             Some("applied 2, already applied 1, by hand 1, not found 0; 1 remuxed, 0 failed")
@@ -1532,7 +1510,7 @@ mod tests {
             "/m/E01.mkv".into(),
             apply::Stage::Plan,
         ));
-        assert_eq!(p.title().as_deref(), Some("dry run 0/2 ⠋"));
+        assert_eq!(p.title('⠋').as_deref(), Some("dry run 0/2 ⠋"));
         p.apply_event(&done(
             "/m/E01.mkv",
             vec![(1, Outcome::Patched), (2, Outcome::NotFound)],
