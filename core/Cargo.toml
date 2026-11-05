@@ -7,8 +7,9 @@ description = "subcheck's library: reading, checking and fixing the text subtitl
 license.workspace = true
 
 [features]
-# `test_support`, for integration tests, which see only what the library exports. Dev-dependencies
-# turn it on (cli's, and for this package's own tests the one on itself below); no normal one does.
+# What tests share (`test_support`, and review's `tests_support` modules), for tests that see only
+# what the library exports: its integration tests, and cli's. Dev-dependencies turn it on (cli's,
+# and for this package's own tests the one on itself below); no normal one does.
 test-support = ["dep:tempfile"]
 
 [dependencies]
@@ -19,8 +20,6 @@ thiserror.workspace = true
 jiff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-ratatui.workspace = true
-crossterm.workspace = true
 rustfft.workspace = true
 signal-hook.workspace = true
 rustix.workspace = true

@@ -4,12 +4,12 @@
 
 use crossterm::event::KeyCode;
 
-use super::model::{Pane, Review};
 use super::screen::Screen;
-use super::update::Action;
-use crate::list::Filter;
-use crate::player::Playback;
-use crate::store::State;
+use subcheck_core::list::Filter;
+use subcheck_core::player::Playback;
+use subcheck_core::review::model::{Pane, Review};
+use subcheck_core::review::update::Action;
+use subcheck_core::store::State;
 
 /// Rows a PgUp or PgDn moves.
 const PAGE: usize = 10;
@@ -152,9 +152,9 @@ fn files_key(m: &Review, key: KeyCode) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::review::model::tests_support::{many, path, sample};
-    use crate::review::model::{Confirm, EntryKey};
-    use crate::review::screen::Editor;
+    use crate::tui::screen::Editor;
+    use subcheck_core::review::model::tests_support::{many, path, sample};
+    use subcheck_core::review::model::{Confirm, EntryKey};
 
     /// 30 rows, one per episode, the 16th selected: each move lands on an entry of its own.
     fn mid_list() -> Review {

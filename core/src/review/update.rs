@@ -1,7 +1,8 @@
 //! What each action, and each result of a job or an effect, does to review's state, and the
 //! effects the event loop runs for it. Pure: the store and mpv are touched only by the effects, so
-//! every rule here is tested without a terminal. It takes actions, not keys or clicks, so that each
-//! UI maps its own to the same rules (the terminal's are in `keymap` and `screen`).
+//! every rule here is tested without a terminal. It takes actions, not keys or clicks, so that
+//! each UI maps its own to the same rules: the terminal's are in `subcheck_cli::tui`, its `keymap`
+//! and `screen`.
 
 use std::collections::HashMap;
 
@@ -1172,29 +1173,26 @@ fn inherit(m: &Review, new: &[usize], now: Timestamp) -> Vec<Effect> {
     })]
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
+/// What review's tests share, in this library and outside it: tests outside it reach this through
+/// the `test-support` feature, as they do `crate::test_support`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod tests_support {
     use std::path::PathBuf;
 
-    use crate::apply::patch::Outcome;
-    use crate::review::model::Mark;
+    use jiff::Timestamp;
 
-    use crate::review::model::tests_support::{self, finding, path, sample};
+    use super::{Effect, Input, Task, update};
+    use crate::review::model::Review;
+    use crate::review::model::tests_support::{self, path, sample};
     use crate::scan::Event;
-    use crate::store::{Decided, Record};
+    use crate::store::{Decided, Decision, State};
 
-    pub(crate) fn now() -> Timestamp {
+    pub fn now() -> Timestamp {
         "2026-10-17T12:00:00Z".parse().unwrap()
     }
 
-    /// `action` done to `m`: the effects it asks for.
-    fn act(m: &mut Review, action: Action) -> Vec<Effect> {
-        update(m, Input::Action(action), now())
-    }
-
     /// What the store says to a [`Task::Write`] when it takes every decision.
-    pub(crate) fn taken(effects: Vec<Effect>) -> Input {
+    pub fn taken(effects: Vec<Effect>) -> Input {
         let [Effect::Task(Task::Write { purpose, decisions })] =
             <[Effect; 1]>::try_from(effects).unwrap()
         else {
@@ -1208,12 +1206,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Run a [`Task::Write`] as if the store took it, and feed the result back.
-    fn written(m: &mut Review, effects: Vec<Effect>) {
-        update(m, taken(effects), now());
-    }
-
-    pub(crate) fn decided(effects: &[Effect]) -> Vec<(u64, State, Option<&str>)> {
+    pub fn decided(effects: &[Effect]) -> Vec<(u64, State, Option<&str>)> {
         match effects {
             [Effect::Task(Task::Write { decisions, .. })] => decisions
                 .iter()
@@ -1223,25 +1216,18 @@ pub(crate) mod tests {
         }
     }
 
-    /// What `scan` appends for episode `ep`: its file record, then its findings.
-    fn appended(ep: u32, findings: Vec<crate::store::Finding>) -> Input {
-        let mut records = vec![Record::File(tests_support::file(ep))];
-        records.extend(findings.into_iter().map(Record::Finding));
-        Input::Scan(Event::Appended(records))
-    }
-
-    /// Episode `ep` read back once `scan` saved `findings` for it (see `tests_support::read_back`).
-    pub(crate) fn saved(m: &Review, ep: u32, findings: Vec<crate::store::Finding>) -> Input {
+    /// Episode `ep` read back once `scan` saved `findings` (see `model::tests_support::read_back`).
+    pub fn saved(m: &Review, ep: u32, findings: Vec<crate::store::Finding>) -> Input {
         Input::ReadBack {
             path: path(ep),
             view: Ok(tests_support::read_back(m, ep, findings)),
         }
     }
 
-    pub(crate) const TYPO: &str = "The beat gets trough to our mind";
-    pub(crate) const FIXED: &str = "The beat gets through to our mind";
+    pub const TYPO: &str = "The beat gets trough to our mind";
+    pub const FIXED: &str = "The beat gets through to our mind";
 
-    pub(crate) fn decide_as(m: &mut Review, ids: &[u64], state: State, edited: Option<&str>) {
+    pub fn decide_as(m: &mut Review, ids: &[u64], state: State, edited: Option<&str>) {
         for &id in ids {
             m.run.decisions.insert(
                 id,
@@ -1256,11 +1242,52 @@ pub(crate) mod tests {
     }
 
     /// The sample run with a scan of E04 and E05 under way.
-    pub(crate) fn scanning() -> Review {
+    pub fn scanning() -> Review {
         let mut m = sample();
         let queued = vec![PathBuf::from(path(4)), PathBuf::from(path(5))];
         update(&mut m, Input::Scan(Event::Queued(queued)), now());
         m
+    }
+
+    pub fn states(m: &Review) -> Vec<State> {
+        m.run
+            .findings
+            .iter()
+            .map(|f| m.run.state_of(f.id))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    use crate::apply::patch::Outcome;
+    use crate::review::model::Mark;
+
+    use super::tests_support::{
+        FIXED, TYPO, decide_as, decided, now, saved, scanning, states, taken,
+    };
+    use crate::review::model::tests_support::{self, finding, path, sample};
+    use crate::scan::Event;
+    use crate::store::{Decided, Record};
+
+    /// `action` done to `m`: the effects it asks for.
+    fn act(m: &mut Review, action: Action) -> Vec<Effect> {
+        update(m, Input::Action(action), now())
+    }
+
+    /// Run a [`Task::Write`] as if the store took it, and feed the result back.
+    fn written(m: &mut Review, effects: Vec<Effect>) {
+        update(m, taken(effects), now());
+    }
+
+    /// What `scan` appends for episode `ep`: its file record, then its findings.
+    fn appended(ep: u32, findings: Vec<crate::store::Finding>) -> Input {
+        let mut records = vec![Record::File(tests_support::file(ep))];
+        records.extend(findings.into_iter().map(Record::Finding));
+        Input::Scan(Event::Appended(records))
     }
 
     #[test]
@@ -1609,14 +1636,6 @@ pub(crate) mod tests {
         );
         assert!(m.should_quit);
         assert_eq!(m.fatal.as_deref(), Some("the scan panicked: boom"));
-    }
-
-    pub(crate) fn states(m: &Review) -> Vec<State> {
-        m.run
-            .findings
-            .iter()
-            .map(|f| m.run.state_of(f.id))
-            .collect()
     }
 
     #[test]
@@ -2796,7 +2815,8 @@ pub(crate) mod tests {
 
     #[test]
     fn ctrl_c_or_ctrl_d_while_applying_asks_as_q_does_and_y_stops_it() {
-        // Ctrl-C and Ctrl-D are both `Action::Interrupt` (`map_event`, then `screen::update`).
+        // Ctrl-C and Ctrl-D are both `Action::Interrupt` (`subcheck_cli::tui`'s `map_event`, then
+        // its `screen::update`).
         let applying = || {
             let mut m = accepted();
             act(&mut m, Action::Apply { dry_run: false });
@@ -2824,7 +2844,7 @@ pub(crate) mod tests {
         assert!(!m.should_quit && m.confirm.is_none());
         act(&mut m, Action::Interrupt);
         act(&mut m, Action::Answer(true));
-        // Quitting while apply runs is what stops it (`review::run` ends its groups).
+        // Quitting while apply runs is what stops it (`subcheck_cli::tui::run` ends its groups).
         assert!(m.should_quit && m.progress.applying());
         // A second one, with the question open, quits too.
         let mut m = applying();

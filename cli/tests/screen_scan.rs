@@ -13,14 +13,15 @@ use std::time::Duration;
 
 use common::fixture;
 use crossterm::event::KeyCode;
+use subcheck_cli::mpv::Player;
+use subcheck_cli::tui::run_effect;
+use subcheck_cli::tui::screen::{self, Msg, Screen};
 use subcheck_core::llm::Backend;
-use subcheck_core::mpv::Player;
+use subcheck_core::review::jobs;
 use subcheck_core::review::model::Review;
 use subcheck_core::review::progress::{Scan, Stage};
 use subcheck_core::review::runner::{Runner, opening};
-use subcheck_core::review::screen::{self, Msg, Screen};
 use subcheck_core::review::update::Input;
-use subcheck_core::review::{jobs, run_effect};
 use subcheck_core::scan::{self, Event, Planned};
 use subcheck_core::store::{Decision, Selector, State, Store};
 

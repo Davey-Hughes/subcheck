@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
-use crate::group;
-use crate::player::{Moment, PlayState, Playback};
-use crate::scan::file_stamp;
-use crate::text::timestamp_ms;
+use subcheck_core::group;
+use subcheck_core::player::{Moment, PlayState, Playback};
+use subcheck_core::scan::file_stamp;
+use subcheck_core::text::timestamp_ms;
 
 /// How long a new mpv gets to open its socket.
 const START_TIMEOUT: Duration = Duration::from_secs(3);
@@ -378,9 +378,9 @@ impl Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::script;
     use std::os::unix::net::UnixListener;
     use std::thread;
+    use subcheck_core::test_support::script;
 
     fn moment() -> Moment {
         Moment {

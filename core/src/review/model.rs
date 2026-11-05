@@ -1004,7 +1004,7 @@ fn words(s: &str) -> Vec<Range<usize>> {
 
 /// A small run for the review's tests: the OP lyric "trough" in E01, E02 and E03, and one other
 /// finding in E02. Four findings, two rows.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod tests_support {
     use super::{Review, Row};
     use crate::store::{

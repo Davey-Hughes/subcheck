@@ -7,9 +7,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
-use super::model::{Pane, Review};
-use super::progress::{ApplyStage, FileProgress, Stage};
 use super::screen::Screen;
+use subcheck_core::review::model::{Pane, Review};
+use subcheck_core::review::progress::{ApplyStage, FileProgress, Stage};
 
 /// The files view of the left pane: one line per file of the run, with its stage, and how many
 /// files there are on the bottom border.

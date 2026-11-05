@@ -11,10 +11,10 @@ use ratatui::layout::{Position, Rect};
 
 use super::keymap::{self, Press};
 use super::layout::{self, EDIT_KEYS, HELP, Item};
-use super::model::{EntryKey, Pane, Review};
-use super::update::{self, Action, Effect, Input};
 use super::view;
-use crate::llm::Spent;
+use subcheck_core::llm::Spent;
+use subcheck_core::review::model::{EntryKey, Pane, Review};
+use subcheck_core::review::update::{self, Action, Effect, Input};
 
 /// What the screen's loop takes: an input for `update::update`, one of the terminal's events, or
 /// the spinner's tick.
@@ -457,15 +457,15 @@ fn click_row(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::list::Filter;
-    use crate::player::PlayerCommand;
-    use crate::review::model::Entry;
-    use crate::review::model::tests_support::{self, finding, path, sample};
-    use crate::review::update::tests::{
+    use subcheck_core::list::Filter;
+    use subcheck_core::player::PlayerCommand;
+    use subcheck_core::review::model::Entry;
+    use subcheck_core::review::model::tests_support::{self, finding, path, sample};
+    use subcheck_core::review::update::tests_support::{
         FIXED, TYPO, decide_as, decided, now, saved, scanning, states, taken,
     };
-    use crate::scan::Event;
-    use crate::store::{Run, State};
+    use subcheck_core::scan::Event;
+    use subcheck_core::store::{Run, State};
 
     /// `msg` as the screen's loop takes it.
     pub(crate) fn send(
@@ -525,12 +525,12 @@ pub(crate) mod tests {
         m.status = Some("opened in mpv".into());
         assert_eq!(status(&m).as_deref(), Some("opened in mpv"));
         press(&mut m, &mut s, 'j');
-        let summary = crate::scan::Summary {
+        let summary = subcheck_core::scan::Summary {
             run: "r".into(),
             files: 2,
             checked: 1,
             failed: 1,
-            ..crate::scan::Summary::default()
+            ..subcheck_core::scan::Summary::default()
         };
         send(&mut m, &mut s, Input::ScanEnded(Ok(summary)), now());
         assert_eq!(
@@ -593,7 +593,7 @@ pub(crate) mod tests {
     }
 
     /// E02 as a re-check reads it back: its record, and `findings`.
-    fn e02(findings: Vec<crate::store::Finding>) -> Input {
+    fn e02(findings: Vec<subcheck_core::store::Finding>) -> Input {
         Input::ReadBack {
             path: path(2),
             view: Ok(Run {
@@ -605,7 +605,7 @@ pub(crate) mod tests {
     }
 
     /// E02's snacks line, as finding `id`.
-    fn snacks(id: u64) -> crate::store::Finding {
+    fn snacks(id: u64) -> subcheck_core::store::Finding {
         finding(
             id,
             2,
@@ -822,7 +822,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_click_lands_on_the_entry_drawn_there_when_the_list_is_scrolled() {
-        let mut m = crate::review::model::tests_support::many(30);
+        let mut m = subcheck_core::review::model::tests_support::many(30);
         let mut s = Screen::default();
         send(&mut m, &mut s, Msg::Resize(110, 20), now());
         key(&mut m, &mut s, KeyCode::End);
@@ -838,7 +838,7 @@ pub(crate) mod tests {
     fn the_first_click_lands_on_the_row_drawn_there_when_review_opens_scrolled() {
         // Review opened on the first pending row, entry 25, before any message: the screen it
         // first draws is scrolled to show it.
-        let mut m = crate::review::model::tests_support::many(30);
+        let mut m = subcheck_core::review::model::tests_support::many(30);
         let mut s = Screen::default();
         m.selected = 25;
         s.set_area(&m, Rect::new(0, 0, 110, 20));
@@ -1061,7 +1061,7 @@ pub(crate) mod tests {
         // Ten more rows, pending: the list is taller than the five rows the screen shows.
         let mut m = sample();
         let mut s = Screen::default();
-        let more: Vec<crate::store::Finding> = (0..10_u64)
+        let more: Vec<subcheck_core::store::Finding> = (0..10_u64)
             .map(|n| {
                 let line = format!("Line {n} has an erly typo.");
                 finding(

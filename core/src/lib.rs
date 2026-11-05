@@ -14,7 +14,6 @@ pub mod iso639;
 pub mod list;
 pub mod llm;
 pub mod mkv;
-pub mod mpv;
 pub mod player;
 pub mod review;
 pub mod scan;

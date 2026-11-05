@@ -13,13 +13,13 @@ use ratatui::widgets::{
 
 use super::files;
 use super::layout;
-use super::model::{Entry, FileNote, Mark, Pane, Review, changed, fix_label};
 use super::screen::Screen;
-use crate::list::{self, Filter, label};
-use crate::llm::Spent;
-use crate::store::{State, TimingFix};
-use crate::text::{timestamp, timestamp_ms};
-use crate::timing::shift_label;
+use subcheck_core::list::{self, Filter, label};
+use subcheck_core::llm::Spent;
+use subcheck_core::review::model::{Entry, FileNote, Mark, Pane, Review, changed, fix_label};
+use subcheck_core::store::{State, TimingFix};
+use subcheck_core::text::{timestamp, timestamp_ms};
+use subcheck_core::timing::shift_label;
 
 pub fn view(m: &Review, s: &Screen, f: &mut Frame) {
     let p = layout::panes(f.area());
@@ -707,13 +707,13 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use crate::apply::{self, patch::Outcome};
-    use crate::review::model::Mark;
-    use crate::review::model::tests_support::{path, sample};
-    use crate::review::screen::tests::send;
-    use crate::review::screen::{self, Editor, Msg};
-    use crate::review::update::Input;
-    use crate::review::update::tests::now;
+    use crate::tui::screen::tests::send;
+    use crate::tui::screen::{self, Editor, Msg};
+    use subcheck_core::apply::{self, patch::Outcome};
+    use subcheck_core::review::model::Mark;
+    use subcheck_core::review::model::tests_support::{path, sample};
+    use subcheck_core::review::update::Input;
+    use subcheck_core::review::update::tests_support::now;
 
     #[test]
     fn rows_and_members_carry_their_marks() {
@@ -1008,7 +1008,7 @@ mod tests {
 
     #[test]
     fn a_timing_row_shows_its_track_and_its_members_fixes() {
-        let mut m = crate::review::model::tests_support::with_timing();
+        let mut m = subcheck_core::review::model::tests_support::with_timing();
         let mut s = Screen::default();
         let screen = render_on(&m, &s, 160, 20);
         assert!(
@@ -1024,7 +1024,7 @@ mod tests {
 
     #[test]
     fn the_detail_pane_shows_a_timing_rows_fixes_and_stretches() {
-        let mut m = crate::review::model::tests_support::with_timing();
+        let mut m = subcheck_core::review::model::tests_support::with_timing();
         let mut s = Screen::default();
         m.selected = 1;
         let screen = render_on(&m, &s, 160, 24);
@@ -1223,8 +1223,8 @@ mod tests {
 
     #[test]
     fn the_files_view_shows_each_files_stage_and_the_selected_ones_log() {
-        use crate::review::model::tests_support::path;
-        use crate::scan::Event;
+        use subcheck_core::review::model::tests_support::path;
+        use subcheck_core::scan::Event;
         let mut m = sample();
         let mut s = Screen::default();
         let queued = vec![path(3).into(), path(4).into()];
@@ -1273,7 +1273,7 @@ mod tests {
         send(
             &mut m,
             &mut s,
-            Input::ScanEnded(Ok(crate::scan::Summary::default())),
+            Input::ScanEnded(Ok(subcheck_core::scan::Summary::default())),
             now(),
         );
         let screen = render_on(&m, &s, 160, 20);
@@ -1287,9 +1287,39 @@ mod tests {
     }
 
     #[test]
+    fn the_detail_pane_spins_beside_the_selected_files_stage_under_way() {
+        use subcheck_core::review::model::tests_support::path;
+        use subcheck_core::scan::Event;
+        let mut m = sample();
+        let mut s = Screen::default();
+        send(
+            &mut m,
+            &mut s,
+            Input::Scan(Event::Queued(vec![path(4).into()])),
+            now(),
+        );
+        send(
+            &mut m,
+            &mut s,
+            Input::Scan(Event::Reading(path(4).into())),
+            now(),
+        );
+        send(&mut m, &mut s, Msg::Key(KeyCode::Tab), now());
+        m.file_selected = 3;
+        let before = render_on(&m, &s, 160, 20);
+        assert!(before.contains("│⠋ reading"), "{before}");
+        // A tick turns the spinner a step: the detail pane draws the screen's frame beside the
+        // selected file's stage, as its line in the list does, so a fixed frame fails one assert.
+        send(&mut m, &mut s, Msg::Tick, now());
+        let screen = render_on(&m, &s, 160, 20);
+        assert!(screen.contains("E04  ⠙ reading"), "{screen}");
+        assert!(screen.contains("│⠙ reading"), "{screen}");
+    }
+
+    #[test]
     fn a_file_being_checked_again_spins_on_its_findings_and_says_where_the_check_is() {
-        use crate::review::model::tests_support::path;
-        use crate::scan::Event;
+        use subcheck_core::review::model::tests_support::path;
+        use subcheck_core::scan::Event;
         let mut m = sample();
         let mut s = Screen::default();
         // E02 checked again: the lyric's row (E01, E02, E03) and E02's snacks row spin.
@@ -1338,18 +1368,18 @@ mod tests {
     #[test]
     fn an_empty_list_while_scanning_says_findings_are_coming() {
         let mut m = Review::new(
-            crate::store::Run {
+            subcheck_core::store::Run {
                 name: "r".into(),
-                ..crate::store::Run::default()
+                ..subcheck_core::store::Run::default()
             },
             std::collections::HashMap::new(),
         );
         let mut s = Screen::default();
-        let queued = vec![crate::review::model::tests_support::path(1).into()];
+        let queued = vec![subcheck_core::review::model::tests_support::path(1).into()];
         send(
             &mut m,
             &mut s,
-            Input::Scan(crate::scan::Event::Queued(queued)),
+            Input::Scan(subcheck_core::scan::Event::Queued(queued)),
             now(),
         );
         let screen = render_on(&m, &s, 120, 12);
@@ -1436,11 +1466,11 @@ mod tests {
 
     fn with_cost() -> Review {
         let mut m = sample();
-        m.run.spent.add(Some(&crate::llm::Usage {
+        m.run.spent.add(Some(&subcheck_core::llm::Usage {
             input_tokens: 1_234_567,
             output_tokens: 31_234,
             cost_usd: Some(3.21),
-            ..crate::llm::Usage::default()
+            ..subcheck_core::llm::Usage::default()
         }));
         m
     }
@@ -1569,11 +1599,11 @@ mod tests {
         // None recorded: nothing is said of them.
         let screen = render_on(&m, &s, 120, 30);
         assert!(!screen.contains("LLM"), "{screen}");
-        m.run.spent.add(Some(&crate::llm::Usage {
+        m.run.spent.add(Some(&subcheck_core::llm::Usage {
             input_tokens: 1_234_567,
             output_tokens: 31_234,
             cost_usd: Some(3.21),
-            ..crate::llm::Usage::default()
+            ..subcheck_core::llm::Usage::default()
         }));
         let screen = render_on(&m, &s, 120, 30);
         let lines: Vec<&str> = screen.lines().collect();
@@ -1599,7 +1629,7 @@ mod tests {
 
     #[test]
     fn the_list_stays_put_while_the_selection_moves_inside_it() {
-        let mut m = crate::review::model::tests_support::many(12);
+        let mut m = subcheck_core::review::model::tests_support::many(12);
         let mut s = Screen::default();
         // 10 lines: 1 for the footer and 2 for the border leave 7 rows.
         send(&mut m, &mut s, Msg::Resize(110, 10), now());
@@ -1620,7 +1650,7 @@ mod tests {
 
     #[test]
     fn a_taller_screen_shows_the_entries_above_instead_of_blank_rows() {
-        let mut m = crate::review::model::tests_support::many(12);
+        let mut m = subcheck_core::review::model::tests_support::many(12);
         let mut s = Screen::default();
         send(&mut m, &mut s, Msg::Resize(110, 10), now());
         send(&mut m, &mut s, Msg::Key(KeyCode::End), now());
@@ -1640,7 +1670,7 @@ mod tests {
         m.filter = Filter::Only(State::Pending);
         m.run.decisions.insert(
             1,
-            crate::store::Decision {
+            subcheck_core::store::Decision {
                 finding: 1,
                 state: State::Rejected,
                 edited: None,
@@ -1675,7 +1705,7 @@ mod tests {
         let decide = |m: &mut Review, id, state| {
             m.run.decisions.insert(
                 id,
-                crate::store::Decision {
+                subcheck_core::store::Decision {
                     finding: id,
                     state,
                     edited: None,
@@ -1752,14 +1782,14 @@ mod tests {
 
     #[test]
     fn the_quit_question_shows_over_the_editor() {
-        use crate::review::model::tests_support::path;
+        use subcheck_core::review::model::tests_support::path;
         let mut m = sample();
         let mut s = Screen::default();
         let queued = vec![path(4).into(), path(5).into()];
         send(
             &mut m,
             &mut s,
-            Input::Scan(crate::scan::Event::Queued(queued)),
+            Input::Scan(subcheck_core::scan::Event::Queued(queued)),
             now(),
         );
         m.selected = 1;

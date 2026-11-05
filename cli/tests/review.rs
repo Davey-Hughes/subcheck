@@ -1,15 +1,15 @@
-//! The review's decisions through a real store: written by `review::run_effect`, read back as the
-//! run's view and by `list`. The screen itself is not drawn here; `review::view` has its own tests.
+//! The review's decisions through a real store: written by `tui::run_effect`, read back as the
+//! run's view and by `list`. The screen itself is not drawn here; `tui::view` has its own tests.
 
 use std::collections::{HashMap, VecDeque};
 
 use crossterm::event::KeyCode;
+use subcheck_cli::mpv::Player;
+use subcheck_cli::tui::run_effect;
+use subcheck_cli::tui::screen::{self, Msg, Screen};
 use subcheck_core::list::{self, Filter};
-use subcheck_core::mpv::Player;
 use subcheck_core::review::model::Review;
-use subcheck_core::review::run_effect;
 use subcheck_core::review::runner::Runner;
-use subcheck_core::review::screen::{self, Msg, Screen};
 use subcheck_core::store::{
     Attempt, CheckedWith, Finding, Made, RunHeader, ScanRow, State, Store, TrackRecord,
 };

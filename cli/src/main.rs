@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
+use subcheck_cli::tui;
 use subcheck_core::apply::{self, Mode};
 use subcheck_core::audio::{self, correlate, decode};
 use subcheck_core::blocks::{self, ReadPath};
@@ -301,12 +302,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 !no_tui && std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
             // What planning warns of goes to stderr as it comes, and is kept for the screen, which
             // covers it once it opens.
-            let mut log = review::Tee::new(std::io::stderr());
+            let mut log = tui::Tee::new(std::io::stderr());
             let s = match scan::plan(&paths, &opts, &mut db, &mut log)? {
                 Planned::Nothing(s) if screen => {
                     match review::nothing_to_check(&db, &s, opts.into.as_deref())? {
                         Some(shown) => {
-                            return review::run(review::Open::View(shown), db, &state, karaoke);
+                            return tui::run(tui::Open::View(shown), db, &state, karaoke);
                         }
                         None => s,
                     }
@@ -314,13 +315,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 Planned::Nothing(s) => s,
                 Planned::Scan(plan) if screen => {
                     let warnings = log.into_lines();
-                    let open = review::Open::Scan {
+                    let open = tui::Open::Scan {
                         plan,
                         opts,
                         paths,
                         warnings,
                     };
-                    return review::run(open, db, &state, karaoke);
+                    return tui::run(open, db, &state, karaoke);
                 }
                 Planned::Scan(plan) => {
                     scan::execute(plan, &opts, &mut db, &mut std::io::stderr(), &|_| {})?
@@ -339,7 +340,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let state = store::state_dir()?;
             let db = Store::open()?;
             let shown = db.view(&Selector::parse(&run)?)?;
-            review::run(review::Open::View(shown), db, &state, karaoke)
+            tui::run(tui::Open::View(shown), db, &state, karaoke)
         }
         Command::Timing {
             paths,

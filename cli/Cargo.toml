@@ -6,20 +6,25 @@ rust-version.workspace = true
 description = "Proofread the text subtitles embedded in MKV files"
 license.workspace = true
 
+# The terminal's UI, a library beside the binary so that the integration tests can reach it. Named
+# apart from the binary: `cargo doc` documents one of two targets of the same name (cargo#6313).
+[lib]
+name = "subcheck_cli"
+
 [dependencies]
 subcheck-core = { path = "../core" }
 anyhow.workspace = true
 clap.workspace = true
+crossterm.workspace = true
+jiff.workspace = true
+ratatui.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 subcheck-core = { path = "../core", features = ["test-support"] }
-crossterm.workspace = true
-jiff.workspace = true
 libc.workspace = true
-ratatui.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

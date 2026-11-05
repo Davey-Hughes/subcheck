@@ -10,12 +10,12 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crossterm::event::KeyCode;
+use subcheck_cli::mpv::Player;
+use subcheck_cli::tui::run_effect;
+use subcheck_cli::tui::screen::{self, Msg, Screen};
 use subcheck_core::llm::Backend;
-use subcheck_core::mpv::Player;
 use subcheck_core::review::model::Review;
-use subcheck_core::review::run_effect;
 use subcheck_core::review::runner::Runner;
-use subcheck_core::review::screen::{self, Msg, Screen};
 use subcheck_core::review::update::Input;
 use subcheck_core::scan::{self, Planned};
 use subcheck_core::store::{Decision, Selector, State, Store};

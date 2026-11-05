@@ -31,8 +31,8 @@ crossterm = "0.29.0"
 # `audio`'s cross-correlation. Pure Rust, like flate2's backend.
 rustfft = "6"
 # Safe calls for what std lacks: signals taken on a thread of their own (`group`), process groups
-# killed, a filesystem's free space, read-ahead hints. Both come into the build through crossterm
-# already; rustix's `process` and `fs` features are ours.
+# killed, a filesystem's free space, read-ahead hints. Both come into the binary's build through
+# crossterm already; rustix's `process` and `fs` features are ours.
 signal-hook = "0.3"
 rustix = { version = "1", features = ["fs", "process"] }
 # The store: SQLite compiled in (`bundled`), so there is no system library to find, and it builds
