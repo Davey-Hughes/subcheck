@@ -1,7 +1,7 @@
 //! `subcheck review`: accept, reject or reword each finding of a run, with a key that opens the
-//! moment in mpv. The store and mpv are at the edges (`run_effect`); between them is a pure
-//! Elm-style core (`model`, `update`), and `keymap` and `screen` turn the terminal's keys and
-//! clicks into its actions.
+//! moment in mpv. The store and mpv are at the edges (`runner`, and `run_effect` for mpv); between
+//! them is a pure Elm-style core (`model`, `update`), and `keymap` and `screen` turn the terminal's
+//! keys and clicks into its actions.
 
 pub mod files;
 pub mod jobs;
@@ -9,11 +9,12 @@ pub mod keymap;
 pub mod layout;
 pub mod model;
 pub mod progress;
+pub mod runner;
 pub mod screen;
 pub mod update;
 pub mod view;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -23,7 +24,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseButton, MouseEventKind,
 };
 use crossterm::execute;
@@ -35,14 +36,15 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 
 use crate::group;
-use crate::llm::Backend;
-use crate::player::{self, Player};
-use crate::scan::{self, file_stamp};
+use crate::mpv::{self, Player};
+use crate::player::PlayerCommand;
+use crate::scan;
 use crate::store::{Run, Selector, Store};
-use model::{FileNote, Review};
+use model::Review;
 use progress::Scan;
+use runner::Runner;
 use screen::{Mouse, Msg, Screen};
-use update::{Effect, Input, Job, Switch};
+use update::{Effect, Input};
 
 /// A terminal event as a `Msg`. Ctrl and Alt chords never reach the plain-key handlers, so Ctrl-C
 /// quits instead of reading as `c`; with the mouse they are ignored.
@@ -93,165 +95,45 @@ fn next_msg(mut read: impl FnMut() -> io::Result<Event>) -> io::Result<Msg> {
     }
 }
 
-/// How each of the run's files with findings differs from when it was scanned, by path; files as
-/// they were are left out.
-pub fn file_notes(run: &Run) -> HashMap<String, FileNote> {
-    // Only files with findings ever show a note, and on a network share each check is a round trip.
-    let shown: HashSet<&str> = run.findings.iter().map(|f| f.file.as_str()).collect();
-    let mut notes = HashMap::new();
-    // The newest record of each file wins: a file a run checked twice keeps its last stamp.
-    for f in run.files.iter().filter(|f| shown.contains(f.path.as_str())) {
-        let note = match file_stamp(Path::new(&f.path)) {
-            Ok((size, mtime)) if size == f.size && mtime == f.mtime => None,
-            Ok(_) => Some(FileNote::Changed),
-            Err(_) => Some(FileNote::Missing),
-        };
-        match note {
-            Some(n) => notes.insert(f.path.clone(), n),
-            None => notes.remove(&f.path),
-        };
-    }
-    notes
+/// Read the terminal on a thread of its own, each key, click or resize sent as its `Msg`. A
+/// terminal that cannot be read ends the screen (`Input::Fatal`), and so does a panic: with this
+/// thread gone no key reaches the loop, `q` and Ctrl-C among them.
+fn input(tx: Sender<Msg>) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("input".into())
+        .spawn(move || {
+            let read = panic::catch_unwind(AssertUnwindSafe(|| {
+                loop {
+                    let msg = next_msg(event::read).unwrap_or_else(|e| {
+                        Input::Fatal(format!("reading the terminal: {e}")).into()
+                    });
+                    let fatal = matches!(msg, Msg::Input(Input::Fatal(_)));
+                    if tx.send(msg).is_err() || fatal {
+                        return;
+                    }
+                }
+            }));
+            if let Err(panic) = read {
+                let _ = tx.send(
+                    Input::Fatal(format!(
+                        "reading the terminal panicked: {}",
+                        jobs::panic_text(panic.as_ref())
+                    ))
+                    .into(),
+                );
+            }
+        })?;
+    Ok(())
 }
 
-/// Run one effect and say how it went. `state` is the state directory, where apply writes the
-/// fixed tracks; `tx` is the screen's channel, for the jobs `c`, `A` and `D` start.
-pub fn run_effect(
-    effect: Effect,
-    store: &mut Store,
-    player: &mut Player,
-    state: &Path,
-    tx: &Sender<Msg>,
-) -> Input {
+/// Run one effect and say how it went: a task through `runner`, a player command on mpv.
+pub fn run_effect(effect: Effect, runner: &mut Runner<Msg>, player: &mut Player) -> Input {
     match effect {
-        Effect::Write { purpose, decisions } => {
-            let result = store.decide(&decisions).map_err(|e| e.to_string());
-            Input::Written {
-                purpose,
-                decisions,
-                result,
-            }
-        }
-        Effect::ReadBack(path) => {
-            let view = store.file_view(&path).map_err(|e| e.to_string());
-            Input::ReadBack { path, view }
-        }
-        Effect::FindRun { path, run } => {
-            let found = match &run {
-                Some(name) => store.scan_named(name),
-                None => store.newest_scan_naming(&path),
-            };
-            let found = match found {
-                Ok(Some(scan)) => Ok((scan.name, scan.header.backend)),
-                Ok(None) => Err(match run {
-                    Some(name) => format!("no run named {name}"),
-                    None => format!("{}: no run named it", model::episode(&path)),
-                }),
-                Err(e) => Err(e.to_string()),
-            };
-            Input::RunFound { path, found }
-        }
-        Effect::Recheck { run, paths } => {
-            let (here, missing): (Vec<String>, Vec<String>) =
-                paths.iter().cloned().partition(|p| Path::new(p).is_file());
-            let job = if here.is_empty() {
-                Err("nothing to check".into())
-            } else {
-                let files: Vec<PathBuf> = here.iter().map(PathBuf::from).collect();
-                recheck(store, tx, &run, &files)
-            };
-            Input::Started {
-                job,
-                missing,
-                paths,
-            }
-        }
-        Effect::StartApply {
-            run,
-            dry_run,
-            karaoke,
-        } => Input::ApplyStarted(
-            store
-                .reopen()
-                .map_err(|e| e.to_string())
-                .and_then(|applying| {
-                    jobs::apply(
-                        run,
-                        dry_run,
-                        karaoke,
-                        applying,
-                        state.to_path_buf(),
-                        tx.clone(),
-                    )
-                    .map_err(|e| e.to_string())
-                }),
-        ),
-        Effect::Switch(to) => Input::Switched(
-            other_view(store, &to)
-                .map(|run| {
-                    let notes = file_notes(&run);
-                    (run, notes)
-                })
-                .map_err(|e| format!("{e:#}")),
-        ),
-        Effect::Open(moment) => Input::Opened(player.open(&moment)),
-        Effect::Playback(p) => Input::Played(player.playback(p)),
-        Effect::Close => Input::Closed(player.close()),
+        Effect::Task(task) => runner.run(task),
+        Effect::Player(PlayerCommand::Open(moment)) => Input::Opened(player.open(&moment)),
+        Effect::Player(PlayerCommand::Playback(p)) => Input::Played(player.playback(p)),
+        Effect::Player(PlayerCommand::Close) => Input::Closed(player.close()),
     }
-}
-
-/// The view `v` opens, read from the store: a run's folders, or the newest run that named a file.
-fn other_view(store: &Store, to: &Switch) -> anyhow::Result<Run> {
-    match to {
-        Switch::FoldersOf(name) => {
-            let scan = store
-                .scan_named(name)?
-                .with_context(|| format!("no run named {name}"))?;
-            store.folders_view(&scan)
-        }
-        Switch::RunNaming(path) => {
-            let scan = store
-                .newest_scan_naming(path)?
-                .with_context(|| format!("{}: no run named it", model::episode(path)))?;
-            Ok(store.run_view(&scan)?)
-        }
-    }
-}
-
-/// Check `files` again into run `run`, as `subcheck scan --run <run> --force <files>` does: with
-/// the run's backend and languages, on a thread of its own that sends to `tx`.
-fn recheck(
-    store: &mut Store,
-    tx: &Sender<Msg>,
-    run: &str,
-    files: &[PathBuf],
-) -> Result<Job, String> {
-    let scan = store
-        .scan_named(run)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("no run named {run}"))?;
-    // One this subcheck no longer knows would fail every file at the LLM: refused here instead.
-    Backend::from_label(&scan.header.backend).map_err(|e| format!("run {run}: {e}"))?;
-    let (backend, langs) = scan::resume(&scan, None, None, &[])?;
-    let opts = scan::Options {
-        chunk_lines: backend.chunk_lines,
-        backend,
-        jobs: scan::DEFAULT_JOBS,
-        langs,
-        force: true,
-        verbose: false,
-        into: Some(run.to_string()),
-    };
-    let planned = scan::plan(files, &opts, store, &mut io::sink()).map_err(|e| format!("{e:#}"))?;
-    let scan::Planned::Scan(plan) = planned else {
-        return Err("nothing to check".into());
-    };
-    let scans = store.reopen().map_err(|e| e.to_string())?;
-    jobs::scan(plan, opts, scans, tx.clone()).map_err(|e| e.to_string())?;
-    Ok(Job {
-        run: run.to_string(),
-        resume: progress::again_command(run, files),
-    })
 }
 
 /// Restores the terminal on every exit path: normal return, `?`, or panic.
@@ -349,13 +231,6 @@ fn opening_status(warnings: &[String]) -> Option<String> {
     })
 }
 
-/// The run a scan's screen opens on: the run as the store shows it. A file the scan checks again
-/// keeps its findings in the list until the scan saves the new ones (see `Review::refresh`); a file
-/// it skips is there from the start.
-pub fn opening(store: &Store, plan: &scan::Plan) -> rusqlite::Result<Run> {
-    store.run_view(plan.scan())
-}
-
 /// What the screen opens on when a scan has nothing to check (`s`): with `--run` (`into`), the run;
 /// else the files under the paths it was given, as they are. `None` when there is nothing to show,
 /// and `scan`'s line says why.
@@ -382,7 +257,7 @@ const TICK: Duration = Duration::from_millis(250);
 /// where mpv's socket goes when there is no runtime directory, and apply writes the fixed tracks.
 /// `karaoke`: the screen's apply re-spaces per-letter karaoke. Exit status 1 when a scan or an
 /// apply failed, or a file in one did.
-pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow::Result<ExitCode> {
+pub fn run(open: Open, store: Store, state: &Path, karaoke: bool) -> anyhow::Result<ExitCode> {
     let (run, scanning, warnings) = match open {
         Open::View(run) => (run, None, Vec::new()),
         Open::Scan {
@@ -391,7 +266,7 @@ pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow:
             paths,
             warnings,
         } => (
-            opening(&store, &plan).context("reading the run")?,
+            runner::opening(&store, &plan).context("reading the run")?,
             Some((plan, opts, paths)),
             warnings,
         ),
@@ -400,8 +275,8 @@ pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow:
         println!("No findings in {}.", run.called());
         return Ok(ExitCode::SUCCESS);
     }
-    let notes = file_notes(&run);
-    let mut player = Player::new("mpv", player::socket_path(state));
+    let notes = runner::file_notes(&run);
+    let mut player = Player::new("mpv", mpv::socket_path(state));
     let mut model = Review::new(run, notes);
     model.karaoke = karaoke;
     model.status = opening_status(&warnings);
@@ -422,8 +297,8 @@ pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow:
     // With no scan, the status line opens on what the run's LLM calls cost (`Screen::show_cost`).
     let mut screen = Screen::default();
     screen.set_area(&model, Rect::new(0, 0, size.width, size.height));
-    // The loop keeps a sender of its own, for the jobs `c`, `A` and `D` start: the channel cannot
-    // close while the screen runs, and each job says why it ends before it does
+    // The runner keeps a sender of its own, for the jobs `c`, `A` and `D` start: the channel
+    // cannot close while the screen runs, and each job says why it ends before it does
     // (`Input::ScanEnded`, `Input::ApplyEnded`, `Input::Fatal`), as the input thread does.
     let (tx, rx) = mpsc::channel();
     if let Some((plan, opts, paths)) = scanning {
@@ -434,22 +309,21 @@ pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow:
         let scans = store.reopen()?;
         jobs::scan(plan, opts, scans, tx.clone()).context("starting the scan")?;
     }
+    let mut runner = Runner::new(store, state.to_path_buf(), tx.clone());
     // A scan may be running from here, so every way out goes through the teardown below, which
     // ends its LLM calls: an input thread that does not start, the loop's error, and a panic on
     // this thread, caught here (the hook has restored the terminal) and resumed once they are
     // ended. Not a drop guard: one made here would end the groups before `player`, made earlier,
     // let go of its own.
-    let looped = match jobs::input(tx.clone()) {
+    let looped = match input(tx.clone()) {
         Ok(()) => panic::catch_unwind(AssertUnwindSafe(|| {
             screen_loop(
                 &mut terminal,
                 &mut model,
                 &mut screen,
                 &rx,
-                &tx,
-                &mut store,
+                &mut runner,
                 &mut player,
-                state,
             )
         })),
         Err(e) => Ok(Err(e).context("reading the terminal")),
@@ -515,16 +389,13 @@ fn outcome(
 
 /// Draw, take the next message (the terminal's, a job's, or a tick while one runs), update, and
 /// run the effects, until the model quits.
-#[allow(clippy::too_many_arguments)] // called once, from `run`: a struct of them would save nothing
 fn screen_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     model: &mut Review,
     screen: &mut Screen,
     rx: &mpsc::Receiver<Msg>,
-    tx: &Sender<Msg>,
-    store: &mut Store,
+    runner: &mut Runner<Msg>,
     player: &mut Player,
-    state: &Path,
 ) -> anyhow::Result<()> {
     while !model.should_quit {
         terminal.draw(|f| view::view(model, screen, f))?;
@@ -537,7 +408,7 @@ fn screen_loop(
         }
         let mut queue: VecDeque<Effect> = effects.into();
         while let Some(effect) = queue.pop_front() {
-            let input = run_effect(effect, store, player, state, tx);
+            let input = run_effect(effect, runner, player);
             queue.extend(screen::update(
                 model,
                 screen,
@@ -550,7 +421,7 @@ fn screen_loop(
 }
 
 /// The loop's next message: the terminal's or a job's, or while a job runs a tick should none come
-/// for [`TICK`]. The loop holds a `Sender` of its own (for the jobs `c`, `A` and `D` start), so
+/// for [`TICK`]. The runner holds a `Sender` of its own (for the jobs `c`, `A` and `D` start), so
 /// the channel cannot close while the screen runs; a disconnect is fatal, a backstop: each job
 /// (the input thread, each scan and apply) reports why it ends before it does (`Input::Fatal`,
 /// `Input::ScanEnded`, `Input::ApplyEnded`), and with the input thread gone no key can quit.
@@ -662,56 +533,6 @@ mod tests {
             map_event(&mouse(MouseEventKind::ScrollUp, KeyModifiers::CONTROL)),
             None
         );
-    }
-
-    #[test]
-    fn files_that_changed_or_went_missing_are_noted() {
-        let dir = tempfile::tempdir().unwrap();
-        let same = dir.path().join("same.mkv");
-        let changed = dir.path().join("changed.mkv");
-        std::fs::write(&same, b"1234").unwrap();
-        std::fs::write(&changed, b"1234").unwrap();
-        let record = |p: &Path| {
-            let (size, mtime) = file_stamp(p).unwrap();
-            crate::store::FileRecord {
-                path: p.to_string_lossy().into_owned(),
-                size,
-                mtime,
-                error: None,
-                tracks: vec![],
-                lines: 0,
-                truncated: None,
-                checks: vec![crate::store::Check::Llm],
-            }
-        };
-        let gone = |name: &str| crate::store::FileRecord {
-            path: dir.path().join(name).to_string_lossy().into_owned(),
-            ..record(&same)
-        };
-        let files = vec![
-            record(&same),
-            record(&changed),
-            gone("gone.mkv"),
-            gone("clean-and-gone.mkv"),
-        ];
-        // Findings in the first three; the fourth had none, so it is never checked.
-        let findings = files[..3]
-            .iter()
-            .map(|f| crate::store::Finding {
-                file: f.path.clone(),
-                ..model::tests_support::finding(1, 1, "a", "b", 0)
-            })
-            .collect();
-        let run = Run {
-            files,
-            findings,
-            ..Run::default()
-        };
-        std::fs::write(&changed, b"12345").unwrap();
-        let notes = file_notes(&run);
-        assert_eq!(notes.len(), 2, "{notes:?}");
-        assert_eq!(notes[&run.files[1].path], FileNote::Changed);
-        assert_eq!(notes[&run.files[2].path], FileNote::Missing);
     }
 
     #[test]
@@ -835,6 +656,40 @@ mod tests {
         }
         let (_tx, rx) = mpsc::channel();
         assert_eq!(receive(&rx, true), Msg::Tick);
+    }
+
+    #[test]
+    fn each_player_command_runs_on_mpv_and_comes_back_as_its_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_at(&dir.path().join("subcheck.db")).unwrap();
+        let mut player = Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock"));
+        let (tx, _rx) = mpsc::channel();
+        let mut runner = Runner::new(store, dir.path().into(), tx);
+        let mut ran = |command| {
+            let effect = Effect::Player(command);
+            run_effect(effect, &mut runner, &mut player)
+        };
+        let moment = crate::player::Moment {
+            file: "/m/E01.mkv".into(),
+            start_ms: 0,
+            sid: None,
+            paused: false,
+        };
+        // No mpv to start, and none on the socket: each says so as its own input.
+        let opened = ran(PlayerCommand::Open(moment));
+        let missing = "no-mpv not found: install mpv to open findings";
+        assert!(
+            matches!(&opened, Input::Opened(Err(e)) if e.ends_with(missing)),
+            "{opened:?}"
+        );
+        assert_eq!(
+            ran(PlayerCommand::Playback(crate::player::Playback::Pause)),
+            Input::Played(Err("mpv is not open (o opens it)".into()))
+        );
+        assert_eq!(
+            ran(PlayerCommand::Close),
+            Input::Closed(Err("mpv is not open".into()))
+        );
     }
 
     /// The sample run with a scan of two files under way, as the loop leaves it on a stop.

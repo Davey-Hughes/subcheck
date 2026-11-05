@@ -1,6 +1,8 @@
-//! The screen's threads: the terminal's input, the scan and apply, each sending what happens to
-//! the loop's channel as a `Msg`. Each runs to its end or the process's: quitting with a job
-//! running ends its LLM calls or mkvmerge through `group::end`, and its threads with the process.
+//! Review's jobs: the scan and apply, each on a thread of its own, sending what happens to the
+//! UI's channel as an `Input` or the UI's own message that one becomes. The runner starts them for
+//! `c`, `A` and `D`, and the screen starts the scan it opens with. Each runs to its end or the
+//! process's: quitting with a job running ends its LLM calls or mkvmerge through `group::end`, and
+//! its threads with the process.
 
 use std::any::Any;
 use std::ffi::OsStr;
@@ -9,49 +11,20 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
-use crossterm::event;
-
-use super::screen::Msg;
 use super::update::Input;
 use crate::apply::{self, Mode};
 use crate::scan::{self, Options, Plan};
 use crate::store::{Run, Store};
 
-/// Read the terminal on a thread of its own, each key, click or resize sent as its `Msg`. A
-/// terminal that cannot be read ends the screen (`Input::Fatal`), and so does a panic: with this
-/// thread gone no key reaches the loop, `q` and Ctrl-C among them.
-pub fn input(tx: Sender<Msg>) -> io::Result<()> {
-    std::thread::Builder::new()
-        .name("input".into())
-        .spawn(move || {
-            let read = panic::catch_unwind(AssertUnwindSafe(|| {
-                loop {
-                    let msg = super::next_msg(event::read).unwrap_or_else(|e| {
-                        Input::Fatal(format!("reading the terminal: {e}")).into()
-                    });
-                    let fatal = matches!(msg, Msg::Input(Input::Fatal(_)));
-                    if tx.send(msg).is_err() || fatal {
-                        return;
-                    }
-                }
-            }));
-            if let Err(panic) = read {
-                let _ = tx.send(
-                    Input::Fatal(format!(
-                        "reading the terminal panicked: {}",
-                        panic_text(panic.as_ref())
-                    ))
-                    .into(),
-                );
-            }
-        })?;
-    Ok(())
-}
-
 /// Run `plan` on a thread of its own, saving through `store`, a connection of its own: each step
 /// sent as `Input::Scan`, then how it ended as `Input::ScanEnded`. What `scan` would log goes
 /// nowhere: the screen has each file's lines from its events. A panic is `Input::Fatal`.
-pub fn scan(plan: Plan, opts: Options, mut store: Store, tx: Sender<Msg>) -> io::Result<()> {
+pub fn scan<T: From<Input> + Send + 'static>(
+    plan: Plan,
+    opts: Options,
+    mut store: Store,
+    tx: Sender<T>,
+) -> io::Result<()> {
     std::thread::Builder::new()
         .name("scan".into())
         .spawn(move || {
@@ -78,13 +51,13 @@ pub fn scan(plan: Plan, opts: Options, mut store: Store, tx: Sender<Msg>) -> io:
 /// before the remux. Each step is sent as `Input::Apply`, then how it ended as
 /// `Input::ApplyEnded`. What `apply` prints goes nowhere: the screen has each file's block from
 /// its events. A panic is `Input::Fatal`.
-pub fn apply(
+pub fn apply<T: From<Input> + Send + 'static>(
     run: Run,
     dry_run: bool,
     karaoke: bool,
     mut store: Store,
     state: PathBuf,
-    tx: Sender<Msg>,
+    tx: Sender<T>,
 ) -> io::Result<()> {
     std::thread::Builder::new()
         .name("apply".into())
@@ -123,8 +96,8 @@ pub fn apply(
     Ok(())
 }
 
-/// What a panic said.
-fn panic_text(panic: &(dyn Any + Send)) -> String {
+/// What a panic said, for a thread that ends on one with `Input::Fatal`.
+pub fn panic_text(panic: &(dyn Any + Send)) -> String {
     panic
         .downcast_ref::<&str>()
         .map(|s| (*s).to_string())

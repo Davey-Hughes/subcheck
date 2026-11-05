@@ -6,46 +6,38 @@
 use subcheck_core::test_support as common;
 
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use crossterm::event::KeyCode;
 use subcheck_core::llm::Backend;
-use subcheck_core::player::Player;
+use subcheck_core::mpv::Player;
 use subcheck_core::review::model::Review;
 use subcheck_core::review::run_effect;
+use subcheck_core::review::runner::Runner;
 use subcheck_core::review::screen::{self, Msg, Screen};
 use subcheck_core::review::update::Input;
 use subcheck_core::scan::{self, Planned};
 use subcheck_core::store::{Decision, Selector, State, Store};
 
 /// The loop's inner part: a message, then every effect it leads to, run for real.
-fn send(
-    m: &mut Review,
-    s: &mut Screen,
-    msg: Msg,
-    store: &mut Store,
-    player: &mut Player,
-    state: &Path,
-    tx: &mpsc::Sender<Msg>,
-) {
+fn send(m: &mut Review, s: &mut Screen, msg: Msg, runner: &mut Runner<Msg>, player: &mut Player) {
     let now = jiff::Timestamp::now();
     let mut queue: VecDeque<_> = screen::update(m, s, msg, now).into();
     while let Some(effect) = queue.pop_front() {
-        let input = run_effect(effect, store, player, state, tx);
+        let input = run_effect(effect, runner, player);
         queue.extend(screen::update(m, s, input.into(), now));
     }
 }
 
-/// The review, its screen, and what their loop works with.
+/// The review, its screen, and what their loop works with; `store`, a connection of the test's own
+/// to the runner's database, to read back what the screen wrote.
 struct Tui {
     m: Review,
     screen: Screen,
     store: Store,
+    runner: Runner<Msg>,
     player: Player,
-    state: PathBuf,
-    tx: mpsc::Sender<Msg>,
     rx: mpsc::Receiver<Msg>,
 }
 
@@ -55,10 +47,8 @@ impl Tui {
             &mut self.m,
             &mut self.screen,
             Msg::Key(KeyCode::Char(c)),
-            &mut self.store,
+            &mut self.runner,
             &mut self.player,
-            &self.state,
-            &self.tx,
         );
     }
 
@@ -74,10 +64,8 @@ impl Tui {
                 &mut self.m,
                 &mut self.screen,
                 msg,
-                &mut self.store,
+                &mut self.runner,
                 &mut self.player,
-                &self.state,
-                &self.tx,
             );
             if ended {
                 return;
@@ -141,10 +129,9 @@ fn d_then_a_on_the_screen() {
     let mut s = Tui {
         m: Review::new(store.view(&Selector::Newest).unwrap(), HashMap::new()),
         screen: Screen::default(),
+        runner: Runner::new(store.reopen().unwrap(), dir.path().join("state"), tx),
         store,
         player: Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock")),
-        state: dir.path().join("state"),
-        tx,
         rx,
     };
     let stamp = scan::file_stamp(&file).unwrap();

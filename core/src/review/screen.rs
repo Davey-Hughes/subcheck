@@ -458,6 +458,7 @@ fn click_row(
 pub(crate) mod tests {
     use super::*;
     use crate::list::Filter;
+    use crate::player::PlayerCommand;
     use crate::review::model::Entry;
     use crate::review::model::tests_support::{self, finding, path, sample};
     use crate::review::update::tests::{
@@ -849,7 +850,8 @@ pub(crate) mod tests {
     #[test]
     fn a_double_click_opens_and_a_slow_or_moved_one_does_not() {
         let (mut m, mut s) = on_screen();
-        let opens = |effects: Vec<Effect>| matches!(effects[..], [Effect::Open(_)]);
+        let opens =
+            |effects: Vec<Effect>| matches!(effects[..], [Effect::Player(PlayerCommand::Open(_))]);
         assert_eq!(click(&mut m, &mut s, 5, 2, 0), []);
         assert!(opens(click(&mut m, &mut s, 5, 2, 500)), "within 500 ms");
         assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
@@ -872,7 +874,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_double_click_survives_the_scans_messages_between_its_clicks() {
-        let opens = |effects: Vec<Effect>| matches!(effects[..], [Effect::Open(_)]);
+        let opens =
+            |effects: Vec<Effect>| matches!(effects[..], [Effect::Player(PlayerCommand::Open(_))]);
         // The spinner's tick, which comes after 250 ms without a message while a job runs.
         let (mut m, mut s) = on_screen();
         assert_eq!(click(&mut m, &mut s, 5, 2, 0), []);
@@ -894,7 +897,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_double_click_survives_its_file_being_checked_again() {
-        let opens = |effects: Vec<Effect>| matches!(effects[..], [Effect::Open(_)]);
+        let opens =
+            |effects: Vec<Effect>| matches!(effects[..], [Effect::Player(PlayerCommand::Open(_))]);
         let (mut m, mut s) = on_screen();
         assert_eq!(click(&mut m, &mut s, 5, 2, 0), []);
         // E02 checked again: its snacks line, at y 2, comes back as finding 9.

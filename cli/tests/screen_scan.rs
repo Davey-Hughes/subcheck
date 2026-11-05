@@ -14,32 +14,31 @@ use std::time::Duration;
 use common::fixture;
 use crossterm::event::KeyCode;
 use subcheck_core::llm::Backend;
-use subcheck_core::player::Player;
+use subcheck_core::mpv::Player;
 use subcheck_core::review::model::Review;
 use subcheck_core::review::progress::{Scan, Stage};
+use subcheck_core::review::runner::{Runner, opening};
 use subcheck_core::review::screen::{self, Msg, Screen};
 use subcheck_core::review::update::Input;
-use subcheck_core::review::{jobs, opening, run_effect};
+use subcheck_core::review::{jobs, run_effect};
 use subcheck_core::scan::{self, Event, Planned};
 use subcheck_core::store::{Decision, Selector, State, Store};
 
 /// The loop's inner part: a message, then every effect it leads to, run for real.
-fn send(
-    m: &mut Review,
-    s: &mut Screen,
-    msg: Msg,
-    store: &mut Store,
-    player: &mut Player,
-    tx: &mpsc::Sender<Msg>,
-) {
+fn send(m: &mut Review, s: &mut Screen, msg: Msg, runner: &mut Runner<Msg>, player: &mut Player) {
     let now = jiff::Timestamp::now();
-    // Where apply would write its tracks: no test here starts apply, so nothing goes there.
-    let state = Path::new("/no-state");
     let mut queue: VecDeque<_> = screen::update(m, s, msg, now).into();
     while let Some(effect) = queue.pop_front() {
-        let input = run_effect(effect, store, player, state, tx);
+        let input = run_effect(effect, runner, player);
         queue.extend(screen::update(m, s, input.into(), now));
     }
+}
+
+/// A runner writing through a connection of its own to `store`'s database, which each test reads
+/// back through `store`, its jobs sending to `tx`.
+fn runner_on(store: &Store, tx: &mpsc::Sender<Msg>) -> Runner<Msg> {
+    // Where apply would write its tracks: no test here starts apply, so nothing goes there.
+    Runner::new(store.reopen().unwrap(), "/no-state".into(), tx.clone())
 }
 
 /// A database of its own, in a directory that goes with it.
@@ -85,6 +84,7 @@ fn a_scan_on_the_screen_fills_the_list_and_passes_decisions_on() {
     let mut screen = Screen::default();
     let mut player = Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock"));
     let (tx, rx) = mpsc::channel();
+    let mut runner = runner_on(&store, &tx);
     jobs::scan(plan, opts, store.reopen().unwrap(), tx.clone()).unwrap();
 
     let mut accepted = false;
@@ -95,7 +95,7 @@ fn a_scan_on_the_screen_fills_the_list_and_passes_decisions_on() {
         let ended = matches!(msg, Msg::Input(Input::ScanEnded(_)));
         let e01_done =
             matches!(&msg, Msg::Input(Input::Scan(Event::Finished { path, .. })) if *path == e01);
-        send(&mut model, &mut screen, msg, &mut store, &mut player, &tx);
+        send(&mut model, &mut screen, msg, &mut runner, &mut player);
         if e01_done {
             // E01's two findings are rows of their own: accept both before E02's arrive (they may
             // be in the channel already, behind this one). E01's alone so far: were E02's here too,
@@ -108,9 +108,8 @@ fn a_scan_on_the_screen_fills_the_list_and_passes_decisions_on() {
                     &mut model,
                     &mut screen,
                     Msg::Key(KeyCode::Char('a')),
-                    &mut store,
+                    &mut runner,
                     &mut player,
-                    &tx,
                 );
             }
             accepted = true;
@@ -188,13 +187,14 @@ fn a_file_whose_llm_check_stands_shows_the_timing_check_alone() {
     let dir = tempfile::tempdir().unwrap();
     let mut player = Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock"));
     let (tx, rx) = mpsc::channel();
+    let mut runner = runner_on(&store, &tx);
     jobs::scan(adding, opts, store.reopen().unwrap(), tx.clone()).unwrap();
     loop {
         let msg = rx
             .recv_timeout(Duration::from_mins(1))
             .expect("the scan goes on");
         let ended = matches!(msg, Msg::Input(Input::ScanEnded(_)));
-        send(&mut model, &mut screen, msg, &mut store, &mut player, &tx);
+        send(&mut model, &mut screen, msg, &mut runner, &mut player);
         if ended {
             break;
         }
@@ -369,6 +369,7 @@ fn checked_again(
     let dir = tempfile::tempdir().unwrap();
     let mut player = Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock"));
     let (tx, rx) = mpsc::channel();
+    let mut runner = runner_on(store, &tx);
     jobs::scan(plan, opts, store.reopen().unwrap(), tx.clone()).unwrap();
     loop {
         let msg = rx
@@ -376,7 +377,7 @@ fn checked_again(
             .expect("the scan goes on");
         let ended = matches!(msg, Msg::Input(Input::ScanEnded(_)));
         let seen = msg.clone();
-        send(&mut model, &mut screen, msg, store, &mut player, &tx);
+        send(&mut model, &mut screen, msg, &mut runner, &mut player);
         on_msg(&model, &seen);
         if ended {
             break;
@@ -456,14 +457,14 @@ fn c_checks_a_file_again_and_a_decision_on_a_finding_that_comes_back_is_kept() {
     let dir = tempfile::tempdir().unwrap();
     let mut player = Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock"));
     let (tx, rx) = mpsc::channel();
+    let mut runner = runner_on(&store, &tx);
     for key in [KeyCode::Tab, KeyCode::Char('c')] {
         send(
             &mut model,
             &mut screen,
             Msg::Key(key),
-            &mut store,
+            &mut runner,
             &mut player,
-            &tx,
         );
     }
     let asked = model.status_text().unwrap();
@@ -475,9 +476,8 @@ fn c_checks_a_file_again_and_a_decision_on_a_finding_that_comes_back_is_kept() {
         &mut model,
         &mut screen,
         Msg::Key(KeyCode::Char('y')),
-        &mut store,
+        &mut runner,
         &mut player,
-        &tx,
     );
     assert!(model.progress.running());
     loop {
@@ -485,7 +485,7 @@ fn c_checks_a_file_again_and_a_decision_on_a_finding_that_comes_back_is_kept() {
             .recv_timeout(Duration::from_mins(1))
             .expect("the check goes on");
         let ended = matches!(msg, Msg::Input(Input::ScanEnded(_)));
-        send(&mut model, &mut screen, msg, &mut store, &mut player, &tx);
+        send(&mut model, &mut screen, msg, &mut runner, &mut player);
         if ended {
             break;
         }

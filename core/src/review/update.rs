@@ -11,7 +11,7 @@ use super::model::{Confirm, Edit, Entry, EntryKey, FileNote, Mark, Pane, Review,
 use super::progress::{Scan, Stage};
 use crate::apply;
 use crate::list::{self, Filter, label};
-use crate::player::{Moment, PlayState, Playback};
+use crate::player::{Moment, PlayState, Playback, PlayerCommand};
 use crate::scan;
 use crate::store::{Decided, Decision, Record, Run, State};
 use crate::text::{timestamp, timestamp_ms};
@@ -22,23 +22,23 @@ use crate::text::{timestamp, timestamp_ms};
 pub enum Input {
     /// What the user asks for, by whatever key, button or click the UI maps to it.
     Action(Action),
-    /// A `Write` effect finished: what became of each decision, or why none was written.
+    /// A [`Task::Write`] finished: what became of each decision, or why none was written.
     Written {
         purpose: WriteFor,
         decisions: Vec<Decision>,
         result: Result<Vec<Decided>, String>,
     },
-    /// A `ReadBack` effect finished: the file as the store shows it, or why it could not be read.
+    /// A [`Task::ReadBack`] finished: the file as the store shows it, or why it could not be read.
     ReadBack {
         path: String,
         view: Result<Run, String>,
     },
-    /// A `FindRun` effect finished: the run's name and backend, or why there is none.
+    /// A [`Task::FindRun`] finished: the run's name and backend, or why there is none.
     RunFound {
         path: String,
         found: Result<(String, String), String>,
     },
-    /// A `Recheck` effect finished: the scan it started, or why none did; the files it left out,
+    /// A [`Task::Recheck`] finished: the scan it started, or why none did; the files it left out,
     /// no longer on disk; and all the files it was asked for (when no scan started, those still
     /// on disk fail with the reason).
     Started {
@@ -46,13 +46,13 @@ pub enum Input {
         missing: Vec<String>,
         paths: Vec<String>,
     },
-    /// A `Switch` effect finished: the view and its files' notes, or why it could not be read.
+    /// A [`Task::Switch`] finished: the view and its files' notes, or why it could not be read.
     Switched(Result<(Run, HashMap<String, FileNote>), String>),
-    /// An `Open` effect finished.
+    /// A [`PlayerCommand::Open`] finished.
     Opened(Result<(), String>),
-    /// A `Playback` effect finished: where mpv is now.
+    /// A [`PlayerCommand::Playback`] finished: where mpv is now.
     Played(Result<PlayState, String>),
-    /// A `Close` effect finished.
+    /// A [`PlayerCommand::Close`] finished.
     Closed(Result<(), String>),
     /// What the scan under way just did.
     Scan(scan::Event),
@@ -63,7 +63,7 @@ pub enum Input {
     Fatal(String),
     /// What the screen's apply (or dry run) just did.
     Apply(apply::Event),
-    /// A `StartApply` effect finished: apply's thread started, or why it could not.
+    /// A [`Task::StartApply`] finished: apply's thread started, or why it could not.
     ApplyStarted(Result<(), String>),
     /// Apply ended: its summary, or why it failed as a whole.
     ApplyEnded(Result<apply::Summary, String>),
@@ -153,9 +153,21 @@ pub enum Switch {
     RunNaming(String),
 }
 
+/// What `update` asks to have done; each comes back as an [`Input`].
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // effects are few and short-lived, so a box is not worth it
 pub enum Effect {
+    /// For the store, or a job on a thread of its own.
+    Task(Task),
+    /// For the UI's player, which runs it and says how it went ([`Input::Opened`],
+    /// [`Input::Played`], [`Input::Closed`]).
+    Player(PlayerCommand),
+}
+
+/// What `update` asks of the store, or of a job on a thread of its own.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // tasks are few and short-lived, so a box is not worth it
+pub enum Task {
     /// Record these decisions in the store.
     Write {
         purpose: WriteFor,
@@ -165,16 +177,10 @@ pub enum Effect {
     ReadBack(String),
     /// Find the run `c` checks a file again into: `run`, the one the screen shows, or with none (a
     /// paths view) the newest that named the file ([`Input::RunFound`]).
-    FindRun {
-        path: String,
-        run: Option<String>,
-    },
+    FindRun { path: String, run: Option<String> },
     /// Check `paths` again into `run`, as `subcheck scan --run <run> --force <paths>`
     /// does ([`Input::Started`]).
-    Recheck {
-        run: String,
-        paths: Vec<String>,
-    },
+    Recheck { run: String, paths: Vec<String> },
     /// Open the other view of the screen's findings (`v`), read from the store with each file's
     /// note ([`Input::Switched`]).
     Switch(Switch),
@@ -186,11 +192,6 @@ pub enum Effect {
         dry_run: bool,
         karaoke: bool,
     },
-    Open(Moment),
-    /// Pause or seek the open mpv.
-    Playback(Playback),
-    /// Close mpv, and leave review open.
-    Close,
 }
 
 /// What `input` does to `m`, and the effects to run for it.
@@ -315,8 +316,8 @@ fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
         Action::SwitchView => return switch_view(m),
         Action::Apply { dry_run } => return apply_key(m, dry_run),
         Action::Play => return open(m),
-        Action::ClosePlayer => return vec![Effect::Close],
-        Action::Playback(p) => return vec![Effect::Playback(p)],
+        Action::ClosePlayer => return vec![Effect::Player(PlayerCommand::Close)],
+        Action::Playback(p) => return vec![Effect::Player(PlayerCommand::Playback(p))],
         Action::Answer(yes) => return answer(m, yes),
         Action::SelectFile(path) => select_file(m, &path),
         Action::ShowFileFindings => file_findings(m),
@@ -450,10 +451,10 @@ fn decide(
         m.status = Some(format!("already {}", label(state)));
         return Vec::new();
     }
-    vec![Effect::Write {
+    vec![Effect::Task(Task::Write {
         purpose: WriteFor::Decide { entry, before },
         decisions,
-    }]
+    })]
 }
 
 /// `x`: each finding `entry` stands for back to pending, but those that are.
@@ -468,10 +469,10 @@ fn clear(m: &mut Review, entry: Entry, now: Timestamp) -> Vec<Effect> {
         m.status = Some("nothing to clear".into());
         return Vec::new();
     }
-    vec![Effect::Write {
+    vec![Effect::Task(Task::Write {
         purpose: WriteFor::Decide { entry, before },
         decisions,
-    }]
+    })]
 }
 
 /// Decisions that put back what the last decision of this session changed.
@@ -489,10 +490,10 @@ fn undo(m: &mut Review, now: Timestamp) -> Vec<Effect> {
             at: now,
         })
         .collect();
-    vec![Effect::Write {
+    vec![Effect::Task(Task::Write {
         purpose: WriteFor::Undo,
         decisions,
-    }]
+    })]
 }
 
 /// A write's result: on success the decisions take effect, and after `a` `r` `e` or `x` the
@@ -646,7 +647,10 @@ fn replaced(m: &mut Review, decisions: &[Decision], outcomes: &[Decided]) -> Vec
         "your decision went to its new finding"
     };
     m.status = Some(format!("{} was checked again; {what}", m.label(first)));
-    files.into_iter().map(Effect::ReadBack).collect()
+    files
+        .into_iter()
+        .map(|p| Effect::Task(Task::ReadBack(p)))
+        .collect()
 }
 
 /// The episode labels of the files the decisions are on, each once, in order of first appearance.
@@ -796,7 +800,7 @@ fn open(m: &mut Review) -> Vec<Effect> {
             timestamp(start_ms)
         )
     });
-    vec![Effect::Open(moment)]
+    vec![Effect::Player(PlayerCommand::Open(moment))]
 }
 
 /// `q`: quit; while a job runs, ask first.
@@ -843,11 +847,11 @@ fn start_apply(m: &mut Review, dry_run: bool) -> Vec<Effect> {
         resume.push_str(" --karaoke");
     }
     m.progress.start_apply(dry_run, resume);
-    vec![Effect::StartApply {
+    vec![Effect::Task(Task::StartApply {
         run: m.run.clone(),
         dry_run,
         karaoke: m.karaoke,
-    }]
+    })]
 }
 
 /// A step of the screen's apply: the files view follows it. A file done marks its findings (outside
@@ -931,7 +935,9 @@ fn switch_view(m: &mut Review) -> Vec<Effect> {
         return Vec::new();
     }
     if !m.run.of_paths {
-        return vec![Effect::Switch(Switch::FoldersOf(m.run.name.clone()))];
+        return vec![Effect::Task(Task::Switch(Switch::FoldersOf(
+            m.run.name.clone(),
+        )))];
     }
     let in_list = match m.pane {
         Pane::Findings => m.selected_entry().map(|e| {
@@ -950,7 +956,7 @@ fn switch_view(m: &mut Review) -> Vec<Effect> {
                 .get(m.file_selected)
                 .map(|f| f.path.clone())
         })
-        .map(|p| Effect::Switch(Switch::RunNaming(p)))
+        .map(|p| Effect::Task(Task::Switch(Switch::RunNaming(p))))
         .into_iter()
         .collect()
 }
@@ -980,16 +986,16 @@ fn recheck(m: &mut Review) -> Vec<Effect> {
         return Vec::new();
     }
     let run = (!m.run.of_paths).then(|| m.run.name.clone());
-    vec![Effect::FindRun { path, run }]
+    vec![Effect::Task(Task::FindRun { path, run })]
 }
 
 /// `y` to checking `path` again into `run`: at once with no scan running, else once it ends.
 fn again(m: &mut Review, path: String, run: String) -> Vec<Effect> {
     if !m.progress.running() {
-        return vec![Effect::Recheck {
+        return vec![Effect::Task(Task::Recheck {
             run,
             paths: vec![path],
-        }];
+        })];
     }
     m.status = Some(format!(
         "{} will be checked again when the scan is done",
@@ -1012,7 +1018,7 @@ fn run_found(m: &mut Review, path: String, found: Result<(String, String), Strin
 fn next_again(m: &mut Review) -> Vec<Effect> {
     m.progress
         .next_batch()
-        .map(|(run, paths)| Effect::Recheck { run, paths })
+        .map(|(run, paths)| Effect::Task(Task::Recheck { run, paths }))
         .into_iter()
         .collect()
 }
@@ -1093,7 +1099,9 @@ fn scanned(m: &mut Review, event: scan::Event) -> Vec<Effect> {
     let mut effects = Vec::new();
     for r in records {
         match r {
-            Record::File(f) if f.error.is_none() => effects.push(Effect::ReadBack(f.path)),
+            Record::File(f) if f.error.is_none() => {
+                effects.push(Effect::Task(Task::ReadBack(f.path)));
+            }
             r @ (Record::File(_) | Record::Usage(_)) => m.run.add(r),
             // They come with the read-back, as the store has them by then.
             Record::Finding(_) | Record::Decision(_) => {}
@@ -1158,10 +1166,10 @@ fn inherit(m: &Review, new: &[usize], now: Timestamp) -> Vec<Effect> {
     if decisions.is_empty() {
         return Vec::new();
     }
-    vec![Effect::Write {
+    vec![Effect::Task(Task::Write {
         purpose: WriteFor::Inherit { before },
         decisions,
-    }]
+    })]
 }
 
 #[cfg(test)]
@@ -1185,9 +1193,10 @@ pub(crate) mod tests {
         update(m, Input::Action(action), now())
     }
 
-    /// What the store says to a Write effect when it takes every decision.
+    /// What the store says to a [`Task::Write`] when it takes every decision.
     pub(crate) fn taken(effects: Vec<Effect>) -> Input {
-        let [Effect::Write { purpose, decisions }] = <[Effect; 1]>::try_from(effects).unwrap()
+        let [Effect::Task(Task::Write { purpose, decisions })] =
+            <[Effect; 1]>::try_from(effects).unwrap()
         else {
             panic!("expected one write");
         };
@@ -1199,14 +1208,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// Run a Write effect as if the store took it, and feed the result back.
+    /// Run a [`Task::Write`] as if the store took it, and feed the result back.
     fn written(m: &mut Review, effects: Vec<Effect>) {
         update(m, taken(effects), now());
     }
 
     pub(crate) fn decided(effects: &[Effect]) -> Vec<(u64, State, Option<&str>)> {
         match effects {
-            [Effect::Write { decisions, .. }] => decisions
+            [Effect::Task(Task::Write { decisions, .. })] => decisions
                 .iter()
                 .map(|d| (d.finding, d.state, d.edited.as_deref()))
                 .collect(),
@@ -1481,10 +1490,10 @@ pub(crate) mod tests {
         );
         assert_eq!(
             ended,
-            [Effect::Recheck {
+            [Effect::Task(Task::Recheck {
                 run: "r".into(),
                 paths: vec![path(1)],
-            }]
+            })]
         );
         assert_eq!(m.confirm, Some(Confirm::Quit));
         let job = Job {
@@ -1566,10 +1575,10 @@ pub(crate) mod tests {
         );
         assert_eq!(
             effects,
-            [Effect::Recheck {
+            [Effect::Task(Task::Recheck {
                 run: "s".into(),
                 paths: vec![path(2)],
-            }]
+            })]
         );
         assert_eq!(m.confirm, Some(Confirm::Quit));
         let job = Job {
@@ -1975,7 +1984,9 @@ pub(crate) mod tests {
     #[test]
     fn a_failed_write_changes_nothing() {
         let mut m = sample();
-        let Some(Effect::Write { purpose, decisions }) = act(&mut m, Action::Accept).pop() else {
+        let Some(Effect::Task(Task::Write { purpose, decisions })) =
+            act(&mut m, Action::Accept).pop()
+        else {
             panic!("expected a write");
         };
         update(
@@ -2069,12 +2080,12 @@ pub(crate) mod tests {
         let mut m = sample();
         assert_eq!(
             act(&mut m, Action::Play),
-            [Effect::Open(Moment {
+            [Effect::Player(PlayerCommand::Open(Moment {
                 file: path(1),
                 start_ms: 163_060,
                 sid: Some(1),
                 paused: false,
-            })]
+            }))]
         );
         assert_eq!(m.status.as_deref(), Some("opening E01 at 0:02:43.06"));
         update(&mut m, Input::Opened(Err("mpv not found".into())), now());
@@ -2087,12 +2098,12 @@ pub(crate) mod tests {
         m.selected = 1;
         assert_eq!(
             act(&mut m, Action::Play),
-            [Effect::Open(Moment {
+            [Effect::Player(PlayerCommand::Open(Moment {
                 file: path(1),
                 start_ms: 763_763,
                 sid: Some(1),
                 paused: true,
-            })]
+            }))]
         );
         assert_eq!(
             m.status.as_deref(),
@@ -2132,7 +2143,7 @@ pub(crate) mod tests {
     #[test]
     fn playback_keys_ask_mpv_and_show_where_it_is() {
         let mut m = sample();
-        let playback = |p| vec![Effect::Playback(p)];
+        let playback = |p| vec![Effect::Player(PlayerCommand::Playback(p))];
         assert_eq!(
             act(&mut m, Action::Playback(Playback::Pause)),
             playback(Playback::Pause)
@@ -2174,7 +2185,10 @@ pub(crate) mod tests {
     #[test]
     fn capital_o_closes_mpv_and_says_so() {
         let mut m = sample();
-        assert_eq!(act(&mut m, Action::ClosePlayer), [Effect::Close]);
+        assert_eq!(
+            act(&mut m, Action::ClosePlayer),
+            [Effect::Player(PlayerCommand::Close)]
+        );
         update(&mut m, Input::Closed(Ok(())), now());
         assert_eq!(m.status.as_deref(), Some("closed mpv"));
         update(&mut m, Input::Closed(Err("mpv is not open".into())), now());
@@ -2281,7 +2295,7 @@ pub(crate) mod tests {
             appended(2, vec![finding(9, 2, TYPO, FIXED, 165_060)]),
             now(),
         );
-        assert_eq!(effects, [Effect::ReadBack(path(2))]);
+        assert_eq!(effects, [Effect::Task(Task::ReadBack(path(2)))]);
         assert_eq!(
             m.run.findings.len(),
             4,
@@ -2306,7 +2320,8 @@ pub(crate) mod tests {
         let mut m = sample();
         m.selected = 1;
         let effects = act(&mut m, Action::Accept);
-        let [Effect::Write { purpose, decisions }] = <[Effect; 1]>::try_from(effects).unwrap()
+        let [Effect::Task(Task::Write { purpose, decisions })] =
+            <[Effect; 1]>::try_from(effects).unwrap()
         else {
             panic!("expected one write");
         };
@@ -2315,7 +2330,10 @@ pub(crate) mod tests {
             decisions: decisions.clone(),
             result: Ok(vec![Decided::Followed(vec![9])]),
         };
-        assert_eq!(update(&mut m, followed, now()), [Effect::ReadBack(path(2))]);
+        assert_eq!(
+            update(&mut m, followed, now()),
+            [Effect::Task(Task::ReadBack(path(2)))]
+        );
         assert_eq!(
             m.status.as_deref(),
             Some("E02 was checked again; your decision went to its new finding")
@@ -2325,7 +2343,10 @@ pub(crate) mod tests {
             decisions,
             result: Ok(vec![Decided::Gone]),
         };
-        assert_eq!(update(&mut m, gone, now()), [Effect::ReadBack(path(2))]);
+        assert_eq!(
+            update(&mut m, gone, now()),
+            [Effect::Task(Task::ReadBack(path(2)))]
+        );
         assert_eq!(
             m.status.as_deref(),
             Some("E02 was checked again; that finding is gone")
@@ -2364,10 +2385,10 @@ pub(crate) mod tests {
         let mut m = on_e02_in_files();
         assert_eq!(
             act(&mut m, Action::Recheck),
-            [Effect::FindRun {
+            [Effect::Task(Task::FindRun {
                 path: path(2),
                 run: Some("2026-10-17T04-39-18".into()),
-            }]
+            })]
         );
         let found = Input::RunFound {
             path: path(2),
@@ -2386,10 +2407,10 @@ pub(crate) mod tests {
         m.run.of_paths = true;
         assert_eq!(
             act(&mut m, Action::Recheck),
-            [Effect::FindRun {
+            [Effect::Task(Task::FindRun {
                 path: path(2),
                 run: None,
-            }]
+            })]
         );
     }
 
@@ -2403,10 +2424,10 @@ pub(crate) mod tests {
         });
         assert_eq!(
             act(&mut m, Action::Answer(true)),
-            [Effect::Recheck {
+            [Effect::Task(Task::Recheck {
                 run: "r".into(),
                 paths: vec![path(2)],
-            }]
+            })]
         );
         let job = Job {
             run: "r".into(),
@@ -2449,10 +2470,10 @@ pub(crate) mod tests {
         );
         assert_eq!(
             ended,
-            [Effect::Recheck {
+            [Effect::Task(Task::Recheck {
                 run: "r".into(),
                 paths: vec![path(1), path(3)],
-            }]
+            })]
         );
         assert_eq!(m.progress.again, [(path(2), "s".to_string())]);
     }
@@ -2510,10 +2531,10 @@ pub(crate) mod tests {
         );
         assert_eq!(
             ended,
-            [Effect::Recheck {
+            [Effect::Task(Task::Recheck {
                 run: "r".into(),
                 paths: vec![path(1)],
-            }]
+            })]
         );
         let why = "run r: no LLM is called gpt";
         let effects = update(
@@ -2527,10 +2548,10 @@ pub(crate) mod tests {
         );
         assert_eq!(
             effects,
-            [Effect::Recheck {
+            [Effect::Task(Task::Recheck {
                 run: "s".into(),
                 paths: vec![path(2)],
-            }]
+            })]
         );
         assert_eq!(m.progress.files[0].label('⠙'), format!("✗ FAILED: {why}"));
         assert!(
@@ -2542,7 +2563,7 @@ pub(crate) mod tests {
         m.file_selected = 0;
         assert!(matches!(
             act(&mut m, Action::Recheck).as_slice(),
-            [Effect::FindRun { .. }]
+            [Effect::Task(Task::FindRun { .. })]
         ));
     }
 
@@ -2566,21 +2587,23 @@ pub(crate) mod tests {
         let mut m = sample();
         assert_eq!(
             act(&mut m, Action::SwitchView),
-            [Effect::Switch(Switch::FoldersOf(m.run.name.clone()))]
+            [Effect::Task(Task::Switch(Switch::FoldersOf(
+                m.run.name.clone()
+            )))]
         );
         // In a paths view, the selected row's first member's file.
         m.run.of_paths = true;
         m.selected = 0;
         assert_eq!(
             act(&mut m, Action::SwitchView),
-            [Effect::Switch(Switch::RunNaming(path(1)))]
+            [Effect::Task(Task::Switch(Switch::RunNaming(path(1))))]
         );
         // In the files view, the selected file.
         act(&mut m, Action::ShowPane(Pane::Files));
         m.file_selected = 2;
         assert_eq!(
             act(&mut m, Action::SwitchView),
-            [Effect::Switch(Switch::RunNaming(path(3)))]
+            [Effect::Task(Task::Switch(Switch::RunNaming(path(3))))]
         );
     }
 
@@ -2594,7 +2617,7 @@ pub(crate) mod tests {
         assert_eq!(m.selected_entry(), None);
         assert_eq!(
             act(&mut m, Action::SwitchView),
-            [Effect::Switch(Switch::RunNaming(path(2)))]
+            [Effect::Task(Task::Switch(Switch::RunNaming(path(2))))]
         );
     }
 
@@ -2669,11 +2692,11 @@ pub(crate) mod tests {
         let effects = act(&mut m, Action::Answer(true));
         assert_eq!(
             effects,
-            [Effect::StartApply {
+            [Effect::Task(Task::StartApply {
                 run: m.run.clone(),
                 dry_run: false,
                 karaoke: false,
-            }]
+            })]
         );
         assert!(m.progress.applying());
         assert_eq!(
@@ -2700,11 +2723,11 @@ pub(crate) mod tests {
         let effects = act(&mut m, Action::Apply { dry_run: true });
         assert_eq!(
             effects,
-            [Effect::StartApply {
+            [Effect::Task(Task::StartApply {
                 run: m.run.clone(),
                 dry_run: true,
                 karaoke: true,
-            }]
+            })]
         );
         assert_eq!(
             m.progress.apply.as_ref().unwrap().resume,
