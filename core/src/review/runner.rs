@@ -19,8 +19,8 @@ use crate::store::{Run, Store};
 
 /// Runs `update`'s tasks for a UI: through `store`, the connection review writes through; with
 /// `state`, the state directory, where apply writes the fixed tracks; and with `tx`, a sender on
-/// the UI's channel, where the jobs `c`, `A` and `D` start send what they do. `T` is what that
-/// channel carries: an [`Input`], or a UI's own message that one becomes.
+/// the UI's channel, where the jobs it starts send what they do. `T` is what that channel carries:
+/// an [`Input`], or a UI's own message that one becomes.
 pub struct Runner<T> {
     store: Store,
     state: PathBuf,
@@ -122,7 +122,8 @@ pub fn file_notes(run: &Run) -> HashMap<String, FileNote> {
     notes
 }
 
-/// The view `v` opens, read from the store: a run's folders, or the newest run that named a file.
+/// The view [`Task::Switch`] asks for, read from the store: a run's folders, or the newest run that
+/// named a file.
 fn other_view(store: &Store, to: &Switch) -> anyhow::Result<Run> {
     match to {
         Switch::FoldersOf(name) => {
@@ -176,7 +177,7 @@ fn recheck<T: From<Input> + Send + 'static>(
     })
 }
 
-/// The run a scan's screen opens on: the run as the store shows it. A file the scan checks again
+/// The run a UI opens on with a scan: the run as the store shows it. A file the scan checks again
 /// keeps its findings in the list until the scan saves the new ones (see `Review::refresh`); a file
 /// it skips is there from the start.
 pub fn opening(store: &Store, plan: &scan::Plan) -> rusqlite::Result<Run> {

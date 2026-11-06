@@ -2844,7 +2844,7 @@ mod tests {
         assert!(!m.should_quit && m.confirm.is_none());
         act(&mut m, Action::Interrupt);
         act(&mut m, Action::Answer(true));
-        // Quitting while apply runs is what stops it (`subcheck_cli::tui::run` ends its groups).
+        // Quitting while apply runs is what stops it: the loop that runs `update` ends its groups.
         assert!(m.should_quit && m.progress.applying());
         // A second one, with the question open, quits too.
         let mut m = applying();

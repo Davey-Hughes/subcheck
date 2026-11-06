@@ -1,12 +1,14 @@
 //! Review: accept, reject or reword each finding of a run, and open its moment in a player. A pure
 //! Elm-style core (`model`, `update`) takes a UI's actions; the store and the jobs are at its edge
 //! (`runner`, `jobs`). Each UI maps its own keys and clicks to those actions, and runs the player
-//! commands `update` gives it on a player of its own; the terminal's UI is `subcheck_cli::tui`.
+//! commands `update` gives it on a player of its own; the terminal's UI is `subcheck_cli::tui`. A
+//! UI whose own loop must not wait runs `update` and the runner behind a thread, through `session`.
 
 pub mod jobs;
 pub mod model;
 pub mod progress;
 pub mod runner;
+pub mod session;
 pub mod update;
 
 use crate::scan;

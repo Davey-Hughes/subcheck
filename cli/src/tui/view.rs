@@ -347,13 +347,7 @@ fn mark(state: Option<State>) -> &'static str {
 }
 
 fn entry_line(m: &Review, e: Entry, spinner: char) -> Line<'static> {
-    // A row with anything pending is still to do, however its decided members differ.
-    let state = match e {
-        Entry::Row(_) if m.has_pending(e) => Some(State::Pending),
-        Entry::Row(r) => m.shown_state(r),
-        Entry::Member(_, i) => Some(m.state(i)),
-    };
-    entry_text(m, e, spinner).style(colour(state))
+    entry_text(m, e, spinner).style(colour(m.entry_state(e)))
 }
 
 fn entry_text(m: &Review, e: Entry, spinner: char) -> Line<'static> {

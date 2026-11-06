@@ -1,8 +1,8 @@
 //! Review's jobs: the scan and apply, each on a thread of its own, sending what happens to the
 //! UI's channel as an `Input` or the UI's own message that one becomes. The runner starts them for
-//! `c`, `A` and `D`, and the screen starts the scan it opens with. Each runs to its end or the
-//! process's: quitting with a job running ends its LLM calls or mkvmerge through `group::end`, and
-//! its threads with the process.
+//! `update`'s tasks, and a UI that opens on a scan starts that one itself. Each runs to its end or
+//! the process's: quitting with a job running ends its LLM calls or mkvmerge through `group::end`,
+//! and its threads with the process.
 
 use std::any::Any;
 use std::ffi::OsStr;
@@ -18,7 +18,7 @@ use crate::store::{Run, Store};
 
 /// Run `plan` on a thread of its own, saving through `store`, a connection of its own: each step
 /// sent as `Input::Scan`, then how it ended as `Input::ScanEnded`. What `scan` would log goes
-/// nowhere: the screen has each file's lines from its events. A panic is `Input::Fatal`.
+/// nowhere: the review has each file's lines from the scan's events. A panic is `Input::Fatal`.
 pub fn scan<T: From<Input> + Send + 'static>(
     plan: Plan,
     opts: Options,
@@ -49,8 +49,8 @@ pub fn scan<T: From<Input> + Send + 'static>(
 /// and write nothing), as a bare `subcheck apply` does: the original kept as `.orig`, the quick
 /// check. Saving through `store`, a connection of its own; the fixed tracks written under `state`
 /// before the remux. Each step is sent as `Input::Apply`, then how it ended as
-/// `Input::ApplyEnded`. What `apply` prints goes nowhere: the screen has each file's block from
-/// its events. A panic is `Input::Fatal`.
+/// `Input::ApplyEnded`. What `apply` prints goes nowhere: the review has each file's block from
+/// the apply's events. A panic is `Input::Fatal`.
 pub fn apply<T: From<Input> + Send + 'static>(
     run: Run,
     dry_run: bool,

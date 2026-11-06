@@ -732,6 +732,17 @@ impl Review {
         states.all(|s| s == first).then_some(first)
     }
 
+    /// The state an entry's list line goes by: a row that shows a pending member is still to do,
+    /// however its decided members differ; else what its shown members agree on, `None` when they
+    /// do not.
+    pub fn entry_state(&self, e: Entry) -> Option<State> {
+        match e {
+            Entry::Row(_) if self.has_pending(e) => Some(State::Pending),
+            Entry::Row(r) => self.shown_state(r),
+            Entry::Member(_, i) => Some(self.state(i)),
+        }
+    }
+
     /// All members' state when they agree; `None` when they do not.
     pub fn row_state(&self, row: usize) -> Option<State> {
         let mut states = self.rows[row].members.iter().map(|&i| self.state(i));
@@ -1355,6 +1366,28 @@ mod tests {
                 Some(_) => assert_eq!(labels, ["track 5 English", "track 6 English"]),
             }
         }
+    }
+
+    #[test]
+    fn an_entrys_state_is_pending_while_anything_it_shows_is_and_none_when_it_shows_a_mix() {
+        use crate::review::update::tests_support::decide_as;
+        let mut m = tests_support::sample();
+        let (row, e01) = (Entry::Row(0), Entry::Member(0, 0));
+        assert_eq!(m.entry_state(row), Some(State::Pending));
+        // Decided differently, with one still to do: the row is still to do.
+        decide_as(&mut m, &[1], State::Accepted, None);
+        decide_as(&mut m, &[2], State::Rejected, None);
+        assert_eq!(m.entry_state(row), Some(State::Pending));
+        assert_eq!(m.entry_state(e01), Some(State::Accepted));
+        // Its one pending member hidden by the filter: the row goes by the member it shows.
+        m.filter = Filter::Only(State::Rejected);
+        assert_eq!(m.entry_state(row), Some(State::Rejected));
+        m.filter = Filter::All;
+        // None left to do: `None` when they differ, else what they agree on.
+        decide_as(&mut m, &[4], State::Rejected, None);
+        assert_eq!(m.entry_state(row), None);
+        m.filter = Filter::Only(State::Rejected);
+        assert_eq!(m.entry_state(row), Some(State::Rejected));
     }
 
     #[test]
