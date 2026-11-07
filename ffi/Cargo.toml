@@ -1,0 +1,25 @@
+[package]
+name = "subcheck-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "subcheck's review for a UI in another language, through UniFFI"
+license.workspace = true
+
+# `cdylib` is what the bindgen reads the interface from, and `staticlib` what the app links, so that
+# it is one binary; `lib` is for the tests.
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+subcheck-core = { path = "../core" }
+uniffi.workspace = true
+
+[lints]
+workspace = true
+
+# The round trip's store is seeded with review's sample run (`test-support`).
+[dev-dependencies]
+subcheck-core = { path = "../core", features = ["test-support"] }
+jiff.workspace = true
+tempfile.workspace = true

@@ -1,5 +1,10 @@
 /target
 
+# The build directory CI's commands make at the root (`-B build`), and one at gui/qt/build, a
+# symlink included (so no trailing slash): kept out of git and out of dev/check-gui.sh's list.
+/build
+/gui/qt/build
+
 # Specs, plans, and review findings. Kept on disk as a working record, but not tracked, so a routine
 # `git add -A` cannot put them in the history.
 /docs/

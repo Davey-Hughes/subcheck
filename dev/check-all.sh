@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# The local mirror of CI (.forgejo/workflows/ci.yml, and its macOS counterpart in
-# .github/workflows/ci.yml). Run it before you push a branch and open a PR: CI runs these same steps
-# there, and this is them several minutes earlier.
+# The local mirror of CI's subcheck job (.forgejo/workflows/ci.yml, and its macOS counterpart in
+# .github/workflows/ci.yml); dev/check-gui.sh is the gui jobs'. Run it before you push a branch and
+# open a PR: CI runs these same steps there, and this is them several minutes earlier.
 #
 #   dev/check-all.sh
 #

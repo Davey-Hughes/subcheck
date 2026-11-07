@@ -1,7 +1,7 @@
 name: CI
 
 # The GitHub half of a two-forge CI: Forgejo's runners are docker only, so the
-# macOS leg runs here, on the push mirror. Forgejo pushes every branch, so a
+# macOS jobs run here, on the push mirror. Forgejo pushes every branch, so a
 # pull request's branch runs here as a `push` event; nothing opens pull requests
 # on GitHub. See .forgejo/workflows/ci.yml for why this is not a merge gate.
 on:
@@ -52,3 +52,23 @@ jobs:
         env:
           SUBCHECK_NEED_MKVMERGE: ${{ runner.os == 'Linux' && '1' || '' }}
           SUBCHECK_NEED_FFMPEG: ${{ runner.os == 'Linux' && '1' || '' }}
+
+  # The Qt app on macOS, built and tested as the gui job in .forgejo/workflows/ci.yml does it,
+  # less clang-format, which one platform is enough for. Like that job it does not gate, so look at
+  # it before merging, as at the macOS leg above. Keep the steps the two share in step.
+  gui-macos:
+    name: gui-macos
+    runs-on: macos-latest
+    # A hang outside the tests, which CTest limits one by one (gui/qt/CMakeLists.txt), fails the job
+    # rather than running to GitHub's six hours, on every push of every branch: a download, a build.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - run: rustc --version
+      - run: brew install corrosion ninja
+      - name: Install uniffi-bindgen-cpp
+        run: cargo install uniffi-bindgen-cpp --git https://github.com/NordSecurity/uniffi-bindgen-cpp --tag v0.10.0+v0.31.0 --locked
+      - run: cmake -S gui/qt -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure --no-tests=error

@@ -1,0 +1,7 @@
+# The C++ under gui/qt/, which the gui CI job and dev/check-gui.sh check with
+# `clang-format --dry-run -Werror`: indents of 4 with `public:` at the class's own, as Qt's own
+# code is written, and 100 columns, as rustfmt and the comments elsewhere.
+BasedOnStyle: LLVM
+IndentWidth: 4
+AccessModifierOffset: -4
+ColumnLimit: 100

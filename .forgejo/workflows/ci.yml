@@ -14,10 +14,10 @@ env:
 
 # This file is the Forgejo half of a two-forge CI, and the half that gates.
 # .github/workflows/ci.yml exists because this instance has docker runners
-# only, so the macOS leg runs there and nowhere here.
+# only, so the macOS jobs run there and nowhere here.
 #
 # It is NOT a pre-merge gate, though. Nothing pushes to GitHub by hand: the forge
-# push-mirrors every branch there, so the macOS job does run on a pull request's
+# push-mirrors every branch there, so the macOS jobs do run on a pull request's
 # branch, as a `push` event, shortly after each push. But its result never
 # reaches the Forgejo pull request, so nothing stops a merge on a red macOS run.
 # Before merging, look:
@@ -26,11 +26,11 @@ env:
 #
 # A macOS failure found only after the merge means main is broken: fix forward.
 #
-# The job clones with git rather than with actions/checkout, and the reason is
+# Both jobs clone with git rather than with actions/checkout, and the reason is
 # worth stating because the failure it avoids is silent. checkout is a
 # JavaScript action, and a JS action needs a node inside the job's container to
-# execute. The rust image carries none, and this runner does not inject one, so
-# a job combining `container:` with any JS action dies before its first step.
+# execute. Neither job's image carries one, and this runner does not inject one,
+# so a job combining `container:` with any JS action dies before its first step.
 #
 # The clone is authenticated because the instance requires sign-in for all
 # content, so an anonymous fetch is refused even for a public repository. The
@@ -38,9 +38,9 @@ env:
 # runner's own view of the forge -- an address on its container network --
 # rather than the public hostname.
 #
-# The job runs in rust:1.99.1-bookworm, the version rust-toolchain.toml names,
-# and the two move together. A floating rust:1-bookworm lets the runner keep
-# whatever copy it pulled last. An exact tag cannot go stale, and with it
+# The subcheck job runs in rust:1.99.1-bookworm, the version rust-toolchain.toml
+# names, and the two move together. A floating rust:1-bookworm lets the runner
+# keep whatever copy it pulled last. An exact tag cannot go stale, and with it
 # matching the file rustup has nothing to download in the job. Should they ever
 # differ, the file wins: rustup honours it inside the image too.
 
@@ -152,3 +152,85 @@ jobs:
       # once written, runs.
       - name: Doctests
         run: cargo test --doc
+
+  # The Qt app (gui/qt/): its C++ bindings to ffi/, generated at build time, and its tests. Not a
+  # merge gate: branch protection requires `CI / subcheck (pull_request)` alone, by that exact
+  # name. It runs on Arch, the desktop the app is built for first, with packages as new as that
+  # desktop's. Two things can break it with no change in the repository: an Arch upgrade, and the
+  # image, which this runner keeps as it first pulled it, so that every run upgrades an older copy
+  # (hence the keyring first, below). If either gets noisy, pin the image to a dated Arch Linux
+  # Archive snapshot. Nothing is cached, as this runner runs no JS actions, so the bindgen
+  # compiles every time. No path filter either: a change to core can break ffi/ or the app. It
+  # waits for `subcheck`, so that the gating job's result comes first, and the two of one run never
+  # build side by side on the one machine this runner shares. dev/check-gui.sh runs these same
+  # steps locally: change it with this job.
+  gui:
+    name: gui
+    needs: subcheck
+    runs-on: docker
+    # A hang outside the tests, which CTest limits one by one (gui/qt/CMakeLists.txt), fails the job
+    # rather than holding the runner until its own limit: a download, pacman, a build.
+    timeout-minutes: 20
+    container:
+      image: archlinux:base-devel
+    steps:
+      # The keyring first: pacman checks every package against the keyring it has before it
+      # installs any, a new keyring among them, and the runner's copy of the image only ages. A new
+      # keyring is taken in only with a local key to sign it, which an older image may lack:
+      # `pacman-key --init` makes one if it is missing.
+      #
+      # git for the checkout, which the image lacks. corrosion depends on `rust`, which rustup
+      # provides; without rustup here, that is Arch's rust package, which ignores
+      # rust-toolchain.toml. The check is that rustup is what provides it: `pacman -Q` answers for
+      # whichever package does.
+      - name: Install the tools
+        run: |
+          pacman-key --init
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Su --noconfirm --needed git rustup cmake ninja clang corrosion
+          [ "$(pacman -Qq rust)" = rustup ] || {
+            echo "error: Arch's rust package came in, and ignores rust-toolchain.toml" >&2
+            exit 1
+          }
+
+      - name: Checkout
+        env:
+          TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          host="${FORGEJO_SERVER_URL#http://}"; host="${host#https://}"
+          scheme="${FORGEJO_SERVER_URL%%://*}"
+          git init -q .
+          git remote add origin "${scheme}://x-access-token:${TOKEN}@${host}/${FORGEJO_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "$FORGEJO_REF"
+          git checkout -q FETCH_HEAD
+
+      # The toolchain rust-toolchain.toml names, which Corrosion and the bindgen build with.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      # So the log says which Rust this was.
+      - run: rustc --version
+
+      # Our C++ against gui/qt/.clang-format, before the slow steps. An empty list stops it, as
+      # clang-format given no file reads an empty stdin and passes.
+      - name: clang-format
+        run: |
+          [ -n "$(git ls-files 'gui/qt/*.cpp' 'gui/qt/*.h' 'gui/qt/*.hpp')" ] || {
+            echo "error: no C++ under gui/qt/ for clang-format to check" >&2
+            exit 1
+          }
+          git ls-files -z 'gui/qt/*.cpp' 'gui/qt/*.h' 'gui/qt/*.hpp' | xargs -0 clang-format --dry-run -Werror
+
+      # The bindgen, outside the workspace: as a member, every clippy run would compile it. Its
+      # tag names the uniffi it is built against, which the root Cargo.toml pins: the two move
+      # together, and the same line is in .github/workflows/ci.yml. dev/check-gui.sh reads the tag
+      # out of this line, so it stays the one such line in this file.
+      - name: Install uniffi-bindgen-cpp
+        run: cargo install uniffi-bindgen-cpp --git https://github.com/NordSecurity/uniffi-bindgen-cpp --tag v0.10.0+v0.31.0 --locked
+
+      # A warning in our C++ fails the build, and one in the generated code does not, as
+      # gui/qt/CMakeLists.txt says; then the tests, which seed their run with a real scan.
+      # Finding no tests fails the step, as CTest alone passes with none run.
+      - run: cmake -S gui/qt -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure --no-tests=error

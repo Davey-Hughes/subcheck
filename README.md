@@ -62,6 +62,14 @@ is missing. The tests read small MKVs committed under `core/tests/fixtures/`, wi
 mkvextract's output for each as the oracle; `dev/make-fixtures.sh` rebuilds them, needed only to
 add or change one.
 
+`dev/check-gui.sh` does the same for the Qt app under `gui/qt/`, whose CI job does not gate yet:
+clang-format, then a CMake build that generates the C++ bindings to `ffi/`, then the app's tests.
+Besides Rust from rustup, which the build asks for the toolchain `rust-toolchain.toml` names, it
+needs cmake, ninja, clang-format, [Corrosion](https://github.com/corrosion-rs/corrosion) and
+[uniffi-bindgen-cpp](https://github.com/NordSecurity/uniffi-bindgen-cpp), installed with
+`cargo install` at the tag CI installs; it stops first, naming the command, when the bindgen is
+missing or at another tag.
+
 This repository's history before 2026-11-02 was in
 [daveyutils](https://github.com/Davey-Hughes/daveyutils): a `(daveyutils#N)` in a commit message is
 that repository's pull request N.
