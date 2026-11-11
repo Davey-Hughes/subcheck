@@ -97,6 +97,11 @@ pub enum Action {
     /// selects its row. A key whose findings all went, or whose entry the list does not show,
     /// leaves the selection where it is and says so on the status line.
     Select(EntryKey),
+    /// Select the entry `by` places on in the list as shown, or back when negative, stopping at
+    /// its first and last: at an end, the entry already selected. Worked out from the selection as
+    /// review holds it, so that each of several moves, however quickly they come, starts where the
+    /// one before ended.
+    Move(i32),
     /// Expand the selected row into its members, or collapse it (from the row or a member).
     Toggle,
     /// Show the findings under this filter, the selection kept on its finding's row.
@@ -288,6 +293,7 @@ fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
             }
         }
         Action::Select(key) => select(m, &key),
+        Action::Move(by) => move_by(m, by),
         Action::Toggle => toggle(m),
         Action::SetFilter(filter) => set_filter(m, filter),
         Action::NextFile => next_file(m),
@@ -342,6 +348,21 @@ fn select(m: &mut Review, key: &EntryKey) {
         Some(at) => m.selected = at,
         None => m.status = Some("that finding changed; the selection stays".into()),
     }
+}
+
+/// The entry `by` places from the selected one, clamped to the list's first and last; an empty
+/// list has none to move to.
+fn move_by(m: &mut Review, by: i32) {
+    let Some(last) = m.entries().len().checked_sub(1) else {
+        return;
+    };
+    let step = usize::try_from(by.unsigned_abs()).unwrap_or(usize::MAX);
+    let to = if by < 0 {
+        m.selected.saturating_sub(step)
+    } else {
+        m.selected.saturating_add(step)
+    };
+    m.selected = to.min(last);
 }
 
 /// The file at `path` in the files view. One not in it (another view's) is not selected, and the
@@ -2258,6 +2279,50 @@ mod tests {
         act(&mut m, Action::Interrupt);
         assert!(m.should_quit);
         assert_eq!(m.status, said(), "Interrupt");
+    }
+
+    #[test]
+    fn a_move_steps_through_the_list_as_shown_and_stops_at_its_ends() {
+        let mut m = tests_support::many(30);
+        m.selected = 15;
+        for (by, to) in [
+            (1, 16),
+            (-10, 6),
+            (-10, 0),
+            (-1, 0),
+            (10, 10),
+            (i32::MAX, 29),
+            (1, 29),
+            (i32::MIN, 0),
+        ] {
+            assert_eq!(act(&mut m, Action::Move(by)), []);
+            assert_eq!(m.selected, to, "by {by}");
+        }
+    }
+
+    #[test]
+    fn a_move_counts_an_expanded_rows_members_as_entries() {
+        let mut m = sample();
+        act(&mut m, Action::Toggle);
+        act(&mut m, Action::Move(1));
+        assert_eq!(m.selected_entry(), Some(Entry::Member(0, 0)));
+        act(&mut m, Action::Move(3));
+        assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
+    }
+
+    #[test]
+    fn a_move_at_an_end_or_in_an_empty_list_still_lets_a_message_go() {
+        let mut m = sample();
+        m.selected = 1;
+        m.status = Some("a message".into());
+        act(&mut m, Action::Move(1));
+        assert_eq!((m.selected, m.status.as_deref()), (1, None));
+        // Nothing in the sample is rejected: under that filter the list is empty.
+        act(&mut m, Action::SetFilter(Filter::Only(State::Rejected)));
+        assert_eq!(m.entries(), []);
+        m.status = Some("a message".into());
+        act(&mut m, Action::Move(-1));
+        assert_eq!((m.selected, m.status.as_deref()), (0, None));
     }
 
     #[test]

@@ -197,6 +197,12 @@ pub enum Action {
     Select {
         key: EntryKey,
     },
+    /// Select the entry `by` places on in the list as shown, or back when negative, stopping at
+    /// its first and last: at an end, the entry already selected. Review works it out from its own
+    /// selection, so that each of several quick moves starts where the one before ended.
+    Move {
+        by: i32,
+    },
     /// Expand the selected row into its members, or collapse it (from the row or a member).
     Toggle,
     Accept,
@@ -413,6 +419,7 @@ impl From<Action> for update::Action {
     fn from(action: Action) -> update::Action {
         match action {
             Action::Select { key } => update::Action::Select(key.into()),
+            Action::Move { by } => update::Action::Move(by),
             Action::Toggle => update::Action::Toggle,
             Action::Accept => update::Action::Accept,
             Action::Reject => update::Action::Reject,
@@ -640,6 +647,7 @@ mod tests {
                 },
                 update::Action::Select(model::EntryKey::Member(7)),
             ),
+            (Action::Move { by: -3 }, update::Action::Move(-3)),
             (Action::Toggle, update::Action::Toggle),
             (Action::Accept, update::Action::Accept),
             (Action::Reject, update::Action::Reject),

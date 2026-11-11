@@ -12,7 +12,7 @@ use subcheck_core::review::update::Action;
 use subcheck_core::store::State;
 
 /// Rows a PgUp or PgDn moves.
-const PAGE: usize = 10;
+const PAGE: u16 = 10;
 
 /// What a key press does.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,14 +69,14 @@ fn next_filter(filter: Filter) -> Filter {
     }
 }
 
-/// A key in the findings. A moving key's entry is worked out here, from the selection and the
-/// list as shown, so how far a page goes is the screen's to say.
+/// A key in the findings. How far a page goes is the screen's to say; where a move from the
+/// selection lands is review's (`Action::Move`), which works it out from its own selection. The
+/// first and last entries are worked out here.
 fn findings_key(m: &Review, key: KeyCode) -> Option<Action> {
     let entries = m.entries();
-    let selected = m.selected;
     let last = entries.len().saturating_sub(1);
-    // The entry a moving key lands on, by its key. An empty list has none to land on: the key only
-    // lets the message go.
+    // The entry a key lands on, by its key. An empty list has none to land on: the key only lets
+    // the message go.
     let to = |i: usize| {
         entries
             .get(i)
@@ -88,10 +88,10 @@ fn findings_key(m: &Review, key: KeyCode) -> Option<Action> {
         KeyCode::Char('v') => Action::SwitchView,
         KeyCode::Char('A') => Action::Apply { dry_run: false },
         KeyCode::Char('D') => Action::Apply { dry_run: true },
-        KeyCode::Down | KeyCode::Char('j') => to((selected + 1).min(last)),
-        KeyCode::Up | KeyCode::Char('k') => to(selected.saturating_sub(1)),
-        KeyCode::PageDown => to((selected + PAGE).min(last)),
-        KeyCode::PageUp => to(selected.saturating_sub(PAGE)),
+        KeyCode::Down | KeyCode::Char('j') => Action::Move(1),
+        KeyCode::Up | KeyCode::Char('k') => Action::Move(-1),
+        KeyCode::PageDown => Action::Move(i32::from(PAGE)),
+        KeyCode::PageUp => Action::Move(-i32::from(PAGE)),
         KeyCode::Home | KeyCode::Char('g') => to(0),
         KeyCode::End | KeyCode::Char('G') => to(last),
         KeyCode::Char('f') => Action::SetFilter(next_filter(m.filter)),
@@ -139,8 +139,8 @@ fn files_key(m: &Review, key: KeyCode) -> Option<Action> {
         KeyCode::Char('D') => Action::Apply { dry_run: true },
         KeyCode::Down | KeyCode::Char('j') => to((selected + 1).min(last)),
         KeyCode::Up | KeyCode::Char('k') => to(selected.saturating_sub(1)),
-        KeyCode::PageDown => to((selected + PAGE).min(last)),
-        KeyCode::PageUp => to(selected.saturating_sub(PAGE)),
+        KeyCode::PageDown => to((selected + usize::from(PAGE)).min(last)),
+        KeyCode::PageUp => to(selected.saturating_sub(usize::from(PAGE))),
         KeyCode::Home | KeyCode::Char('g') => to(0),
         KeyCode::End | KeyCode::Char('G') => to(last),
         KeyCode::Enter => Action::ShowFileFindings,
@@ -155,6 +155,8 @@ mod tests {
     use crate::tui::screen::Editor;
     use subcheck_core::review::model::tests_support::{many, path, sample};
     use subcheck_core::review::model::{Confirm, EntryKey};
+    use subcheck_core::review::update::tests_support::now;
+    use subcheck_core::review::update::{Input, update};
 
     /// 30 rows, one per episode, the 16th selected: each move lands on an entry of its own.
     fn mid_list() -> Review {
@@ -183,12 +185,12 @@ mod tests {
             (KeyCode::Char('v'), Action::SwitchView),
             (KeyCode::Char('A'), Action::Apply { dry_run: false }),
             (KeyCode::Char('D'), Action::Apply { dry_run: true }),
-            (KeyCode::Down, row(17)),
-            (KeyCode::Char('j'), row(17)),
-            (KeyCode::Up, row(15)),
-            (KeyCode::Char('k'), row(15)),
-            (KeyCode::PageDown, row(26)),
-            (KeyCode::PageUp, row(6)),
+            (KeyCode::Down, Action::Move(1)),
+            (KeyCode::Char('j'), Action::Move(1)),
+            (KeyCode::Up, Action::Move(-1)),
+            (KeyCode::Char('k'), Action::Move(-1)),
+            (KeyCode::PageDown, Action::Move(10)),
+            (KeyCode::PageUp, Action::Move(-10)),
             (KeyCode::Home, row(1)),
             (KeyCode::Char('g'), row(1)),
             (KeyCode::End, row(30)),
@@ -233,21 +235,13 @@ mod tests {
 
     #[test]
     fn moving_keys_stop_at_the_lists_ends() {
-        let mut m = many(30);
-        let s = Screen::default();
-        m.selected = 0;
-        for key in [KeyCode::Up, KeyCode::Char('k'), KeyCode::PageUp] {
-            assert_eq!(press(&m, &s, key), Press::Act(row(1)), "{key:?}");
-        }
-        m.selected = 29;
-        for key in [KeyCode::Down, KeyCode::Char('j'), KeyCode::PageDown] {
-            assert_eq!(press(&m, &s, key), Press::Act(row(30)), "{key:?}");
-        }
-        // Nothing in the sample is rejected: under that filter the list is empty.
+        // The findings' moves stop in review (`Action::Move`), as the next test shows; `g` and
+        // `G` on an empty list, and the files' moves, stop here. Nothing in the sample is
+        // rejected: under that filter the list is empty.
         let mut m = sample();
         let s = Screen::default();
         m.filter = Filter::Only(State::Rejected);
-        for key in [KeyCode::Char('j'), KeyCode::Char('G'), KeyCode::PageDown] {
+        for key in [KeyCode::Char('g'), KeyCode::Char('G')] {
             assert_eq!(press(&m, &s, key), Press::Act(Action::Dismiss), "{key:?}");
         }
         let mut m = many(30);
@@ -257,6 +251,75 @@ mod tests {
         assert_eq!(press(&m, &s, KeyCode::Char('j')), Press::Act(file(30)));
         m.file_selected = 0;
         assert_eq!(press(&m, &s, KeyCode::Char('k')), Press::Act(file(1)));
+    }
+
+    /// The entry a moving key lands on by selecting the neighbour, clamped to the list, or
+    /// `Dismiss` with none: the rule a `Move` must agree with.
+    fn selecting_the_clamped_neighbour(m: &Review, key: KeyCode) -> Action {
+        let entries = m.entries();
+        let last = entries.len().saturating_sub(1);
+        let to = |i: usize| {
+            entries
+                .get(i)
+                .map_or(Action::Dismiss, |&e| Action::Select(m.entry_key(e)))
+        };
+        match key {
+            KeyCode::Down | KeyCode::Char('j') => to((m.selected + 1).min(last)),
+            KeyCode::Up | KeyCode::Char('k') => to(m.selected.saturating_sub(1)),
+            KeyCode::PageDown => to((m.selected + 10).min(last)),
+            KeyCode::PageUp => to(m.selected.saturating_sub(10)),
+            other => panic!("not a moving key: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_moving_key_lands_where_selecting_its_clamped_neighbour_does() {
+        // A long list, one with an expanded row and its members, and an empty one; from every
+        // entry, a message showing, which each move lets go.
+        let lists: [fn() -> Review; 3] = [
+            || many(30),
+            || {
+                let mut m = sample();
+                update(&mut m, Input::Action(Action::Toggle), now());
+                m
+            },
+            || {
+                let mut m = sample();
+                m.filter = Filter::Only(State::Rejected);
+                m
+            },
+        ];
+        let keys = [
+            KeyCode::Down,
+            KeyCode::Char('j'),
+            KeyCode::Up,
+            KeyCode::Char('k'),
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+        ];
+        for list in lists {
+            for at in 0..list().entries().len().max(1) {
+                for key in keys {
+                    let (mut moved, mut selected) = (list(), list());
+                    for m in [&mut moved, &mut selected] {
+                        m.selected = at;
+                        m.status = Some("a message".into());
+                    }
+                    let Press::Act(action) = press(&moved, &Screen::default(), key) else {
+                        panic!("{key:?} is not an action");
+                    };
+                    update(&mut moved, Input::Action(action), now());
+                    let action = selecting_the_clamped_neighbour(&selected, key);
+                    update(&mut selected, Input::Action(action), now());
+                    assert_eq!(
+                        (moved.selected, &moved.status),
+                        (selected.selected, &selected.status),
+                        "{key:?} from {at}"
+                    );
+                    assert_eq!(moved.status, None, "{key:?} from {at}");
+                }
+            }
+        }
     }
 
     #[test]

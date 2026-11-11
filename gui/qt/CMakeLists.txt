@@ -1,5 +1,6 @@
 # subcheck's Qt app: the C++ bindings to ffi/ (the subcheck-ffi crate), generated at build time
-# and never committed, and the tests that drive a real session through them.
+# and never committed; the window over them, `subcheck-qt`; and the tests that drive real sessions
+# through both.
 cmake_minimum_required(VERSION 3.22)
 project(subcheck-qt LANGUAGES CXX)
 
@@ -34,6 +35,18 @@ else()
     set(cargo_root "$ENV{HOME}/.cargo")
 endif()
 find_program(UNIFFI_BINDGEN_CPP uniffi-bindgen-cpp HINTS "${cargo_root}/bin" REQUIRED NO_CACHE)
+# The Qt both CI jobs build with, Arch's and Homebrew's. The standard setup runs moc where it is
+# needed, and puts a QML module's files where `loadFromModule` looks for them.
+find_package(Qt6 6.12 REQUIRED COMPONENTS Quick Test)
+qt_standard_project_setup(REQUIRES 6.12)
+
+# The gui CI job builds with this on, so that its one run of the tests also gives gcovr what they
+# reached. Every target is instrumented; gcovr counts gui/qt/src/ alone.
+option(SUBCHECK_COVERAGE "Build for gcov, as the gui CI job does" OFF)
+if(SUBCHECK_COVERAGE)
+    add_compile_options(--coverage)
+    add_link_options(--coverage)
+endif()
 
 # `subcheck` is for the tests, which seed their runs with a real scan. LOCKED: a build never
 # changes Cargo.lock.
@@ -64,10 +77,36 @@ add_library(subcheck_bindings STATIC ${GENERATED})
 target_include_directories(subcheck_bindings PUBLIC "${BINDINGS_DIR}")
 target_link_libraries(subcheck_bindings PUBLIC subcheck_ffi-static Threads::Threads)
 
-# Our own code is held to these, and a warning in it fails the build.
+# Our own code is held to these, and a warning in it fails the build. So is the C++ Qt generates
+# for a target given them: moc's, and the QML module's type registrations, resources and compiled
+# QML. The module's plugin, a target qt_add_qml_module makes, is not given them.
 function(subcheck_warnings target)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
 endfunction()
+
+# The window's C++ and QML, as the QML module Subcheck on a static library, which the app and the
+# tests link alike. The QML reaches the C++ through the types the module registers, which qmllint
+# checks it against, rather than through context properties, which it cannot see into. The
+# module's files go to a directory named as it, where qmllint looks.
+qt_add_library(subcheck_window STATIC)
+# Main.qml at the module's root, where `loadFromModule` looks, though it sits in qml/ here.
+set_source_files_properties(qml/Main.qml PROPERTIES QT_RESOURCE_ALIAS Main.qml)
+qt_add_qml_module(subcheck_window
+    URI Subcheck
+    VERSION 1.0
+    OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Subcheck"
+    QML_FILES qml/Main.qml
+    SOURCES src/findings_model.h src/findings_model.cpp src/session_bridge.h
+            src/session_bridge.cpp)
+target_include_directories(subcheck_window PUBLIC src)
+target_link_libraries(subcheck_window PUBLIC subcheck_bindings Qt6::Quick)
+subcheck_warnings(subcheck_window)
+
+# The module's plugin, which registers its types: main.cpp imports it by name.
+qt_add_executable(subcheck-qt src/main.cpp)
+target_link_libraries(subcheck-qt PRIVATE subcheck_window subcheck_windowplugin)
+subcheck_warnings(subcheck-qt)
+install(TARGETS subcheck-qt)
 
 enable_testing()
 
@@ -75,10 +114,11 @@ enable_testing()
 # instead of holding CTest, and the CI jobs, for good.
 set(SUBCHECK_TEST_TIMEOUT 60)
 
-# The tests' run, made by the real `subcheck scan` with core's fake LLM over a copy of a fixture,
+# The smoke's run, made by the real `subcheck scan` with core's fake LLM over a copy of a fixture,
 # in a store of the build directory's own: a session given neither variable finds the user's. The
-# smoke decides a finding in it, so a test that counts on the run as seeded needs a copy of its
-# own, or a RESOURCE_LOCK it shares with the smoke: under `ctest -j`, the order would decide.
+# smoke decides a finding in it, so a test that counts on the run as seeded needs a run of its own:
+# CTest seeds a fixture once per run of the tests, and a RESOURCE_LOCK would keep two tests from
+# sharing the store at once, not the smoke's decision from being there when the other starts.
 set(SEEDED "${CMAKE_BINARY_DIR}/seeded")
 add_test(NAME seed_a_run
     COMMAND "${CMAKE_COMMAND}" -D "SUBCHECK=$<TARGET_FILE:subcheck>" -D "REPO_ROOT=${REPO_ROOT}"
@@ -93,3 +133,49 @@ subcheck_warnings(bindings_smoke)
 add_test(NAME bindings_smoke COMMAND bindings_smoke "${SEEDED}/media")
 set_tests_properties(bindings_smoke PROPERTIES
     FIXTURES_REQUIRED seeded_run ENVIRONMENT "${SEEDED_ENV}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+
+# The list's model, on the splices it is given, with no session. Offscreen, as every Qt test here
+# is, so that none opens a window on the desktop of whoever runs them.
+qt_add_executable(findings_model_test tests/findings_model_test.cpp)
+target_link_libraries(findings_model_test PRIVATE subcheck_window Qt6::Test)
+subcheck_warnings(findings_model_test)
+add_test(NAME findings_model_test COMMAND findings_model_test)
+set_tests_properties(findings_model_test PROPERTIES
+    ENVIRONMENT QT_QPA_PLATFORM=offscreen TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+
+# A Qt test of the window's code, `tests/<name>.cpp`, on runs of its own (see the smoke's): two
+# copies of typos.mkv, so that each of its two rows has two members to expand into; and a run with
+# no findings. Their folders, the test's selectors, are SUBCHECK_TEST_MEDIA and SUBCHECK_TEST_CLEAN.
+function(subcheck_window_test name)
+    set(dir "${CMAKE_BINARY_DIR}/seeded-${name}")
+    add_test(NAME seed_${name}
+        COMMAND "${CMAKE_COMMAND}" -D "SUBCHECK=$<TARGET_FILE:subcheck>" -D "REPO_ROOT=${REPO_ROOT}"
+                -D "DIR=${dir}" -D COPIES=2 -D CLEAN=1
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/seed.cmake")
+    set_tests_properties(seed_${name} PROPERTIES
+        FIXTURES_SETUP ${name}_run TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+    qt_add_executable(${name} tests/${name}.cpp)
+    target_link_libraries(${name} PRIVATE subcheck_window subcheck_windowplugin Qt6::Test)
+    subcheck_warnings(${name})
+    add_test(NAME ${name} COMMAND ${name})
+    set(env "SUBCHECK_DB=${dir}/subcheck.db" "XDG_STATE_HOME=${dir}/state"
+        "SUBCHECK_TEST_MEDIA=${dir}/media" "SUBCHECK_TEST_CLEAN=${dir}/clean"
+        QT_QPA_PLATFORM=offscreen)
+    set_tests_properties(${name} PROPERTIES
+        FIXTURES_REQUIRED ${name}_run ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+endfunction()
+
+subcheck_window_test(session_bridge_test)
+subcheck_window_test(window_test)
+
+# The app itself: one binary, and wired as main.cpp means it to be.
+add_test(NAME one_binary
+    COMMAND "${CMAKE_COMMAND}" -D "APP=$<TARGET_FILE:subcheck-qt>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/one_binary.cmake")
+set_tests_properties(one_binary PROPERTIES TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+add_test(NAME app_starts
+    COMMAND "${CMAKE_COMMAND}" -D "APP=$<TARGET_FILE:subcheck-qt>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/app_starts.cmake")
+set_tests_properties(app_starts PROPERTIES
+    FIXTURES_REQUIRED seeded_run ENVIRONMENT "${SEEDED_ENV};QT_QPA_PLATFORM=offscreen"
+    TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
