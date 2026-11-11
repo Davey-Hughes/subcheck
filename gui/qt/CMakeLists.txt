@@ -36,7 +36,7 @@ else()
 endif()
 find_program(UNIFFI_BINDGEN_CPP uniffi-bindgen-cpp HINTS "${cargo_root}/bin" REQUIRED NO_CACHE)
 # The Qt both CI jobs build with, Arch's and Homebrew's. The standard setup runs moc where it is
-# needed, and puts a QML module's files where `loadFromModule` looks for them.
+# needed, and gives a QML module's files the resource prefix that `loadFromModule` looks under.
 find_package(Qt6 6.12 REQUIRED COMPONENTS Quick Test)
 qt_standard_project_setup(REQUIRES 6.12)
 
@@ -87,14 +87,17 @@ endfunction()
 # The window's C++ and QML, as the QML module Subcheck on a static library, which the app and the
 # tests link alike. The QML reaches the C++ through the types the module registers, which qmllint
 # checks it against, rather than through context properties, which it cannot see into. The
-# module's files go to a directory named as it, where qmllint looks.
+# module's files go to qml/Subcheck, whose parent qmllint is given as an import path, and not to
+# Subcheck beside the build's other products: where a filesystem ignores case, as macOS's does by
+# default, that is one name with the `subcheck` that Corrosion copies there and the tests' seed
+# runs, and the copy then lands inside the module's directory.
 qt_add_library(subcheck_window STATIC)
 # Main.qml at the module's root, where `loadFromModule` looks, though it sits in qml/ here.
 set_source_files_properties(qml/Main.qml PROPERTIES QT_RESOURCE_ALIAS Main.qml)
 qt_add_qml_module(subcheck_window
     URI Subcheck
     VERSION 1.0
-    OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Subcheck"
+    OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/qml/Subcheck"
     QML_FILES qml/Main.qml
     SOURCES src/findings_model.h src/findings_model.cpp src/session_bridge.h
             src/session_bridge.cpp)

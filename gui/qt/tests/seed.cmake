@@ -12,6 +12,14 @@ foreach(var SUBCHECK REPO_ROOT DIR)
         message(FATAL_ERROR "seed.cmake: ${var} is not set")
     endif()
 endforeach()
+# On a filesystem that ignores case, a directory whose name differs from the executable's only by
+# case is the same path, and running it fails with no more than "permission denied": this says
+# what happened, and what to do.
+if(IS_DIRECTORY "${SUBCHECK}")
+    message(FATAL_ERROR "seed.cmake: ${SUBCHECK} is a directory, not subcheck: on a filesystem "
+        "that ignores case, something in the build directory takes its name in another case. "
+        "Remove the build directory and build again.")
+endif()
 file(REMOVE_RECURSE "${DIR}")
 file(MAKE_DIRECTORY "${DIR}/media" "${DIR}/state")
 set(fixture "${REPO_ROOT}/core/tests/fixtures/typos.mkv")
