@@ -4,11 +4,12 @@
 # rustup finds this file from the working directory upward, so it governs every cargo run inside
 # the repository.
 #
-# To move on: change `channel` here and the `image: rust:<version>-bookworm` line in
-# .forgejo/workflows/ci.yml with it. A mismatch still builds with this version -- rustup honours
-# the file inside the image too -- but the job then downloads it first. An editor's
-# rust-analyzer, through rustup's proxy, needs `rustup component add rust-analyzer` after a bump;
-# it is not listed below because CI would then download it in every job.
+# To move on: change `channel` here and, with it, the `image: rust:<version>-bookworm` lines in
+# .forgejo/workflows/ci.yml and .forgejo/workflows/advisories.yml. A mismatch still runs this
+# version -- rustup honours the file inside the image too, and the advisories job installs its
+# channel -- but the jobs then download it first. An editor's rust-analyzer, through rustup's
+# proxy, needs `rustup component add rust-analyzer` after a bump; it is not listed below because
+# CI would then download it in every job.
 [toolchain]
 channel = "1.99.1"
 profile = "minimal"

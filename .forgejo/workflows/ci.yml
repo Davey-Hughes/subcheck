@@ -39,10 +39,11 @@ env:
 # rather than the public hostname.
 #
 # The subcheck job runs in rust:1.99.1-bookworm, the version rust-toolchain.toml
-# names, and the two move together. A floating rust:1-bookworm lets the runner
-# keep whatever copy it pulled last. An exact tag cannot go stale, and with it
-# matching the file rustup has nothing to download in the job. Should they ever
-# differ, the file wins: rustup honours it inside the image too.
+# names, as does advisories.yml's job, and all three move together (the file
+# says how). A floating rust:1-bookworm lets the runner keep whatever copy it
+# pulled last. An exact tag cannot go stale, and with it matching the file
+# rustup has nothing to download in the job. Should they ever differ, the file
+# wins: rustup honours it inside the image too.
 
 jobs:
   # The `apply` tests remux with mkvmerge and the `audio` tests decode with

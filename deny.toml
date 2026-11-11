@@ -1,0 +1,28 @@
+# cargo-deny's configuration. .forgejo/workflows/advisories.yml runs the advisories check against
+# it, and so can you, checking the same graph CI does:
+#
+#   cargo deny --locked check advisories
+#
+# Only that check is configured here. A bare `cargo deny check` runs all four, and licenses, which
+# this file does not configure, then rejects every dependency.
+#
+# `[graph]` turns every feature of the workspace's crates on, so a dependency behind a feature is
+# checked however the crates are built. It is set here rather than on the command line so that the
+# local command and CI check the same graph.
+#
+# `[advisories]` keeps cargo-deny 0.20.2's defaults but one: a vulnerability, notice or unmaintained
+# advisory fails the check, and so does an unsound one on any crate. That is `unsound = "all"`; the
+# default, "workspace", drops unsound advisories on crates outside the workspace without even a
+# note. A yanked crate only warns. How to accept a finding, by an `ignore` entry or for everything
+# at once, is in the workflow's header.
+#
+# This Cargo.lock is the one checked. The uniffi-bindgen-cpp the gui jobs install is built from a
+# lockfile of its own, and is not checked: it is a build tool, run over our own code, and what
+# ships of it is the C++ it generates, not its crates.
+
+[graph]
+all-features = true
+
+[advisories]
+unsound = "all"
+ignore = []

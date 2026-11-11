@@ -89,6 +89,14 @@ cmake --build ~/.cache/subcheck-qt-build --target subcheck-qt
 ~/.cache/subcheck-qt-build/subcheck-qt
 ```
 
+CI also checks `Cargo.lock` against the [RustSec](https://rustsec.org) advisory database, in a
+workflow of its own, `.forgejo/workflows/advisories.yml`: weekly, after each merge to main, and on
+a pull request that changes one of the files the workflow lists. A new advisory can turn it red
+with nothing changed here, so no merge waits on it. To run it locally, install
+[cargo-deny](https://github.com/EmbarkStudios/cargo-deny) and run
+`cargo deny --locked check advisories`, which reads `deny.toml`. How to accept a finding is in the
+workflow's header, the one place that describes it.
+
 This repository's history before 2026-11-02 was in
 [daveyutils](https://github.com/Davey-Hughes/daveyutils): a `(daveyutils#N)` in a commit message is
 that repository's pull request N.

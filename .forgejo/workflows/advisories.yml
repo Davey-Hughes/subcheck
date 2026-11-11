@@ -1,0 +1,174 @@
+name: advisories
+
+# `cargo deny check advisories`: Cargo.lock against the RustSec advisory database, configured by
+# deny.toml, which gives the command to run it locally. Advisories only, not licenses, bans or
+# sources.
+#
+# A workflow of its own, not a job in ci.yml, because it runs on other events (below) and its
+# result can change with no commit: the database it reads is cloned fresh each run. Nor is it a
+# required status, and the path filter below says why it must never become one. So a new advisory
+# turns this red without holding up a merge.
+#
+# Two ways to accept a finding, and they are not alternatives. This is the one place both are
+# described; deny.toml and the README point here.
+#
+#   - One advisory, the normal path: an entry in deny.toml's `ignore` list,
+#       { id = "RUSTSEC-…", reason = "…" },
+#     whose reason says why it is accepted (no fixed release, not reachable, or a fix behind a
+#     major bump) and when to revisit it. It goes through a pull request like any other change.
+#     Every run prints each accepted advisory as a note carrying its reason, so a green run still
+#     says what it let through. An entry that stops matching, because the crate moved past it or
+#     the advisory was withdrawn, prints `warning[advisory-not-detected]`: delete it then.
+#   - Everything, for a while, the emergency path: the repository variable `ADVISORIES_MODE`, set
+#     to `warn` under the repository's Settings → Actions → Variables. The job still runs and
+#     prints every finding as it would fail, then passes, with a `WARN-ONLY MODE` line at the top
+#     of the step and another under any findings. Delete the variable and findings fail again.
+#     Unset, or any value but `warn`, means findings fail; a value that is set and is not `warn`
+#     is named in the log, so a typo cannot pass for a working switch.
+
+on:
+  push:
+    branches: [main]
+  # Pull requests only when they touch what decides the graph or this job: the manifests,
+  # Cargo.lock, deny.toml, rust-toolchain.toml (whose channel the job runs), the cargo config
+  # (which can change the resolved graph and the index it is read from) or this file. Unfiltered,
+  # an advisory published today would turn every open pull request red for a change none of them
+  # made. A push to main, the schedule and a dispatch stay unfiltered: they are what catch a new
+  # advisory against an unchanged Cargo.lock.
+  #
+  # The filter is also why this must never become a required status: a pull request that touches
+  # none of these never reports it, so a required check would leave that pull request pending for
+  # ever.
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+      - ".cargo/config"
+      - ".forgejo/workflows/advisories.yml"
+  workflow_dispatch:
+  # Weekly, Mondays 15:00 UTC, so that an advisory published against a Cargo.lock nobody has
+  # touched is heard of in a week when nothing merges.
+  schedule:
+    - cron: "0 15 * * 1"
+
+# The event is in the key, so a push, the schedule and a dispatch on main never cancel one
+# another: a weekly run cut short by a merge would be a week's check that never finished. A newer
+# push to a pull request still cancels that pull request's older run.
+concurrency:
+  group: advisories-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: docker
+    # A hang fails the job rather than holding the runner until its own limit. Nothing compiles, so
+    # the time is downloads, all cold as nothing is cached: the cargo-deny release, the advisory
+    # database, the crates `cargo metadata` reads.
+    timeout-minutes: 20
+    # The subcheck job's image, and its clone by hand, which ci.yml's header explains. With that
+    # image the runner keeps one copy, the toolchain the step below asks for is already in it, and
+    # the job runs neither a rustup installer fetched at run time nor a JavaScript action's code.
+    # rust-toolchain.toml says to bump it with ci.yml's.
+    container:
+      image: rust:1.99.1-bookworm
+    steps:
+      - name: Checkout
+        env:
+          TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          host="${FORGEJO_SERVER_URL#http://}"; host="${host#https://}"
+          scheme="${FORGEJO_SERVER_URL%%://*}"
+          git init -q .
+          git remote add origin "${scheme}://x-access-token:${TOKEN}@${host}/${FORGEJO_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "$FORGEJO_REF"
+          git checkout -q FETCH_HEAD
+
+      # cargo-deny compiles nothing: it needs cargo, for `cargo metadata`, and nothing else. So the
+      # toolchain is rust-toolchain.toml's channel without the file's components.
+      # `RUSTUP_TOOLCHAIN`, set for every later step, makes rustup ignore the file, so it never
+      # adds rustfmt and clippy for a job that neither formats nor lints. `--no-self-update` keeps
+      # the image's rustup rather than one fetched at run time. A file the sed no longer reads fails
+      # the step rather than guess.
+      - name: Install Rust (rust-toolchain.toml's channel, no components)
+        run: |
+          set -eu
+          channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          : "${channel:?no channel line in rust-toolchain.toml}"
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          RUSTUP_TOOLCHAIN="$channel" cargo --version
+
+      # A prebuilt release, as for cargo-llvm-cov in ci.yml: this job only runs the tool. The musl
+      # build is static, so it runs on bookworm's glibc. The digest is upstream's, from the
+      # `.sha256` the release publishes beside the tarball. It is pinned here rather than fetched
+      # at run time, because whoever can replace a release asset in place can replace its `.sha256`
+      # too. To move on, change the version and the digest together, the digest checked against a
+      # download of the new tarball.
+      - name: Install cargo-deny
+        run: |
+          curl -fsSL -o /tmp/cargo-deny.tar.gz \
+            https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  /tmp/cargo-deny.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/cargo-deny.tar.gz -C /usr/local/bin --strip-components=1 \
+            cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny
+          cargo deny --version
+
+      # Everything the check needs from the network, once, in a step that fails on any error
+      # whatever the mode: the advisory database (`db`, a clone of github.com/RustSec/advisory-db)
+      # and the crates and index entries of the graph (`index`). The check below then runs
+      # `--offline`, so both of its runs read this one snapshot of the database, and a fetch that
+      # fails halfway cannot pass for a finding. `fetch db` alone is not enough: it downloads no
+      # crates, and an `--offline` check on a fresh CARGO_HOME then fails inside `cargo metadata`.
+      - name: Fetch the advisory database and the crate graph
+        run: |
+          set -eu
+          cargo deny --log-level info --locked fetch db index
+          # Informational only, so it can never fail the step.
+          for db in "${CARGO_HOME:-$HOME/.cargo}"/advisory-dbs/*/; do
+            [ -d "$db/.git" ] && git -C "$db" log -1 --format='advisory database snapshot: %H (committed %cI)' || true
+          done
+
+      # `--locked`, so the check reads the committed Cargo.lock rather than a fresh resolve. The
+      # graph is set in deny.toml (`[graph] all-features`), so a local run checks the same one.
+      # `--log-level info` prints each accepted advisory as a note carrying its deny.toml reason.
+      #
+      # Warn mode excuses findings and nothing else. It runs the check as usual first, so the log
+      # shows every finding at the severity that fails it. Only when that fails does it run the
+      # same check again, quietly and just as offline, with `-W` for each kind of finding, which
+      # makes cargo-deny report findings as warnings: if that passes, findings were all that
+      # failed, and the step says so and passes. A broken deny.toml or a stale Cargo.lock already
+      # failed the fetch step, in either mode, so this step never runs on one; anything else that
+      # is not a finding fails the re-run. A switch that swallowed those too would turn "the check
+      # passed" into "the check may not have run".
+      #
+      # Not `-W` on the only run: it relabels the advisories deny.toml accepts as warnings too, and
+      # the log could no longer tell an accepted advisory from one that would fail.
+      #
+      # `set -eu` explicitly rather than the runner's implicit `-e`: the closing WARN-ONLY line
+      # must never print after a failed re-run.
+      - name: Check advisories
+        env:
+          MODE: ${{ vars.ADVISORIES_MODE }}
+        run: |
+          set -eu
+          case "$MODE" in
+            warn) echo "WARN-ONLY MODE: ADVISORIES_MODE=warn, so findings below are reported but do not fail this step" ;;
+            '') ;;
+            *) echo "ADVISORIES_MODE is '$MODE', not 'warn', so findings fail this step as usual" ;;
+          esac
+          rc=0
+          cargo deny --log-level info --locked --offline check --show-stats advisories || rc=$?
+          if [ "$rc" -ne 0 ] && [ "$MODE" = warn ]; then
+            cargo deny --log-level error --locked --offline check \
+              -W vulnerability -W notice -W unmaintained -W unsound -W yanked advisories
+            echo "WARN-ONLY MODE: the check above failed, and passed again with every kind of finding demoted to a warning, so findings are all that failed it. This step passes only because ADVISORIES_MODE=warn; delete the variable to restore the check."
+            rc=0
+          fi
+          exit "$rc"
