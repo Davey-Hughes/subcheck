@@ -38,7 +38,7 @@ rustix = { version = "1", features = ["fs", "process"] }
 # The store: SQLite compiled in (`bundled`), so there is no system library to find, and it builds
 # the same on macOS; it needs a C compiler. `fallible_uint` lets a u64 or usize be a parameter,
 # refused rather than wrapped past i64::MAX.
-rusqlite = { version = "=0.40.2", features = ["bundled", "fallible_uint"] }
+rusqlite = { version = "=0.41.1", features = ["bundled", "fallible_uint"] }
 tempfile = "3"
 # ffi/'s scaffolding, from proc macros alone. Exactly the uniffi that uniffi-bindgen-cpp's tag is
 # built against (`--tag v<bindgen>+v<uniffi>`, in both CI files), since the bindgen reads the
