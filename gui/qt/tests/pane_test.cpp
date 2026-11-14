@@ -1,7 +1,8 @@
 // The video pane on real mpv, on an X display of the test's own, as the mpv of a player whose
 // settle time is far longer than any wait here: only what mpv says, passed on by the pane, can end
 // a move in time. A load and a seek end when playback starts again, a frame step when the position
-// moves, and a load that fails when its file ends on an error. Linux only: Xvfb is X11's.
+// moves, and a load that fails when its file ends on an error. Once closed, the pane is black
+// again. Linux only: Xvfb is X11's.
 #include "desktop_session.h"
 #include "mpv_item.h"
 #include "overloaded.h"
@@ -70,8 +71,32 @@ class PaneTest : public QObject {
     PlayerPort player{std::chrono::seconds(20)};
     QQmlEngine engine;
     std::unique_ptr<QObject> window;
+    MpvItem *pane = nullptr;
     QStringList reports;
     std::string video = qEnvironmentVariable("SUBCHECK_TEST_VIDEO").toStdString();
+
+    // The pane's pixels that are bright, in what the window shows now: the fixture's video is all
+    // but black, so these are a subtitle's. -1 when the grab holds none of the pane, so that a
+    // failed grab is never taken for a black pane.
+    int bright() const {
+        const QImage shot = qobject_cast<QQuickWindow *>(window.get())->grabWindow();
+        const qreal scale = shot.devicePixelRatio();
+        const QRectF area = pane->mapRectToScene(pane->boundingRect());
+        const QRect pixels =
+            QRectF(area.topLeft() * scale, area.size() * scale).toRect() & shot.rect();
+        if (pixels.isEmpty()) {
+            return -1;
+        }
+        int count = 0;
+        for (int y = pixels.top(); y <= pixels.bottom(); ++y) {
+            for (int x = pixels.left(); x <= pixels.right(); ++x) {
+                if (qGray(shot.pixel(x, y)) > 127) {
+                    ++count;
+                }
+            }
+        }
+        return count;
+    }
 
 private slots:
     void initTestCase() {
@@ -85,7 +110,7 @@ private slots:
                           QUrl());
         window.reset(component.create());
         QVERIFY2(window, qPrintable(component.errorString()));
-        auto *pane = window->findChild<MpvItem *>("video");
+        pane = window->findChild<MpvItem *>("video");
         QVERIFY(pane);
         pane->setPlayer(&player);
     }
@@ -130,19 +155,37 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened"}, 5000);
     }
 
-    // A file that is not there: loaded, as it cannot be read, and its end on an error says so.
+    // A file that is not there: loaded, as it cannot be read, and its end on an error says so. The
+    // frame of the file it replaced, a subtitle up, goes with that file: the pane is black.
     void aLoadThatFailsEndsOnItsFileEnding() {
+        QTRY_VERIFY2_WITH_TIMEOUT(bright() > 0, "no subtitle: mpv draws none without a font", 5000);
         reports.clear();
         const std::string gone = QDir::currentPath().toStdString() + "/pane_test-gone.mkv";
         player.run(PlayerCommand(PlayerCommand::kOpen{Moment{gone, 0, std::nullopt, false}}));
         QTRY_COMPARE_WITH_TIMEOUT(
             reports, QStringList{"opened: mpv could not open pane_test-gone.mkv"}, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(bright(), 0, 5000);
     }
 
     void closeStops() {
         reports.clear();
         player.run(PlayerCommand(PlayerCommand::kClose{}));
         QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"closed"}, 5000);
+    }
+
+    // A frame left in the pane would show a file that is no longer open. The pane draws when mpv
+    // asks it to, and mpv need not ask as its video output goes. An open of its own first, at a
+    // moment with a subtitle up, so that there is a frame to lose, as the load that failed left
+    // none. It waits as long as the first: mpv makes its video output again, which Close took.
+    void closeBlanksThePane() {
+        reports.clear();
+        player.run(PlayerCommand(PlayerCommand::kOpen{Moment{video, 2500, 4, true}}));
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened"}, 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(bright() > 0, "no subtitle: mpv draws none without a font", 5000);
+        reports.clear();
+        player.run(PlayerCommand(PlayerCommand::kClose{}));
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"closed"}, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(bright(), 0, 5000);
     }
 };
 

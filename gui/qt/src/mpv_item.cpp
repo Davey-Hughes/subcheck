@@ -33,6 +33,12 @@ MpvItem::MpvItem(QQuickItem *parent) : MpvAbstractItem(parent) {
                 if (port && name == QStringLiteral("time-pos") && value.isValid()) {
                     port->moved();
                 }
+                // The pane shows what it last drew until it draws again, and MpvQt draws only when
+                // mpv asks; mpv need not ask as its video output goes, when a file is closed or
+                // plays to its end. Drawn then, as if mpv had asked, with no video, it is black.
+                if (name == QStringLiteral("vo-configured") && !value.toBool()) {
+                    requestUpdateFromRenderer();
+                }
             });
     connect(mpv, &MpvController::endFile, this, [this](const QString &reason) {
         if (port) {
@@ -40,6 +46,7 @@ MpvItem::MpvItem(QQuickItem *parent) : MpvAbstractItem(parent) {
         }
     });
     observeProperty(QStringLiteral("time-pos"), MPV_FORMAT_DOUBLE);
+    observeProperty(QStringLiteral("vo-configured"), MPV_FORMAT_FLAG);
 }
 
 // The player outlives the window that shows this pane, and must not send it requests after.

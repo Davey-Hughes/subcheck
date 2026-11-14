@@ -72,8 +72,9 @@ clang-format, Qt 6.12 (Quick, Test and qmllint), [MpvQt](https://invent.kde.org/
 [uniffi-bindgen-cpp](https://github.com/NordSecurity/uniffi-bindgen-cpp), installed with
 `cargo install` at the tag CI installs; it stops first, naming the command, when the bindgen is
 missing or at another tag. On Linux, two tests run real mpv, each on an X display of its own, the
-pane's and the app's end to end, so the script needs Xvfb and xdotool there too; those displays
-are the tests' alone, and nothing they play makes a sound.
+pane's and the app's end to end, so the script needs Xvfb and xdotool there too, and a font, which
+mpv needs to draw the subtitle the pane's test looks for; those displays are the tests' alone, and
+nothing they play makes a sound.
 
 The app is `subcheck-qt [run | paths…]`, which takes the run or paths `subcheck review` takes. It
 lists the findings on the left and plays them on the right: `j` and `k` (or the up and down

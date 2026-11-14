@@ -186,12 +186,14 @@ jobs:
       # provides; without rustup here, that is Arch's rust package, which ignores
       # rust-toolchain.toml. The check is that rustup is what provides it: `pacman -Q` answers for
       # whichever package does. mpvqt for the video pane, with mpv; and for the tests on real mpv,
-      # X servers of their own (Xvfb), drawn with Mesa's software OpenGL, and xdotool for keys.
+      # X servers of their own (Xvfb), drawn with Mesa's software OpenGL, xdotool for keys, and a
+      # font, as the image has none and mpv draws no subtitle without one: pane_test looks for a
+      # subtitle in the pane.
       - name: Install the tools
         run: |
           pacman-key --init
           pacman -Sy --noconfirm archlinux-keyring
-          pacman -Su --noconfirm --needed git rustup cmake ninja clang corrosion qt6-base qt6-declarative gcovr mpv mpvqt mesa xorg-server-xvfb xdotool
+          pacman -Su --noconfirm --needed git rustup cmake ninja clang corrosion qt6-base qt6-declarative gcovr mpv mpvqt mesa xorg-server-xvfb xdotool ttf-dejavu
           [ "$(pacman -Qq rust)" = rustup ] || {
             echo "error: Arch's rust package came in, and ignores rust-toolchain.toml" >&2
             exit 1
