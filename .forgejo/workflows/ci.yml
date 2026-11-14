@@ -154,17 +154,19 @@ jobs:
       - name: Doctests
         run: cargo test --doc
 
-  # The Qt app (gui/qt/): its C++ bindings to ffi/, generated at build time, its window, and its
-  # tests, with a floor under the share of the window's C++ lines they reach. Not a merge gate:
-  # branch protection requires `CI / subcheck (pull_request)` alone, by that exact name. It runs on
-  # Arch, the desktop the app is built for first, with packages as new as that desktop's. Two things
-  # can break it with no change in the repository: an Arch upgrade, and the image, which this runner
-  # keeps as it first pulled it, so that every run upgrades an older copy (hence the keyring first,
-  # below). If either gets noisy, pin the image to a dated Arch Linux Archive snapshot. Nothing is
-  # cached, as this runner runs no JS actions, so the bindgen compiles every time. No path filter
-  # either: a change to core can break ffi/ or the app. It waits for `subcheck`, so that the gating
-  # job's result comes first, and the two of one run never build side by side on the one machine
-  # this runner shares. dev/check-gui.sh runs these same steps locally: change it with this job.
+  # The Qt app (gui/qt/): its C++ bindings to ffi/, generated at build time, its window and its
+  # video, and its tests, with a floor under the share of the window's C++ lines they reach; two of
+  # them run real mpv, each on a display of its own: the pane's, and the app's end to end. Not a
+  # merge gate: branch protection requires `CI / subcheck (pull_request)` alone, by that exact
+  # name. It runs on Arch, the desktop the app is built for first, with packages as new as that
+  # desktop's. Two things can break it with no change in the repository: an Arch upgrade, and the
+  # image, which this runner keeps as it first pulled it, so that every run upgrades an older copy
+  # (hence the keyring first, below). If either gets noisy, pin the image to a dated Arch Linux
+  # Archive snapshot. Nothing is cached, as this runner runs no JS actions, so the bindgen
+  # compiles every time. No path filter either: a change to core can break ffi/ or the app. It
+  # waits for `subcheck`, so that the gating job's result comes first, and the two of one run never
+  # build side by side on the one machine this runner shares. dev/check-gui.sh runs these same
+  # steps locally: change it with this job.
   gui:
     name: gui
     needs: subcheck
@@ -183,12 +185,13 @@ jobs:
       # git for the checkout, which the image lacks. corrosion depends on `rust`, which rustup
       # provides; without rustup here, that is Arch's rust package, which ignores
       # rust-toolchain.toml. The check is that rustup is what provides it: `pacman -Q` answers for
-      # whichever package does.
+      # whichever package does. mpvqt for the video pane, with mpv; and for the tests on real mpv,
+      # X servers of their own (Xvfb), drawn with Mesa's software OpenGL, and xdotool for keys.
       - name: Install the tools
         run: |
           pacman-key --init
           pacman -Sy --noconfirm archlinux-keyring
-          pacman -Su --noconfirm --needed git rustup cmake ninja clang corrosion qt6-base qt6-declarative gcovr
+          pacman -Su --noconfirm --needed git rustup cmake ninja clang corrosion qt6-base qt6-declarative gcovr mpv mpvqt mesa xorg-server-xvfb xdotool
           [ "$(pacman -Qq rust)" = rustup ] || {
             echo "error: Arch's rust package came in, and ignores rust-toolchain.toml" >&2
             exit 1
@@ -239,17 +242,19 @@ jobs:
 
       # A warning in our C++, or in the C++ Qt generates for it, fails the build; one in the
       # bindings' generated .cpp, or in the QML plugin's, does not, as gui/qt/CMakeLists.txt says.
-      # Then the tests, which seed their runs with a real scan. Finding no tests fails the step, as
-      # CTest alone passes with none run.
+      # Then the tests, which seed their runs with a real scan, the two on real mpv among them.
+      # Finding no tests fails the step, as CTest alone passes with none run.
       - run: cmake --build build
       - run: ctest --test-dir build --output-on-failure --no-tests=error
 
       # The share of our C++'s lines the tests reach (gui/qt/src/, less main.cpp, which only wires
-      # the parts together, and which app_starts runs), and the floor it must not fall under, as
-      # the Rust's in the subcheck job. A line counts as reached when any copy of it the compiler
-      # made ran: a destructor's line has one per kind of destructor, and the deleting one never
-      # runs here. gcovr says when the share is under the floor. dev/check-gui.sh reads the floor
-      # out of the `cpp_floor=` line below, so it stays the one such line in this file.
+      # the parts together, and which app_starts and the end-to-end test run), and the floor it
+      # must not fall under, as the Rust's in the subcheck job. The app that the end-to-end test
+      # runs is built for gcov too, so the lines it reaches count. A line counts as reached when
+      # any copy of it the compiler made ran: a destructor's line has one per kind of destructor,
+      # and the deleting one never runs here. gcovr says when the share is under the floor.
+      # dev/check-gui.sh reads the floor out of the `cpp_floor=` line below, so it stays the one
+      # such line in this file.
       - name: C++ coverage
         run: |
           cpp_floor=90

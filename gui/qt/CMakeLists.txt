@@ -39,6 +39,8 @@ find_program(UNIFFI_BINDGEN_CPP uniffi-bindgen-cpp HINTS "${cargo_root}/bin" REQ
 # needed, and gives a QML module's files the resource prefix that `loadFromModule` looks under.
 find_package(Qt6 6.12 REQUIRED COMPONENTS Quick Test)
 qt_standard_project_setup(REQUIRES 6.12)
+# The video pane: MpvQt, as Arch packages it and the macOS job builds it.
+find_package(MpvQt 1.2.1 REQUIRED)
 
 # The gui CI job builds with this on, so that its one run of the tests also gives gcovr what they
 # reached. Every target is instrumented; gcovr counts gui/qt/src/ alone.
@@ -92,17 +94,16 @@ endfunction()
 # default, that is one name with the `subcheck` that Corrosion copies there and the tests' seed
 # runs, and the copy then lands inside the module's directory.
 qt_add_library(subcheck_window STATIC)
-# Main.qml at the module's root, where `loadFromModule` looks, though it sits in qml/ here.
-set_source_files_properties(qml/Main.qml PROPERTIES QT_RESOURCE_ALIAS Main.qml)
 qt_add_qml_module(subcheck_window
     URI Subcheck
     VERSION 1.0
     OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/qml/Subcheck"
     QML_FILES qml/Main.qml
     SOURCES src/findings_model.h src/findings_model.cpp src/session_bridge.h
-            src/session_bridge.cpp)
+            src/session_bridge.cpp src/player_port.h src/player_port.cpp src/mpv_item.h
+            src/mpv_item.cpp src/overloaded.h)
 target_include_directories(subcheck_window PUBLIC src)
-target_link_libraries(subcheck_window PUBLIC subcheck_bindings Qt6::Quick)
+target_link_libraries(subcheck_window PUBLIC subcheck_bindings Qt6::Quick MpvQt::MpvQt)
 subcheck_warnings(subcheck_window)
 
 # The module's plugin, which registers its types: main.cpp imports it by name.
@@ -116,6 +117,21 @@ enable_testing()
 # Every test's limit, in seconds: a session that never sends its next event fails its test,
 # instead of holding CTest, and the CI jobs, for good.
 set(SUBCHECK_TEST_TIMEOUT 60)
+
+# The mpv config of every test that makes the video pane, in place of the user's: MpvQt reads
+# mpvqt/mpvqt.conf in Qt's config location. On Linux that is XDG_CONFIG_HOME. On macOS it is
+# ~/Library/Preferences, under the home CoreFoundation takes from CFFIXED_USER_HOME, which the tests
+# there get as a home of the build directory's, with the same file where MpvQt looks under it.
+# window_test stops when Qt's config location is not the test's, so that a redirect that does not
+# take fails loudly. No sound, whatever a test plays.
+set(TEST_CONFIG "${CMAKE_BINARY_DIR}/test-config")
+file(WRITE "${TEST_CONFIG}/mpvqt/mpvqt.conf" "ao=null\n")
+set(TEST_MPV_ENV "XDG_CONFIG_HOME=${TEST_CONFIG}")
+if(APPLE)
+    set(TEST_HOME "${CMAKE_BINARY_DIR}/test-home")
+    file(WRITE "${TEST_HOME}/Library/Preferences/mpvqt/mpvqt.conf" "ao=null\n")
+    list(APPEND TEST_MPV_ENV "CFFIXED_USER_HOME=${TEST_HOME}")
+endif()
 
 # The smoke's run, made by the real `subcheck scan` with core's fake LLM over a copy of a fixture,
 # in a store of the build directory's own: a session given neither variable finds the user's. The
@@ -146,6 +162,14 @@ add_test(NAME findings_model_test COMMAND findings_model_test)
 set_tests_properties(findings_model_test PROPERTIES
     ENVIRONMENT QT_QPA_PLATFORM=offscreen TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 
+# The player, on a fake mpv, with no session.
+qt_add_executable(player_port_test tests/player_port_test.cpp)
+target_link_libraries(player_port_test PRIVATE subcheck_window Qt6::Test)
+subcheck_warnings(player_port_test)
+add_test(NAME player_port_test COMMAND player_port_test)
+set_tests_properties(player_port_test PROPERTIES
+    ENVIRONMENT QT_QPA_PLATFORM=offscreen TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+
 # A Qt test of the window's code, `tests/<name>.cpp`, on runs of its own (see the smoke's): two
 # copies of typos.mkv, so that each of its two rows has two members to expand into; and a run with
 # no findings. Their folders, the test's selectors, are SUBCHECK_TEST_MEDIA and SUBCHECK_TEST_CLEAN.
@@ -163,7 +187,7 @@ function(subcheck_window_test name)
     add_test(NAME ${name} COMMAND ${name})
     set(env "SUBCHECK_DB=${dir}/subcheck.db" "XDG_STATE_HOME=${dir}/state"
         "SUBCHECK_TEST_MEDIA=${dir}/media" "SUBCHECK_TEST_CLEAN=${dir}/clean"
-        QT_QPA_PLATFORM=offscreen)
+        ${TEST_MPV_ENV} QT_QPA_PLATFORM=offscreen)
     set_tests_properties(${name} PROPERTIES
         FIXTURES_REQUIRED ${name}_run ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 endfunction()
@@ -180,5 +204,61 @@ add_test(NAME app_starts
     COMMAND "${CMAKE_COMMAND}" -D "APP=$<TARGET_FILE:subcheck-qt>"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/app_starts.cmake")
 set_tests_properties(app_starts PROPERTIES
-    FIXTURES_REQUIRED seeded_run ENVIRONMENT "${SEEDED_ENV};QT_QPA_PLATFORM=offscreen"
+    FIXTURES_REQUIRED seeded_run
+    ENVIRONMENT "${SEEDED_ENV};${TEST_MPV_ENV};QT_QPA_PLATFORM=offscreen"
     TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+
+# The tests on real mpv, each on an X display of its own: the pane as the player's mpv
+# (tests/pane_test.cpp), on timing.mkv, the fixture with video; and the app end to end
+# (tests/end_to_end_test.cpp), over a run of it. Linux only, as Xvfb and xdotool are X11's: the gui
+# job runs them, and gui-macos does not.
+if(NOT APPLE)
+    find_program(XVFB Xvfb REQUIRED)
+    find_program(XDOTOOL xdotool REQUIRED)
+    find_package(Qt6 6.12 REQUIRED COMPONENTS Network)
+    qt_add_executable(pane_test tests/pane_test.cpp)
+    target_link_libraries(pane_test PRIVATE subcheck_window subcheck_windowplugin Qt6::Test)
+    subcheck_warnings(pane_test)
+    add_test(NAME pane_test COMMAND pane_test)
+    set(env "SUBCHECK_TEST_VIDEO=${REPO_ROOT}/core/tests/fixtures/timing.mkv"
+        "SUBCHECK_TEST_DIR=${CMAKE_BINARY_DIR}/pane_test-run" "SUBCHECK_XVFB=${XVFB}"
+        "XDG_CONFIG_HOME=${TEST_CONFIG}")
+    set_tests_properties(pane_test PROPERTIES ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+
+    set(dir "${CMAKE_BINARY_DIR}/seeded-end_to_end_test")
+    add_test(NAME seed_end_to_end_test
+        COMMAND "${CMAKE_COMMAND}" -D "SUBCHECK=$<TARGET_FILE:subcheck>" -D "REPO_ROOT=${REPO_ROOT}"
+                -D "DIR=${dir}" -D FIXTURE=timing.mkv
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/seed.cmake")
+    set_tests_properties(seed_end_to_end_test PROPERTIES
+        FIXTURES_SETUP end_to_end_run TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+    qt_add_executable(end_to_end_test tests/end_to_end_test.cpp)
+    target_link_libraries(end_to_end_test PRIVATE Qt6::Network Qt6::Test)
+    subcheck_warnings(end_to_end_test)
+    add_test(NAME end_to_end_test COMMAND end_to_end_test)
+    set(env "SUBCHECK_DB=${dir}/subcheck.db" "XDG_STATE_HOME=${dir}/state"
+        "SUBCHECK_TEST_MEDIA=${dir}/media" "SUBCHECK_TEST_DIR=${dir}"
+        "SUBCHECK_QT=$<TARGET_FILE:subcheck-qt>" "SUBCHECK_XVFB=${XVFB}"
+        "SUBCHECK_XDOTOOL=${XDOTOOL}")
+    set_tests_properties(end_to_end_test PROPERTIES
+        FIXTURES_REQUIRED end_to_end_run ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+endif()
+
+# Every test runs with none of a desktop session's variables, as in CI, which has none. Qt's
+# offscreen platform still opens $DISPLAY for OpenGL when it is set, so a run from a desktop's
+# terminal would make GL contexts on the desktop's X server, and window_test's mpv, which offscreen
+# never becomes ready, could become ready there; the bus, theme and session names would reach the
+# desktop's too. pane_test and end_to_end_test name their own display after, for their own
+# processes. The names are tests/desktop_session.h's exact ones, its twin, and the two change
+# together; CMake cannot match the header's prefixes, KDE_ and XDG_SESSION_, so of those only the
+# names Qt reads are here. Appended, so that a test's own modifications stay. The last statement in
+# this file, as it reaches only the tests above it.
+set(DESKTOP_SESSION_NAMES DISPLAY WAYLAND_DISPLAY PULSE_SERVER PIPEWIRE_REMOTE
+    DBUS_SESSION_BUS_ADDRESS AT_SPI_BUS_ADDRESS XDG_CURRENT_DESKTOP QT_QPA_PLATFORMTHEME
+    SESSION_MANAGER DESKTOP_SESSION ICEAUTHORITY XAUTHORITY XDG_SEAT XDG_VTNR
+    KDE_FULL_SESSION KDE_SESSION_VERSION XDG_SESSION_TYPE)
+list(TRANSFORM DESKTOP_SESSION_NAMES APPEND "=unset:" OUTPUT_VARIABLE unset_desktop_session)
+get_property(tests DIRECTORY PROPERTY TESTS)
+foreach(test IN LISTS tests)
+    set_property(TEST ${test} APPEND PROPERTY ENVIRONMENT_MODIFICATION ${unset_desktop_session})
+endforeach()

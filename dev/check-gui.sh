@@ -9,11 +9,12 @@
 # The job's steps, in its order, with its commands; when a step changes there, change it here.
 # check-all.sh stays Rust-only, so that it still works on a machine without the C++ tools.
 #
-# Needs cmake, ninja, clang-format, Corrosion, Qt 6.12 (Quick, Test and qmllint), gcovr with the
-# gcov of the compiler CMake picks, and the bindgen at CI's tag, installed with `cargo install`
-# (the error says how). The build directory is SUBCHECK_GUI_BUILD, or one per checkout under the
-# XDG cache: a CMake build directory belongs to one source directory, and it is large, with a
-# build of the Rust inside.
+# Needs cmake, ninja, clang-format, Corrosion, Qt 6.12 (Quick, Test and qmllint), MpvQt 1.2.1 with
+# mpv 0.38 or later, gcovr with the gcov of the compiler CMake picks, and the bindgen at CI's tag,
+# installed with `cargo install` (the error says how); on Linux, Xvfb and xdotool for the tests on
+# real mpv, each on a display of its own. The build directory is SUBCHECK_GUI_BUILD, or one per
+# checkout under the XDG cache: a CMake build directory belongs to one source directory, and it is
+# large, with a build of the Rust inside.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 

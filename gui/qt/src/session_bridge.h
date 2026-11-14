@@ -3,6 +3,7 @@
 #pragma once
 
 #include "findings_model.h"
+#include "player_port.h"
 #include "subcheck_ffi.hpp"
 
 #include <QObject>
@@ -30,13 +31,16 @@ class SessionBridge : public QObject {
     Q_PROPERTY(int selected READ selected NOTIFY summaryChanged)
     Q_PROPERTY(bool empty READ empty NOTIFY summaryChanged)
     Q_PROPERTY(QString fatal READ fatal NOTIFY fatalChanged)
+    // The player, which the video pane is the mpv of.
+    Q_PROPERTY(PlayerPort *player READ player CONSTANT)
 
 public:
-    // `selector` is `subcheck review`'s: a run, or paths. The end's text goes to `out` and `err`,
-    // as the terminal's does to stdout and stderr. `wait` is how long a quit gives review to end
-    // before the session is closed.
-    SessionBridge(std::vector<std::string> selector, std::ostream &out, std::ostream &err,
-                  std::chrono::milliseconds wait, QObject *parent = nullptr);
+    // `selector` is `subcheck review`'s: a run, or paths. `player` runs review's player commands,
+    // and stops when review ends. The end's text goes to `out` and `err`, as the terminal's does
+    // to stdout and stderr. `wait` is how long a quit gives review to end before the session is
+    // closed, and the window ends anyway.
+    SessionBridge(std::vector<std::string> selector, PlayerPort &player, std::ostream &out,
+                  std::ostream &err, std::chrono::milliseconds wait, QObject *parent = nullptr);
     // Lets go of the session as every way out does, should the bridge go first.
     ~SessionBridge() override;
 
@@ -45,6 +49,7 @@ public:
     void start();
 
     FindingsModel *findings();
+    PlayerPort *player();
     QString title() const;
     QString statusLine() const;
     int selected() const;
@@ -63,6 +68,10 @@ public:
     void accept();
     void reject();
     void undo();
+    // The selected entry's moment in the video pane; closing it; and the playback keys'.
+    void play();
+    void closePlayer();
+    void playback(subcheck_ffi::Playback playback);
     // Asks review to end, and says so on the status line until it has. If it has not within the
     // bridge's wait, the session is closed and the window ends anyway, with status 1: what the
     // last decisions came to is unknown.
@@ -81,7 +90,6 @@ signals:
 private:
     void apply(const subcheck_ffi::Event &event);
     void changed(const subcheck_ffi::Event::kChanged &change);
-    void refuse(const subcheck_ffi::PlayerCommand &command);
     void ended(const subcheck_ffi::Event::kEnded &end);
     template <typename Call> void guarded(Call call);
     void send(subcheck_ffi::Action action);
@@ -92,6 +100,7 @@ private:
     void finish(int status);
 
     std::vector<std::string> selector;
+    PlayerPort &port;
     std::ostream &out;
     std::ostream &err;
     FindingsModel list;

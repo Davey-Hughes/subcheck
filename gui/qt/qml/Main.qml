@@ -1,5 +1,6 @@
-// The window: the findings above the status line, and the fatal end's dialog.
-// Layout and bindings only; what a key or a click does is the bridge's (session_bridge.cpp).
+// The window: the findings on the left, the video on the right, the status line under both, and
+// the fatal end's dialog. Layout and bindings only; what a key or a click does is the bridge's
+// (session_bridge.cpp), and what the video shows the player's (player_port.cpp).
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -27,9 +28,9 @@ ApplicationWindow {
 
         objectName: "findings"
         anchors.left: parent.left
-        anchors.right: parent.right
         anchors.top: parent.top
         anchors.bottom: statusLine.top
+        width: parent.width * 0.4
         clip: true
         focus: true
         model: window.bridge.findings
@@ -61,6 +62,16 @@ ApplicationWindow {
                 onTapped: window.bridge.select(parent.index)
             }
         }
+    }
+
+    // Black until something plays, and again once it is closed.
+    MpvItem {
+        objectName: "video"
+        anchors.left: list.right
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: statusLine.top
+        player: window.bridge.player
     }
 
     Label {

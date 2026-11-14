@@ -67,11 +67,24 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
       - run: rustc --version
-      # Qt's two formulae the app uses, not `qt`, which is every Qt module.
-      - run: brew install qtbase qtdeclarative corrosion ninja
+      # Qt's two formulae the app uses, not `qt`, which is every Qt module; mpv, whose library
+      # draws the video; and for MpvQt's build, KDE's CMake modules and pkgconf, which its
+      # FindLibmpv.cmake runs and the runner's image need not have.
+      - run: brew install qtbase qtdeclarative mpv extra-cmake-modules pkgconf corrosion ninja
+      # MpvQt, which Homebrew does not package, at the release Arch's package is, checked by its
+      # commit, as a tag can move. Built outside the checkout, so nothing of it is in build/.
+      - name: Build MpvQt
+        run: |
+          git clone -q --depth 1 --branch v1.2.1 https://invent.kde.org/libraries/mpvqt.git "$RUNNER_TEMP/mpvqt-src"
+          expected=8a4d1ae9d1a1c5c94cd96bccb5330b83c1704b99
+          found=$(git -C "$RUNNER_TEMP/mpvqt-src" rev-parse HEAD)
+          [ "$found" = "$expected" ] || { echo "error: MpvQt's tag v1.2.1 is at $found, not $expected" >&2; exit 1; }
+          cmake -S "$RUNNER_TEMP/mpvqt-src" -B "$RUNNER_TEMP/mpvqt-build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/mpvqt" -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+          cmake --build "$RUNNER_TEMP/mpvqt-build"
+          cmake --install "$RUNNER_TEMP/mpvqt-build"
       - name: Install uniffi-bindgen-cpp
         run: cargo install uniffi-bindgen-cpp --git https://github.com/NordSecurity/uniffi-bindgen-cpp --tag v0.10.0+v0.31.0 --locked
-      - run: cmake -S gui/qt -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+      - run: cmake -S gui/qt -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/mpvqt;$(brew --prefix)"
       - name: qmllint
         run: cmake --build build --target all_qmllint
       - run: cmake --build build

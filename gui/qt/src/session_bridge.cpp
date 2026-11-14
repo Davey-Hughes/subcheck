@@ -1,5 +1,7 @@
 #include "session_bridge.h"
 
+#include "overloaded.h"
+
 #include <chrono>
 #include <exception>
 #include <utility>
@@ -9,23 +11,17 @@ using namespace subcheck_ffi;
 
 namespace {
 
-template <typename... F> struct Overloaded : F... {
-    using F::operator()...;
-};
-
-// What a player command that comes anyway is told: no action this window offers makes one, as
-// only Play, ClosePlayer and Playback do, and the player comes with the video.
-const char *const noPlayer = "this window has no player yet";
-
 // What an error that gives no reason says. A failure is known by its text alone: the dialog, the
 // one way out of a failed review, shows only with text, and quit and dismiss look for it.
 const char *const noReason = "review ended on an error that gave no reason";
 
 } // namespace
 
-SessionBridge::SessionBridge(std::vector<std::string> selector, std::ostream &out,
-                             std::ostream &err, std::chrono::milliseconds wait, QObject *parent)
-    : QObject(parent), selector(std::move(selector)), out(out), err(err) {
+SessionBridge::SessionBridge(std::vector<std::string> selector, PlayerPort &player,
+                             std::ostream &out, std::ostream &err, std::chrono::milliseconds wait,
+                             QObject *parent)
+    : QObject(parent), selector(std::move(selector)), port(player), out(out), err(err) {
+    connect(&port, &PlayerPort::reported, this, &SessionBridge::report);
     // Queued: each event the pump reads is applied on this object's thread, in the pump's order.
     connect(this, &SessionBridge::eventArrived, this, &SessionBridge::apply, Qt::QueuedConnection);
     // Precise, as a coarse timer may fire early, before review has had the whole wait.
@@ -69,6 +65,8 @@ void SessionBridge::start() {
 
 FindingsModel *SessionBridge::findings() { return &list; }
 
+PlayerPort *SessionBridge::player() { return &port; }
+
 QString SessionBridge::title() const {
     return opened ? QString::fromStdString(summary.title) : QStringLiteral("subcheck");
 }
@@ -111,6 +109,24 @@ bool SessionBridge::key(int key, const QString &text) {
         reject();
     } else if (text == u"u") {
         undo();
+    } else if (text == u"o") {
+        play();
+    } else if (text == u"O") {
+        closePlayer();
+    } else if (key == Qt::Key_Space) {
+        playback(Playback(Playback::kPause{}));
+    } else if (key == Qt::Key_Left) {
+        playback(Playback(Playback::kSeek{-5}));
+    } else if (key == Qt::Key_Right) {
+        playback(Playback(Playback::kSeek{5}));
+    } else if (text == u",") {
+        playback(Playback(Playback::kSeek{-1}));
+    } else if (text == u".") {
+        playback(Playback(Playback::kSeek{1}));
+    } else if (text == u"[") {
+        playback(Playback(Playback::kPreviousFrame{}));
+    } else if (text == u"]") {
+        playback(Playback(Playback::kNextFrame{}));
     } else if (text == u"q") {
         quit();
     } else {
@@ -139,6 +155,14 @@ void SessionBridge::accept() { send(Action(Action::kAccept{})); }
 void SessionBridge::reject() { send(Action(Action::kReject{})); }
 
 void SessionBridge::undo() { send(Action(Action::kUndo{})); }
+
+void SessionBridge::play() { send(Action(Action::kPlay{})); }
+
+void SessionBridge::closePlayer() { send(Action(Action::kClosePlayer{})); }
+
+void SessionBridge::playback(Playback playback) {
+    send(Action(Action::kPlayback{std::move(playback)}));
+}
 
 void SessionBridge::quit() {
     // With the fatal end's dialog up, closing the window is closing the dialog.
@@ -171,7 +195,7 @@ void SessionBridge::apply(const Event &event) {
     }
     std::visit(Overloaded{
                    [this](const Event::kChanged &change) { changed(change); },
-                   [this](const Event::kPlayer &player) { refuse(player.v1); },
+                   [this](const Event::kPlayer &player) { port.run(player.v1); },
                    [this](const Event::kEnded &end) { ended(end); },
                },
                event.get_variant());
@@ -185,21 +209,6 @@ void SessionBridge::changed(const Event::kChanged &change) {
     summary = change.summary;
     opened = true;
     emit summaryChanged();
-}
-
-void SessionBridge::refuse(const PlayerCommand &command) {
-    std::visit(Overloaded{
-                   [this](const PlayerCommand::kOpen &) {
-                       report(PlayerReport(PlayerReport::kOpened{noPlayer}));
-                   },
-                   [this](const PlayerCommand::kPlayback &) {
-                       report(PlayerReport(PlayerReport::kPlayFailed{noPlayer}));
-                   },
-                   [this](const PlayerCommand::kClose &) {
-                       report(PlayerReport(PlayerReport::kClosed{noPlayer}));
-                   },
-               },
-               command.get_variant());
 }
 
 void SessionBridge::ended(const Event::kEnded &end) {
@@ -225,9 +234,11 @@ void SessionBridge::send(Action action) {
     }
 }
 
-// Only for an event applied, so while there is a session.
+// The player reports in its own time: after review has ended, to no one.
 void SessionBridge::report(PlayerReport report) {
-    guarded([&] { session->report(std::move(report)); });
+    if (session) {
+        guarded([&] { session->report(std::move(report)); });
+    }
 }
 
 void SessionBridge::fail(const std::string &why) {
@@ -252,6 +263,7 @@ void SessionBridge::giveUp() {
 // the pump; then let go. A pump left waiting would hold the session and its core thread for good.
 void SessionBridge::letGo() {
     quitWait.stop();
+    port.release();
     if (session) {
         try {
             session->close();

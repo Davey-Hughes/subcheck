@@ -1,13 +1,18 @@
 // The real window, its QML loaded from the module as the app loads it, offscreen, on real sessions
 // over the run seeded for it: keys pressed and a row clicked as a person would, through the QML's
-// handlers to review and back. Every test leaves the run as it found it.
+// handlers to review and back. Every test leaves the run as it found it. Its video pane makes a
+// real mpv, which offscreen can never show video: the player's own tests run it on a fake.
 #include "session_bridge.h"
 
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QQmlApplicationEngine>
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QRegularExpression>
 #include <QSignalSpy>
+#include <QStandardPaths>
 #include <QTest>
 #include <QtQml/QQmlExtensionPlugin>
 
@@ -30,12 +35,13 @@ std::string clean() { return qEnvironmentVariable("SUBCHECK_TEST_CLEAN").toStdSt
 struct Shown {
     std::ostringstream out;
     std::ostringstream err;
+    PlayerPort player{std::chrono::seconds(1)};
     SessionBridge bridge;
     QQmlApplicationEngine engine;
     QQuickWindow *window = nullptr;
 
     explicit Shown(std::vector<std::string> selector)
-        : bridge(std::move(selector), out, err, std::chrono::seconds(1)) {
+        : bridge(std::move(selector), player, out, err, std::chrono::seconds(1)) {
         engine.setInitialProperties({{QStringLiteral("bridge"), QVariant::fromValue(&bridge)}});
         engine.loadFromModule("Subcheck", "Main");
         if (!engine.rootObjects().isEmpty()) {
@@ -62,12 +68,14 @@ struct Shown {
         return list->data(list->index(row), FindingsModel::StateRole).toString();
     }
 
-    // The delegate showing `row`, wherever the list has put it.
+    // The delegate showing `row`, wherever the list has put it: never the highlight, which is the
+    // list's child too, with no index of its own.
     QQuickItem *delegate(int row) const {
         auto *content = find("findings")->property("contentItem").value<QQuickItem *>();
         const QList<QQuickItem *> items = content->childItems();
         for (QQuickItem *item : items) {
-            if (item->property("index").toInt() == row) {
+            const QVariant index = item->property("index");
+            if (index.isValid() && index.toInt() == row) {
                 return item;
             }
         }
@@ -92,6 +100,30 @@ private slots:
         QVERIFY2(qEnvironmentVariableIsSet("SUBCHECK_DB") &&
                      qEnvironmentVariableIsSet("SUBCHECK_TEST_MEDIA"),
                  "run through ctest, which seeds a store of the test's own");
+        // Its mpv reads mpvqt/mpvqt.conf in Qt's config location, which CTest moves into the build
+        // directory, beside this test: on Linux by XDG_CONFIG_HOME, on macOS by the home
+        // CoreFoundation takes from CFFIXED_USER_HOME. Should either not take, every test stops
+        // here, before any makes an mpv, rather than run on the user's own file. The location and
+        // the file are checked apart, so that a failure on a runner no one can step through names
+        // the half to fix.
+#ifdef Q_OS_MACOS
+        const QString config =
+            QCoreApplication::applicationDirPath() + "/test-home/Library/Preferences";
+#else
+        const QString config = QCoreApplication::applicationDirPath() + "/test-config";
+#endif
+        const QString location = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation);
+        QVERIFY2(QDir::cleanPath(location) == QDir::cleanPath(config) ||
+                     QFileInfo(location).canonicalFilePath() ==
+                         QFileInfo(config).canonicalFilePath(),
+                 qPrintable("Qt's config location is " + location + ", not the test's " + config));
+        const QString conf = config + "/mpvqt/mpvqt.conf";
+        QVERIFY2(
+            QFile::exists(conf),
+            qPrintable("the test's mpvqt.conf, which CMake writes as it configures, is not at " +
+                       conf));
+        // As main.cpp, before the first window.
+        QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
     }
 
     void init() {
@@ -186,6 +218,32 @@ private slots:
         QCOMPARE(finished[0][0].toInt(), 0);
         QVERIFY(w.window->isVisible());
         QCOMPARE(w.out.str(), "media: 0 accepted, 0 rejected, 4 pending\n");
+    }
+
+    // The video pane beside the list, as the mpv of the window's player; a player key goes through
+    // the QML to review and its player, whose answer is review's status line. Offscreen, mpv never
+    // becomes ready, so `o` waits there.
+    void theVideoPaneIsBesideTheListAndThePlayersKeysReachIt() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *list = w.find("findings");
+        QObject *video = w.find("video");
+        QVERIFY(video);
+        QCOMPARE(video->property("player").value<PlayerPort *>(), &w.player);
+        QCOMPARE(video->property("x").toReal(), list->property("width").toReal());
+        QVERIFY(video->property("width").toReal() > list->property("width").toReal());
+        QCOMPARE(video->property("x").toReal() + video->property("width").toReal(),
+                 w.window->width());
+        QObject *status = w.find("statusLine");
+        QTest::keyClick(w.window, Qt::Key_Space);
+        QTRY_COMPARE(status->property("text").toString(), "mpv has no file open (o opens one)");
+        QTest::keyClick(w.window, Qt::Key_O);
+        QTRY_COMPARE(status->property("text").toString(), "opening E01 at 0:00:00.00");
+        QTest::keyClick(w.window, Qt::Key_Right);
+        QTRY_COMPARE(status->property("text").toString(), "mpv is still opening the file");
+        QTest::keyClick(w.window, 'O');
+        QTRY_COMPARE(status->property("text").toString(), "closed mpv");
     }
 
     void anEmptyRunSaysSo() {

@@ -1,6 +1,7 @@
 // The bridge on real sessions over the run seeded for it: two copies of typos.mkv, so two rows of
 // two members each, four findings pending. The tests share the run in turn, so each leaves it as
 // it found it.
+#include "fake_mpv.h"
 #include "session_bridge.h"
 
 #include <QElapsedTimer>
@@ -10,6 +11,7 @@
 #include <chrono>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace subcheck_ffi;
@@ -37,16 +39,17 @@ QString decision(SessionBridge &bridge, int row) {
     return list->data(list->index(row), FindingsModel::StateRole).toString();
 }
 
-// A bridge on `selector`, its end's text in `out` and `err`. A short wait after a quit, so that
-// the give-up's test runs in about a second: the store is the test's own, so no lock held
-// elsewhere slows review's end in the others.
+// A bridge on `selector`, its end's text in `out` and `err`, and its player, which has no mpv until
+// a test gives it one. A short wait after a quit, so that the give-up's test runs in about a
+// second: the store is the test's own, so no lock held elsewhere slows review's end in the others.
 struct Opened {
     std::ostringstream out;
     std::ostringstream err;
+    PlayerPort player{std::chrono::milliseconds(100)};
     SessionBridge bridge;
 
     explicit Opened(std::vector<std::string> selector)
-        : bridge(std::move(selector), out, err, std::chrono::seconds(1)) {}
+        : bridge(std::move(selector), player, out, err, std::chrono::seconds(1)) {}
 };
 
 } // namespace
@@ -303,24 +306,82 @@ private slots:
         QCOMPARE(o.out.str(), "");
     }
 
-    // Nothing this window sends asks for the player; a command that comes anyway is told there is
-    // none, which the status line says.
-    void aPlayerCommandIsToldThereIsNoPlayer() {
+    // `o` opens the selected line's moment through review and the player to mpv, two seconds
+    // early (here, from 0:00), with its subtitle track; each playback key asks mpv its command;
+    // `O` closes. What the player reports is review's status line.
+    void thePlayersKeysReachMpvAndItsReportsTheStatusLine() {
+        // Before the bridge, which stops it as it goes.
+        FakeMpv mpv;
         Opened o({media()});
+        o.player.attach(&mpv);
+        o.player.ready();
         o.bridge.start();
         QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
-        const std::vector<PlayerCommand> commands = {
-            PlayerCommand(PlayerCommand::kOpen{Moment{"typos.mkv", 0, std::nullopt, false}}),
-            PlayerCommand(PlayerCommand::kPlayback{Playback(Playback::kPause{})}),
-            PlayerCommand(PlayerCommand::kClose{}),
+        QVERIFY(o.bridge.key(Qt::Key_O, "o"));
+        QTRY_COMPARE(mpv.last(), "get path");
+        mpv.answer(o.player, {}, "property unavailable");
+        QCOMPARE(mpv.last(), QString("loadfile %1/typos - E01.mkv replace -1 "
+                                     "start=0:00:00.000,sid=1,sub-visibility=yes")
+                                 .arg(QString::fromStdString(media())));
+        mpv.answer(o.player);
+        o.player.restarted();
+        QCOMPARE(mpv.last(), "set pause no");
+        mpv.answer(o.player);
+        QTRY_COMPARE(o.bridge.statusLine(), "opened in mpv");
+
+        const std::vector<std::tuple<int, QString, QString>> keys = {
+            {Qt::Key_Space, " ", "cycle pause"},
+            {Qt::Key_Left, "", "seek -5 relative+exact"},
+            {Qt::Key_Right, "", "seek 5 relative+exact"},
+            {Qt::Key_Comma, ",", "seek -1 relative+exact"},
+            {Qt::Key_Period, ".", "seek 1 relative+exact"},
+            {Qt::Key_BracketLeft, "[", "frame-back-step"},
+            {Qt::Key_BracketRight, "]", "frame-step"},
         };
-        for (const PlayerCommand &command : commands) {
-            emit o.bridge.eventArrived(Event(Event::kPlayer{command}));
-            QTRY_COMPARE(o.bridge.statusLine(), "this window has no player yet");
+        for (const auto &[key, text, command] : keys) {
+            const std::size_t before = mpv.requests.size();
+            QVERIFY(o.bridge.key(key, text));
+            QTRY_VERIFY(mpv.requests.size() > before);
+            QCOMPARE(mpv.last(), "get time-pos");
+            mpv.answer(o.player, 2.0);
+            QCOMPARE(mpv.last(), command);
+            mpv.answer(o.player);
+            // Both are said, as one or the other lands each of these moves (a frame step, which
+            // starts no playback again, on the position alone) and this test does not care which;
+            // what lands the move ends its wait, and a pause is read at once.
+            o.player.restarted();
+            o.player.moved();
+            QCOMPARE(mpv.last(), "get pause");
+            mpv.answer(o.player, true);
+            mpv.answer(o.player, 2.5);
+            QTRY_COMPARE(o.bridge.statusLine(), "⏸ 0:00:02.500");
             // Any action lets a message go.
             o.bridge.move(0);
             QTRY_COMPARE(o.bridge.statusLine(), counts);
         }
+
+        QVERIFY(o.bridge.key(Qt::Key_O, "O"));
+        QTRY_COMPARE(mpv.last(), "stop");
+        mpv.answer(o.player);
+        QTRY_COMPARE(o.bridge.statusLine(), "closed mpv");
+    }
+
+    // Review's end stops the video, as the terminal's quit closes its mpv; what the player says
+    // after goes nowhere.
+    void theEndStopsThePlayer() {
+        // Before the bridge, which stops it as it goes.
+        FakeMpv mpv;
+        Opened o({media()});
+        o.player.attach(&mpv);
+        o.player.ready();
+        QSignalSpy finished(&o.bridge, &SessionBridge::finished);
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        QVERIFY(o.bridge.key(Qt::Key_Q, "q"));
+        QTRY_COMPARE(finished.count(), 1);
+        QCOMPARE(mpv.last(), "stop");
+        emit o.player.reported(PlayerReport(PlayerReport::kClosed{std::nullopt}));
+        QCOMPARE(o.err.str(), "");
     }
 
     void aSpliceThatDoesNotFitIsAFatalEnd() {

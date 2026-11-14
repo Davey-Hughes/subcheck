@@ -66,25 +66,54 @@ add or change one.
 clang-format, then a CMake build that generates the C++ bindings to `ffi/`, qmllint over the QML,
 the app's tests, and the share of its C++ lines they reach, against CI's floor. Besides Rust from
 rustup, which the build asks for the toolchain `rust-toolchain.toml` names, it needs cmake, ninja,
-clang-format, Qt 6.12 (Quick, Test and qmllint), [gcovr](https://gcovr.com),
+clang-format, Qt 6.12 (Quick, Test and qmllint), [MpvQt](https://invent.kde.org/libraries/mpvqt)
+1.2.1 with mpv 0.38 or later, [gcovr](https://gcovr.com),
 [Corrosion](https://github.com/corrosion-rs/corrosion) and
 [uniffi-bindgen-cpp](https://github.com/NordSecurity/uniffi-bindgen-cpp), installed with
 `cargo install` at the tag CI installs; it stops first, naming the command, when the bindgen is
-missing or at another tag.
+missing or at another tag. On Linux, two tests run real mpv, each on an X display of its own, the
+pane's and the app's end to end, so the script needs Xvfb and xdotool there too; those displays
+are the tests' alone, and nothing they play makes a sound.
 
 The app is `subcheck-qt [run | paths…]`, which takes the run or paths `subcheck review` takes. It
-lists the findings: `j` and `k` (or the arrows) move, Enter expands a row into its members, `a`, `r`
-and `u` accept, reject and undo, and `q` quits. At the end it prints the counts as the terminal
-does, but names a view of paths as its window's title does: by the first path's last part, and
-`+N` for the others. It exits with 1 after an error, or when review has not ended 10 s after
-quitting, and with 0 otherwise. The 10 s gives one decision's write time to wait out another
-process's lock on the store, which the store waits up to 5 s for. It is not enough for several
-writes queued behind a lock held longer, or for an open that waits on the lock more than once: the
-window then closes review, which can lose a decision not yet written. It has no player yet. To
-build and run it, with the same tools:
+lists the findings on the left and plays them on the right: `j` and `k` (or the up and down
+arrows) move, Enter expands a row into its members, `a`, `r` and `u` accept, reject and undo, `o`
+plays the selected line in the video pane as the terminal's `o` does in mpv, and `O` stops
+playback, leaving the pane black and review open; Space pauses, ← and → seek 5 s, `,` and `.` 1 s,
+and `[` and `]` step a frame; `q` quits. At the end it prints the counts as the terminal does, but
+names a view of paths as its window's title does: by the first path's last part, and `+N` for the
+others. It exits with 1 after an error, or when review has not ended 10 s after quitting, and with
+0 otherwise. The 10 s gives one decision's write time to wait out another process's lock on the
+store, which the store waits up to 5 s for. It is not enough for several writes queued behind a
+lock held longer, or for an open that waits on the lock more than once: the window then closes
+review, which can lose a decision not yet written.
+
+The video pane is mpv, inside the window through MpvQt. It reads its options from
+`$XDG_CONFIG_HOME/mpvqt/mpvqt.conf` on Linux (by default `~/.config/mpvqt/mpvqt.conf`) and
+`~/Library/Preferences/mpvqt/mpvqt.conf` on macOS, not from `~/.config/mpv/mpv.conf` as the
+terminal's mpv does, so subtitle styling set there does not reach it; a line
+`include=~/.config/mpv/mpv.conf` in `mpvqt.conf` brings it in. To build and run the app, with the
+same tools (on Linux, Xvfb and xdotool among them: configuring adds the tests that use them):
 
 ```sh
 cmake -S gui/qt -B ~/.cache/subcheck-qt-build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build ~/.cache/subcheck-qt-build --target subcheck-qt
+~/.cache/subcheck-qt-build/subcheck-qt
+```
+
+On macOS, Homebrew has no MpvQt, so it is built from its release first, into a prefix of its
+own, and the app's build is told where it is and where Homebrew's Qt and mpv are. The third
+command must print `8a4d1ae9d1a1c5c94cd96bccb5330b83c1704b99`, the commit CI checks the tag
+against:
+
+```sh
+brew install qtbase qtdeclarative mpv extra-cmake-modules pkgconf corrosion ninja cmake
+git clone --depth 1 --branch v1.2.1 https://invent.kde.org/libraries/mpvqt.git ~/.cache/mpvqt-src
+git -C ~/.cache/mpvqt-src rev-parse HEAD
+cmake -S ~/.cache/mpvqt-src -B ~/.cache/mpvqt-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/.local/opt/mpvqt" -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+cmake --build ~/.cache/mpvqt-build
+cmake --install ~/.cache/mpvqt-build
+cmake -S gui/qt -B ~/.cache/subcheck-qt-build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH="$HOME/.local/opt/mpvqt;$(brew --prefix)"
 cmake --build ~/.cache/subcheck-qt-build --target subcheck-qt
 ~/.cache/subcheck-qt-build/subcheck-qt
 ```
