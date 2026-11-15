@@ -77,15 +77,15 @@ private:
     void drop();
     void next();
     void open(const subcheck_ffi::Moment &moment);
-    static std::deque<QStringList> pauseFirst(const subcheck_ffi::Moment &moment);
-    void load(const subcheck_ffi::Moment &moment, Stamp now);
-    void seekTo(const subcheck_ffi::Moment &moment, Stamp now);
-    void opened(bool paused);
+    void load(const subcheck_ffi::Moment &moment, Stamp now, bool resume);
+    void seekTo(const subcheck_ffi::Moment &moment, Stamp now, bool resume);
+    void opened(bool resume);
     void playback(subcheck_ffi::Playback playback);
     void close();
     std::uint64_t request(Answer then, Refused otherwise);
     void ask(const QStringList &command, Answer then, Refused otherwise = nullptr);
-    void read(const QString &property, Answer then, Missing missing = nullptr);
+    void read(const QString &property, Answer then, Missing missing = nullptr,
+              Refused otherwise = nullptr);
     void askAll(std::deque<QStringList> commands, std::function<void()> then,
                 Refused otherwise = nullptr);
     void land(const QStringList &move, Landing on, bool loading, std::function<void()> then,

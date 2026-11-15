@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use subcheck_core::group;
 use subcheck_core::player::{Moment, PlayState, Playback};
 use subcheck_core::scan::file_stamp;
-use subcheck_core::text::timestamp_ms;
+use subcheck_core::text::timestamp_us;
 
 /// How long a new mpv gets to open its socket.
 const START_TIMEOUT: Duration = Duration::from_secs(3);
@@ -55,13 +55,14 @@ pub fn socket_path(state: &Path) -> PathBuf {
 /// needs escaping.
 pub fn loadfile_command(m: &Moment) -> Value {
     let mut options = serde_json::Map::new();
-    options.insert("start".into(), timestamp_ms(m.start_ms).into());
+    options.insert("start".into(), timestamp_us(m.start_us).into());
     if let Some(sid) = m.sid {
         options.insert("sid".into(), sid.to_string().into());
     }
     options.insert("sub-visibility".into(), "yes".into());
     // Not `pause`: mpv puts a per-file option back when its file ends, which can be after the
-    // next file was loaded and unpaused; `open` sets it before loading.
+    // next file was loaded, and would pause or unpause that one; `open` sets mpv's own pause
+    // instead, before the load and, if mpv was playing, after it.
     json!({"name": "loadfile", "url": m.file, "flags": "replace", "options": options})
 }
 
@@ -91,18 +92,29 @@ impl Player {
         }
     }
 
-    /// Show `m` in the mpv listening on the socket, or start one and show it there. Playing, as
-    /// `o` is there to show the line, unless the moment is a frame to stay on.
+    /// Show `m` in the mpv listening on the socket, or start one and show it there, on its frame:
+    /// playing on from there if mpv was playing a file, and paused there if not, with no file open
+    /// or paused (in mpv's own window too), as `o` changes where mpv is and not whether it plays.
     pub fn open(&mut self, m: &Moment) -> Result<(), String> {
         self.reap();
-        let mut conn = match Conn::connect(&self.socket) {
-            Ok(conn) => conn,
-            Err(_) => self.start()?,
+        // Whether mpv plays, read before the pause below makes every mpv paused: one started here
+        // has no file to play, and one with no path has none either, whatever its pause says. It
+        // decides only whether mpv plays again once there, so a read that mpv fails counts as
+        // paused, which leaves mpv on the frame.
+        let (mut conn, open, playing) = match Conn::connect(&self.socket) {
+            Ok(mut conn) => {
+                let open = conn.request(&json!(["get_property", "path"])).ok();
+                let playing = open.is_some()
+                    && matches!(
+                        conn.request(&json!(["get_property", "pause"])),
+                        Ok(Value::Bool(false))
+                    );
+                (conn, open, playing)
+            }
+            Err(_) => (self.start()?, None, false),
         };
-        // A frame to stay on: paused before mpv gets there, or a playing mpv goes on past it.
-        if m.paused {
-            conn.request(&json!(["set_property", "pause", true]))?;
-        }
+        // Before mpv gets there, or a playing mpv goes on past the frame.
+        conn.request(&json!(["set_property", "pause", true]))?;
         // The file mpv has open already is sought, not reopened (slow for a big file over NFS),
         // if this review loaded it and it is unchanged on disk since: a remux in place keeps the
         // path, and after a fix of one letter even the size. One still loading cannot seek yet,
@@ -112,11 +124,10 @@ impl Player {
             (&self.loaded, stamp),
             (Some((file, then)), Some(now)) if *file == m.file && *then == now
         );
-        let open = conn.request(&json!(["get_property", "path"])).ok();
         let sought = open.as_ref().and_then(Value::as_str) == Some(m.file.as_str())
             && unchanged
             && conn
-                .request(&json!(["seek", timestamp_ms(m.start_ms), "absolute+exact"]))
+                .request(&json!(["seek", timestamp_us(m.start_us), "absolute+exact"]))
                 .is_ok();
         if sought {
             if let Some(sid) = m.sid {
@@ -127,7 +138,16 @@ impl Player {
             conn.request(&loadfile_command(m))?;
             self.loaded = stamp.map(|s| (m.file.clone(), s));
         }
-        conn.request(&json!(["set_property", "pause", m.paused]))?;
+        // After the seek or the load, so that mpv plays on from the frame, not from where it was.
+        // Refused, mpv stays paused on the frame, which is still the moment opened; any other
+        // error, with no answer from mpv, fails the open as on any request (mpv's own answers are
+        // the errors `Conn::request` starts with "mpv: ").
+        if playing
+            && let Err(e) = conn.request(&json!(["set_property", "pause", false]))
+            && !e.starts_with("mpv: ")
+        {
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -385,9 +405,8 @@ mod tests {
     fn moment() -> Moment {
         Moment {
             file: "/m/K-On! - E02.mkv".into(),
-            start_ms: 163_060,
+            start_us: 165_064_500,
             sid: Some(2),
-            paused: false,
         }
     }
 
@@ -446,8 +465,16 @@ mod tests {
         (program, argv)
     }
 
+    fn pause() -> Value {
+        json!(["set_property", "pause", true])
+    }
+
     fn unpause() -> Value {
         json!(["set_property", "pause", false])
+    }
+
+    fn read(property: &str) -> Value {
+        json!(["get_property", property])
     }
 
     #[test]
@@ -472,7 +499,7 @@ mod tests {
                 "name": "loadfile",
                 "url": "/m/K-On! - E02.mkv",
                 "flags": "replace",
-                "options": {"start": "0:02:43.060", "sid": "2", "sub-visibility": "yes"}
+                "options": {"start": "0:02:45.064500", "sid": "2", "sub-visibility": "yes"}
             })
         );
         let no_sid = Moment {
@@ -482,57 +509,200 @@ mod tests {
         assert!(loadfile_command(&no_sid)["options"].get("sid").is_none());
     }
 
+    // mpv up with no file open: paused before the load, and left paused, as nothing played.
     #[test]
-    fn a_frame_to_stay_on_is_opened_paused_to_the_millisecond() {
+    fn with_no_file_open_a_moment_is_opened_paused_to_the_microsecond() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("mpv.sock");
         let mpv = fake_mpv(UnixListener::bind(&socket).unwrap(), idle);
-        let frame = Moment {
-            start_ms: 763_763,
-            paused: true,
-            ..moment()
-        };
         let mut player = Player::new(dir.path().join("no-such-mpv"), socket);
-        assert_eq!(player.open(&frame), Ok(()));
-        let pause = json!(["set_property", "pause", true]);
+        assert_eq!(player.open(&moment()), Ok(()));
         assert_eq!(
             mpv.join().unwrap(),
-            [
-                pause.clone(),
-                json!(["get_property", "path"]),
-                loadfile_command(&frame),
-                pause
-            ]
+            [read("path"), pause(), loadfile_command(&moment())]
         );
-        assert_eq!(loadfile_command(&frame)["options"]["start"], "0:12:43.763");
-        assert!(loadfile_command(&frame)["options"].get("pause").is_none());
+        let options = &loadfile_command(&moment())["options"];
+        assert_eq!(options["start"], "0:02:45.064500");
+        assert!(options.get("pause").is_none());
     }
 
+    /// What `o` on [`on_disk`]'s moment sends an mpv with its file open, which this review loaded,
+    /// up to the seek's settings: whether mpv plays, read before anything is sent, then the pause,
+    /// the seek, and the settings.
+    fn sought() -> Vec<Value> {
+        vec![
+            read("path"),
+            read("pause"),
+            pause(),
+            json!(["seek", "0:02:45.064500", "absolute+exact"]),
+            json!(["set_property", "sid", 2]),
+            json!(["set_property", "sub-visibility", true]),
+        ]
+    }
+
+    // `o` again, on the line mpv shows or another of the file, while mpv is paused: sought, and
+    // left paused.
     #[test]
-    fn a_frame_in_the_file_mpv_has_open_is_sought_once_paused() {
+    fn a_paused_mpv_is_sought_in_the_file_it_has_open_and_left_paused() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("mpv.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let m = Moment {
-            paused: true,
-            ..on_disk(dir.path())
-        };
+        let m = on_disk(dir.path());
         let mut player = Player::new("mpv", socket);
         load(&mut player, &listener, &m);
-        let mpv = fake_mpv(listener, has_open(&m.file, ok(Value::Null)));
+        let mpv = fake_mpv(listener, has_open(&m.file, true, ok(Value::Null)));
         assert_eq!(player.open(&m), Ok(()));
-        let pause = json!(["set_property", "pause", true]);
+        assert_eq!(mpv.join().unwrap(), sought());
+    }
+
+    // While mpv plays: paused before the seek, so that it does not go on past the frame meanwhile,
+    // and playing again once it is there, as the last request.
+    #[test]
+    fn a_playing_mpv_is_sought_in_the_file_it_has_open_and_plays_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let m = on_disk(dir.path());
+        let mut player = Player::new("mpv", socket);
+        load(&mut player, &listener, &m);
+        let mpv = fake_mpv(listener, has_open(&m.file, false, ok(Value::Null)));
+        assert_eq!(player.open(&m), Ok(()));
+        let mut want = sought();
+        want.push(unpause());
+        assert_eq!(mpv.join().unwrap(), want);
+    }
+
+    // Another file while mpv plays: loaded paused, and playing once the load is asked for, through
+    // mpv's own pause, not the load's (`loadfile_command` says why).
+    #[test]
+    fn a_playing_mpv_loads_another_file_and_plays_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        let mpv = fake_mpv(
+            UnixListener::bind(&socket).unwrap(),
+            has_open("/m/K-On! - E01.mkv", false, ok(Value::Null)),
+        );
+        let mut player = Player::new(dir.path().join("no-such-mpv"), socket);
+        assert_eq!(player.open(&moment()), Ok(()));
         assert_eq!(
             mpv.join().unwrap(),
             [
-                pause.clone(),
-                json!(["get_property", "path"]),
-                json!(["seek", "0:02:43.060", "absolute+exact"]),
-                json!(["set_property", "sid", 2]),
-                json!(["set_property", "sub-visibility", true]),
-                pause
+                read("path"),
+                read("pause"),
+                pause(),
+                loadfile_command(&moment()),
+                unpause()
             ]
         );
+    }
+
+    // Whether mpv plays decides only whether it plays again once there: a read of it that mpv
+    // fails counts as paused, and the moment opens, left paused on its frame.
+    #[test]
+    fn a_failed_read_of_pause_opens_the_moment_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        let mpv = fake_mpv(UnixListener::bind(&socket).unwrap(), |c| {
+            match (c[0].as_str(), c[1].as_str()) {
+                (Some("get_property"), Some("path")) => ok("/m/K-On! - E01.mkv"),
+                (Some("get_property"), Some("pause")) => error("unknown error"),
+                _ => ok(Value::Null),
+            }
+        });
+        let mut player = Player::new(dir.path().join("no-such-mpv"), socket);
+        assert_eq!(player.open(&moment()), Ok(()));
+        assert_eq!(
+            mpv.join().unwrap(),
+            [
+                read("path"),
+                read("pause"),
+                pause(),
+                loadfile_command(&moment())
+            ]
+        );
+    }
+
+    // As a failed read does: a pause that is no flag says nothing of mpv playing.
+    #[test]
+    fn a_pause_that_is_no_flag_opens_the_moment_paused() {
+        for paused in [Value::Null, json!("no")] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("mpv.sock");
+            let mpv = fake_mpv(UnixListener::bind(&socket).unwrap(), move |c| {
+                match (c[0].as_str(), c[1].as_str()) {
+                    (Some("get_property"), Some("path")) => ok("/m/K-On! - E01.mkv"),
+                    (Some("get_property"), Some("pause")) => ok(paused.clone()),
+                    _ => ok(Value::Null),
+                }
+            });
+            let mut player = Player::new(dir.path().join("no-such-mpv"), socket);
+            assert_eq!(player.open(&moment()), Ok(()));
+            assert_eq!(
+                mpv.join().unwrap(),
+                [
+                    read("path"),
+                    read("pause"),
+                    pause(),
+                    loadfile_command(&moment())
+                ]
+            );
+        }
+    }
+
+    // Once mpv has been sent to the moment, a refused unpause leaves it paused on the frame, which
+    // is still the moment opened.
+    #[test]
+    fn a_refused_unpause_still_opens_the_moment() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        let playing = has_open("/m/K-On! - E01.mkv", false, ok(Value::Null));
+        let mpv = fake_mpv(UnixListener::bind(&socket).unwrap(), move |c| {
+            if *c == unpause() {
+                error("unknown error")
+            } else {
+                playing(c)
+            }
+        });
+        let mut player = Player::new(dir.path().join("no-such-mpv"), socket);
+        assert_eq!(player.open(&moment()), Ok(()));
+        assert_eq!(
+            mpv.join().unwrap(),
+            [
+                read("path"),
+                read("pause"),
+                pause(),
+                loadfile_command(&moment()),
+                unpause()
+            ]
+        );
+    }
+
+    // An mpv gone before it answers the unpause is no refusal, so the open fails, as it would on
+    // any other request.
+    #[test]
+    fn an_mpv_gone_before_the_unpause_fails_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let playing = has_open("/m/K-On! - E01.mkv", false, ok(Value::Null));
+        let mpv = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut sent = Vec::new();
+            for line in BufReader::new(&stream).lines() {
+                let request: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                sent.push(request["command"].clone());
+                if request["command"] == unpause() {
+                    break;
+                }
+                let mut reply = playing(&request["command"]);
+                reply["request_id"] = request["request_id"].clone();
+                writeln!(&stream, "{reply}").unwrap();
+            }
+            sent
+        });
+        let mut player = Player::new(dir.path().join("no-such-mpv"), socket);
+        assert_eq!(player.open(&moment()), Err(HUNG_UP.into()));
+        assert_eq!(mpv.join().unwrap().last(), Some(&unpause()));
     }
 
     #[test]
@@ -545,11 +715,7 @@ mod tests {
         assert_eq!(player.open(&moment()), Ok(()));
         assert_eq!(
             mpv.join().unwrap(),
-            [
-                json!(["get_property", "path"]),
-                loadfile_command(&moment()),
-                unpause()
-            ]
+            [read("path"), pause(), loadfile_command(&moment())]
         );
     }
 
@@ -563,11 +729,16 @@ mod tests {
         }
     }
 
-    /// An mpv with `file` open; `seek` is its answer to a seek.
-    fn has_open(file: &str, seek: Value) -> impl Fn(&Value) -> Value + Send + 'static + use<> {
+    /// An mpv with `file` open, paused or playing; `seek` is its answer to a seek.
+    fn has_open(
+        file: &str,
+        paused: bool,
+        seek: Value,
+    ) -> impl Fn(&Value) -> Value + Send + 'static + use<> {
         let file = file.to_string();
         move |c| match (c[0].as_str(), c[1].as_str()) {
-            (_, Some("path")) => ok(file.clone()),
+            (Some("get_property"), Some("path")) => ok(file.clone()),
+            (Some("get_property"), Some("pause")) => ok(paused),
             (Some("seek"), _) => seek.clone(),
             _ => ok(Value::Null),
         }
@@ -577,34 +748,9 @@ mod tests {
     fn load(player: &mut Player, listener: &UnixListener, m: &Moment) {
         let mpv = fake_mpv(listener.try_clone().unwrap(), idle);
         assert_eq!(player.open(m), Ok(()));
-        let pause = json!(["set_property", "pause", m.paused]);
-        let mut want = Vec::new();
-        if m.paused {
-            want.push(pause.clone());
-        }
-        want.extend([json!(["get_property", "path"]), loadfile_command(m), pause]);
-        assert_eq!(mpv.join().unwrap(), want);
-    }
-
-    #[test]
-    fn the_file_mpv_has_open_is_sought_not_reloaded() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("mpv.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let m = on_disk(dir.path());
-        let mut player = Player::new("mpv", socket);
-        load(&mut player, &listener, &m);
-        let mpv = fake_mpv(listener, has_open(&m.file, ok(Value::Null)));
-        assert_eq!(player.open(&m), Ok(()));
         assert_eq!(
             mpv.join().unwrap(),
-            [
-                json!(["get_property", "path"]),
-                json!(["seek", "0:02:43.060", "absolute+exact"]),
-                json!(["set_property", "sid", 2]),
-                json!(["set_property", "sub-visibility", true]),
-                unpause()
-            ]
+            [read("path"), pause(), loadfile_command(m)]
         );
     }
 
@@ -625,9 +771,9 @@ mod tests {
             .unwrap()
             .set_modified(later)
             .unwrap();
-        let mpv = fake_mpv(listener, has_open(&m.file, ok(Value::Null)));
+        let mpv = fake_mpv(listener, has_open(&m.file, true, ok(Value::Null)));
         assert_eq!(player.open(&m), Ok(()));
-        assert_eq!(mpv.join().unwrap()[1..], [loadfile_command(&m), unpause()]);
+        assert_eq!(mpv.join().unwrap()[3..], [loadfile_command(&m)]);
     }
 
     #[test]
@@ -638,15 +784,16 @@ mod tests {
         // mpv's window from another review: whatever it opened then may be stale.
         let mpv = fake_mpv(
             UnixListener::bind(&socket).unwrap(),
-            has_open(&m.file, ok(Value::Null)),
+            has_open(&m.file, true, ok(Value::Null)),
         );
         let mut player = Player::new("mpv", socket);
         assert_eq!(player.open(&m), Ok(()));
-        assert_eq!(mpv.join().unwrap()[1..], [loadfile_command(&m), unpause()]);
+        assert_eq!(mpv.join().unwrap()[3..], [loadfile_command(&m)]);
     }
 
+    // While mpv plays: the reload plays on too.
     #[test]
-    fn a_file_that_cannot_seek_yet_is_loaded_again() {
+    fn a_file_that_cannot_seek_yet_is_loaded_again_and_plays_on() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("mpv.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -654,11 +801,22 @@ mod tests {
         let mut player = Player::new("mpv", socket);
         load(&mut player, &listener, &m);
         // Still loading: mpv names the file but refuses the seek.
-        let mpv = fake_mpv(listener, has_open(&m.file, error("error running command")));
+        let mpv = fake_mpv(
+            listener,
+            has_open(&m.file, false, error("error running command")),
+        );
         assert_eq!(player.open(&m), Ok(()));
-        let sent = mpv.join().unwrap();
-        assert_eq!(sent[1][0], "seek");
-        assert_eq!(sent[2..], [loadfile_command(&m), unpause()]);
+        assert_eq!(
+            mpv.join().unwrap(),
+            [
+                read("path"),
+                read("pause"),
+                pause(),
+                json!(["seek", "0:02:45.064500", "absolute+exact"]),
+                loadfile_command(&m),
+                unpause()
+            ]
+        );
     }
 
     /// Stands in for the started mpv: an idle one on `socket`, once the program has written its
@@ -771,16 +929,19 @@ mod tests {
         assert!(argv.ends_with("--focus-on=never\n"), "{argv}");
     }
 
+    // An mpv started here has no file open: nothing is read from it first, and it stays paused.
     #[test]
-    fn with_no_mpv_running_one_is_started_and_loaded() {
+    fn with_no_mpv_running_one_is_started_and_loads_paused() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("sock/mpv.sock");
         let (program, argv) = fake_program(dir.path());
         let server = mpv_once_started(&socket, &argv);
         let mut player = Player::new(&program, socket.clone());
         assert_eq!(player.open(&moment()), Ok(()));
-        let sent = server.join().unwrap();
-        assert_eq!(sent[1], loadfile_command(&moment()));
+        assert_eq!(
+            server.join().unwrap(),
+            [pause(), loadfile_command(&moment())]
+        );
         assert_eq!(
             std::fs::read_to_string(&argv).unwrap(),
             format!(

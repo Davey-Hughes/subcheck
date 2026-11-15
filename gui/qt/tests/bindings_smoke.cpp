@@ -99,12 +99,12 @@ void a_run_opens_takes_a_decision_plays_and_ends(const std::string &folder) {
 
     s->send(Action(Action::kPlay{}));
     std::optional<std::string> opening = changed(*s, "playing").summary.status;
-    check(opening == "opening typos at 0:00:18.00", "the status line says what opens");
+    check(opening == "opening typos at 0:00:20.000", "the status line says what opens");
     PlayerCommand open = player(*s, "playing");
     const PlayerCommand::kOpen *o = as<PlayerCommand::kOpen>(open);
-    check(o && o->v1.file.ends_with("/media/typos.mkv") && o->v1.sid == 1u && !o->v1.paused,
-          "play opens the run's file on its subtitle track, playing");
-    check(o && o->v1.start_ms == 18000, "two seconds before the selected row's line");
+    check(o && o->v1.file.ends_with("/media/typos.mkv") && o->v1.sid == 1u,
+          "play opens the run's file on its subtitle track");
+    check(o && o->v1.start_us == 20'004'500, "on the first frame of the selected row's line");
 
     s->report(PlayerReport(PlayerReport::kOpened{std::nullopt}));
     check(changed(*s, "opened").summary.status == "opened in mpv", "the report reaches review");

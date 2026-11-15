@@ -587,7 +587,7 @@ fn opens_line(m: &Review, i: usize) -> Vec<Line<'static>> {
     vec![
         Line::default(),
         Line::styled(
-            format!("o opens {}, paused on {on}", timestamp_ms(at.at_ms)),
+            format!("o opens {} on {on}", timestamp_ms(at.at_ms)),
             Style::default().fg(Color::DarkGray),
         ),
     ]
@@ -1041,7 +1041,7 @@ mod tests {
             "{screen}"
         );
         assert!(
-            screen.contains("│o opens 0:12:43.763, paused on the frame that shows the error"),
+            screen.contains("│o opens 0:12:43.763 on the frame that shows the error"),
             "{screen}"
         );
         // E02, the partial one.

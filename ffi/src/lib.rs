@@ -92,15 +92,14 @@ pub struct PlayState {
     pub at_ms: i64,
 }
 
-/// A moment to open ([`player::Moment`]): a file, where to start, and the subtitles to show.
+/// A moment to open ([`player::Moment`]): the file, where to seek, the subtitles to show.
 #[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
 pub struct Moment {
     pub file: String,
-    pub start_ms: i64,
+    /// Where the player seeks, in µs, as review gives it, for mpv to show the frame review means.
+    pub start_us: i64,
     /// mpv's `--sid`; none leaves the choice to the player.
     pub sid: Option<u64>,
-    /// Stay on the frame at `start_ms` (a timing finding's), rather than play from it (a line's).
-    pub paused: bool,
 }
 
 /// What review asks of the UI's player ([`player::PlayerCommand`]), which says how it went
@@ -304,15 +303,13 @@ impl From<player::Moment> for Moment {
     fn from(moment: player::Moment) -> Moment {
         let player::Moment {
             file,
-            start_ms,
+            start_us,
             sid,
-            paused,
         } = moment;
         Moment {
             file,
-            start_ms,
+            start_us,
             sid: sid.map(wide),
-            paused,
         }
     }
 }
@@ -575,18 +572,16 @@ mod tests {
     fn each_player_command_and_the_end_cross() {
         let open = player::PlayerCommand::Open(player::Moment {
             file: "/m/E01.mkv".into(),
-            start_ms: 165_060,
+            start_us: 165_064_500,
             sid: Some(2),
-            paused: true,
         });
         let cases = [
             (
                 session::Event::Player(open),
                 Event::Player(PlayerCommand::Open(Moment {
                     file: "/m/E01.mkv".into(),
-                    start_ms: 165_060,
+                    start_us: 165_064_500,
                     sid: Some(2),
-                    paused: true,
                 })),
             ),
             (
@@ -609,9 +604,8 @@ mod tests {
         }
         let moment = player::Moment {
             file: String::new(),
-            start_ms: -1,
+            start_us: -1,
             sid: None,
-            paused: false,
         };
         assert_eq!(Moment::from(moment).sid, None);
     }

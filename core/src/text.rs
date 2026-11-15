@@ -448,9 +448,8 @@ pub fn karaoke_line(group: &[&Event]) -> Option<String> {
     Some(collapse(&joined))
 }
 
-/// `H:MM:SS.mmm`: a time to the millisecond, as mpv's `--start` and `seek` take it. A frame's time
-/// needs it: mpv shows the frame nearest the time it is given, and at 60 fps a centisecond is more
-/// than half a frame.
+/// `H:MM:SS.mmm`: a time to the millisecond, the precision Matroska stores frames' and lines' times
+/// to; a centisecond can be more than half a frame (at 60 fps), and name the wrong one.
 pub fn timestamp_ms(ms: i64) -> String {
     let ms = ms.max(0);
     format!(
@@ -459,6 +458,20 @@ pub fn timestamp_ms(ms: i64) -> String {
         ms / 60_000 % 60,
         ms / 1000 % 60,
         ms % 1000
+    )
+}
+
+/// `H:MM:SS.uuuuuu`: a time to the µs, as mpv's `--start` and `seek` take it, for a target between
+/// milliseconds ([`crate::player::line_start_us`]); never before 0:00, which mpv counts back from
+/// the end.
+pub fn timestamp_us(us: i64) -> String {
+    let us = us.max(0);
+    format!(
+        "{}:{:02}:{:02}.{:06}",
+        us / 3_600_000_000,
+        us / 60_000_000 % 60,
+        us / 1_000_000 % 60,
+        us % 1_000_000
     )
 }
 
@@ -821,5 +834,13 @@ mod tests {
     fn timestamps_print_like_ass() {
         assert_eq!(timestamp(779_080), "0:12:59.08");
         assert_eq!(timestamp(3_723_450), "1:02:03.45");
+    }
+
+    #[test]
+    fn a_time_for_mpv_to_the_microsecond_is_never_before_the_start() {
+        assert_eq!(timestamp_us(3_723_004_500), "1:02:03.004500");
+        assert_eq!(timestamp_us(165_064_500), "0:02:45.064500");
+        assert_eq!(timestamp_us(-35_500), "0:00:00.000000");
+        assert_eq!(timestamp_us(i64::MAX), "2562047788:00:54.775807");
     }
 }

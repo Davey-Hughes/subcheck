@@ -12,10 +12,10 @@ use super::model::{Confirm, Edit, Entry, EntryKey, FileNote, Mark, Pane, Review,
 use super::progress::{Scan, Stage};
 use crate::apply;
 use crate::list::{self, Filter, label};
-use crate::player::{Moment, PlayState, Playback, PlayerCommand};
+use crate::player::{self, Moment, PlayState, Playback, PlayerCommand};
 use crate::scan;
 use crate::store::{Decided, Decision, Record, Run, State};
-use crate::text::{timestamp, timestamp_ms};
+use crate::text::timestamp_ms;
 
 /// What `update` takes: an action, or what a job or an effect has to say.
 #[derive(Debug, Clone, PartialEq)]
@@ -792,36 +792,37 @@ fn open(m: &mut Review) -> Vec<Effect> {
         m.status = Some(format!("file missing: {}", f.file));
         return Vec::new();
     }
-    // A timing finding opens on the frame that shows its error, paused; a line two seconds early,
-    // playing.
-    let (start_ms, sid, paused) = if let Some(at) = list::timing_moment(&m.run, f) {
-        (at.at_ms, at.sid, true)
+    // Whether mpv plays once there is the player's to keep, from mpv's own state, a pause made in
+    // mpv's window among it, so the moment carries none. A timing finding with a frame that shows
+    // its error opens on that frame, sought at the frame's own time: worked out from the frame rate
+    // for the frame before a cut, it can be a millisecond off the time the file stores, either way,
+    // which the 5 ms that mpv shows a frame from before its target takes in, and a line's 4.5 ms
+    // past would not. One with no such frame opens on its first moved line, which, like any line,
+    // opens on its first frame.
+    let (at_ms, start_us, sid) = if let Some(at) = list::timing_moment(&m.run, f) {
+        let start_us = if at.on_frame {
+            at.at_ms.saturating_mul(1000)
+        } else {
+            player::line_start_us(at.at_ms)
+        };
+        (at.at_ms, start_us, at.sid)
     } else if f.timing.is_some() {
         m.status = Some("nothing to open: no line of this track moves".into());
         return Vec::new();
     } else {
-        let (at, sid) = list::mpv_moment(&m.run, f);
-        (at, sid, false)
+        let (at, sid) = list::line_moment(&m.run, f);
+        (at, player::line_start_us(at), sid)
     };
     let moment = Moment {
         file: f.file.clone(),
-        start_ms,
+        start_us,
         sid,
-        paused,
     };
-    m.status = Some(if paused {
-        format!(
-            "opening {} at {}, paused",
-            m.label(&moment.file),
-            timestamp_ms(start_ms)
-        )
-    } else {
-        format!(
-            "opening {} at {}",
-            m.label(&moment.file),
-            timestamp(start_ms)
-        )
-    });
+    m.status = Some(format!(
+        "opening {} at {}",
+        m.label(&moment.file),
+        timestamp_ms(at_ms)
+    ));
     vec![Effect::Player(PlayerCommand::Open(moment))]
 }
 
@@ -2116,39 +2117,58 @@ mod tests {
     }
 
     #[test]
-    fn o_opens_two_seconds_early_on_the_default_track() {
+    fn o_opens_a_line_on_its_first_frame_on_the_default_track() {
         let mut m = sample();
-        assert_eq!(
-            act(&mut m, Action::Play),
-            [Effect::Player(PlayerCommand::Open(Moment {
-                file: path(1),
-                start_ms: 163_060,
-                sid: Some(1),
-                paused: false,
-            }))]
-        );
-        assert_eq!(m.status.as_deref(), Some("opening E01 at 0:02:43.06"));
+        let open = [Effect::Player(PlayerCommand::Open(Moment {
+            file: path(1),
+            start_us: 165_064_500,
+            sid: Some(1),
+        }))];
+        assert_eq!(act(&mut m, Action::Play), open);
+        assert_eq!(m.status.as_deref(), Some("opening E01 at 0:02:45.060"));
         update(&mut m, Input::Opened(Err("mpv not found".into())), now());
         assert_eq!(m.status.as_deref(), Some("mpv not found"));
+        // Again on the same line: the same moment, so that mpv goes back to its first frame.
+        assert_eq!(act(&mut m, Action::Play), open);
     }
 
     #[test]
-    fn o_opens_a_timing_finding_paused_on_the_frame_that_shows_it() {
+    fn o_opens_a_timing_finding_on_the_frame_that_shows_it() {
         let mut m = crate::review::model::tests_support::with_timing();
         m.selected = 1;
         assert_eq!(
             act(&mut m, Action::Play),
             [Effect::Player(PlayerCommand::Open(Moment {
                 file: path(1),
-                start_ms: 763_763,
+                start_us: 763_763_000,
                 sid: Some(1),
-                paused: true,
             }))]
         );
+        assert_eq!(m.status.as_deref(), Some("opening E01 at 0:12:43.763"));
+    }
+
+    // With no frame that shows its error, it opens on its first moved line as a line opens: on
+    // that line's first frame.
+    #[test]
+    fn a_timing_finding_with_no_frame_opens_on_its_first_moved_lines_first_frame() {
+        let mut m = crate::review::model::tests_support::with_timing();
+        for f in &mut m.run.findings {
+            if let Some(t) = &mut f.timing {
+                for s in &mut t.stretches {
+                    s.frame_ms = None;
+                }
+            }
+        }
+        m.selected = 1;
         assert_eq!(
-            m.status.as_deref(),
-            Some("opening E01 at 0:12:43.763, paused")
+            act(&mut m, Action::Play),
+            [Effect::Player(PlayerCommand::Open(Moment {
+                file: path(1),
+                start_us: 1_004_500,
+                sid: Some(1),
+            }))]
         );
+        assert_eq!(m.status.as_deref(), Some("opening E01 at 0:00:01.000"));
     }
 
     #[test]

@@ -209,9 +209,9 @@ set_tests_properties(app_starts PROPERTIES
     TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 
 # The tests on real mpv, each on an X display of its own: the pane as the player's mpv
-# (tests/pane_test.cpp), on timing.mkv, the fixture with video; and the app end to end
-# (tests/end_to_end_test.cpp), over a run of it. Linux only, as Xvfb and xdotool are X11's: the gui
-# job runs them, and gui-macos does not.
+# (tests/pane_test.cpp), on timing.mkv and ties.mkv, two fixtures with video; and the app end to
+# end (tests/end_to_end_test.cpp), over a run of timing.mkv. Linux only, as Xvfb and xdotool are
+# X11's: the gui job runs them, and gui-macos does not.
 if(NOT APPLE)
     find_program(XVFB Xvfb REQUIRED)
     find_program(XDOTOOL xdotool REQUIRED)
@@ -221,6 +221,7 @@ if(NOT APPLE)
     subcheck_warnings(pane_test)
     add_test(NAME pane_test COMMAND pane_test)
     set(env "SUBCHECK_TEST_VIDEO=${REPO_ROOT}/core/tests/fixtures/timing.mkv"
+        "SUBCHECK_TEST_LINES=${REPO_ROOT}/core/tests/fixtures/ties.mkv"
         "SUBCHECK_TEST_DIR=${CMAKE_BINARY_DIR}/pane_test-run" "SUBCHECK_XVFB=${XVFB}"
         "XDG_CONFIG_HOME=${TEST_CONFIG}")
     set_tests_properties(pane_test PROPERTIES ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})

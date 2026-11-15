@@ -79,15 +79,15 @@ nothing they play makes a sound.
 The app is `subcheck-qt [run | paths…]`, which takes the run or paths `subcheck review` takes. It
 lists the findings on the left and plays them on the right: `j` and `k` (or the up and down
 arrows) move, Enter expands a row into its members, `a`, `r` and `u` accept, reject and undo, `o`
-plays the selected line in the video pane as the terminal's `o` does in mpv, and `O` stops
-playback, leaving the pane black and review open; Space pauses, ← and → seek 5 s, `,` and `.` 1 s,
-and `[` and `]` step a frame; `q` quits. At the end it prints the counts as the terminal does, but
-names a view of paths as its window's title does: by the first path's last part, and `+N` for the
-others. It exits with 1 after an error, or when review has not ended 10 s after quitting, and with
-0 otherwise. The 10 s gives one decision's write time to wait out another process's lock on the
-store, which the store waits up to 5 s for. It is not enough for several writes queued behind a
-lock held longer, or for an open that waits on the lock more than once: the window then closes
-review, which can lose a decision not yet written.
+opens the selected finding in the video pane as the terminal's `o` does in mpv, playing on if the
+pane plays and paused if not, and `O` stops playback, leaving the pane black and review open; Space
+plays and pauses, ← and → seek 5 s, `,` and `.` 1 s, and `[` and `]` step a frame; `q` quits. At the
+end it prints the counts as the terminal does, but names a view of paths as its window's title does:
+by the first path's last part, and `+N` for the others. It exits with 1 after an error, or when
+review has not ended 10 s after quitting, and with 0 otherwise. The 10 s gives one decision's write
+time to wait out another process's lock on the store, which the store waits up to 5 s for. It is not
+enough for several writes queued behind a lock held longer, or for an open that waits on the lock
+more than once: the window then closes review, which can lose a decision not yet written.
 
 The video pane is mpv, inside the window through MpvQt. It reads its options from
 `$XDG_CONFIG_HOME/mpvqt/mpvqt.conf` on Linux (by default `~/.config/mpvqt/mpvqt.conf`) and
@@ -187,8 +187,10 @@ terminal gets the command that makes the rest (`subcheck apply <view>`).
 
 A fix repeated across episodes (an OP lyric, say) is one row; `⏎` expands it into its episodes. A
 season's timing findings on one track are one row too, whatever each episode's fix (`−1 frame ×23 ·
-partial ×1`): `o` opens one paused on the frame that shows the error, `[` `]` step from there, and
-`e` does not apply (a timing fix is accepted or rejected).
+partial ×1`): `o` opens one on the frame that shows the error, or with none, its first moved line's
+first frame, playing on or paused as mpv was, as a line does. `[` `]` step from there once it is
+paused (if mpv plays, Space and then `o` again open it there paused), and `e` does not apply (a
+timing fix is accepted or rejected).
 
 Decided rows stay in the list: green when accepted, red when rejected, yellow when a group's
 episodes are all decided, differently. A row with anything still pending keeps the terminal's
@@ -210,7 +212,7 @@ filter, to the next row).
 | `c` | in the files view: check the file again (asks first; while a scan runs, once it ends; refused while apply runs) |
 | `A` | apply the accepted fixes of the view (asks first; not while a scan runs) |
 | `D` | dry run: what apply would do, writing nothing |
-| `o` | open the line in mpv, 2 s early, with its subtitle track; again on the same line replays it |
+| `o` | open the finding in mpv with its subtitle track: a line on its first frame, a timing finding on the frame that shows the error, or with none, its first moved line's first frame; paused if mpv is paused or has no file open, playing on if it plays; again on the same row goes back there |
 | `O` | close mpv and stay in review; the next `o` opens it again |
 | Space | pause or resume mpv |
 | ← → | mpv back or forward 5 s |

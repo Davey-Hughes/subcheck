@@ -64,7 +64,7 @@ ApplicationWindow {
         }
     }
 
-    // Black until something plays, and again once it is closed.
+    // Black until a file opens, and again once it is closed.
     MpvItem {
         objectName: "video"
         anchors.left: list.right

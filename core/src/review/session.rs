@@ -954,14 +954,16 @@ mod tests {
         s.send(Action::Play);
         let (rows, summary) = next_change(&s);
         assert_eq!(rows, None);
-        assert_eq!(summary.status.as_deref(), Some("opening E01 at 0:02:43.06"));
+        assert_eq!(
+            summary.status.as_deref(),
+            Some("opening E01 at 0:02:45.060")
+        );
         assert_eq!(
             next(&s),
             Some(Event::Player(PlayerCommand::Open(Moment {
                 file: tests_support::path(1),
-                start_ms: 163_060,
+                start_us: 165_064_500,
                 sid: Some(1),
-                paused: false,
             })))
         );
         s.report(PlayerReport::Opened(Ok(())));

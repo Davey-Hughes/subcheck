@@ -14,7 +14,8 @@ pub enum Filter {
     Only(State),
 }
 
-/// mpv starts this far before a line, so you see it appear.
+/// `subcheck list`'s mpv commands start this far before a line, so that whoever runs one sees it
+/// appear. Review opens on the line itself ([`crate::player::line_start_us`]).
 const LEAD_MS: i64 = 2000;
 
 pub fn render(run: &Run, filter: Filter, mpv: bool) -> String {
@@ -152,23 +153,21 @@ pub fn shown_at<'a>(
     (occurrence, track)
 }
 
-/// Where mpv opens a finding: two seconds before its line (in ms), and mpv's sid for its track.
-pub fn mpv_moment(run: &Run, f: &Finding) -> (i64, Option<usize>) {
+/// Where a line finding's line starts (in ms) where it is shown ([`shown_at`]), and mpv's sid for
+/// that track.
+pub fn line_moment(run: &Run, f: &Finding) -> (i64, Option<usize>) {
     let (occurrence, track) = shown_at(run, f);
-    (
-        occurrence.map_or(0, |o| (o.start_ms - LEAD_MS).max(0)),
-        track.map(|t| t.sid),
-    )
+    (occurrence.map_or(0, |o| o.start_ms), track.map(|t| t.sid))
 }
 
 /// The mpv command that opens the file two seconds before the line, with the subtitle track that
 /// shows it: the occurrence on a default track if there is one, else the first.
 pub fn mpv_command(run: &Run, f: &Finding) -> String {
-    let (start, sid) = mpv_moment(run, f);
+    let (start, sid) = line_moment(run, f);
     let sid = sid.map(|s| format!(" --sid={s}")).unwrap_or_default();
     format!(
         "mpv --start={}{sid} {}",
-        timestamp(start),
+        timestamp((start - LEAD_MS).max(0)),
         shell_quote(&f.file)
     )
 }

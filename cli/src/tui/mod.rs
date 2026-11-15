@@ -580,9 +580,8 @@ mod tests {
         };
         let moment = subcheck_core::player::Moment {
             file: "/m/E01.mkv".into(),
-            start_ms: 0,
+            start_us: 0,
             sid: None,
-            paused: false,
         };
         // No mpv to start, and none on the socket: each says so as its own input.
         let opened = ran(PlayerCommand::Open(moment));

@@ -239,7 +239,7 @@ private slots:
         QTest::keyClick(w.window, Qt::Key_Space);
         QTRY_COMPARE(status->property("text").toString(), "mpv has no file open (o opens one)");
         QTest::keyClick(w.window, Qt::Key_O);
-        QTRY_COMPARE(status->property("text").toString(), "opening E01 at 0:00:00.00");
+        QTRY_COMPARE(status->property("text").toString(), "opening E01 at 0:00:01.000");
         QTest::keyClick(w.window, Qt::Key_Right);
         QTRY_COMPARE(status->property("text").toString(), "mpv is still opening the file");
         QTest::keyClick(w.window, 'O');

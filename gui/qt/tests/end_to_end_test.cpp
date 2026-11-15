@@ -166,7 +166,8 @@ private slots:
         QVERIFY(xdotool({"windowfocus", "--sync", windows.section('\n', 0, 0)}));
 
         // The first row accepted, which moves on to the second; back to the first, and played: a
-        // timing finding's, paused on the frame that shows it, with its track's subtitles.
+        // timing finding's, on the frame that shows it, with its track's subtitles, and paused, as
+        // mpv had no file open.
         QVERIFY(xdotool({"key", "a", "k", "o"}));
         QTRY_COMPARE_WITH_TIMEOUT(ask(socket, "time-pos").value("data").toDouble(), 2.5, 10000);
         QCOMPARE(ask(socket, "path").value("data").toString(),
@@ -184,6 +185,11 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(ask(socket, "time-pos").value("data").toDouble(), 3.0, 5000);
         QVERIFY(xdotool({"key", "comma"}));
         QTRY_COMPARE_WITH_TIMEOUT(ask(socket, "time-pos").value("data").toDouble(), 2.0, 5000);
+        // Space plays. Paused still, as `o` opened it, through the frame step and the seek, so that
+        // only Space can make the check after it pass.
+        QCOMPARE(ask(socket, "pause").value("data").toBool(), true);
+        QVERIFY(xdotool({"key", "space"}));
+        QTRY_COMPARE_WITH_TIMEOUT(ask(socket, "pause").value("data").toBool(), false, 5000);
         // Closed: mpv answers, and has no file.
         QVERIFY(xdotool({"key", "O"}));
         QTRY_COMPARE_WITH_TIMEOUT(ask(socket, "path").value("error").toString(),
