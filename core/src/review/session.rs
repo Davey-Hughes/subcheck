@@ -20,7 +20,7 @@ use super::model::{Entry, EntryKey, Review};
 use super::runner::{self, Runner};
 use super::update::{self, Action, Effect, Input};
 use crate::group;
-use crate::player::{PlayState, PlayerCommand};
+use crate::player::{self, PlayState, PlayerCommand, PlayerError};
 use crate::store::{self, Selector, State, Store};
 
 /// What a UI hears, in order ([`Session::next_event`]).
@@ -202,12 +202,14 @@ impl Sent {
     }
 }
 
-/// What the UI's player says of a [`PlayerCommand`] it ran ([`Session::report`]).
+/// What the UI's player says of a [`PlayerCommand`] it ran, or later of a file it had said was
+/// open ([`Session::report`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlayerReport {
-    Opened(Result<(), String>),
-    Played(Result<PlayState, String>),
-    Closed(Result<(), String>),
+    Opened(Result<player::Opened, PlayerError>),
+    Played(Result<PlayState, PlayerError>),
+    Closed(Result<(), PlayerError>),
+    Failed(PlayerError),
 }
 
 /// What the core thread takes: an input for `update`, from the UI or a job; or the stop that
@@ -334,6 +336,7 @@ impl Session {
             PlayerReport::Opened(result) => Input::Opened(result),
             PlayerReport::Played(result) => Input::Played(result),
             PlayerReport::Closed(result) => Input::Closed(result),
+            PlayerReport::Failed(error) => Input::PlayerFailed(error),
         };
         let _ = self.inputs.send(Msg::Input(input));
     }
@@ -487,7 +490,7 @@ mod tests {
     use rustix::process::{Resource, Rlimit, setrlimit};
 
     use crate::list::Filter;
-    use crate::player::{Moment, Playback};
+    use crate::player::{How, Moment, Playback};
     use crate::review::model::tests_support::{self, finding, many, sample, with_timing};
     use crate::review::model::{Pane, Row};
     use crate::review::progress::Scan;
@@ -947,9 +950,26 @@ mod tests {
     #[test]
     fn a_change_is_published_before_its_effects_run_and_a_tasks_result_after_it() {
         let dir = tempfile::tempdir().unwrap();
-        let s = session(dir.path(), |_| {});
+        // E01 on disk, under its own name, so that the stat `o` makes finds it.
+        let e01 = dir.path().join("K-On! - E01 - Episode.mkv");
+        std::fs::write(&e01, "1").unwrap();
+        let file = e01.to_string_lossy().into_owned();
+        let on_disk = file.clone();
+        let s = session(dir.path(), move |m| {
+            for f in &mut m.run.findings {
+                if f.file == tests_support::path(1) {
+                    f.file.clone_from(&on_disk);
+                }
+            }
+            for f in &mut m.run.files {
+                if f.path == tests_support::path(1) {
+                    f.path.clone_from(&on_disk);
+                }
+            }
+        });
         next(&s);
-        // A player command: what is about to happen, then the command; the report comes back as an
+        // A player command: what is about to happen; then, once the core thread has read the
+        // file's stamp, which changes nothing shown, the command. The report comes back as an
         // input of its own.
         s.send(Action::Play);
         let (rows, summary) = next_change(&s);
@@ -960,16 +980,20 @@ mod tests {
         );
         assert_eq!(
             next(&s),
-            Some(Event::Player(PlayerCommand::Open(Moment {
-                file: tests_support::path(1),
-                start_us: 165_064_500,
-                sid: Some(1),
-            })))
+            Some(Event::Player(PlayerCommand::Open {
+                moment: Moment {
+                    file,
+                    start_us: 165_064_500,
+                    sid: Some(1),
+                },
+                how: How::Load,
+                options: player::load_options(),
+            }))
         );
-        s.report(PlayerReport::Opened(Ok(())));
+        s.report(PlayerReport::Opened(Ok(player::Opened { paused: true })));
         let (rows, summary) = next_change(&s);
         assert_eq!(rows, None);
-        assert_eq!(summary.status.as_deref(), Some("opened in mpv"));
+        assert_eq!(summary.status.as_deref(), Some("opened in mpv, paused"));
         // A task whose result changes the rows: the status line cleared first, on its own, while
         // the write is still to run; then the rows, once the store has said.
         s.send(Action::Accept);
@@ -998,9 +1022,18 @@ mod tests {
         s.send(Action::ClosePlayer);
         next_change(&s);
         assert_eq!(next(&s), Some(Event::Player(PlayerCommand::Close)));
-        s.report(PlayerReport::Closed(Err("mpv is not open".into())));
+        s.report(PlayerReport::Closed(Err(PlayerError::NotOpen)));
         let (_, summary) = next_change(&s);
         assert_eq!(summary.status.as_deref(), Some("mpv is not open"));
+        // The selection on E02 since the accept, a file that is not on disk: the stat says so,
+        // and nothing goes to the player.
+        s.send(Action::Play);
+        next_change(&s);
+        let (_, summary) = next_change(&s);
+        assert_eq!(
+            summary.status,
+            Some(format!("file missing: {}", tests_support::path(2)))
+        );
     }
 
     #[test]
@@ -1133,7 +1166,7 @@ mod tests {
             assert_eq!(next(&s), None);
         }
         s.send(Action::Accept);
-        s.report(PlayerReport::Opened(Ok(())));
+        s.report(PlayerReport::Opened(Ok(player::Opened { paused: true })));
         s.close();
         s.close();
         assert_eq!(next(&s), None);

@@ -12,7 +12,7 @@ use super::model::{Confirm, Edit, Entry, EntryKey, FileNote, Mark, Pane, Review,
 use super::progress::{Scan, Stage};
 use crate::apply;
 use crate::list::{self, Filter, label};
-use crate::player::{self, Moment, PlayState, Playback, PlayerCommand};
+use crate::player::{self, How, Moment, Opened, PlayState, Playback, PlayerCommand, PlayerError};
 use crate::scan;
 use crate::store::{Decided, Decision, Record, Run, State};
 use crate::text::timestamp_ms;
@@ -49,12 +49,21 @@ pub enum Input {
     },
     /// A [`Task::Switch`] finished: the view and its files' notes, or why it could not be read.
     Switched(Result<(Run, HashMap<String, FileNote>), String>),
-    /// A [`PlayerCommand::Open`] finished.
-    Opened(Result<(), String>),
+    /// A [`Task::Stamp`] finished: the moment `o` opens, and its file's size and mtime now, or none
+    /// when they could not be read.
+    Stamped {
+        moment: Moment,
+        stamp: Option<(u64, Timestamp)>,
+    },
+    /// A [`PlayerCommand::Open`] finished: where mpv was left, or why it did not open.
+    Opened(Result<Opened, PlayerError>),
     /// A [`PlayerCommand::Playback`] finished: where mpv is now.
-    Played(Result<PlayState, String>),
+    Played(Result<PlayState, PlayerError>),
     /// A [`PlayerCommand::Close`] finished.
-    Closed(Result<(), String>),
+    Closed(Result<(), PlayerError>),
+    /// A file the player had said was open failed after all: the window's load that outlasted its
+    /// wait, then ended on an error.
+    PlayerFailed(PlayerError),
     /// What the scan under way just did.
     Scan(scan::Event),
     /// The scan ended: its summary, or why it failed.
@@ -190,6 +199,11 @@ pub enum Task {
     /// Open the other view of the screen's findings (`v`), read from the store with each file's
     /// note ([`Input::Switched`]).
     Switch(Switch),
+    /// Read the size and mtime of the file `o` opens, for review to say seek or load
+    /// ([`Input::Stamped`]): a stat, which can hang on a stalled mount, so a task. A session runs
+    /// it on its own thread, not the window's; the terminal runs every task in its loop, which a
+    /// stall holds.
+    Stamp(Moment),
     /// Apply `run`'s accepted fixes on a thread of their own (with `dry_run`, say what would change
     /// and write nothing); `karaoke` as `apply --karaoke` ([`Input::ApplyStarted`], then
     /// [`Input::Apply`] for each step and [`Input::ApplyEnded`]).
@@ -218,10 +232,15 @@ pub fn update(m: &mut Review, input: Input, now: Timestamp) -> Vec<Effect> {
             paths: p,
         } => started(m, job, &missing, &p),
         Input::Switched(result) => switched(m, result),
+        Input::Stamped { moment, stamp } => stamped(m, moment, stamp),
         Input::Opened(result) => {
             m.status = Some(match result {
-                Ok(()) => "opened in mpv".into(),
-                Err(e) => e,
+                Ok(Opened { paused: true }) => "opened in mpv, paused".into(),
+                Ok(Opened { paused: false }) => "opened in mpv, playing".into(),
+                Err(e) => {
+                    m.loaded = None;
+                    player_words(m, Asked::Open, e)
+                }
             });
             Vec::new()
         }
@@ -232,15 +251,22 @@ pub fn update(m: &mut Review, input: Input, now: Timestamp) -> Vec<Effect> {
                     if p.paused { "⏸" } else { "▶" },
                     timestamp_ms(p.at_ms)
                 ),
-                Err(e) => e,
+                Err(e) => player_words(m, Asked::Playback, e),
             });
             Vec::new()
         }
+        // Whatever it says, mpv may no longer have the file review loaded.
         Input::Closed(result) => {
+            m.loaded = None;
             m.status = Some(match result {
                 Ok(()) => "closed mpv".into(),
-                Err(e) => e,
+                Err(e) => player_words(m, Asked::Close, e),
             });
+            Vec::new()
+        }
+        Input::PlayerFailed(e) => {
+            m.loaded = None;
+            m.status = Some(player_words(m, Asked::Open, e));
             Vec::new()
         }
         Input::Scan(event) => scanned(m, event),
@@ -815,7 +841,7 @@ fn open(m: &mut Review) -> Vec<Effect> {
     };
     let moment = Moment {
         file: f.file.clone(),
-        start_us,
+        start_us: start_us.max(0),
         sid,
     };
     m.status = Some(format!(
@@ -823,7 +849,60 @@ fn open(m: &mut Review) -> Vec<Effect> {
         m.label(&moment.file),
         timestamp_ms(at_ms)
     ));
-    vec![Effect::Player(PlayerCommand::Open(moment))]
+    vec![Effect::Task(Task::Stamp(moment))]
+}
+
+/// `o`'s file stat, and review's word to the player: a seek when review last had it load this
+/// file, unchanged on disk since, else a load. The player checks the seek against what its mpv
+/// has open, so a load forgotten too soon costs a reload, never a wrong frame. A file that is not
+/// there (whose size and mtime cannot be read) is not opened, as one whose note says it is missing
+/// is not: mpv could not read it either, and the terminal's player, which does not wait for a load
+/// to land, would say it opened. Its note is left as it is, so that the next `o` stats the file
+/// again: a mount back, it opens.
+fn stamped(m: &mut Review, moment: Moment, stamp: Option<(u64, Timestamp)>) -> Vec<Effect> {
+    let Some(stamp) = stamp else {
+        m.loaded = None;
+        m.status = Some(format!("file missing: {}", moment.file));
+        return Vec::new();
+    };
+    let now = Some((moment.file.clone(), stamp));
+    let how = if m.loaded == now {
+        How::Seek
+    } else {
+        How::Load
+    };
+    m.loaded = now;
+    vec![Effect::Player(PlayerCommand::Open {
+        moment,
+        how,
+        options: player::load_options(),
+    })]
+}
+
+/// What the player was asked, for the words of what went wrong.
+#[derive(Clone, Copy)]
+enum Asked {
+    Open,
+    Playback,
+    Close,
+}
+
+/// The status line's words for what went wrong with a player command, the same in both UIs.
+fn player_words(m: &Review, asked: Asked, e: PlayerError) -> String {
+    match e {
+        PlayerError::NotOpen => match asked {
+            Asked::Playback => "mpv is not open (o opens it)".into(),
+            Asked::Open | Asked::Close => "mpv is not open".into(),
+        },
+        PlayerError::NoFile => "mpv has no file open (o opens one)".into(),
+        PlayerError::StillOpening => "mpv is still opening the file".into(),
+        PlayerError::CouldNotOpen { file } => format!("mpv could not open {}", m.label(&file)),
+        PlayerError::NoAnswer => "mpv did not answer".into(),
+        PlayerError::HungUp => "mpv closed the connection without answering".into(),
+        PlayerError::NoVideo => "the video pane could not show video".into(),
+        PlayerError::Mpv(e) => format!("mpv: {e}"),
+        PlayerError::Failed(e) => e,
+    }
 }
 
 /// `q`: quit; while a job runs, ask first.
@@ -2119,17 +2198,45 @@ mod tests {
     #[test]
     fn o_opens_a_line_on_its_first_frame_on_the_default_track() {
         let mut m = sample();
-        let open = [Effect::Player(PlayerCommand::Open(Moment {
+        let moment = Moment {
             file: path(1),
             start_us: 165_064_500,
             sid: Some(1),
-        }))];
-        assert_eq!(act(&mut m, Action::Play), open);
+        };
+        let effects = act(&mut m, Action::Play);
+        assert_eq!(effects, [Effect::Task(Task::Stamp(moment.clone()))]);
         assert_eq!(m.status.as_deref(), Some("opening E01 at 0:02:45.060"));
-        update(&mut m, Input::Opened(Err("mpv not found".into())), now());
-        assert_eq!(m.status.as_deref(), Some("mpv not found"));
+        assert_eq!(
+            stat(&mut m, effects, Some(stamp(1))),
+            open(moment.clone(), How::Load)
+        );
         // Again on the same line: the same moment, so that mpv goes back to its first frame.
-        assert_eq!(act(&mut m, Action::Play), open);
+        let effects = act(&mut m, Action::Play);
+        assert_eq!(
+            stat(&mut m, effects, Some(stamp(1))),
+            open(moment, How::Seek)
+        );
+    }
+
+    /// The player command review sends once `o`'s stat (the one task in `effects`) reads `stamp`.
+    fn stat(m: &mut Review, effects: Vec<Effect>, stamp: Option<(u64, Timestamp)>) -> Vec<Effect> {
+        let [Effect::Task(Task::Stamp(moment))] = <[Effect; 1]>::try_from(effects).unwrap() else {
+            panic!("expected the stat of the file to open");
+        };
+        update(m, Input::Stamped { moment, stamp }, now())
+    }
+
+    /// The stamp of a file `size` bytes long.
+    fn stamp(size: u64) -> (u64, Timestamp) {
+        (size, now())
+    }
+
+    fn open(moment: Moment, how: How) -> Vec<Effect> {
+        vec![Effect::Player(PlayerCommand::Open {
+            moment,
+            how,
+            options: player::load_options(),
+        })]
     }
 
     #[test]
@@ -2138,7 +2245,7 @@ mod tests {
         m.selected = 1;
         assert_eq!(
             act(&mut m, Action::Play),
-            [Effect::Player(PlayerCommand::Open(Moment {
+            [Effect::Task(Task::Stamp(Moment {
                 file: path(1),
                 start_us: 763_763_000,
                 sid: Some(1),
@@ -2162,13 +2269,163 @@ mod tests {
         m.selected = 1;
         assert_eq!(
             act(&mut m, Action::Play),
-            [Effect::Player(PlayerCommand::Open(Moment {
+            [Effect::Task(Task::Stamp(Moment {
                 file: path(1),
                 start_us: 1_004_500,
                 sid: Some(1),
             }))]
         );
         assert_eq!(m.status.as_deref(), Some("opening E01 at 0:00:01.000"));
+    }
+
+    // mpv counts a time before 0:00 back from the end.
+    #[test]
+    fn a_line_before_the_start_opens_at_the_start() {
+        let mut m = sample();
+        m.run.findings[0].occurrences[0].start_ms = -35;
+        let effects = act(&mut m, Action::Play);
+        let [Effect::Task(Task::Stamp(moment))] = &effects[..] else {
+            panic!("expected the stat: {effects:?}");
+        };
+        assert_eq!(moment.start_us, 0);
+    }
+
+    // The file review last had the player load, unchanged on disk since, is sought; a load
+    // otherwise: another file, the same one changed, or one never loaded.
+    #[test]
+    fn the_same_file_unchanged_since_its_load_is_sought() {
+        let mut m = sample();
+        let how = |m: &mut Review, read: (u64, Timestamp)| {
+            let effects = act(m, Action::Play);
+            match &stat(m, effects, Some(read))[..] {
+                [Effect::Player(PlayerCommand::Open { how, .. })] => *how,
+                other => panic!("expected an open: {other:?}"),
+            }
+        };
+        assert_eq!(how(&mut m, stamp(1)), How::Load);
+        assert_eq!(how(&mut m, stamp(1)), How::Seek);
+        // A remux in place: the same path, another size; or, one letter fixed, the same size and a
+        // later mtime.
+        assert_eq!(how(&mut m, stamp(2)), How::Load);
+        assert_eq!(how(&mut m, stamp(2)), How::Seek);
+        let later = (2, now() + jiff::SignedDuration::from_secs(1));
+        assert_eq!(how(&mut m, later), How::Load);
+        assert_eq!(how(&mut m, later), How::Seek);
+        act(&mut m, Action::NextFile);
+        assert_eq!(how(&mut m, later), How::Load);
+        act(&mut m, Action::PreviousFile);
+        assert_eq!(how(&mut m, later), How::Load);
+    }
+
+    // What review forgets lets the next `o` load: any close, and any open that failed, at once
+    // or later.
+    #[test]
+    fn review_forgets_its_load_once_the_player_closes_or_an_open_fails() {
+        let gone = PlayerError::CouldNotOpen { file: path(1) };
+        for (after, said) in [
+            (Input::Closed(Ok(())), "closed mpv"),
+            (Input::Closed(Err(PlayerError::NotOpen)), "mpv is not open"),
+            (
+                Input::Opened(Err(PlayerError::NoAnswer)),
+                "mpv did not answer",
+            ),
+            (Input::PlayerFailed(gone), "mpv could not open E01"),
+        ] {
+            let mut m = sample();
+            let effects = act(&mut m, Action::Play);
+            stat(&mut m, effects, Some(stamp(1)));
+            update(&mut m, Input::Opened(Ok(Opened { paused: true })), now());
+            let effects = act(&mut m, Action::Play);
+            assert!(matches!(
+                stat(&mut m, effects, Some(stamp(1)))[..],
+                [Effect::Player(PlayerCommand::Open { how: How::Seek, .. })]
+            ));
+            update(&mut m, after, now());
+            assert_eq!(m.status.as_deref(), Some(said));
+            let effects = act(&mut m, Action::Play);
+            assert!(
+                matches!(
+                    stat(&mut m, effects, Some(stamp(1)))[..],
+                    [Effect::Player(PlayerCommand::Open { how: How::Load, .. })]
+                ),
+                "after {said}"
+            );
+        }
+    }
+
+    // As a file whose note says it is missing is not opened: mpv could not read it either.
+    #[test]
+    fn a_file_that_cannot_be_read_now_is_not_opened() {
+        let mut m = sample();
+        let effects = act(&mut m, Action::Play);
+        stat(&mut m, effects, Some(stamp(1)));
+        let effects = act(&mut m, Action::Play);
+        assert_eq!(stat(&mut m, effects, None), []);
+        assert_eq!(
+            m.status.as_deref(),
+            Some(format!("file missing: {}", path(1)).as_str())
+        );
+        assert_eq!(m.loaded, None);
+    }
+
+    #[test]
+    fn each_thing_a_player_reports_has_its_words() {
+        let error = |e| Input::Opened(Err(e));
+        for (input, said) in [
+            (
+                Input::Opened(Ok(Opened { paused: true })),
+                "opened in mpv, paused",
+            ),
+            (
+                Input::Opened(Ok(Opened { paused: false })),
+                "opened in mpv, playing",
+            ),
+            (error(PlayerError::NotOpen), "mpv is not open"),
+            (
+                error(PlayerError::NoFile),
+                "mpv has no file open (o opens one)",
+            ),
+            (
+                error(PlayerError::StillOpening),
+                "mpv is still opening the file",
+            ),
+            (
+                error(PlayerError::CouldNotOpen { file: path(2) }),
+                "mpv could not open E02",
+            ),
+            (error(PlayerError::NoAnswer), "mpv did not answer"),
+            (
+                error(PlayerError::HungUp),
+                "mpv closed the connection without answering",
+            ),
+            (
+                error(PlayerError::NoVideo),
+                "the video pane could not show video",
+            ),
+            (
+                error(PlayerError::Mpv("invalid parameter".into())),
+                "mpv: invalid parameter",
+            ),
+            (
+                error(PlayerError::Failed(
+                    "mpv not found: install mpv to open findings".into(),
+                )),
+                "mpv not found: install mpv to open findings",
+            ),
+            (
+                Input::Played(Err(PlayerError::NotOpen)),
+                "mpv is not open (o opens it)",
+            ),
+            (Input::Closed(Err(PlayerError::NotOpen)), "mpv is not open"),
+            (
+                Input::PlayerFailed(PlayerError::CouldNotOpen { file: path(1) }),
+                "mpv could not open E01",
+            ),
+        ] {
+            let mut m = sample();
+            update(&mut m, input, now());
+            assert_eq!(m.status.as_deref(), Some(said));
+        }
     }
 
     #[test]
@@ -2234,11 +2491,7 @@ mod tests {
         assert_eq!(m.status.as_deref(), Some("⏸ 0:02:51.060"));
         update(&mut m, at(false), now());
         assert_eq!(m.status.as_deref(), Some("▶ 0:02:51.060"));
-        update(
-            &mut m,
-            Input::Played(Err("mpv is not open (o opens it)".into())),
-            now(),
-        );
+        update(&mut m, Input::Played(Err(PlayerError::NotOpen)), now());
         assert_eq!(m.status.as_deref(), Some("mpv is not open (o opens it)"));
     }
 
@@ -2251,7 +2504,7 @@ mod tests {
         );
         update(&mut m, Input::Closed(Ok(())), now());
         assert_eq!(m.status.as_deref(), Some("closed mpv"));
-        update(&mut m, Input::Closed(Err("mpv is not open".into())), now());
+        update(&mut m, Input::Closed(Err(PlayerError::NotOpen)), now());
         assert_eq!(m.status.as_deref(), Some("mpv is not open"));
     }
 

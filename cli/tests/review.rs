@@ -122,7 +122,8 @@ fn decisions_made_in_review_are_in_the_store() {
     );
     let mut model = Review::new(store.run_view(&scan).unwrap(), HashMap::new());
     let mut screen = Screen::default();
-    let mut player = Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock"));
+    let no_mpv = dir.path().join("no-mpv");
+    let mut player = Player::new(&no_mpv, dir.path().join("mpv.sock"));
     let mut runner = runner_on(&store);
     let key = |c| Msg::Key(KeyCode::Char(c));
 
@@ -162,17 +163,36 @@ fn decisions_made_in_review_are_in_the_store() {
     assert_eq!(run.state_of(3), State::Pending);
     assert_eq!(run.state_of(1), State::Accepted);
 
-    // With no mpv to start, `o` says so in the status line.
+    // The file not on disk, `o` reads its stamp through the loop's runner and says so in the
+    // status line, asking nothing of mpv.
     model.filter = Filter::All;
     send(&mut model, &mut screen, key('o'), &mut runner, &mut player);
-    assert!(
-        model
-            .status
-            .as_deref()
-            .is_some_and(|s| s.contains("not found")),
-        "{:?}",
-        model.status
+    assert_eq!(
+        model.status.as_deref(),
+        Some(format!("file missing: {OTHER}").as_str())
     );
+
+    // A file on disk gets past the stat to the player, which has no mpv to start and says so. A
+    // run of its own, as the review orders its rows by path, which the test's directory decides.
+    let video = dir.path().join("E03.mkv");
+    std::fs::write(&video, b"").unwrap();
+    let path = video.to_str().unwrap();
+    let on_disk = store
+        .begin_scan(&header, std::slice::from_ref(&video))
+        .unwrap();
+    checked(
+        &mut store,
+        &on_disk,
+        path,
+        vec![finding(path, "gets trough", "gets through")],
+    );
+    let mut model = Review::new(store.run_view(&on_disk).unwrap(), HashMap::new());
+    send(&mut model, &mut screen, key('o'), &mut runner, &mut player);
+    let not_found = format!(
+        "{} not found: install mpv to open findings",
+        no_mpv.display()
+    );
+    assert_eq!(model.status.as_deref(), Some(not_found.as_str()));
 }
 
 #[test]

@@ -1,21 +1,16 @@
 // The player on a fake mpv, with no session and no window: which requests each command sends, in
 // which order, what it waits for, and what it reports.
 #include "fake_mpv.h"
-#include "overloaded.h"
 #include "player_port.h"
+#include "said.h"
 
-#include <QDir>
 #include <QElapsedTimer>
-#include <QFile>
-#include <QTemporaryDir>
 #include <QTest>
 
 #include <chrono>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <tuple>
-#include <variant>
 #include <vector>
 
 using namespace subcheck_ffi;
@@ -26,22 +21,17 @@ const QString unavailable = QStringLiteral("property unavailable");
 // mpv's text for a command it refuses, as a seek of a file it still loads.
 const QString refused = QStringLiteral("error running command");
 
-// A file of one byte in `dir`, for a test whose player stats what it opens; empty when it could
-// not be written.
-QString oneByteFile(const QTemporaryDir &dir) {
-    const QString path = dir.filePath(QStringLiteral("a.mkv"));
-    QFile file(path);
-    if (!file.open(QIODevice::WriteOnly) || file.write("a") != 1) {
-        return {};
-    }
-    return path;
-}
-
 Moment moment(const std::string &file, std::int64_t at, std::optional<std::uint64_t> sid) {
     return Moment{file, at, sid};
 }
 
-PlayerCommand open(const Moment &m) { return PlayerCommand(PlayerCommand::kOpen{m}); }
+// Options core never gives: the port hands mpv whatever list review gives it, and names none
+// itself, which core's own pair would hide.
+const std::vector<FileOption> given = {{"title", "t"}, {"osd-level", "1"}};
+
+PlayerCommand open(const Moment &m, How how = How::kLoad) {
+    return PlayerCommand(PlayerCommand::kOpen{m, how, given});
+}
 
 PlayerCommand playback(Playback p) { return PlayerCommand(PlayerCommand::kPlayback{std::move(p)}); }
 
@@ -53,6 +43,16 @@ PlayerCommand close() { return PlayerCommand(PlayerCommand::kClose{}); }
 // open only; then the pause every move starts with.
 const QStringList firstWithNoFile = {"get path", "set pause yes"};
 const QStringList firstWithAFile = {"get path", "get pause", "set pause yes"};
+
+// The load of `file` at `start`, with its subtitle track if it has one and the options the tests
+// give, paused or playing.
+QString loadOf(const QString &file, const QString &start, const QString &sid = {},
+               bool paused = true) {
+    return QStringLiteral("loadfile %1 replace -1 start=%2%3,sub-visibility=yes,title=t,"
+                          "osd-level=1,pause=%4")
+        .arg(file, start, sid.isEmpty() ? QString() : QStringLiteral(",sid=") + sid,
+             paused ? QStringLiteral("yes") : QStringLiteral("no"));
+}
 
 // Answers the Open `player` has under way as `mpv` with `path` open would (none when empty), paused
 // or playing, as far as its move: the requests above, which it returns for the test to compare.
@@ -71,38 +71,17 @@ QStringList answerOpening(FakeMpv &mpv, PlayerPort &player, const QString &path 
     return asked;
 }
 
-// A report as one line, to compare.
-QString said(const PlayerReport &report) {
-    const auto error = [](const std::optional<std::string> &e) {
-        return e ? QStringLiteral(": ") + QString::fromStdString(*e) : QString();
-    };
-    return std::visit(
-        Overloaded{
-            [&](const PlayerReport::kOpened &r) {
-                return QStringLiteral("opened") + error(r.error);
-            },
-            [](const PlayerReport::kPlayed &r) {
-                return QStringLiteral("played %1 %2")
-                    .arg(r.state.paused ? QStringLiteral("paused") : QStringLiteral("playing"))
-                    .arg(r.state.at_ms);
-            },
-            [](const PlayerReport::kPlayFailed &r) {
-                return QStringLiteral("play failed: ") + QString::fromStdString(r.error);
-            },
-            [&](const PlayerReport::kClosed &r) {
-                return QStringLiteral("closed") + error(r.error);
-            },
-        },
-        report.get_variant());
-}
-
-// The player, its fake mpv, and what it has reported, each as one line.
+// The player, its fake mpv, and what it has reported, each as one line. Its limits are far longer
+// than any test waits, but where a test gives one of its own.
 struct Rig {
     PlayerPort player;
     FakeMpv mpv;
     QStringList reports;
 
-    explicit Rig(std::chrono::milliseconds settle = std::chrono::seconds(10)) : player(settle) {
+    explicit Rig(std::chrono::milliseconds settle = std::chrono::seconds(10),
+                 std::chrono::milliseconds answer = std::chrono::seconds(10),
+                 std::chrono::milliseconds ready = std::chrono::seconds(10))
+        : player(settle, answer, ready) {
         QObject::connect(&player, &PlayerPort::reported,
                          [this](const PlayerReport &r) { reports << said(r); });
         player.attach(&mpv);
@@ -129,8 +108,7 @@ class PlayerPortTest : public QObject {
     Q_OBJECT
 
 private slots:
-    // The newest moment only, once mpv can show it; paused, with nothing after the load to unpause
-    // it, as mpv had no file open to play.
+    // The newest moment only, once mpv can show it; loaded paused, as mpv had no file open to play.
     void anOpenWaitsUntilMpvCanShowVideo() {
         Rig r;
         r.player.run(open(moment("/m/a.mkv", 1'000'000, 1)));
@@ -138,61 +116,58 @@ private slots:
         QCOMPARE(r.mpv.requests.size(), 0u);
         r.player.ready();
         QCOMPARE(r.openWith(), firstWithNoFile);
-        QCOMPARE(r.mpv.last(),
-                 "loadfile /m/b.mkv replace -1 start=0:00:02.004500,sid=2,sub-visibility=yes");
+        QCOMPARE(r.mpv.last(), loadOf("/m/b.mkv", "0:00:02.004500", "2"));
         QCOMPARE(r.reports, QStringList());
         r.mpv.answer(r.player);
         r.player.restarted();
-        QCOMPARE(r.reports, QStringList{"opened"});
+        QCOMPARE(r.reports, QStringList{"opened paused"});
         QCOMPARE(r.mpv.requests.size(), 3u);
     }
 
     // Nothing can be open before mpv can show video: a Playback says so, or that the file is
-    // still opening, and a Close drops the Open that waits.
+    // still opening, and a Close drops the Open that waits, or with none says nothing is open.
     void beforeThenAPlaybackOrACloseIsAnsweredAtOnce() {
         Rig r;
         r.player.run(seek(5));
         r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
         r.player.run(seek(5));
         r.player.run(close());
+        r.player.run(close());
         r.player.ready();
-        QCOMPARE(r.reports, (QStringList{"play failed: mpv has no file open (o opens one)",
-                                         "play failed: mpv is still opening the file", "closed"}));
+        QCOMPARE(r.reports, (QStringList{"play failed: no file", "play failed: still opening",
+                                         "closed", "closed: not open"}));
         QCOMPARE(r.mpv.requests.size(), 0u);
     }
 
-    // Paused before mpv gets there, so that a playing mpv does not go on past the frame, and opened
-    // once playback starts there, with nothing after it to unpause, as mpv had no file open, then
-    // one paused: a position is no landing for a load, as mpv can hold one from before it until
-    // now. Whether mpv plays is read only with a file open, and before anything is sent. The
-    // subtitle track only when review names one; the time in µs, as review gives it; never a time
-    // before 0:00, which mpv counts from the end.
+    // Paused before mpv gets there, so that a playing mpv does not go on past the frame, and
+    // opened once playback starts there, loaded paused as mpv had no file open, then one paused:
+    // a position is no landing for a load, as mpv can hold one from before it until now. Whether
+    // mpv plays is read only with a file open, and before anything is sent. The subtitle track
+    // only when review names one; the time in µs, as review gives it.
     void anotherFileIsLoaded() {
         Rig r;
         r.player.ready();
         r.player.run(open(moment("/m/a.mkv", 62'504'500, 2)));
         QCOMPARE(r.openWith(), firstWithNoFile);
-        QCOMPARE(r.mpv.last(),
-                 "loadfile /m/a.mkv replace -1 start=0:01:02.504500,sid=2,sub-visibility=yes");
+        QCOMPARE(r.mpv.last(), loadOf("/m/a.mkv", "0:01:02.504500", "2"));
         r.mpv.answer(r.player);
         r.player.moved();
         QCOMPARE(r.reports, QStringList());
         r.player.restarted();
-        QCOMPARE(r.reports, QStringList{"opened"});
+        QCOMPARE(r.reports, QStringList{"opened paused"});
         QCOMPARE(r.mpv.requests.size(), 3u);
 
-        r.player.run(open(moment("/m/b.mkv", -40'000, std::nullopt)));
+        r.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
         QCOMPARE(r.openWith("/m/a.mkv"), firstWithAFile);
-        QCOMPARE(r.mpv.last(),
-                 "loadfile /m/b.mkv replace -1 start=0:00:00.000000,sub-visibility=yes");
+        QCOMPARE(r.mpv.last(), loadOf("/m/b.mkv", "0:00:00.000000"));
         r.mpv.answer(r.player);
         r.player.restarted();
         QCOMPARE(r.mpv.requests.size(), 7u);
-        QCOMPARE(r.reports, (QStringList{"opened", "opened"}));
+        QCOMPARE(r.reports, (QStringList{"opened paused", "opened paused"}));
     }
 
     // Whether mpv plays decides only whether it plays again once there: a read of it that mpv
-    // fails, or that gives no flag, counts as paused, and the Open goes on, left paused.
+    // fails, or that gives no flag, counts as paused, and the Open goes on, loading paused.
     void aFailedReadOfPauseOpensPaused() {
         Rig r;
         r.loaded();
@@ -203,12 +178,10 @@ private slots:
         r.mpv.answer(r.player, {}, QStringLiteral("unknown error"));
         QCOMPARE(r.mpv.last(), "set pause yes");
         r.mpv.answer(r.player);
-        QVERIFY(r.mpv.last().startsWith("loadfile "));
+        QCOMPARE(r.mpv.last(), loadOf("/m/b.mkv", "0:00:00.000000"));
         r.mpv.answer(r.player);
-        auto sent = r.mpv.requests.size();
         r.player.restarted();
-        QCOMPARE(r.reports, QStringList{"opened"});
-        QCOMPARE(r.mpv.requests.size(), sent);
+        QCOMPARE(r.reports, QStringList{"opened paused"});
 
         r.player.run(open(moment("/m/c.mkv", 0, std::nullopt)));
         r.mpv.answer(r.player, QStringLiteral("/m/b.mkv"));
@@ -216,264 +189,204 @@ private slots:
         r.mpv.answer(r.player);
         QCOMPARE(r.mpv.last(), "set pause yes");
         r.mpv.answer(r.player);
-        QVERIFY(r.mpv.last().startsWith("loadfile "));
+        QCOMPARE(r.mpv.last(), loadOf("/m/c.mkv", "0:00:00.000000"));
         r.mpv.answer(r.player);
-        sent = r.mpv.requests.size();
+        const auto sent = r.mpv.requests.size();
         r.player.restarted();
-        QCOMPARE(r.reports, (QStringList{"opened", "opened"}));
+        QCOMPARE(r.reports, (QStringList{"opened paused", "opened paused"}));
         QCOMPARE(r.mpv.requests.size(), sent);
     }
 
-    // Another file while mpv plays one: loaded paused, as any is, and playing again only once the
-    // load has landed, so that mpv plays on from the frame, not from where it was; the Open reports
-    // once mpv has answered that.
+    // As the terminal's: mpv refusing the read of the path, whatever its words, counts as no file
+    // open, so even a seek loads, paused, with no read of whether mpv plays. No answer at all is
+    // no refusal, and fails the Open.
+    void aRefusedReadOfThePathLoads() {
+        Rig r;
+        r.player.ready();
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt), How::kSeek));
+        QCOMPARE(r.mpv.last(), "get path");
+        r.mpv.answer(r.player, {}, QStringLiteral("unknown error"));
+        QCOMPARE(r.mpv.last(), "set pause yes");
+        r.mpv.answer(r.player);
+        QCOMPARE(r.mpv.last(), loadOf("/m/a.mkv", "0:00:00.000000"));
+        r.mpv.answer(r.player);
+        r.player.restarted();
+        QCOMPARE(r.reports, QStringList{"opened paused"});
+
+        Rig silent(std::chrono::seconds(10), std::chrono::milliseconds(300));
+        silent.player.ready();
+        silent.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        QTRY_COMPARE_WITH_TIMEOUT(silent.reports, QStringList{"open failed: no answer"}, 2000);
+        QCOMPARE(silent.mpv.requests.size(), 1u);
+    }
+
+    // Another file while mpv plays one: paused, then loaded playing, by the load's own option, so
+    // that a user's reset-on-next-file cannot undo it; nothing after it, and the Open reports once
+    // the load has landed.
     void aPlayingMpvLoadsAnotherFileAndPlaysOn() {
         Rig r;
         r.loaded();
         r.player.run(open(moment("/m/b.mkv", 2'004'500, 2)));
         QCOMPARE(r.openWith("/m/a.mkv", false), firstWithAFile);
-        const QString load = QStringLiteral(
-            "loadfile /m/b.mkv replace -1 start=0:00:02.004500,sid=2,sub-visibility=yes");
+        const QString load = loadOf("/m/b.mkv", "0:00:02.004500", "2", false);
         QCOMPARE(r.mpv.last(), load);
         r.mpv.answer(r.player);
+        QCOMPARE(r.reports, QStringList());
+        r.player.restarted();
         QCOMPARE(r.mpv.last(), load);
+        QCOMPARE(r.reports, QStringList{"opened playing"});
+    }
+
+    // Review says seek when it had the player load the file, unchanged since: sought, if mpv still
+    // has it open, its settings first, in core's order, and left paused with nothing after it.
+    // Told to seek with another file open, or none, the port loads; told to load, it loads, the
+    // file it has open or not (review's word: the file changed on disk).
+    void aSeekIsSoughtInTheFileMpvHasOpenAndAnythingElseLoaded() {
+        Rig r;
+        r.player.ready();
+        r.player.run(open(moment("/m/a.mkv", 5'000'000, 3), How::kSeek));
+        QCOMPARE(r.openWith("/m/a.mkv"), firstWithAFile);
+        QCOMPARE(r.mpv.last(), "set sid 3");
+        r.mpv.answer(r.player);
+        QCOMPARE(r.mpv.last(), "set sub-visibility yes");
+        r.mpv.answer(r.player);
+        QCOMPARE(r.mpv.last(), "seek 0:00:05.000000 absolute+exact");
+        r.mpv.answer(r.player);
+        auto sent = r.mpv.requests.size();
+        r.player.restarted();
+        QCOMPARE(r.reports, QStringList{"opened paused"});
+        QCOMPARE(r.mpv.requests.size(), sent);
+
+        const QString load = loadOf("/m/a.mkv", "0:00:05.000000", "3");
+        for (const auto &[how, path] : {std::pair{How::kSeek, QStringLiteral("/m/b.mkv")},
+                                        std::pair{How::kLoad, QStringLiteral("/m/a.mkv")}}) {
+            r.player.run(open(moment("/m/a.mkv", 5'000'000, 3), how));
+            QCOMPARE(r.openWith(path), firstWithAFile);
+            QCOMPARE(r.mpv.last(), load);
+            r.mpv.answer(r.player);
+            r.player.restarted();
+        }
+        r.player.run(open(moment("/m/a.mkv", 5'000'000, 3), How::kSeek));
+        QCOMPARE(r.openWith(), firstWithNoFile);
+        QCOMPARE(r.mpv.last(), load);
+        r.mpv.answer(r.player);
+        r.player.restarted();
+        QCOMPARE(r.reports.size(), 4);
+    }
+
+    // While mpv plays the file: sought paused, and playing again only once the seek has landed, so
+    // that it plays on from the frame; the Open reports once mpv has answered that.
+    void aPlayingMpvIsSoughtAndPlaysOn() {
+        Rig r;
+        r.player.ready();
+        r.player.run(open(moment("/m/a.mkv", 5'000'000, std::nullopt), How::kSeek));
+        QCOMPARE(r.openWith("/m/a.mkv", false), firstWithAFile);
+        QCOMPARE(r.mpv.last(), "set sub-visibility yes");
+        r.mpv.answer(r.player);
+        QCOMPARE(r.mpv.last(), "seek 0:00:05.000000 absolute+exact");
+        r.mpv.answer(r.player);
+        QCOMPARE(r.mpv.last(), "seek 0:00:05.000000 absolute+exact");
         r.player.restarted();
         QCOMPARE(r.mpv.last(), "set pause no");
         QCOMPARE(r.reports, QStringList());
         r.mpv.answer(r.player);
-        QCOMPARE(r.reports, QStringList{"opened"});
-    }
-
-    // As the terminal's: sought if this player loaded it and it is unchanged on disk since, in
-    // its size and in its modification time; loaded otherwise, also when mpv has it open but
-    // this player did not load it, and when it cannot be read now.
-    void theSameFileUnchangedIsSought() {
-        QTemporaryDir dir(QDir::currentPath() + QStringLiteral("/player_port_test-XXXXXX"));
-        QVERIFY(dir.isValid());
-        const QString path = dir.filePath(QStringLiteral("a.mkv"));
-        const std::string file = path.toStdString();
-        QFile written(path);
-        QVERIFY(written.open(QIODevice::WriteOnly));
-        written.write("a");
-        written.close();
-        Rig r;
-        r.player.ready();
-        // An Open of the file mpv has open, paused: the move it makes once its settings are made.
-        const auto move = [&] {
-            r.player.run(open(moment(file, 5'000'000, 3)));
-            r.openWith(path);
-            while (r.mpv.last().startsWith("set ")) {
-                r.mpv.answer(r.player);
-            }
-            const QString made = r.mpv.last();
-            r.mpv.answer(r.player);
-            r.player.restarted();
-            return made;
-        };
-        QVERIFY(move().startsWith("loadfile "));
-        r.player.run(open(moment(file, 5'000'000, 3)));
-        QCOMPARE(r.openWith(path), firstWithAFile);
-        QCOMPARE(r.mpv.last(), "set sid 3");
-        r.mpv.answer(r.player);
-        QCOMPARE(r.mpv.last(), "set sub-visibility yes");
-        r.mpv.answer(r.player);
-        QCOMPARE(r.mpv.last(), "seek 0:00:05.000000 absolute+exact");
-        r.mpv.answer(r.player);
-        const auto sent = r.mpv.requests.size();
-        r.player.restarted();
-        QCOMPARE(r.reports, (QStringList{"opened", "opened"}));
-        // Paused, it stays so: nothing after the seek.
-        QCOMPARE(r.mpv.requests.size(), sent);
-
-        // A fix of one letter in place: the same size, a later modification time.
-        QVERIFY(written.open(QIODevice::ReadWrite));
-        written.write("b");
-        written.close();
-        const auto later = std::filesystem::last_write_time(file) + std::chrono::seconds(1);
-        std::filesystem::last_write_time(file, later);
-        QVERIFY(move().startsWith("loadfile "));
-        QCOMPARE(move(), "seek 0:00:05.000000 absolute+exact");
-        // A letter more, the modification time put back: only the size has changed.
-        QVERIFY(written.open(QIODevice::Append));
-        written.write("c");
-        written.close();
-        std::filesystem::last_write_time(file, later);
-        QVERIFY(move().startsWith("loadfile "));
-        // Gone from disk since this player loaded it: loaded again, not sought, so that mpv says
-        // whether it still opens.
-        QVERIFY(QFile::remove(path));
-        QVERIFY(move().startsWith("loadfile "));
-
-        // Never loaded by this player: loaded on the name alone.
-        const std::string gone = dir.filePath(QStringLiteral("gone.mkv")).toStdString();
-        r.player.run(open(moment(gone, 0, std::nullopt)));
-        QCOMPARE(r.openWith(QString::fromStdString(gone)), firstWithAFile);
-        QVERIFY(r.mpv.last().startsWith("loadfile "));
-    }
-
-    // While mpv plays the file this player loaded, unchanged: sought paused, and playing again
-    // only once the seek has landed, so that it plays on from the frame.
-    void aPlayingMpvIsSoughtAndPlaysOn() {
-        QTemporaryDir dir(QDir::currentPath() + QStringLiteral("/player_port_test-XXXXXX"));
-        QVERIFY(dir.isValid());
-        const QString path = oneByteFile(dir);
-        QVERIFY(!path.isEmpty());
-        const std::string file = path.toStdString();
-        Rig r;
-        r.player.ready();
-        r.player.run(open(moment(file, 5'000'000, 3)));
-        QCOMPARE(r.openWith(), firstWithNoFile);
-        QVERIFY(r.mpv.last().startsWith("loadfile "));
-        r.mpv.answer(r.player);
-        r.player.restarted();
-        QCOMPARE(r.reports, QStringList{"opened"});
-
-        r.player.run(open(moment(file, 5'000'000, 3)));
-        QCOMPARE(r.openWith(path, false), firstWithAFile);
-        QCOMPARE(r.mpv.last(), "set sid 3");
-        r.mpv.answer(r.player);
-        QCOMPARE(r.mpv.last(), "set sub-visibility yes");
-        r.mpv.answer(r.player);
-        QCOMPARE(r.mpv.last(), "seek 0:00:05.000000 absolute+exact");
-        r.mpv.answer(r.player);
-        QCOMPARE(r.mpv.last(), "seek 0:00:05.000000 absolute+exact");
-        r.player.restarted();
-        QCOMPARE(r.mpv.last(), "set pause no");
-        QCOMPARE(r.reports, QStringList{"opened"});
-        r.mpv.answer(r.player);
-        QCOMPARE(r.reports, (QStringList{"opened", "opened"}));
+        QCOMPARE(r.reports, QStringList{"opened playing"});
     }
 
     // As the terminal's: a seek mpv refuses, whatever the error, loads the file instead, and the
-    // Open goes on as that load, the whole of it: paused first, then the loadfile, which lands when
-    // playback starts and fails when its file ends on an error, then playing again if mpv played
-    // before the Open. A file mpv still loads is the case it is for.
+    // Open goes on as that load, mpv paused already: the loadfile, which lands when playback
+    // starts, playing if mpv played before the Open, and fails when its file ends on an error. A
+    // file mpv still loads is the case it is for.
     void aRefusedSeekLoadsTheFileAgain() {
-        QTemporaryDir dir(QDir::currentPath() + QStringLiteral("/player_port_test-XXXXXX"));
-        QVERIFY(dir.isValid());
-        const QString path = oneByteFile(dir);
-        QVERIFY(!path.isEmpty());
-        const std::string file = path.toStdString();
         Rig r;
         r.player.ready();
-        r.player.run(open(moment(file, 5'000'000, 3)));
-        QCOMPARE(r.openWith(), firstWithNoFile);
-        QVERIFY(r.mpv.last().startsWith("loadfile "));
-        r.mpv.answer(r.player);
-        r.player.restarted();
-        QCOMPARE(r.reports, QStringList{"opened"});
-
-        r.player.run(open(moment(file, 5'000'000, 3)));
-        QCOMPARE(r.openWith(path, false), firstWithAFile);
+        r.player.run(open(moment("/m/a.mkv", 5'000'000, 3), How::kSeek));
+        QCOMPARE(r.openWith("/m/a.mkv", false), firstWithAFile);
         QCOMPARE(r.mpv.last(), "set sid 3");
         r.mpv.answer(r.player);
         QCOMPARE(r.mpv.last(), "set sub-visibility yes");
         r.mpv.answer(r.player);
         QCOMPARE(r.mpv.last(), "seek 0:00:05.000000 absolute+exact");
         r.mpv.answer(r.player, {}, refused);
-        QCOMPARE(r.mpv.last(), "set pause yes");
-        r.mpv.answer(r.player);
-        QCOMPARE(
-            r.mpv.last(),
-            QStringLiteral("loadfile %1 replace -1 start=0:00:05.000000,sid=3,sub-visibility=yes")
-                .arg(path));
+        QCOMPARE(r.mpv.last(), loadOf("/m/a.mkv", "0:00:05.000000", "3", false));
         r.mpv.answer(r.player);
         r.player.ended(false);
-        QCOMPARE(r.reports, QStringList{"opened"});
+        QCOMPARE(r.reports, QStringList());
         r.player.restarted();
-        QCOMPARE(r.mpv.last(), "set pause no");
-        QCOMPARE(r.reports, QStringList{"opened"});
-        r.mpv.answer(r.player);
-        QCOMPARE(r.reports, (QStringList{"opened", "opened"}));
+        QCOMPARE(r.reports, QStringList{"opened playing"});
 
         r.reports.clear();
-        r.player.run(open(moment(file, 0, std::nullopt)));
-        QCOMPARE(r.openWith(path), firstWithAFile);
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt), How::kSeek));
+        QCOMPARE(r.openWith("/m/a.mkv"), firstWithAFile);
         QCOMPARE(r.mpv.last(), "set sub-visibility yes");
         r.mpv.answer(r.player);
         QCOMPARE(r.mpv.last(), "seek 0:00:00.000000 absolute+exact");
         r.mpv.answer(r.player, {}, refused);
-        QCOMPARE(r.mpv.last(), "set pause yes");
-        r.mpv.answer(r.player);
-        QCOMPARE(r.mpv.last(),
-                 QStringLiteral("loadfile %1 replace -1 start=0:00:00.000000,sub-visibility=yes")
-                     .arg(path));
+        QCOMPARE(r.mpv.last(), loadOf("/m/a.mkv", "0:00:00.000000"));
         r.mpv.answer(r.player);
         r.player.ended(true);
-        QCOMPARE(r.reports, QStringList{"opened: mpv could not open a.mkv"});
+        QCOMPARE(r.reports, QStringList{"open failed: could not open /m/a.mkv"});
     }
 
-    // A setting the seek needs, refused as the seek can be, loads the file instead too, and mpv,
-    // which played before the Open, plays again once the load has landed.
+    // A setting the seek needs, refused as the seek can be, loads the file instead too, the
+    // terminal's rule as much as the window's.
     void aRefusedSettingOfTheSeekLoadsTheFileAgain() {
-        QTemporaryDir dir(QDir::currentPath() + QStringLiteral("/player_port_test-XXXXXX"));
-        QVERIFY(dir.isValid());
-        const QString path = oneByteFile(dir);
-        QVERIFY(!path.isEmpty());
-        const std::string file = path.toStdString();
         Rig r;
         r.player.ready();
-        r.player.run(open(moment(file, 5'000'000, 3)));
-        QCOMPARE(r.openWith(), firstWithNoFile);
-        r.mpv.answer(r.player);
-        r.player.restarted();
-        QCOMPARE(r.reports, QStringList{"opened"});
-
-        r.player.run(open(moment(file, 5'000'000, 3)));
-        QCOMPARE(r.openWith(path, false), firstWithAFile);
+        r.player.run(open(moment("/m/a.mkv", 5'000'000, 3), How::kSeek));
+        QCOMPARE(r.openWith("/m/a.mkv", false), firstWithAFile);
         QCOMPARE(r.mpv.last(), "set sid 3");
         r.mpv.answer(r.player, {}, refused);
-        QCOMPARE(r.mpv.last(), "set pause yes");
-        r.mpv.answer(r.player);
-        QCOMPARE(
-            r.mpv.last(),
-            QStringLiteral("loadfile %1 replace -1 start=0:00:05.000000,sid=3,sub-visibility=yes")
-                .arg(path));
+        QCOMPARE(r.mpv.last(), loadOf("/m/a.mkv", "0:00:05.000000", "3", false));
         r.mpv.answer(r.player);
         r.player.restarted();
-        QCOMPARE(r.mpv.last(), "set pause no");
-        r.mpv.answer(r.player);
-        QCOMPARE(r.reports, (QStringList{"opened", "opened"}));
+        QCOMPARE(r.reports, QStringList{"opened playing"});
+    }
+
+    // Only a pause is no step of the seek: mpv refuses none while it answers at all, so a refusal
+    // fails the Open rather than load.
+    void aRefusedPauseFailsTheOpen() {
+        Rig r;
+        r.player.ready();
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt), How::kSeek));
+        r.mpv.answer(r.player, QStringLiteral("/m/a.mkv"));
+        r.mpv.answer(r.player, true);
+        QCOMPARE(r.mpv.last(), "set pause yes");
+        r.mpv.answer(r.player, {}, QStringLiteral("unknown error"));
+        QCOMPARE(r.reports, QStringList{"open failed: mpv: unknown error"});
+        QCOMPARE(r.mpv.requests.size(), 3u);
     }
 
     // Why a seek meets a file still loading: an Open that went on, its settle time up, while mpv
     // said nothing. The reload then lands on a restart after its own answer only: one before it is
     // the earlier load's, late.
     void aReloadLandsOnlyOnARestartAfterItsAnswer() {
-        QTemporaryDir dir(QDir::currentPath() + QStringLiteral("/player_port_test-XXXXXX"));
-        QVERIFY(dir.isValid());
-        const QString path = oneByteFile(dir);
-        QVERIFY(!path.isEmpty());
-        const std::string file = path.toStdString();
         Rig r(std::chrono::milliseconds(300));
         r.player.ready();
-        r.player.run(open(moment(file, 0, std::nullopt)));
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
         QCOMPARE(r.openWith(), firstWithNoFile);
-        QVERIFY(r.mpv.last().startsWith("loadfile "));
+        const QString load = loadOf("/m/a.mkv", "0:00:00.000000");
+        QCOMPARE(r.mpv.last(), load);
         r.mpv.answer(r.player);
-        QTRY_COMPARE_WITH_TIMEOUT(r.reports, QStringList{"opened"}, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(r.reports, QStringList{"opened paused"}, 2000);
 
-        r.player.run(open(moment(file, 0, std::nullopt)));
-        QCOMPARE(r.openWith(path), firstWithAFile);
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt), How::kSeek));
+        QCOMPARE(r.openWith("/m/a.mkv"), firstWithAFile);
         QCOMPARE(r.mpv.last(), "set sub-visibility yes");
         r.mpv.answer(r.player);
         QCOMPARE(r.mpv.last(), "seek 0:00:00.000000 absolute+exact");
         r.mpv.answer(r.player, {}, refused);
-        QCOMPARE(r.mpv.last(), "set pause yes");
-        r.mpv.answer(r.player);
-        const QString reload =
-            QStringLiteral("loadfile %1 replace -1 start=0:00:00.000000,sub-visibility=yes")
-                .arg(path);
-        QCOMPARE(r.mpv.last(), reload);
+        QCOMPARE(r.mpv.last(), load);
         r.player.restarted();
-        QCOMPARE(r.reports, QStringList{"opened"});
-        QCOMPARE(r.mpv.last(), reload);
+        QCOMPARE(r.reports, QStringList{"opened paused"});
+        QCOMPARE(r.mpv.last(), load);
         r.mpv.answer(r.player);
         r.player.restarted();
-        QCOMPARE(r.reports, (QStringList{"opened", "opened"}));
+        QCOMPARE(r.reports, (QStringList{"opened paused", "opened paused"}));
     }
 
-    // Only the load's own end fails it: the file it replaces ends too, stopped.
+    // Only the load's own end fails it: the file it replaces ends too, stopped. Its file is
+    // named as review gave it.
     void aLoadThatFailsSaysSo() {
         Rig r;
         r.player.ready();
@@ -483,10 +396,56 @@ private slots:
         r.player.ended(false);
         QCOMPARE(r.reports, QStringList());
         r.player.ended(true);
-        QCOMPARE(r.reports, QStringList{"opened: mpv could not open b.mkv"});
+        QCOMPARE(r.reports, QStringList{"open failed: could not open /m/dir/b.mkv"});
         // Once the Open has reported, a later end is no one's.
         r.player.ended(true);
         QCOMPARE(r.reports.size(), 1);
+    }
+
+    // A load that outlasts its settle time reports opened. Should mpv then end that file on an
+    // error, before it ever played, that is a report of its own, after an end with no error too,
+    // which is most often the end of the file it replaced. Once it plays, or the port loads or
+    // stops, an end on an error is no longer its.
+    void aLoadThatFailsAfterItReportedOpenedSaysSoLate() {
+        Rig r(std::chrono::milliseconds(100));
+        r.player.ready();
+        const auto loadLate = [&r](const std::string &file) {
+            r.reports.clear();
+            r.player.run(open(moment(file, 0, std::nullopt)));
+            r.openWith();
+            r.mpv.answer(r.player);
+            QTRY_COMPARE_WITH_TIMEOUT(r.reports, QStringList{"opened paused"}, 2000);
+        };
+        loadLate("/m/a.mkv");
+        r.player.ended(true);
+        QCOMPARE(r.reports, (QStringList{"opened paused", "failed: could not open /m/a.mkv"}));
+        r.player.ended(true);
+        QCOMPARE(r.reports.size(), 2);
+        loadLate("/m/b.mkv");
+        r.player.restarted();
+        r.player.ended(true);
+        QCOMPARE(r.reports, QStringList{"opened paused"});
+        loadLate("/m/c.mkv");
+        r.player.ended(false);
+        r.player.ended(true);
+        QCOMPARE(r.reports, (QStringList{"opened paused", "failed: could not open /m/c.mkv"}));
+        // A new Open's load sent, the late load is given up: an end on an error before its answer
+        // is the late file's, which the user has moved on from.
+        loadLate("/m/d.mkv");
+        r.player.run(open(moment("/m/e.mkv", 0, std::nullopt)));
+        r.openWith("/m/d.mkv");
+        QVERIFY(r.mpv.last().startsWith("loadfile /m/e.mkv"));
+        r.player.ended(true);
+        QCOMPARE(r.reports, QStringList{"opened paused"});
+        // A stop sent, whatever ended was stopped.
+        r.mpv.answer(r.player);
+        r.player.restarted();
+        loadLate("/m/f.mkv");
+        r.player.run(close());
+        r.mpv.answer(r.player, QStringLiteral("/m/f.mkv"));
+        QCOMPARE(r.mpv.last(), "stop");
+        r.player.ended(true);
+        QCOMPARE(r.reports, QStringList{"opened paused"});
     }
 
     // The position is read only once playback starts again after mpv's answer to the seek: a
@@ -580,16 +539,39 @@ private slots:
         r.player.run(seek(5));
         r.mpv.answer(r.player, {}, unavailable);
         r.mpv.answer(r.player, QStringLiteral("/m/a.mkv"));
-        QCOMPARE(r.reports, (QStringList{"play failed: mpv has no file open (o opens one)",
-                                         "play failed: mpv is still opening the file"}));
+        QCOMPARE(r.reports, (QStringList{"play failed: no file", "play failed: still opening"}));
     }
 
-    // Any other error ends the command with mpv's words, as the terminal's do, but a refused
-    // unpause after an Open has landed: mpv is still paused on the frame, the moment it opened.
+    // As the terminal: with nothing open, there was nothing to close; stopped all the same, as a
+    // load mpv has taken and not started names no path. A read of the path that mpv refuses in
+    // other words is nothing open too, as it is for an Open.
+    void aCloseWithNothingOpenSaysSo() {
+        Rig r;
+        r.player.ready();
+        r.player.run(close());
+        QCOMPARE(r.mpv.last(), "get path");
+        r.mpv.answer(r.player, {}, unavailable);
+        QCOMPARE(r.mpv.last(), "stop");
+        r.mpv.answer(r.player);
+        r.player.run(close());
+        r.mpv.answer(r.player, QStringLiteral("/m/a.mkv"));
+        QCOMPARE(r.mpv.last(), "stop");
+        r.mpv.answer(r.player);
+        r.player.run(close());
+        r.mpv.answer(r.player, {}, QStringLiteral("unknown error"));
+        QCOMPARE(r.mpv.last(), "stop");
+        r.mpv.answer(r.player);
+        QCOMPARE(r.reports, (QStringList{"closed: not open", "closed", "closed: not open"}));
+    }
+
+    // Any other error ends the command with mpv's words, as the terminal's do, the Open's pause
+    // among them, but a refused unpause after a seek has landed: mpv is still paused on the frame,
+    // the moment it opened, and the Open says it is paused.
     void mpvsErrorsEndTheirCommand() {
         Rig r;
         r.player.ready();
         r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        r.mpv.answer(r.player, {}, unavailable);
         r.mpv.answer(r.player, {}, QStringLiteral("unknown error"));
         r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
         r.openWith();
@@ -613,20 +595,22 @@ private slots:
         r.player.restarted();
         r.mpv.answer(r.player, true);
         r.mpv.answer(r.player, {}, unavailable);
-        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
-        r.openWith("/m/b.mkv", false);
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt), How::kSeek));
+        r.openWith("/m/a.mkv", false);
+        r.mpv.answer(r.player);
         r.mpv.answer(r.player);
         r.player.restarted();
         QCOMPARE(r.mpv.last(), "set pause no");
         r.mpv.answer(r.player, {}, QStringLiteral("unknown error"));
         r.player.run(close());
+        r.mpv.answer(r.player, QStringLiteral("/m/a.mkv"));
         r.mpv.answer(r.player, {}, QStringLiteral("unknown error"));
         QCOMPARE(r.reports,
-                 (QStringList{"opened: mpv: unknown error", "opened: mpv: loading failed",
+                 (QStringList{"open failed: mpv: unknown error", "open failed: mpv: loading failed",
                               "play failed: mpv: unknown error", "play failed: mpv: unknown error",
                               "play failed: mpv: error running command",
                               "play failed: mpv: property unavailable",
-                              "play failed: mpv: property unavailable", "opened",
+                              "play failed: mpv: property unavailable", "opened paused",
                               "closed: mpv: unknown error"}));
     }
 
@@ -642,9 +626,53 @@ private slots:
         r.player.restarted();
         r.mpv.answer(r.player, false);
         r.mpv.answer(r.player, 6.0);
+        QCOMPARE(r.mpv.last(), "get path");
+        r.mpv.answer(r.player, QStringLiteral("/m/a.mkv"));
         QCOMPARE(r.mpv.last(), "stop");
         r.mpv.answer(r.player);
         QCOMPARE(r.reports, (QStringList{"played playing 6000", "closed"}));
+    }
+
+    // A request mpv does not answer in its time fails its command, as the terminal's do, and the
+    // next runs: an answer that comes after is no one's. An answer ends its request's time, so a
+    // command that has reported fails no later.
+    void aRequestMpvDoesNotAnswerInTimeFailsItsCommand() {
+        Rig r(std::chrono::seconds(10), std::chrono::milliseconds(300));
+        r.loaded();
+        QElapsedTimer waited;
+        waited.start();
+        r.player.run(seek(5));
+        const std::uint64_t unanswered = r.mpv.requests.back().id;
+        r.player.run(close());
+        QTRY_COMPARE_WITH_TIMEOUT(r.reports, QStringList{"play failed: no answer"}, 2000);
+        QVERIFY2(waited.elapsed() >= 300, qPrintable(QString::number(waited.elapsed())));
+        QCOMPARE(r.mpv.last(), "get path");
+        r.player.answered(unanswered, {}, 1.0);
+        QCOMPARE(r.mpv.last(), "get path");
+        r.mpv.answer(r.player, QStringLiteral("/m/a.mkv"));
+        r.mpv.answer(r.player);
+        QCOMPARE(r.reports, (QStringList{"play failed: no answer", "closed"}));
+        QTest::qWait(500);
+        QCOMPARE(r.reports.size(), 2);
+    }
+
+    // An Open that waits for a pane that never shows video fails in its time, rather than wait
+    // for good; a newer one waits its own time, and the next mpv that is ready has none to run.
+    void anOpenThatWaitsTooLongForThePaneFails() {
+        Rig r(std::chrono::seconds(10), std::chrono::seconds(10), std::chrono::seconds(1));
+        QElapsedTimer waited;
+        waited.start();
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        QTest::qWait(300);
+        // A runner so slow that the first Open's time ended in the wait fails here, not on the
+        // port's rule below.
+        QCOMPARE(r.reports, QStringList());
+        r.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
+        QTRY_COMPARE_WITH_TIMEOUT(r.reports, QStringList{"open failed: no video"}, 5000);
+        QVERIFY2(waited.elapsed() >= 1300, qPrintable(QString::number(waited.elapsed())));
+        r.player.ready();
+        QCOMPARE(r.mpv.requests.size(), 0u);
+        QCOMPARE(r.reports.size(), 1);
     }
 
     // Review has ended: playback stops, and what was under way or waiting reports nothing.
@@ -692,14 +720,13 @@ private slots:
         const auto sent = r.mpv.requests.size();
         FakeMpv other;
         r.player.attach(&other);
-        QCOMPARE(r.reports, QStringList{"play failed: mpv has no file open (o opens one)"});
+        QCOMPARE(r.reports, QStringList{"play failed: no file"});
         r.mpv.answer(r.player);
         r.player.restarted();
         QCOMPARE(other.requests.size(), 0u);
         r.player.ready();
         QCOMPARE(answerOpening(other, r.player), firstWithNoFile);
-        QCOMPARE(other.last(),
-                 "loadfile /m/b.mkv replace -1 start=0:00:00.000000,sub-visibility=yes");
+        QCOMPARE(other.last(), loadOf("/m/b.mkv", "0:00:00.000000"));
         QCOMPARE(r.mpv.requests.size(), sent);
         QCOMPARE(r.reports.size(), 1);
     }
@@ -718,7 +745,22 @@ private slots:
         r.player.restarted();
         r.player.moved();
         QCOMPARE(r.mpv.requests.size(), sent);
-        QCOMPARE(r.reports, QStringList{"play failed: mpv has no file open (o opens one)"});
+        QCOMPARE(r.reports, QStringList{"play failed: no file"});
+    }
+
+    // A pane lets go of its own mpv only: an mpv the player has since been given stays. Letting go
+    // gives up the request under way, and its time with it.
+    void detachLetsGoOnlyOfItsOwnMpv() {
+        Rig r(std::chrono::seconds(10), std::chrono::milliseconds(300));
+        r.loaded();
+        FakeMpv other;
+        r.player.detach(&other);
+        r.player.run(seek(5));
+        QCOMPARE(r.mpv.last(), "get time-pos");
+        r.player.detach(&r.mpv);
+        QCOMPARE(r.reports, QStringList{"play failed: no file"});
+        QTest::qWait(500);
+        QCOMPARE(r.reports, QStringList{"play failed: no file"});
     }
 };
 

@@ -2,15 +2,10 @@
 
 #include "overloaded.h"
 
-#include <QFileInfo>
-
 #include <mpv/client.h>
 
-#include <algorithm>
 #include <cmath>
-#include <filesystem>
 #include <string>
-#include <system_error>
 #include <utility>
 #include <variant>
 
@@ -21,15 +16,17 @@ namespace {
 // mpv's own text for a property with no value now: the position, or the path, with no file open.
 const QString unavailable = QStringLiteral("property unavailable");
 
-// A Playback's answer with nothing to play, and while a file opens: the terminal's words for the
-// same states of its mpv (cli/src/mpv.rs).
-const char *const nothingOpen = "mpv has no file open (o opens one)";
-const char *const stillOpening = "mpv is still opening the file";
+PlayerError mpvSaid(const QString &error) {
+    return PlayerError(PlayerError::kMpv{error.toStdString()});
+}
 
-// `us` as the terminal gives mpv a time, H:MM:SS.uuuuuu, to the µs review gives it in; never
-// before 0:00, as mpv counts a negative time back from the end.
+PlayerError couldNotOpen(const std::string &file) {
+    return PlayerError(PlayerError::kCouldNotOpen{file});
+}
+
+// `us` as the terminal gives mpv a time, H:MM:SS.uuuuuu, to the µs review gives it in. Review gives
+// none before 0:00, which mpv would count back from the end.
 QString mpvTime(std::int64_t us) {
-    us = std::max<std::int64_t>(us, 0);
     return QStringLiteral("%1:%2:%3.%4")
         .arg(us / 3'600'000'000)
         .arg(us / 60'000'000 % 60, 2, 10, QLatin1Char('0'))
@@ -37,40 +34,37 @@ QString mpvTime(std::int64_t us) {
         .arg(us % 1'000'000, 6, 10, QLatin1Char('0'));
 }
 
-// mpv's own pause, set before every move to a moment, or a playing mpv goes on past the frame;
-// and unset once there, if mpv played before the Open (`opened`), not sooner, or it plays on from
-// where it was meanwhile. As the terminal's: not a per-file option of the load, which mpv puts
-// back when its file ends, and that can be after the next was loaded.
+// mpv's own pause, set before every move to a moment, or a playing mpv goes on past the frame; and
+// unset once a seek has landed, if mpv played before the Open, not sooner, or it plays on from
+// where it was meanwhile. A load sets its own, as the file's option (`load`).
 QStringList setPause(bool paused) {
     return {QStringLiteral("set"), QStringLiteral("pause"),
             paused ? QStringLiteral("yes") : QStringLiteral("no")};
 }
 
-// The file's size and modification time, to the nanosecond as the terminal's are, or none when
-// they cannot be read.
-std::optional<std::pair<std::uintmax_t, std::int64_t>> stamp(const std::string &file) {
-    std::error_code error;
-    const std::filesystem::path path(file);
-    const std::uintmax_t size = std::filesystem::file_size(path, error);
-    if (error) {
-        return std::nullopt;
-    }
-    const auto mtime = std::filesystem::last_write_time(path, error);
-    if (error) {
-        return std::nullopt;
-    }
-    return std::pair{size, static_cast<std::int64_t>(mtime.time_since_epoch().count())};
-}
-
 } // namespace
 
-PlayerPort::PlayerPort(std::chrono::milliseconds settle, QObject *parent) : QObject(parent) {
-    this->settle.setSingleShot(true);
-    this->settle.setInterval(settle);
-    // A coarse timer may end up to 5% early, and the wait's end reports the move as landed: a
-    // move mpv says nothing of is given its whole settle time.
-    this->settle.setTimerType(Qt::PreciseTimer);
-    connect(&this->settle, &QTimer::timeout, this, &PlayerPort::landed);
+PlayerPort::PlayerPort(std::chrono::milliseconds settle, std::chrono::milliseconds answer,
+                       std::chrono::milliseconds ready, QObject *parent)
+    : QObject(parent) {
+    // Each precise: a coarse timer may end up to 5% early. A move mpv says nothing of is given its
+    // whole settle time, and its end reports the move as landed.
+    for (auto [timer, after] : {std::pair{&this->settle, settle}, std::pair{&unanswered, answer},
+                                std::pair{&notShown, ready}}) {
+        timer->setSingleShot(true);
+        timer->setInterval(after);
+        timer->setTimerType(Qt::PreciseTimer);
+    }
+    // A load mpv has said nothing of when its time ends is opened as far as the port can tell, and
+    // can still fail.
+    connect(&this->settle, &QTimer::timeout, this, [this] {
+        if (loading) {
+            late = loadingFile;
+        }
+        landed();
+    });
+    connect(&unanswered, &QTimer::timeout, this, &PlayerPort::noAnswer);
+    connect(&notShown, &QTimer::timeout, this, &PlayerPort::notReady);
 }
 
 // The mpv gone will answer nothing more and land nothing, and a new one has shown nothing and is
@@ -87,6 +81,7 @@ void PlayerPort::attach(Mpv *mpv) {
         again.push_front(*busy);
     }
     drop();
+    late.reset();
     this->mpv = mpv;
     isReady = false;
     for (const PlayerCommand &command : again) {
@@ -94,19 +89,34 @@ void PlayerPort::attach(Mpv *mpv) {
     }
 }
 
+void PlayerPort::detach(Mpv *mpv) {
+    if (mpv == this->mpv) {
+        attach(nullptr);
+    }
+}
+
 void PlayerPort::run(const PlayerCommand &command) {
     if (!isReady) {
         // Nothing has opened yet, so nothing can play or need closing; an Open waits for mpv
-        // to show what it opens, and a newer one replaces it, as review's status names only it.
+        // to show what it opens, and a newer one replaces it, as review's status names only it,
+        // each for the time the port gives it.
         std::visit(Overloaded{
-                       [this](const PlayerCommand::kOpen &open) { waiting = open.v1; },
+                       [this, &command](const PlayerCommand::kOpen &) {
+                           waiting = command;
+                           notShown.start();
+                       },
                        [this](const PlayerCommand::kPlayback &) {
-                           emit reported(PlayerReport(
-                               PlayerReport::kPlayFailed{waiting ? stillOpening : nothingOpen}));
+                           emit reported(PlayerReport(PlayerReport::kPlayFailed{
+                               waiting ? PlayerError(PlayerError::kStillOpening{})
+                                       : PlayerError(PlayerError::kNoFile{})}));
                        },
                        [this](const PlayerCommand::kClose &) {
+                           const bool closed = waiting.has_value();
                            waiting.reset();
-                           emit reported(PlayerReport(PlayerReport::kClosed{std::nullopt}));
+                           notShown.stop();
+                           emit reported(PlayerReport(PlayerReport::kClosed{
+                               closed ? std::nullopt
+                                      : std::optional(PlayerError(PlayerError::kNotOpen{}))}));
                        },
                    },
                    command.get_variant());
@@ -118,8 +128,10 @@ void PlayerPort::run(const PlayerCommand &command) {
 
 void PlayerPort::release() {
     waiting.reset();
+    notShown.stop();
     queue.clear();
     drop();
+    late.reset();
     // Its answer goes nowhere: nothing more is reported.
     if (mpv && isReady) {
         mpv->command(nextId++, {QStringLiteral("stop")});
@@ -128,9 +140,9 @@ void PlayerPort::release() {
 
 void PlayerPort::ready() {
     isReady = true;
+    notShown.stop();
     if (waiting) {
-        queue.push_back(PlayerCommand(PlayerCommand::kOpen{*waiting}));
-        waiting.reset();
+        queue.push_back(*std::exchange(waiting, std::nullopt));
     }
     next();
 }
@@ -141,6 +153,7 @@ void PlayerPort::answered(std::uint64_t id, const QString &error, const QVariant
         return;
     }
     asked = 0;
+    unanswered.stop();
     Answer answer = std::exchange(then, nullptr);
     Refused onError = std::exchange(refused, nullptr);
     if (error.isEmpty()) {
@@ -148,11 +161,13 @@ void PlayerPort::answered(std::uint64_t id, const QString &error, const QVariant
     } else if (onError) {
         onError(error);
     } else {
-        fail(QStringLiteral("mpv: ") + error);
+        fail(mpvSaid(error));
     }
 }
 
 void PlayerPort::restarted() {
+    // A file plays: a late load's has landed, or another move did after it.
+    late.reset();
     if (landing == Landing::OnRestart) {
         landed();
     }
@@ -165,11 +180,20 @@ void PlayerPort::moved() {
 }
 
 void PlayerPort::ended(bool failed) {
-    // Only the load under way can fail the Open: a file replaced by it ends too, stopped.
-    if (settling && loading && failed) {
+    // Only the load under way can fail the Open: a file replaced by it ends too, stopped. A late
+    // load that ends on an error is reported as it is, its Open long since reported. An end with
+    // no error leaves the late load waiting: it is most often the file the late load replaced,
+    // whose end comes after its reads, which can outlast the settle time on a stalled mount.
+    if (!failed) {
+        return;
+    }
+    if (settling && loading) {
         settle.stop();
         settling = false;
-        fail(QStringLiteral("mpv could not open ") + loadingName);
+        fail(couldNotOpen(loadingFile));
+    } else if (late) {
+        emit reported(
+            PlayerReport(PlayerReport::kFailed{couldNotOpen(*std::exchange(late, std::nullopt))}));
     }
 }
 
@@ -178,6 +202,7 @@ void PlayerPort::ended(bool failed) {
 void PlayerPort::drop() {
     busy.reset();
     asked = 0;
+    unanswered.stop();
     then = nullptr;
     refused = nullptr;
     onLanded = nullptr;
@@ -194,89 +219,99 @@ void PlayerPort::next() {
     busy = command;
     std::visit(
         Overloaded{
-            [this](const PlayerCommand::kOpen &open) { this->open(open.v1); },
+            [this](const PlayerCommand::kOpen &open) { this->open(open); },
             [this](const PlayerCommand::kPlayback &playback) { this->playback(playback.v1); },
             [this](const PlayerCommand::kClose &) { close(); },
         },
         command.get_variant());
 }
 
-// As the terminal's: the file mpv has open is sought, not loaded again (slow for a big file over
-// NFS), if this port loaded it and it is unchanged on disk since, as a remux in place keeps the
-// path, and after a fix of one letter even the size. Whatever error mpv refuses the seek with, the
-// file is loaded instead, as the terminal's is: a file mpv still loads, as after an Open that went
-// on past its settle time, is the case it is for. Whether mpv plays is read first, as the pause
-// that starts every move makes every mpv paused, and with a file open only: with none, nothing
-// plays, whatever mpv's pause says. It decides only whether mpv plays again once there, so a read
-// that mpv fails, or that gives no flag, counts as paused, which leaves mpv on the frame.
-void PlayerPort::open(const Moment &moment) {
+// As the terminal's, in the steps core's PlayerCommand::Open names. Whether mpv plays is read
+// first, as the pause that starts every move makes every mpv paused, and with a file open only:
+// with none, nothing plays, whatever mpv's pause says. A read of the path that mpv refuses,
+// whatever its words, counts as no file open, so the file is loaded. Whether mpv plays decides
+// only whether it plays again once there, so a read that mpv fails, or that gives no flag, counts
+// as paused, which leaves mpv on the frame. Then the pause, whose refusal fails the Open; then the
+// seek, when review says seek and mpv still has the file open (a file opened in the pane since by
+// other means is loaded again), else the load.
+void PlayerPort::open(const PlayerCommand::kOpen &command) {
+    const auto go = [this, command](bool seek, bool resume) {
+        askAll({setPause(true)}, [this, command, seek, resume] {
+            if (seek) {
+                seekTo(command, resume);
+            } else {
+                load(command, resume);
+            }
+        });
+    };
     read(
         QStringLiteral("path"),
-        [this, moment](const QVariant &path) {
-            const auto move = [this, moment, path](bool resume) {
-                const auto now = stamp(moment.file);
-                const bool same = path.toString() == QString::fromStdString(moment.file) &&
-                                  loaded && now && loaded->file == moment.file &&
-                                  loaded->size == now->first && loaded->mtime == now->second;
-                if (same) {
-                    seekTo(moment, now, resume);
-                } else {
-                    load(moment, now, resume);
-                }
-            };
+        [this, command, go](const QVariant &path) {
+            const bool seek = command.how == How::kSeek &&
+                              path.toString() == QString::fromStdString(command.moment.file);
             read(
                 QStringLiteral("pause"),
-                [move](const QVariant &paused) {
-                    move(paused.metaType() == QMetaType::fromType<bool>() && !paused.toBool());
+                [go, seek](const QVariant &paused) {
+                    go(seek, paused.metaType() == QMetaType::fromType<bool>() && !paused.toBool());
                 },
-                nullptr, [move](const QString &) { move(false); });
+                nullptr, [go, seek](const QString &) { go(seek, false); });
         },
-        [this, moment] { load(moment, stamp(moment.file), false); });
+        nullptr, [go](const QString &) { go(false, false); });
 }
 
-// Once mpv is there: if it played before the Open, it plays again, only now, so that it plays on
-// from the frame, not from where it was, and the Open reports once mpv has answered that. Refused,
-// mpv stays paused on the frame, which is still the moment opened.
+// Once a seek has landed: if mpv played before the Open, it plays again, only now, so that it plays
+// on from the frame, not from where it was, and the Open reports once mpv has answered that.
+// Refused, mpv stays paused on the frame, which is still the moment opened, and the report says so.
 void PlayerPort::opened(bool resume) {
-    const auto done = [this] { finish(PlayerReport(PlayerReport::kOpened{})); };
+    const auto done = [this](bool paused) { finish(PlayerReport(PlayerReport::kOpened{paused})); };
     if (!resume) {
-        done();
+        done(true);
         return;
     }
-    ask(setPause(false), [done](const QVariant &) { done(); }, [done](const QString &) { done(); });
+    ask(
+        setPause(false), [done](const QVariant &) { done(false); },
+        [done](const QString &) { done(true); });
 }
 
-void PlayerPort::load(const Moment &moment, Stamp now, bool resume) {
-    loaded.reset();
-    if (now) {
-        loaded = Loaded{moment.file, now->first, now->second};
-    }
+// As the terminal's (cli/src/mpv.rs, `loadfile_command`): the moment's start and track, subtitles
+// on, review's options for every load, then the pause as mpv is to end up. Every option is the
+// file's alone, set as it starts, after the file before has put back its own, a pause among them,
+// and a user's `reset-on-next-file` what it names, so that neither undoes this pause. The Open
+// reports once the load lands.
+void PlayerPort::load(const PlayerCommand::kOpen &command, bool resume) {
+    const Moment &moment = command.moment;
     const QString file = QString::fromStdString(moment.file);
     QString options = QStringLiteral("start=") + mpvTime(moment.start_us);
     if (moment.sid) {
         options += QStringLiteral(",sid=") + QString::number(*moment.sid);
     }
     options += QStringLiteral(",sub-visibility=yes");
-    loadingName = QFileInfo(file).fileName();
+    for (const FileOption &option : command.options) {
+        options += QLatin1Char(',') + QString::fromStdString(option.name) + QLatin1Char('=') +
+                   QString::fromStdString(option.value);
+    }
+    options += QStringLiteral(",pause=") + (resume ? QStringLiteral("no") : QStringLiteral("yes"));
+    loadingFile = moment.file;
+    // Ends a late load's wait: this load replaces it, and from its answer on, an end on an error is
+    // this load's.
+    late.reset();
     // `replace` then -1, the index mpv 0.38 put before the options. mpv 0.38 came with client API
     // 2.3, so an older mpv's headers stop the build here, rather than every load at run time.
     static_assert(MPV_CLIENT_API_VERSION >= MPV_MAKE_VERSION(2, 3),
                   "loadfile's index argument needs mpv 0.38 or later");
-    askAll({setPause(true)}, [this, file, options, resume] {
-        land({QStringLiteral("loadfile"), file, QStringLiteral("replace"), QStringLiteral("-1"),
-              options},
-             Landing::OnRestart, true, [this, resume] { opened(resume); });
-    });
+    land({QStringLiteral("loadfile"), file, QStringLiteral("replace"), QStringLiteral("-1"),
+          options},
+         Landing::OnRestart, true,
+         [this, resume] { finish(PlayerReport(PlayerReport::kOpened{!resume})); });
 }
 
-// Any of the seek's requests refused, the setting or the seek itself, loads the file instead: the
-// whole load, its pause first, so that mpv is paused whichever was refused, and playing again
-// once there if it played before the Open.
-void PlayerPort::seekTo(const Moment &moment, Stamp now, bool resume) {
-    const Refused reload = [this, moment, now, resume](const QString &) {
-        load(moment, now, resume);
-    };
-    std::deque<QStringList> settings = {setPause(true)};
+// The seek's steps in core's order, the subtitle track and subtitles on, then the seek itself: any
+// of them refused loads the file instead, mpv paused already, as a file mpv still loads refuses the
+// seek, the case it is for.
+void PlayerPort::seekTo(const PlayerCommand::kOpen &command, bool resume) {
+    const Moment &moment = command.moment;
+    const Refused reload = [this, command, resume](const QString &) { load(command, resume); };
+    std::deque<QStringList> settings;
     if (moment.sid) {
         settings.push_back(
             {QStringLiteral("set"), QStringLiteral("sid"), QString::number(*moment.sid)});
@@ -325,14 +360,24 @@ void PlayerPort::playback(Playback playback) {
         },
         [this] {
             read(
-                QStringLiteral("path"), [this](const QVariant &) { fail(stillOpening); },
-                [this] { fail(nothingOpen); });
+                QStringLiteral("path"),
+                [this](const QVariant &) { fail(PlayerError(PlayerError::kStillOpening{})); },
+                [this] { fail(PlayerError(PlayerError::kNoFile{})); });
         });
 }
 
+// As the terminal's words: with nothing open, there was nothing to close, and a read of the path
+// that mpv refuses, whatever its words, is nothing open, as it is for an Open. `stop` all the
+// same, as mpv names no path for a load it has taken and not yet started, which would then play.
 void PlayerPort::close() {
-    ask({QStringLiteral("stop")},
-        [this](const QVariant &) { finish(PlayerReport(PlayerReport::kClosed{std::nullopt})); });
+    const auto stop = [this](std::optional<PlayerError> said) {
+        late.reset();
+        ask({QStringLiteral("stop")},
+            [this, said](const QVariant &) { finish(PlayerReport(PlayerReport::kClosed{said})); });
+    };
+    read(
+        QStringLiteral("path"), [stop](const QVariant &) { stop(std::nullopt); }, nullptr,
+        [stop](const QString &) { stop(PlayerError(PlayerError::kNotOpen{})); });
 }
 
 // The next request's id, now the one the port waits on: `then` takes its answer, and `otherwise`,
@@ -341,6 +386,7 @@ std::uint64_t PlayerPort::request(Answer then, Refused otherwise) {
     asked = nextId++;
     this->then = std::move(then);
     refused = std::move(otherwise);
+    unanswered.start();
     return asked;
 }
 
@@ -359,7 +405,7 @@ void PlayerPort::read(const QString &property, Answer then, Missing missing, Ref
                          } else if (otherwise) {
                              otherwise(error);
                          } else {
-                             fail(QStringLiteral("mpv: ") + error);
+                             fail(mpvSaid(error));
                          }
                      }),
              property);
@@ -424,17 +470,35 @@ void PlayerPort::where() {
     });
 }
 
-void PlayerPort::fail(const QString &why) {
-    const std::string text = why.toStdString();
+// mpv has not answered the request in its time: the request is no one's now, and the command fails.
+// An answer that comes after is dropped, as an earlier command's is.
+void PlayerPort::noAnswer() {
+    asked = 0;
+    then = nullptr;
+    refused = nullptr;
+    fail(PlayerError(PlayerError::kNoAnswer{}));
+}
+
+// The pane has not shown video in the time an Open waits for it: the Open fails, and the next one
+// waits again.
+void PlayerPort::notReady() {
+    if (waiting) {
+        waiting.reset();
+        emit reported(
+            PlayerReport(PlayerReport::kOpenFailed{PlayerError(PlayerError::kNoVideo{})}));
+    }
+}
+
+void PlayerPort::fail(const PlayerError &why) {
     finish(std::visit(
         Overloaded{
-            [&](const PlayerCommand::kOpen &) { return PlayerReport(PlayerReport::kOpened{text}); },
+            [&](const PlayerCommand::kOpen &) {
+                return PlayerReport(PlayerReport::kOpenFailed{why});
+            },
             [&](const PlayerCommand::kPlayback &) {
-                return PlayerReport(PlayerReport::kPlayFailed{text});
+                return PlayerReport(PlayerReport::kPlayFailed{why});
             },
-            [&](const PlayerCommand::kClose &) {
-                return PlayerReport(PlayerReport::kClosed{text});
-            },
+            [&](const PlayerCommand::kClose &) { return PlayerReport(PlayerReport::kClosed{why}); },
         },
         busy->get_variant()));
 }

@@ -127,7 +127,11 @@ fn input(tx: Sender<Msg>) -> io::Result<()> {
 pub fn run_effect(effect: Effect, runner: &mut Runner<Msg>, player: &mut Player) -> Input {
     match effect {
         Effect::Task(task) => runner.run(task),
-        Effect::Player(PlayerCommand::Open(moment)) => Input::Opened(player.open(&moment)),
+        Effect::Player(PlayerCommand::Open {
+            moment,
+            how,
+            options,
+        }) => Input::Opened(player.open(&moment, how, &options)),
         Effect::Player(PlayerCommand::Playback(p)) => Input::Played(player.playback(p)),
         Effect::Player(PlayerCommand::Close) => Input::Closed(player.close()),
     }
@@ -420,6 +424,7 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, MouseEvent};
     use subcheck_core::apply;
+    use subcheck_core::player::{How, PlayerError};
 
     #[test]
     fn keys_map_to_msgs_and_chords_do_not_leak() {
@@ -584,21 +589,25 @@ mod tests {
             sid: None,
         };
         // No mpv to start, and none on the socket: each says so as its own input.
-        let opened = ran(PlayerCommand::Open(moment));
+        let opened = ran(PlayerCommand::Open {
+            moment,
+            how: How::Load,
+            options: Vec::new(),
+        });
         let missing = "no-mpv not found: install mpv to open findings";
         assert!(
-            matches!(&opened, Input::Opened(Err(e)) if e.ends_with(missing)),
+            matches!(&opened, Input::Opened(Err(PlayerError::Failed(e))) if e.ends_with(missing)),
             "{opened:?}"
         );
         assert_eq!(
             ran(PlayerCommand::Playback(
                 subcheck_core::player::Playback::Pause
             )),
-            Input::Played(Err("mpv is not open (o opens it)".into()))
+            Input::Played(Err(PlayerError::NotOpen))
         );
         assert_eq!(
             ran(PlayerCommand::Close),
-            Input::Closed(Err("mpv is not open".into()))
+            Input::Closed(Err(PlayerError::NotOpen))
         );
     }
 

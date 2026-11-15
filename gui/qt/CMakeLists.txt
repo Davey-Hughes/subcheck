@@ -220,10 +220,14 @@ if(NOT APPLE)
     target_link_libraries(pane_test PRIVATE subcheck_window subcheck_windowplugin Qt6::Test)
     subcheck_warnings(pane_test)
     add_test(NAME pane_test COMMAND pane_test)
+    # A config of pane_test's own, as a user could write one, against which every load must still
+    # land on its frame and play or stay paused as the player asks: tests/pane_test.cpp says how.
+    set(PANE_CONFIG "${CMAKE_BINARY_DIR}/pane_test-config")
+    file(WRITE "${PANE_CONFIG}/mpvqt/mpvqt.conf" "ao=null\nhr-seek=no\nreset-on-next-file=pause\n")
     set(env "SUBCHECK_TEST_VIDEO=${REPO_ROOT}/core/tests/fixtures/timing.mkv"
         "SUBCHECK_TEST_LINES=${REPO_ROOT}/core/tests/fixtures/ties.mkv"
         "SUBCHECK_TEST_DIR=${CMAKE_BINARY_DIR}/pane_test-run" "SUBCHECK_XVFB=${XVFB}"
-        "XDG_CONFIG_HOME=${TEST_CONFIG}")
+        "XDG_CONFIG_HOME=${PANE_CONFIG}")
     set_tests_properties(pane_test PROPERTIES ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 
     set(dir "${CMAKE_BINARY_DIR}/seeded-end_to_end_test")

@@ -5,6 +5,7 @@
 #include "player_port.h"
 
 #include <MpvAbstractItem>
+#include <QPointer>
 #include <QtQml/qqmlregistration.h>
 
 class MpvItem : public MpvAbstractItem, public Mpv {
@@ -27,5 +28,6 @@ signals:
     void playerChanged();
 
 private:
-    PlayerPort *port = nullptr;
+    // Null once the player has gone, whichever of the two goes first.
+    QPointer<PlayerPort> port;
 };

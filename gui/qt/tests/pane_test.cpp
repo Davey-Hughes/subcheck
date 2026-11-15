@@ -2,12 +2,14 @@
 // settle time is far longer than any wait here: only what mpv says, passed on by the pane, can end
 // a move in time. A load and a seek end when playback starts again, a frame step when the position
 // moves, and a load that fails when its file ends on an error. A line opens on its first frame,
-// paused or playing as mpv was, and the pane draws it. Once closed, the pane is black again. Linux
-// only: Xvfb is X11's.
+// paused or playing as mpv was, and the pane draws it. Once closed, the pane is black again. mpv's
+// config is one a user could have: `hr-seek=no`, which would land a load on a keyframe but for the
+// option review gives each load, and `reset-on-next-file=pause`, under which the play state still
+// holds. Linux only: Xvfb is X11's.
 #include "desktop_session.h"
 #include "mpv_item.h"
-#include "overloaded.h"
 #include "player_port.h"
+#include "said.h"
 
 #include <QDir>
 #include <QFile>
@@ -29,7 +31,6 @@
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <variant>
 #include <vector>
 
 Q_IMPORT_QML_PLUGIN(SubcheckPlugin)
@@ -38,29 +39,11 @@ using namespace subcheck_ffi;
 
 namespace {
 
-// A report as one line, to compare.
-QString said(const PlayerReport &report) {
-    const auto error = [](const std::optional<std::string> &e) {
-        return e ? QStringLiteral(": ") + QString::fromStdString(*e) : QString();
-    };
-    return std::visit(
-        Overloaded{
-            [&](const PlayerReport::kOpened &r) {
-                return QStringLiteral("opened") + error(r.error);
-            },
-            [](const PlayerReport::kPlayed &r) {
-                return QStringLiteral("played %1 %2")
-                    .arg(r.state.paused ? QStringLiteral("paused") : QStringLiteral("playing"))
-                    .arg(r.state.at_ms);
-            },
-            [](const PlayerReport::kPlayFailed &r) {
-                return QStringLiteral("play failed: ") + QString::fromStdString(r.error);
-            },
-            [&](const PlayerReport::kClosed &r) {
-                return QStringLiteral("closed") + error(r.error);
-            },
-        },
-        report.get_variant());
+// With the options review gives every load (core's `player::load_options`).
+PlayerCommand open(const std::string &file, std::int64_t at, std::optional<std::uint64_t> sid,
+                   How how = How::kLoad) {
+    return PlayerCommand(PlayerCommand::kOpen{
+        Moment{file, at, sid}, how, {{"hr-seek", "yes"}, {"rebase-start-time", "no"}}});
 }
 
 PlayerCommand playback(Playback p) { return PlayerCommand(PlayerCommand::kPlayback{std::move(p)}); }
@@ -70,8 +53,8 @@ PlayerCommand playback(Playback p) { return PlayerCommand(PlayerCommand::kPlayba
 class PaneTest : public QObject {
     Q_OBJECT
 
-    // Far longer than the waits below, so that the settle timer cannot end a move for mpv.
-    PlayerPort player{std::chrono::seconds(20)};
+    // Far longer than the waits below, so that no timer of the player's can end a command for mpv.
+    PlayerPort player{std::chrono::seconds(20), std::chrono::seconds(20), std::chrono::seconds(20)};
     QQmlEngine engine;
     std::unique_ptr<QObject> window;
     MpvItem *pane = nullptr;
@@ -128,10 +111,16 @@ private slots:
 
     // Once mpv can show it, as the pane says, on playback starting there. The longest wait, for the
     // most work, mpv's first video output and a cold shader cache among it; still half the settle
-    // time, so that only mpv's word can end it.
+    // time, so that only mpv's word can end it. mpv runs on the config above, which the load's
+    // own options override for its file alone. Each of review's is read back: mpv takes a file's
+    // options without checking them, so only its value shows that one was handed on.
     void aLoadEndsOnPlaybackStarting() {
-        player.run(PlayerCommand(PlayerCommand::kOpen{Moment{video, 2'500'000, 4}}));
-        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened"}, 10000);
+        QCOMPARE(pane->getProperty("hr-seek"), QVariant(false));
+        QCOMPARE(pane->getProperty("reset-on-next-file").toStringList(), QStringList{"pause"});
+        player.run(open(video, 2'500'000, 4));
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened paused"}, 10000);
+        QCOMPARE(pane->getProperty("hr-seek"), QVariant(true));
+        QCOMPARE(pane->getProperty("rebase-start-time"), QVariant(false));
     }
 
     // A frame on, at the fixture's 2 per second, on the position moving.
@@ -156,12 +145,11 @@ private slots:
     // drawn its frame, so the first bright count is taken for the opened frame's, which holds on
     // the first open only: the test before leaves timing.mkv paused at 2 s, before its track's
     // first line, so nothing bright shows before it; a load over a paused file, it stays paused.
-    // Opened again while it plays, past the line, mpv has the file open, so it is sought, and it
-    // plays on from the line. The frames it plays through can carry both lines too, so the second
-    // open is checked in mpv's properties, not in the pane's pixels. A load would pass every other
-    // check: only a seek keeps mpv's playlist entry.
+    // Opened again while it plays, past the line, told to seek, as review would tell it after the
+    // load, it is sought, and it plays on from the line. The frames it plays through can carry
+    // both lines too, so the second open is checked in mpv's properties, not in the pane's pixels.
+    // A load would pass every other check: only a seek keeps mpv's playlist entry as it was.
     void aLineOpensOnItsFirstFramePausedOrPlayingAsMpvWas() {
-        const PlayerCommand line(PlayerCommand::kOpen{Moment{lines, 41'254'500, 1}});
         const QString underTest = QStringLiteral("Starts on a frame stored early.");
         // Put back however the test ends, so that no test after it plays slowly.
         const auto speed = qScopeGuard([this] { pane->setPropertyBlocking("speed", 1.0); });
@@ -169,16 +157,17 @@ private slots:
                  "the test before leaves timing.mkv open");
         QCOMPARE(pane->getProperty("pause").toBool(), true);
         QVariant loaded;
-        for (int open = 0; open < 2; ++open) {
+        for (int opening = 0; opening < 2; ++opening) {
             reports.clear();
-            player.run(line);
-            QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened"}, 10000);
+            player.run(open(lines, 41'254'500, 1, opening == 0 ? How::kLoad : How::kSeek));
+            QTRY_COMPARE_WITH_TIMEOUT(
+                reports, QStringList{opening == 0 ? "opened paused" : "opened playing"}, 10000);
             QCOMPARE(pane->getProperty("path").toString(), QString::fromStdString(lines));
             const QVariant entry = pane->getProperty("playlist/0/id");
             // An id, not the empty value MpvQt documents for a property mpv lacks: two of those
             // compare equal, and would pass the check on the second open.
             QCOMPARE(entry.metaType(), QMetaType::fromType<qlonglong>());
-            if (open == 0) {
+            if (opening == 0) {
                 loaded = entry;
                 QCOMPARE(pane->getProperty("pause").toBool(), true);
                 QCOMPARE(std::lround(pane->getProperty("time-pos").toDouble() * 1000), 41291);
@@ -236,17 +225,18 @@ private slots:
 
     // Another file over the one open, a copy of the video in the test's own directory, so that its
     // path differs and it is loaded: the file it replaces ends too, stopped, and only the load's
-    // own end can fail it. It plays on, as the file it replaces played. The test closes what the
-    // test before left and opens that file itself, so that it opens paused whatever was left, and
-    // the player's Pause sets it playing.
+    // own end can fail it. It plays on, as the file it replaces played, by the load's own pause
+    // option, as nothing unpauses after a load, and the config's reset-on-next-file=pause leaves
+    // that be. The test closes what the test before left and opens that file itself, so that it
+    // opens paused whatever was left, and the player's Pause sets it playing.
     void anotherFileLoadsOverTheOneOpen() {
         reports.clear();
         player.run(PlayerCommand(PlayerCommand::kClose{}));
         QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"closed"}, 5000);
         reports.clear();
         // As long as the first open's wait: mpv makes its video output again, which Close took.
-        player.run(PlayerCommand(PlayerCommand::kOpen{Moment{video, 2'500'000, 4}}));
-        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened"}, 10000);
+        player.run(open(video, 2'500'000, 4));
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened paused"}, 10000);
         QCOMPARE(pane->getProperty("pause").toBool(), true);
         reports.clear();
         player.run(playback(Playback(Playback::kPause{})));
@@ -259,39 +249,41 @@ private slots:
         // An earlier run's, which a copy does not overwrite.
         QFile::remove(copy);
         QVERIFY(QFile::copy(QString::fromStdString(video), copy));
-        const PlayerCommand copied(PlayerCommand::kOpen{Moment{copy.toStdString(), 2'500'000, 4}});
-        player.run(copied);
-        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened"}, 5000);
+        player.run(open(copy.toStdString(), 2'500'000, 4));
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened playing"}, 5000);
         QCOMPARE(pane->getProperty("pause").toBool(), false);
         QTRY_COMPARE_WITH_TIMEOUT(pane->getProperty("core-idle").toBool(), false, 5000);
-        // Paused, and opened there again, it stays paused: the test after finds the sign up
-        // however long this one took, where played on, it is gone 2 s after the open.
+        // Paused, and opened there again, sought, it stays paused: the test after finds the sign
+        // up however long this one took, where played on, it is gone 2 s after the open.
         reports.clear();
         player.run(playback(Playback(Playback::kPause{})));
         QTRY_COMPARE_WITH_TIMEOUT(reports.size(), 1, 5000);
         QVERIFY2(reports[0].startsWith("played paused "), qPrintable(reports[0]));
         reports.clear();
-        player.run(copied);
-        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened"}, 5000);
+        player.run(open(copy.toStdString(), 2'500'000, 4, How::kSeek));
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened paused"}, 5000);
         QCOMPARE(pane->getProperty("pause").toBool(), true);
     }
 
-    // A file that is not there: loaded, as it cannot be read, and its end on an error says so. The
-    // frame of the file it replaced, a subtitle up, goes with that file: the pane is black.
+    // A file that is not there, as one gone between review's stat and the load would be: loaded, as
+    // the Open says load, and its end on an error says so. The frame of the file it replaced, a
+    // subtitle up, goes with that file: the pane is black.
     void aLoadThatFailsEndsOnItsFileEnding() {
         QTRY_VERIFY2_WITH_TIMEOUT(bright() > 0, "no subtitle: mpv draws none without a font", 5000);
         reports.clear();
         const std::string gone = QDir::currentPath().toStdString() + "/pane_test-gone.mkv";
-        player.run(PlayerCommand(PlayerCommand::kOpen{Moment{gone, 0, std::nullopt}}));
+        player.run(open(gone, 0, std::nullopt));
         QTRY_COMPARE_WITH_TIMEOUT(
-            reports, QStringList{"opened: mpv could not open pane_test-gone.mkv"}, 5000);
+            reports, QStringList{"open failed: could not open " + QString::fromStdString(gone)},
+            5000);
         QTRY_COMPARE_WITH_TIMEOUT(bright(), 0, 5000);
     }
 
-    void closeStops() {
+    // The load that failed left mpv nothing open: nothing to close, as the terminal says.
+    void aCloseWithNothingOpenSaysSo() {
         reports.clear();
         player.run(PlayerCommand(PlayerCommand::kClose{}));
-        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"closed"}, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"closed: not open"}, 5000);
     }
 
     // A frame left in the pane would show a file that is no longer open. The pane draws when mpv
@@ -300,8 +292,8 @@ private slots:
     // none. It waits as long as the first: mpv makes its video output again, which Close took.
     void closeBlanksThePane() {
         reports.clear();
-        player.run(PlayerCommand(PlayerCommand::kOpen{Moment{video, 2'500'000, 4}}));
-        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened"}, 10000);
+        player.run(open(video, 2'500'000, 4));
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened paused"}, 10000);
         QTRY_VERIFY2_WITH_TIMEOUT(bright() > 0, "no subtitle: mpv draws none without a font", 5000);
         reports.clear();
         player.run(PlayerCommand(PlayerCommand::kClose{}));

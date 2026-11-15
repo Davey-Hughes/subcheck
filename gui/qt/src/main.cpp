@@ -34,10 +34,12 @@ int main(int argc, char **argv) {
     for (qsizetype i = 1; i < arguments.size(); ++i) {
         selector.push_back(arguments[i].toStdString());
     }
-    // A load or a seek has a second to land before the player goes on as if it had. Made before
-    // the bridge, which stops it as it goes: the player must outlive the bridge, or the bridge's
-    // last release runs on a player already destroyed.
-    PlayerPort player(1s);
+    // A load or a seek has a second to land before the player goes on as if it had; mpv has two to
+    // answer a request, as the terminal's socket gives it; and an Open waits ten for the pane to
+    // show video, long past a first frame on a display that can draw, so that `o` on one that
+    // cannot says so. Made before the bridge, which stops it as it goes: the player must outlive
+    // the bridge, or the bridge's last release runs on a player already destroyed.
+    PlayerPort player(1s, 2s, 10s);
     // Before the engine, so that it outlives the window that shows it. The wait after a quit is
     // longer than the store waits for another process's write lock (core's BUSY_TIMEOUT), so that
     // review still ends on its own after one write that waits out a lock held elsewhere. It is

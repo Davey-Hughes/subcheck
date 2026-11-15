@@ -2,12 +2,15 @@
 // over the run seeded for it: keys pressed and a row clicked as a person would, through the QML's
 // handlers to review and back. Every test leaves the run as it found it. Its video pane makes a
 // real mpv, which offscreen can never show video: the player's own tests run it on a fake.
+#include "mpv_item.h"
+#include "said.h"
 #include "session_bridge.h"
 
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QQmlApplicationEngine>
+#include <QQmlComponent>
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QRegularExpression>
@@ -17,6 +20,7 @@
 #include <QtQml/QQmlExtensionPlugin>
 
 #include <chrono>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -31,11 +35,13 @@ std::string clean() { return qEnvironmentVariable("SUBCHECK_TEST_CLEAN").toStdSt
 
 // The window over a bridge on `selector`, made as main.cpp makes it but for a short wait after a
 // quit, as in the bridge's tests: the store is the test's own, so no lock held elsewhere slows
-// review's end, and a review that does not end fails its test sooner.
+// review's end, and a review that does not end fails its test sooner. Its player gives an Open a
+// long wait for the pane, which offscreen never shows video, so that an `o` still waits there
+// however slow the runner.
 struct Shown {
     std::ostringstream out;
     std::ostringstream err;
-    PlayerPort player{std::chrono::seconds(1)};
+    PlayerPort player{std::chrono::seconds(1), std::chrono::seconds(2), std::chrono::minutes(1)};
     SessionBridge bridge;
     QQmlApplicationEngine engine;
     QQuickWindow *window = nullptr;
@@ -244,6 +250,38 @@ private slots:
         QTRY_COMPARE(status->property("text").toString(), "mpv is still opening the file");
         QTest::keyClick(w.window, 'O');
         QTRY_COMPARE(status->property("text").toString(), "closed mpv");
+    }
+
+    // The pane holds its player weakly: the same player given again keeps the pane, its command
+    // under way still waiting; a player given in another's place takes the pane from it, and the
+    // one before lets go, its command under way run again with no mpv, as if it came now; a
+    // player that goes first leaves the pane none. Offscreen, the pane's mpv never says it is
+    // ready, so the test says so for it, and the pane's mpv has not answered when the player goes.
+    void aPaneLetsGoOfAnEarlierPlayerAndOutlivesItsOwn() {
+        QQmlEngine engine;
+        QQmlComponent component(&engine);
+        component.setData("import Subcheck; MpvItem {}", QUrl());
+        std::unique_ptr<QObject> made(component.create());
+        auto *pane = qobject_cast<MpvItem *>(made.get());
+        QVERIFY2(pane, qPrintable(component.errorString()));
+        PlayerPort first(std::chrono::seconds(10));
+        auto second = std::make_unique<PlayerPort>(std::chrono::seconds(10));
+        QStringList reports;
+        connect(&first, &PlayerPort::reported, this,
+                [&reports](const subcheck_ffi::PlayerReport &r) { reports << said(r); });
+        pane->setPlayer(&first);
+        first.ready();
+        using subcheck_ffi::Playback;
+        using subcheck_ffi::PlayerCommand;
+        first.run(PlayerCommand(PlayerCommand::kPlayback{Playback(Playback::kSeek{5})}));
+        QCOMPARE(reports, QStringList());
+        pane->setPlayer(&first);
+        QCOMPARE(reports, QStringList());
+        pane->setPlayer(second.get());
+        QCOMPARE(reports, QStringList{"play failed: no file"});
+        QCOMPARE(pane->player(), second.get());
+        second.reset();
+        QCOMPARE(pane->player(), nullptr);
     }
 
     void anEmptyRunSaysSo() {

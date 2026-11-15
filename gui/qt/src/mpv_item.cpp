@@ -49,17 +49,24 @@ MpvItem::MpvItem(QQuickItem *parent) : MpvAbstractItem(parent) {
     observeProperty(QStringLiteral("vo-configured"), MPV_FORMAT_FLAG);
 }
 
-// The player outlives the window that shows this pane, and must not send it requests after.
+// The player must not send this pane requests once it has gone.
 MpvItem::~MpvItem() {
     if (port) {
-        port->attach(nullptr);
+        port->detach(this);
     }
 }
 
 PlayerPort *MpvItem::player() const { return port; }
 
-// The window binds it as it makes the pane, before mpv can be ready.
+// The window binds it as it makes the pane, before mpv can be ready. A player this pane had before
+// lets go of it, as it will hear nothing more from it.
 void MpvItem::setPlayer(PlayerPort *player) {
+    if (player == port) {
+        return;
+    }
+    if (port) {
+        port->detach(this);
+    }
     port = player;
     if (port) {
         port->attach(this);

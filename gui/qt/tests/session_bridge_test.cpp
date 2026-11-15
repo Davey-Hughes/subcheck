@@ -307,9 +307,9 @@ private slots:
     }
 
     // `o` opens the selected line's moment through review and the player to mpv, on its first
-    // frame (core's target, 4.5 ms past the line's start at 1 s), with its subtitle track, and
-    // paused, as mpv has no file open; each playback key asks mpv its command; `O` closes. What the
-    // player reports is review's status line.
+    // frame (core's target, 4.5 ms past the line's start at 1 s), with its subtitle track, loaded
+    // paused, as mpv has no file open; each playback key asks mpv its command; `O` closes. What
+    // the player reports is review's status line.
     void thePlayersKeysReachMpvAndItsReportsTheStatusLine() {
         // Before the bridge, which stops it as it goes.
         FakeMpv mpv;
@@ -324,11 +324,12 @@ private slots:
         QCOMPARE(mpv.last(), "set pause yes");
         mpv.answer(o.player);
         QCOMPARE(mpv.last(), QString("loadfile %1/typos - E01.mkv replace -1 "
-                                     "start=0:00:01.004500,sid=1,sub-visibility=yes")
+                                     "start=0:00:01.004500,sid=1,sub-visibility=yes,hr-seek=yes,"
+                                     "rebase-start-time=no,pause=yes")
                                  .arg(QString::fromStdString(media())));
         mpv.answer(o.player);
         o.player.restarted();
-        QTRY_COMPARE(o.bridge.statusLine(), "opened in mpv");
+        QTRY_COMPARE(o.bridge.statusLine(), "opened in mpv, paused");
 
         const std::vector<std::tuple<int, QString, QString>> keys = {
             {Qt::Key_Space, " ", "cycle pause"},
@@ -362,7 +363,9 @@ private slots:
         }
 
         QVERIFY(o.bridge.key(Qt::Key_O, "O"));
-        QTRY_COMPARE(mpv.last(), "stop");
+        QTRY_COMPARE(mpv.last(), "get path");
+        mpv.answer(o.player, QString::fromStdString(media()) + "/typos - E01.mkv");
+        QCOMPARE(mpv.last(), "stop");
         mpv.answer(o.player);
         QTRY_COMPARE(o.bridge.statusLine(), "closed mpv");
     }

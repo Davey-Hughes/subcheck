@@ -4,6 +4,8 @@ use std::collections::hash_map::Entry as Slot;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
+use jiff::Timestamp;
+
 use super::progress::Progress;
 use crate::apply::patch::Outcome;
 use crate::list::{self, Filter};
@@ -206,6 +208,11 @@ pub struct Review {
     /// (one of its file's with the same carry key): a key that named it finds that one, as
     /// `refresh` carries what pointed at it.
     replaced_by: HashMap<u64, u64>,
+    /// The file review last asked the player to load, and its size and mtime then, until the
+    /// player closes, an open fails, or `o`'s stat cannot read the size and mtime of the file it
+    /// opens: the same file, unchanged since, is sought, not loaded again (slow for a big file
+    /// over NFS). A remux in place keeps the path, and after a fix of one letter even the size.
+    pub loaded: Option<(String, (u64, Timestamp))>,
 }
 
 impl Review {
@@ -245,6 +252,7 @@ impl Review {
             fatal: None,
             kept_from: None,
             replaced_by: HashMap::new(),
+            loaded: None,
         };
         m.selected = m
             .entries()

@@ -1,5 +1,5 @@
 // The generated bindings over a real session, on the run `seed_a_run` made of the folder argv[1]
-// names: the first event, a decision, the player's round (open, a report, a seek, a report), the
+// names: the first event, a decision, the player's round (open, its reports, a seek, a report), the
 // end, then a session closed and a run that is not there. Every call goes through the generated
 // code, whose first call checks that it was generated from this library. Three sessions in one
 // process, where a UI opens one: none reaches group::end, which is what makes that the rule.
@@ -102,12 +102,22 @@ void a_run_opens_takes_a_decision_plays_and_ends(const std::string &folder) {
     check(opening == "opening typos at 0:00:20.000", "the status line says what opens");
     PlayerCommand open = player(*s, "playing");
     const PlayerCommand::kOpen *o = as<PlayerCommand::kOpen>(open);
-    check(o && o->v1.file.ends_with("/media/typos.mkv") && o->v1.sid == 1u,
+    check(o && o->moment.file.ends_with("/media/typos.mkv") && o->moment.sid == 1u,
           "play opens the run's file on its subtitle track");
-    check(o && o->v1.start_us == 20'004'500, "on the first frame of the selected row's line");
+    check(o && o->moment.start_us == 20'004'500, "on the first frame of the selected row's line");
+    check(o && o->how == How::kLoad, "loaded, as the player has loaded nothing for review yet");
+    check(o && o->options.size() == 2 && o->options[0].name == "hr-seek" &&
+              o->options[0].value == "yes" && o->options[1].name == "rebase-start-time" &&
+              o->options[1].value == "no",
+          "with the options review gives every load, in their order");
 
-    s->report(PlayerReport(PlayerReport::kOpened{std::nullopt}));
-    check(changed(*s, "opened").summary.status == "opened in mpv", "the report reaches review");
+    s->report(PlayerReport(PlayerReport::kOpened{false}));
+    check(changed(*s, "opened").summary.status == "opened in mpv, playing",
+          "the report reaches review, with where mpv was left");
+    s->report(PlayerReport(PlayerReport::kFailed{
+        PlayerError(PlayerError::kCouldNotOpen{o ? o->moment.file : std::string()})}));
+    check(changed(*s, "failed").summary.status == "mpv could not open typos",
+          "a late failure reaches review, which words it");
 
     s->send(Action(Action::kPlayback{Playback(Playback::kSeek{5})}));
     check(!changed(*s, "seeking").summary.status, "a seek clears the status line");
@@ -118,6 +128,8 @@ void a_run_opens_takes_a_decision_plays_and_ends(const std::string &folder) {
 
     s->report(PlayerReport(PlayerReport::kPlayed{PlayState{true, 6000}}));
     check(changed(*s, "played").summary.status == "⏸ 0:00:06.000", "where it played, paused");
+    s->report(PlayerReport(PlayerReport::kPlayFailed{PlayerError(PlayerError::kNoAnswer{})}));
+    check(changed(*s, "no answer").summary.status == "mpv did not answer", "a typed failure");
 
     s->send(Action(Action::kQuit{}));
     std::optional<Event> e;

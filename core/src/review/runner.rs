@@ -89,6 +89,10 @@ impl<T: From<Input> + Send + 'static> Runner<T> {
                         .map_err(|e| e.to_string())
                 },
             )),
+            Task::Stamp(moment) => Input::Stamped {
+                stamp: file_stamp(Path::new(&moment.file)).ok(),
+                moment,
+            },
             Task::Switch(to) => Input::Switched(
                 other_view(store, &to)
                     .map(|run| {

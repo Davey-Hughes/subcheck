@@ -102,11 +102,28 @@ pub struct Moment {
     pub sid: Option<u64>,
 }
 
+/// How the player reaches a moment ([`player::How`]): in the file its mpv has open, or by loading
+/// the file.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum How {
+    Seek,
+    Load,
+}
+
 /// What review asks of the UI's player ([`player::PlayerCommand`]), which says how it went
 /// through `Session::report`.
 #[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
 pub enum PlayerCommand {
-    Open(Moment),
+    /// Open the moment as `how` says, in the steps core's `PlayerCommand::Open` names: pause; for
+    /// a seek, in the file mpv has open, the subtitle track and subtitles on, the exact seek, then
+    /// pause off if mpv played, or a load instead should any of it be refused or mpv have another
+    /// file open; for a load, the file with its start, subtitle track, subtitles on, every one of
+    /// `options` and pause as mpv is to end up, as options of that file alone.
+    Open {
+        moment: Moment,
+        how: How,
+        options: Vec<FileOption>,
+    },
     /// Pause or seek the open player.
     Playback(Playback),
     /// Close the player, and leave review open.
@@ -217,29 +234,62 @@ pub enum Action {
     Quit,
 }
 
-/// What the UI's player says of a command it ran ([`session::PlayerReport`]). A failed play is
-/// a variant of its own: UniFFI has no `Result` to carry it in, and `Played` carries a state.
+/// One of mpv's options for the one file a load opens ([`player::FileOption`]), as `--name=value`
+/// names it: words the player hands mpv as they are.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct FileOption {
+    pub name: String,
+    pub value: String,
+}
+
+/// What went wrong with a player command ([`player::PlayerError`]), for review to word: the same
+/// words in every UI.
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum PlayerError {
+    /// No mpv to ask, or nothing open in it to close.
+    NotOpen,
+    /// mpv has no file open.
+    NoFile,
+    /// mpv is still opening the file: it names it, but has no position yet.
+    StillOpening,
+    /// mpv could not open this file: its load ended on an error.
+    CouldNotOpen { file: String },
+    /// mpv did not answer a request within the player's time.
+    NoAnswer,
+    /// mpv closed the connection without answering.
+    HungUp,
+    /// The video pane could not show video within the player's time.
+    NoVideo,
+    /// mpv refused a request: its words.
+    Mpv(String),
+    /// Anything else: starting mpv, or reaching it.
+    Failed(String),
+}
+
+/// What the UI's player says of a command it ran, or later of a file it had said was open
+/// ([`session::PlayerReport`]). A failure is a variant of its own: UniFFI has no `Result` to
+/// carry it in.
 #[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
 pub enum PlayerReport {
-    /// The moment opened, or why not.
-    Opened { error: Option<String> },
+    /// The moment opened, and whether mpv was left paused there.
+    Opened { paused: bool },
+    /// Why an `Open` failed.
+    OpenFailed { error: PlayerError },
     /// Where playback is after a `Playback`.
     Played { state: PlayState },
     /// Why a `Playback` failed.
-    PlayFailed { error: String },
+    PlayFailed { error: PlayerError },
     /// The player closed, or why not.
-    Closed { error: Option<String> },
+    Closed { error: Option<PlayerError> },
+    /// A file the player had said was open failed after all: a load that outlasted the player's
+    /// wait for it, then ended on an error.
+    Failed { error: PlayerError },
 }
 
 /// A position or a count, as UniFFI carries it: it has no `usize`, and no Rust target's is wider
 /// than a u64.
 fn wide(n: usize) -> u64 {
     n as u64
-}
-
-/// `None` as success, as the player's reports say it.
-fn result(error: Option<String>) -> Result<(), String> {
-    error.map_or(Ok(()), Err)
 }
 
 impl From<model::EntryKey> for EntryKey {
@@ -314,10 +364,34 @@ impl From<player::Moment> for Moment {
     }
 }
 
+impl From<player::FileOption> for FileOption {
+    fn from(option: player::FileOption) -> FileOption {
+        let player::FileOption { name, value } = option;
+        FileOption { name, value }
+    }
+}
+
+impl From<player::How> for How {
+    fn from(how: player::How) -> How {
+        match how {
+            player::How::Seek => How::Seek,
+            player::How::Load => How::Load,
+        }
+    }
+}
+
 impl From<player::PlayerCommand> for PlayerCommand {
     fn from(command: player::PlayerCommand) -> PlayerCommand {
         match command {
-            player::PlayerCommand::Open(moment) => PlayerCommand::Open(moment.into()),
+            player::PlayerCommand::Open {
+                moment,
+                how,
+                options,
+            } => PlayerCommand::Open {
+                moment: moment.into(),
+                how: how.into(),
+                options: options.into_iter().map(FileOption::from).collect(),
+            },
             player::PlayerCommand::Playback(playback) => PlayerCommand::Playback(playback.into()),
             player::PlayerCommand::Close => PlayerCommand::Close,
         }
@@ -429,13 +503,35 @@ impl From<Action> for update::Action {
     }
 }
 
+impl From<PlayerError> for player::PlayerError {
+    fn from(error: PlayerError) -> player::PlayerError {
+        match error {
+            PlayerError::NotOpen => player::PlayerError::NotOpen,
+            PlayerError::NoFile => player::PlayerError::NoFile,
+            PlayerError::StillOpening => player::PlayerError::StillOpening,
+            PlayerError::CouldNotOpen { file } => player::PlayerError::CouldNotOpen { file },
+            PlayerError::NoAnswer => player::PlayerError::NoAnswer,
+            PlayerError::HungUp => player::PlayerError::HungUp,
+            PlayerError::NoVideo => player::PlayerError::NoVideo,
+            PlayerError::Mpv(error) => player::PlayerError::Mpv(error),
+            PlayerError::Failed(error) => player::PlayerError::Failed(error),
+        }
+    }
+}
+
 impl From<PlayerReport> for session::PlayerReport {
     fn from(report: PlayerReport) -> session::PlayerReport {
         match report {
-            PlayerReport::Opened { error } => session::PlayerReport::Opened(result(error)),
+            PlayerReport::Opened { paused } => {
+                session::PlayerReport::Opened(Ok(player::Opened { paused }))
+            }
+            PlayerReport::OpenFailed { error } => session::PlayerReport::Opened(Err(error.into())),
             PlayerReport::Played { state } => session::PlayerReport::Played(Ok(state.into())),
-            PlayerReport::PlayFailed { error } => session::PlayerReport::Played(Err(error)),
-            PlayerReport::Closed { error } => session::PlayerReport::Closed(result(error)),
+            PlayerReport::PlayFailed { error } => session::PlayerReport::Played(Err(error.into())),
+            PlayerReport::Closed { error } => {
+                session::PlayerReport::Closed(error.map_or(Ok(()), |e| Err(e.into())))
+            }
+            PlayerReport::Failed { error } => session::PlayerReport::Failed(error.into()),
         }
     }
 }
@@ -570,19 +666,52 @@ mod tests {
 
     #[test]
     fn each_player_command_and_the_end_cross() {
-        let open = player::PlayerCommand::Open(player::Moment {
-            file: "/m/E01.mkv".into(),
-            start_us: 165_064_500,
-            sid: Some(2),
-        });
-        let cases = [
-            (
-                session::Event::Player(open),
-                Event::Player(PlayerCommand::Open(Moment {
+        let open = |how| player::PlayerCommand::Open {
+            moment: player::Moment {
+                file: "/m/E01.mkv".into(),
+                start_us: 165_064_500,
+                sid: Some(2),
+            },
+            how,
+            options: vec![
+                player::FileOption {
+                    name: "a".into(),
+                    value: "1".into(),
+                },
+                player::FileOption {
+                    name: "b".into(),
+                    value: String::new(),
+                },
+            ],
+        };
+        let crossed = |how| {
+            Event::Player(PlayerCommand::Open {
+                moment: Moment {
                     file: "/m/E01.mkv".into(),
                     start_us: 165_064_500,
                     sid: Some(2),
-                })),
+                },
+                how,
+                options: vec![
+                    FileOption {
+                        name: "a".into(),
+                        value: "1".into(),
+                    },
+                    FileOption {
+                        name: "b".into(),
+                        value: String::new(),
+                    },
+                ],
+            })
+        };
+        let cases = [
+            (
+                session::Event::Player(open(player::How::Seek)),
+                crossed(How::Seek),
+            ),
+            (
+                session::Event::Player(open(player::How::Load)),
+                crossed(How::Load),
             ),
             (
                 session::Event::Player(player::PlayerCommand::Close),
@@ -669,14 +798,18 @@ mod tests {
         };
         let cases = [
             (
-                PlayerReport::Opened { error: None },
-                session::PlayerReport::Opened(Ok(())),
+                PlayerReport::Opened { paused: true },
+                session::PlayerReport::Opened(Ok(player::Opened { paused: true })),
             ),
             (
-                PlayerReport::Opened {
-                    error: Some("mpv not found".into()),
+                PlayerReport::Opened { paused: false },
+                session::PlayerReport::Opened(Ok(player::Opened { paused: false })),
+            ),
+            (
+                PlayerReport::OpenFailed {
+                    error: PlayerError::NoVideo,
                 },
-                session::PlayerReport::Opened(Err("mpv not found".into())),
+                session::PlayerReport::Opened(Err(player::PlayerError::NoVideo)),
             ),
             (
                 PlayerReport::Played { state },
@@ -687,9 +820,9 @@ mod tests {
             ),
             (
                 PlayerReport::PlayFailed {
-                    error: "mpv is not open".into(),
+                    error: PlayerError::StillOpening,
                 },
-                session::PlayerReport::Played(Err("mpv is not open".into())),
+                session::PlayerReport::Played(Err(player::PlayerError::StillOpening)),
             ),
             (
                 PlayerReport::Closed { error: None },
@@ -697,13 +830,49 @@ mod tests {
             ),
             (
                 PlayerReport::Closed {
-                    error: Some("mpv crashed".into()),
+                    error: Some(PlayerError::NotOpen),
                 },
-                session::PlayerReport::Closed(Err("mpv crashed".into())),
+                session::PlayerReport::Closed(Err(player::PlayerError::NotOpen)),
+            ),
+            (
+                PlayerReport::Failed {
+                    error: PlayerError::NoAnswer,
+                },
+                session::PlayerReport::Failed(player::PlayerError::NoAnswer),
             ),
         ];
         for (ffi, core) in cases {
             assert_eq!(session::PlayerReport::from(ffi), core);
+        }
+    }
+
+    #[test]
+    fn each_player_error_is_cores() {
+        for (ffi, core) in [
+            (PlayerError::NotOpen, player::PlayerError::NotOpen),
+            (PlayerError::NoFile, player::PlayerError::NoFile),
+            (PlayerError::StillOpening, player::PlayerError::StillOpening),
+            (
+                PlayerError::CouldNotOpen {
+                    file: "/m/E01.mkv".into(),
+                },
+                player::PlayerError::CouldNotOpen {
+                    file: "/m/E01.mkv".into(),
+                },
+            ),
+            (PlayerError::NoAnswer, player::PlayerError::NoAnswer),
+            (PlayerError::HungUp, player::PlayerError::HungUp),
+            (PlayerError::NoVideo, player::PlayerError::NoVideo),
+            (
+                PlayerError::Mpv("invalid parameter".into()),
+                player::PlayerError::Mpv("invalid parameter".into()),
+            ),
+            (
+                PlayerError::Failed("mpv not found".into()),
+                player::PlayerError::Failed("mpv not found".into()),
+            ),
+        ] {
+            assert_eq!(player::PlayerError::from(ffi), core);
         }
     }
 
@@ -801,9 +970,12 @@ mod tests {
         });
         assert_eq!(change().1.status.as_deref(), Some("⏸ 0:02:51.060"));
         s.report(PlayerReport::PlayFailed {
-            error: "mpv is not open".into(),
+            error: PlayerError::NoFile,
         });
-        assert_eq!(change().1.status.as_deref(), Some("mpv is not open"));
+        assert_eq!(
+            change().1.status.as_deref(),
+            Some("mpv has no file open (o opens one)")
+        );
         s.send(Action::Quit);
         assert_eq!(change().1.status, None);
         let end = Event::Ended {

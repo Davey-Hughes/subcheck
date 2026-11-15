@@ -212,7 +212,7 @@ filter, to the next row).
 | `c` | in the files view: check the file again (asks first; while a scan runs, once it ends; refused while apply runs) |
 | `A` | apply the accepted fixes of the view (asks first; not while a scan runs) |
 | `D` | dry run: what apply would do, writing nothing |
-| `o` | open the finding in mpv with its subtitle track: a line on its first frame, a timing finding on the frame that shows the error, or with none, its first moved line's first frame; paused if mpv is paused or has no file open, playing on if it plays; again on the same row goes back there |
+| `o` | open the finding in mpv with its subtitle track: a line on its first frame, a timing finding on the frame that shows the error, or with none, its first moved line's first frame; paused if mpv is paused or has no file open, playing on if it plays, as the status line then says; again on the same row goes back there |
 | `O` | close mpv and stay in review; the next `o` opens it again |
 | Space | pause or resume mpv |
 | ← → | mpv back or forward 5 s |
@@ -225,6 +225,15 @@ The mouse works too. Click a row to select it, and double-click to open it in mp
 the selection over the list and scrolls the detail pane. `? help` at the end of the status line, and
 the editor's `⏎ accept · Esc cancel` there, are clickable. Since review takes the mouse, select text
 in the terminal with Shift+drag.
+
+Whatever `mpv.conf` says (or, for the window, `mpvqt.conf`), a file `o` loads gets, beside its
+start, `sub-visibility=yes` and, when the finding names one, its subtitle track, three more options
+of its own: `hr-seek=yes`, so that it lands on the frame and not on the keyframe before it, which
+makes mpv's own relative seeks in that file exact too; `rebase-start-time=no`, so that mpv's clock
+is the file's own, which subcheck's times are on, even for a file whose first cluster is not at 0;
+and `pause`, as mpv is to end up, which `reset-on-next-file=pause` would otherwise undo. `o` on a
+file that is not there (whose size and time cannot be read) says `file missing`, and asks nothing
+of mpv.
 
 ## LLM costs
 

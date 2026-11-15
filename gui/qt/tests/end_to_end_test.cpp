@@ -136,11 +136,13 @@ private slots:
     }
 
     void aRowIsAcceptedThenItsMomentPlays() {
-        // mpv's config, in place of the user's: no sound, and a socket that says where it is.
+        // mpv's config, in place of the user's: no sound, and a socket that says where it is; and
+        // what a user's could hold that would land a load on a keyframe, but for the options review
+        // gives each load.
         const QString socket = dir + "/mpv.sock";
         QFile config(dir + "/config/mpvqt/mpvqt.conf");
         QVERIFY(config.open(QIODevice::WriteOnly | QIODevice::Truncate));
-        config.write("ao=null\ninput-ipc-server=" + socket.toUtf8() + "\n");
+        config.write("ao=null\nhr-seek=no\ninput-ipc-server=" + socket.toUtf8() + "\n");
         config.close();
 
         // The app on that display and nowhere else; Qt's warnings on its stderr, where the test
