@@ -1,8 +1,9 @@
 // The generated bindings over a real session, on the run `seed_a_run` made of the folder argv[1]
-// names: the first event, a decision, the player's round (open, its reports, a seek, a report), the
-// end, then a session closed and a run that is not there. Every call goes through the generated
-// code, whose first call checks that it was generated from this library. Three sessions in one
-// process, where a UI opens one: none reaches group::end, which is what makes that the rule.
+// names: the first event, a decision, the player's round (open, its reports, a seek, a report),
+// another view that is not there, the end, then a session closed, a run that is not there, and the
+// process's finish. Every call goes through the generated code, whose first call checks that it
+// was generated from this library. Three sessions in one process, where a UI opens one: none stops
+// a job, so none ends the groups, which is what makes that the rule.
 #include "subcheck_ffi.hpp"
 
 #include <cstdint>
@@ -131,6 +132,12 @@ void a_run_opens_takes_a_decision_plays_and_ends(const std::string &folder) {
     s->report(PlayerReport(PlayerReport::kPlayFailed{PlayerError(PlayerError::kNoAnswer{})}));
     check(changed(*s, "no answer").summary.status == "mpv did not answer", "a typed failure");
 
+    s->send(Action(Action::kOpenView{{"no-such-run"}}));
+    check(!changed(*s, "opening a view").summary.status, "a view asked for clears the status line");
+    check(changed(*s, "a view not there").summary.status ==
+              "could not switch views: no run named no-such-run",
+          "a view that is not there leaves the run shown, and says why");
+
     s->send(Action(Action::kQuit{}));
     std::optional<Event> e;
     while ((e = s->next_event()) && !as<Event::kEnded>(*e)) {
@@ -140,12 +147,17 @@ void a_run_opens_takes_a_decision_plays_and_ends(const std::string &folder) {
     check(!s->next_event(), "nothing after the end");
 }
 
-// What was queued before close() may still come out, and then nothing, at once.
+// What was queued before close() may still come out, then close()'s end, which has nothing to
+// say of a job, as none ran, and then nothing, at once.
 void a_closed_session_ends_its_stream(const std::string &folder) {
     std::shared_ptr<Session> s = Session::open({folder});
     s->close();
-    while (s->next_event()) {
+    std::optional<Event> last;
+    while (std::optional<Event> e = s->next_event()) {
+        last = e;
     }
+    const Event::kEnded *end = last ? as<Event::kEnded>(*last) : nullptr;
+    check(end && !end->fatal && end->outro.empty(), "close ends the stream; came: " + came(last));
     check(!s->next_event(), "nothing after close");
 }
 
@@ -171,6 +183,8 @@ int main(int argc, char **argv) {
         a_run_opens_takes_a_decision_plays_and_ends(argv[1]);
         a_closed_session_ends_its_stream(argv[1]);
         a_run_that_is_not_there_ends_at_once();
+        // No signal is ending this process, so it returns at once.
+        finish();
     } catch (const std::exception &e) {
         std::cerr << "FAIL threw: " << e.what() << "\n";
         return 1;

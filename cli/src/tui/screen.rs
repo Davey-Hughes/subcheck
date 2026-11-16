@@ -13,8 +13,10 @@ use super::keymap::{self, Press};
 use super::layout::{self, EDIT_KEYS, HELP, Item};
 use super::view;
 use subcheck_core::llm::Spent;
-use subcheck_core::review::model::{EntryKey, Pane, Review};
+use subcheck_core::review::model::{EntryKey, Pane, Question, Review};
+use subcheck_core::review::progress::{ApplyAt, Stopping};
 use subcheck_core::review::update::{self, Action, Effect, Input};
+use subcheck_core::scan;
 
 /// What the screen's loop takes: an input for `update::update`, one of the terminal's events, or
 /// the spinner's tick.
@@ -159,15 +161,73 @@ impl Screen {
         SPINNER[self.ticks % SPINNER.len()]
     }
 
-    /// What the status line `status` says: the review's own text ([`Review::status_text`]); else
-    /// what the run's LLM calls cost while [`Screen::show_cost`] holds, as much of it as fits
-    /// beside `? help`.
-    pub fn status_text(&self, m: &Review, status: Rect) -> Option<String> {
-        m.status_text().or_else(|| {
+    /// What the status line `line` says: review's ([`status`]); else what the run's LLM calls
+    /// cost while [`Screen::show_cost`] holds, as much of it as fits beside `? help`.
+    pub fn status_text(&self, m: &Review, line: Rect) -> Option<String> {
+        status(m).or_else(|| {
             self.show_cost
-                .then(|| cost_status(&m.run.spent, status))
+                .then(|| cost_status(&m.run.spent, line))
                 .flatten()
         })
+    }
+}
+
+/// The status line's text from review: the open question, as the terminal asks it ([`asked`]);
+/// else review's own ([`Review::status_text`]).
+pub fn status(m: &Review) -> Option<String> {
+    m.question().map(|q| asked(&q)).or_else(|| m.status_text())
+}
+
+/// Question `q` as the status line asks it, ending in `y/n`: `y` answers it.
+pub fn asked(q: &Question) -> String {
+    match q {
+        Question::Quit(Stopping::Scan {
+            done,
+            queued,
+            again,
+        }) => {
+            let again = match again {
+                0 => String::new(),
+                n => format!(" · {n} queued to check again"),
+            };
+            format!("scan is on {done}/{queued}{again} — stop it and quit? y/n")
+        }
+        Question::Quit(Stopping::Apply {
+            dry_run,
+            done,
+            queued,
+            at,
+        }) => {
+            let noun = if *dry_run { "dry run" } else { "apply" };
+            let at = match at {
+                ApplyAt::On { file, stage } => {
+                    format!("on {file} ({}), {done}/{queued}", stage.word())
+                }
+                ApplyAt::Before { file } => format!("starting {file}, {done}/{queued}"),
+                ApplyAt::Finishing => format!("finishing, {done}/{queued}"),
+                ApplyAt::Starting => "starting".into(),
+            };
+            format!("{noun} is {at} — stop it and quit? y/n")
+        }
+        Question::Recheck { label, backend } => format!("check {label} again with {backend}? y/n"),
+        Question::Apply {
+            fixes,
+            files,
+            applied,
+        } => {
+            let fixes = match fixes {
+                1 => "1 fix".to_string(),
+                n => format!("{n} fixes"),
+            };
+            let applied = match applied {
+                0 => String::new(),
+                n => format!(" ({n} applied already)"),
+            };
+            format!(
+                "apply {fixes} in {}{applied}, keeping each .orig? y/n",
+                scan::files(*files)
+            )
+        }
     }
 }
 
@@ -430,6 +490,7 @@ fn status_button(m: &Review, s: &Screen, status: Rect, at: Position) -> Option<K
 }
 
 /// A click on the list's `index`th entry selects it; the second click of a double-click opens it.
+/// Under a question, review lets the question go and selects nothing.
 fn click_row(
     m: &mut Review,
     s: &mut Screen,
@@ -441,7 +502,13 @@ fn click_row(
         return Vec::new();
     };
     let key = m.entry_key(entry);
+    let asked = m.confirm.is_some();
     let mut effects = act(m, Action::Select(key.clone()), now);
+    // No first click of a double-click: a second click would then open the row the click only let
+    // the question go from.
+    if asked {
+        return effects;
+    }
     // The wall clock can step back between two clicks: a negative gap is not a short one.
     let double = last_click.is_some_and(|(clicked, at)| {
         clicked == key && (SignedDuration::ZERO..=DOUBLE_CLICK).contains(&now.duration_since(at))
@@ -457,10 +524,11 @@ fn click_row(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use subcheck_core::apply::Stage;
     use subcheck_core::list::Filter;
     use subcheck_core::player::PlayerError;
-    use subcheck_core::review::model::Entry;
     use subcheck_core::review::model::tests_support::{self, finding, path, sample};
+    use subcheck_core::review::model::{Confirm, Entry};
     use subcheck_core::review::update::Task;
     use subcheck_core::review::update::tests_support::{
         FIXED, TYPO, decide_as, decided, now, saved, scanning, states, taken,
@@ -921,6 +989,121 @@ pub(crate) mod tests {
             opens(click(&mut m, &mut s, 5, 2, 300)),
             "its row, with finding 9"
         );
+    }
+
+    // Under a question, as a key but `y` does: the click lets it go and nothing else, and no
+    // double-click starts from it, so the second click selects as a click of its own.
+    #[test]
+    fn a_click_under_a_question_only_lets_it_go() {
+        let opens = |effects: &[Effect]| matches!(effects, [Effect::Task(Task::Stamp(_))]);
+        let (mut m, mut s) = on_screen();
+        m.confirm = Some(Confirm::Apply);
+        m.status = Some("opened in mpv, paused".into());
+        assert_eq!(click(&mut m, &mut s, 5, 2, 0), []);
+        assert_eq!(m.confirm, None);
+        assert_eq!(m.selected, 0);
+        assert_eq!(m.status.as_deref(), Some("opened in mpv, paused"));
+        // A double-click under it: the first click lets it go, the second selects.
+        m.confirm = Some(Confirm::Apply);
+        assert_eq!(click(&mut m, &mut s, 5, 2, 1000), []);
+        let second = click(&mut m, &mut s, 5, 2, 1300);
+        assert!(!opens(&second), "{second:?}");
+        assert_eq!(m.selected, 1);
+        // That one starts a double-click: it is under no question.
+        assert!(opens(&click(&mut m, &mut s, 5, 2, 1600)));
+        // A file's row.
+        key(&mut m, &mut s, KeyCode::Tab);
+        m.confirm = Some(Confirm::Apply);
+        assert_eq!(click(&mut m, &mut s, 5, 3, 3000), []);
+        assert_eq!((m.confirm.clone(), m.file_selected), (None, 0));
+    }
+
+    // The terminal's own words for each question, which review's data must not move.
+    #[test]
+    fn each_question_is_asked_in_the_terminals_words() {
+        let scan = |again| {
+            Question::Quit(Stopping::Scan {
+                done: 0,
+                queued: 2,
+                again,
+            })
+        };
+        let quit = |dry_run, done, queued, at| {
+            Question::Quit(Stopping::Apply {
+                dry_run,
+                done,
+                queued,
+                at,
+            })
+        };
+        let on = |file: &str, stage| ApplyAt::On {
+            file: file.into(),
+            stage,
+        };
+        let before = |file: &str| ApplyAt::Before { file: file.into() };
+        let apply = |fixes, files, applied| Question::Apply {
+            fixes,
+            files,
+            applied,
+        };
+        for (q, said) in [
+            (scan(0), "scan is on 0/2 — stop it and quit? y/n"),
+            (
+                scan(2),
+                "scan is on 0/2 · 2 queued to check again — stop it and quit? y/n",
+            ),
+            (
+                quit(false, 1, 2, on("E02", Stage::Remux)),
+                "apply is on E02 (remux), 1/2 — stop it and quit? y/n",
+            ),
+            (
+                quit(true, 0, 1, on("E01", Stage::Plan)),
+                "dry run is on E01 (plan), 0/1 — stop it and quit? y/n",
+            ),
+            (
+                quit(false, 0, 0, ApplyAt::Starting),
+                "apply is starting — stop it and quit? y/n",
+            ),
+            (
+                quit(true, 0, 2, before("E01")),
+                "dry run is starting E01, 0/2 — stop it and quit? y/n",
+            ),
+            (
+                quit(false, 2, 2, ApplyAt::Finishing),
+                "apply is finishing, 2/2 — stop it and quit? y/n",
+            ),
+            (
+                Question::Recheck {
+                    label: "E02".into(),
+                    backend: "claude".into(),
+                },
+                "check E02 again with claude? y/n",
+            ),
+            (
+                apply(2, 2, 1),
+                "apply 2 fixes in 2 files (1 applied already), keeping each .orig? y/n",
+            ),
+            (
+                apply(1, 1, 0),
+                "apply 1 fix in 1 file, keeping each .orig? y/n",
+            ),
+        ] {
+            assert_eq!(asked(&q), said);
+        }
+    }
+
+    // The question first, over a message that came while it was open.
+    #[test]
+    fn the_status_line_asks_the_open_question_over_reviews_message() {
+        let mut m = scanning();
+        m.status = Some("opened in mpv, paused".into());
+        m.confirm = Some(Confirm::Quit);
+        assert_eq!(
+            status(&m).as_deref(),
+            Some("scan is on 0/2 — stop it and quit? y/n")
+        );
+        m.confirm = None;
+        assert_eq!(status(&m).as_deref(), Some("opened in mpv, paused"));
     }
 
     #[test]

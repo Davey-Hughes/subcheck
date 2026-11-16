@@ -95,7 +95,11 @@ pub enum WriteFor {
 }
 
 /// What the user asks of review. Each UI maps its own keys, buttons and clicks to these, so the
-/// rules below are the same whichever drives them.
+/// rules below are the same whichever drives them. While a question is open
+/// ([`Review::question`]), every action but `Answer` and `Interrupt` lets it go and does nothing
+/// else; what a job or an effect has to say leaves it open, but that a quit question goes once
+/// nothing is left to stop, and the check-again question `c` found a run for
+/// ([`Input::RunFound`]) takes the place of any other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Quit; while a job runs, ask first.
@@ -130,6 +134,9 @@ pub enum Action {
     ShowPane(Pane),
     /// Open the other view of the screen's findings.
     SwitchView,
+    /// Open the view these words select (`[run | paths…]`, as `subcheck review` takes them) in
+    /// place of the one shown, as `SwitchView` opens the other; not while a job runs.
+    OpenView(Vec<String>),
     /// Apply the view's accepted fixes; with `dry_run`, say what would change and write nothing.
     Apply {
         dry_run: bool,
@@ -159,13 +166,15 @@ pub struct Job {
     pub resume: String,
 }
 
-/// The view `v` opens.
+/// The view `v`, or `OpenView`, opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Switch {
     /// The folders of the run of this name.
     FoldersOf(String),
     /// The newest run that named the file at this path.
     RunNaming(String),
+    /// The view these words select, as `subcheck review` takes them ([`Action::OpenView`]).
+    Selector(Vec<String>),
 }
 
 /// What `update` asks to have done; each comes back as an [`Input`].
@@ -196,8 +205,8 @@ pub enum Task {
     /// Check `paths` again into `run`, as `subcheck scan --run <run> --force <paths>`
     /// does ([`Input::Started`]).
     Recheck { run: String, paths: Vec<String> },
-    /// Open the other view of the screen's findings (`v`), read from the store with each file's
-    /// note ([`Input::Switched`]).
+    /// Open another view of the findings, the other one (`v`) or one a selector names
+    /// (`OpenView`), read from the store with each file's note ([`Input::Switched`]).
     Switch(Switch),
     /// Read the size and mtime of the file `o` opens, for review to say seek or load
     /// ([`Input::Stamped`]): a stat, which can hang on a stalled mount, so a task. A session runs
@@ -298,6 +307,13 @@ pub fn update(m: &mut Review, input: Input, now: Timestamp) -> Vec<Effect> {
 
 /// What `action` does to `m`, and the effects to run for it.
 fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
+    // An open question takes the next action, from whichever UI: an answer, or `Interrupt`, which
+    // asks to quit or quits. Any other lets it go and does nothing else, as a no does, so that a
+    // click meant for the list cannot act behind a question its user has not read.
+    if m.confirm.is_some() && !matches!(action, Action::Answer(_) | Action::Interrupt) {
+        m.confirm = None;
+        return Vec::new();
+    }
     // A message stays until the user does something else. An answer, the end of an edit and
     // Ctrl-C leave it, so a message that came while a question or the editor held the line shows
     // once they are done.
@@ -347,6 +363,7 @@ fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
         Action::CancelEdit => m.editing = None,
         Action::ShowPane(pane) => m.pane = pane,
         Action::SwitchView => return switch_view(m),
+        Action::OpenView(words) => return open_view(m, words),
         Action::Apply { dry_run } => return apply_key(m, dry_run),
         Action::Play => return open(m),
         Action::ClosePlayer => return vec![Effect::Player(PlayerCommand::Close)],
@@ -1010,8 +1027,8 @@ fn applied(m: &mut Review, event: apply::Event) -> Vec<Effect> {
     Vec::new()
 }
 
-/// The other view `v` asked for has been read, or could not be: take it, or say why the screen is
-/// as it was.
+/// The view `v` or `OpenView` asked for has been read, or could not be: take it, or say why the
+/// screen is as it was.
 fn switched(
     m: &mut Review,
     result: Result<(Run, HashMap<String, FileNote>), String>,
@@ -1028,12 +1045,7 @@ fn switched(
 /// member's), or in the files view, or with nothing selected in the list, the selected file's. Not
 /// while a job runs: its progress belongs to the view it started in.
 fn switch_view(m: &mut Review) -> Vec<Effect> {
-    if m.progress.running() {
-        m.status = Some("the scan is still running".into());
-        return Vec::new();
-    }
-    if m.progress.applying() {
-        m.status = Some("apply is still running".into());
+    if refused_while_a_job_runs(m) {
         return Vec::new();
     }
     if !m.run.of_paths {
@@ -1061,6 +1073,28 @@ fn switch_view(m: &mut Review) -> Vec<Effect> {
         .map(|p| Effect::Task(Task::Switch(Switch::RunNaming(p))))
         .into_iter()
         .collect()
+}
+
+/// The view `words` select, in place of the one shown; not while a job runs, as for `v`.
+fn open_view(m: &mut Review, words: Vec<String>) -> Vec<Effect> {
+    if refused_while_a_job_runs(m) {
+        return Vec::new();
+    }
+    vec![Effect::Task(Task::Switch(Switch::Selector(words)))]
+}
+
+/// Whether a new view is refused, for a scan or apply that runs: its progress belongs to the view
+/// it started in. The status line says which.
+fn refused_while_a_job_runs(m: &mut Review) -> bool {
+    let running = if m.progress.running() {
+        "the scan is still running"
+    } else if m.progress.applying() {
+        "apply is still running"
+    } else {
+        return false;
+    };
+    m.status = Some(running.into());
+    true
 }
 
 /// `c` on the selected file: find the run it is checked again into, then ask. A file the scan is
@@ -1365,7 +1399,8 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::apply::patch::Outcome;
-    use crate::review::model::Mark;
+    use crate::review::model::{Mark, Question};
+    use crate::review::progress::{ApplyAt, Stopping};
 
     use super::tests_support::{
         FIXED, TYPO, decide_as, decided, now, saved, scanning, states, taken,
@@ -1377,6 +1412,28 @@ mod tests {
     /// `action` done to `m`: the effects it asks for.
     fn act(m: &mut Review, action: Action) -> Vec<Effect> {
         update(m, Input::Action(action), now())
+    }
+
+    /// The scan a quit would stop: `done` of `queued` files, and `again` queued after it.
+    fn scan_on(done: usize, queued: usize, again: usize) -> Stopping {
+        Stopping::Scan {
+            done,
+            queued,
+            again,
+        }
+    }
+
+    /// Apply a quit would stop (with `dry_run`, a dry run): on E01, its one file, at `stage`.
+    fn applying_on(dry_run: bool, stage: apply::Stage) -> Stopping {
+        Stopping::Apply {
+            dry_run,
+            done: 0,
+            queued: 1,
+            at: ApplyAt::On {
+                file: "E01".into(),
+                stage,
+            },
+        }
     }
 
     /// Run a [`Task::Write`] as if the store took it, and feed the result back.
@@ -1543,14 +1600,10 @@ mod tests {
 
     #[test]
     fn quitting_while_the_scan_runs_asks_first() {
-        let status = |m: &Review| m.status_text();
         let mut m = scanning();
         act(&mut m, Action::Quit);
         assert!(!m.should_quit);
-        assert_eq!(
-            status(&m).as_deref(),
-            Some("scan is on 0/2 — stop it and quit? y/n")
-        );
+        assert_eq!(m.question(), Some(Question::Quit(scan_on(0, 2, 0))));
         act(&mut m, Action::Answer(false));
         assert!(!m.should_quit && m.confirm.is_none());
         act(&mut m, Action::Quit);
@@ -1571,6 +1624,111 @@ mod tests {
         );
         act(&mut m, Action::Quit);
         assert!(m.should_quit);
+    }
+
+    /// Each question review asks, open on the sample with a scan under way, over an edit, as
+    /// Ctrl-C mid-edit opens one, and with a message that came while it was open.
+    fn asking() -> Vec<Review> {
+        let recheck = Confirm::Recheck {
+            path: path(2),
+            run: "r".into(),
+            backend: "claude".into(),
+        };
+        [Confirm::Quit, recheck, Confirm::Apply]
+            .into_iter()
+            .map(|confirm| {
+                let mut m = scanning();
+                act(&mut m, Action::Edit);
+                assert!(m.editing.is_some());
+                m.confirm = Some(confirm);
+                m.status = Some("opened in mpv, paused".into());
+                m
+            })
+            .collect()
+    }
+
+    // As a no: the question goes, and nothing else moves, the message included, which shows once
+    // the question is gone.
+    #[test]
+    fn under_a_question_any_action_but_an_answer_or_interrupt_only_lets_it_go() {
+        let actions = [
+            Action::Quit,
+            Action::Select(EntryKey::Row(vec![3])),
+            Action::Move(1),
+            Action::Toggle,
+            Action::SetFilter(Filter::Only(State::Accepted)),
+            Action::NextFile,
+            Action::PreviousFile,
+            Action::Accept,
+            Action::Reject,
+            Action::Clear,
+            Action::Undo,
+            Action::Edit,
+            Action::Reword("Fixed.".into()),
+            Action::CancelEdit,
+            Action::ShowPane(Pane::Files),
+            Action::SwitchView,
+            Action::Apply { dry_run: true },
+            Action::Play,
+            Action::ClosePlayer,
+            Action::Playback(Playback::Pause),
+            Action::SelectFile(path(3)),
+            Action::ShowFileFindings,
+            Action::Recheck,
+            Action::Dismiss,
+        ];
+        let seen = |m: &Review| {
+            (
+                m.selected,
+                m.expanded.clone(),
+                m.filter,
+                m.pane,
+                m.file_selected,
+                m.editing.clone(),
+                m.status.clone(),
+                m.should_quit,
+            )
+        };
+        for action in actions {
+            for mut m in asking() {
+                let before = seen(&m);
+                let asked = m.confirm.clone();
+                let effects = act(&mut m, action.clone());
+                let what = format!("{action:?} under {asked:?}");
+                assert_eq!(effects, [], "{what}");
+                assert_eq!(m.confirm, None, "{what}");
+                assert_eq!(seen(&m), before, "{what}");
+            }
+        }
+    }
+
+    // They come unasked: a question the user has not answered stays.
+    #[test]
+    fn what_a_job_or_the_player_says_leaves_a_question_open() {
+        let inputs = [
+            Input::Scan(Event::Queued(vec![PathBuf::from(path(4))])),
+            Input::Apply(apply::Event::Queued(vec![path(1)])),
+            Input::ReadBack {
+                path: path(2),
+                view: Err("database is locked".into()),
+            },
+            Input::Switched(Err("disk I/O error".into())),
+            Input::Opened(Ok(Opened { paused: true })),
+            Input::Played(Ok(PlayState {
+                paused: true,
+                at_ms: 1000,
+            })),
+            Input::Closed(Err(PlayerError::NotOpen)),
+            Input::PlayerFailed(PlayerError::CouldNotOpen { file: path(1) }),
+        ];
+        for input in inputs {
+            for mut m in asking() {
+                let asked = m.confirm.clone();
+                let what = format!("{input:?} under {asked:?}");
+                update(&mut m, input.clone(), now());
+                assert_eq!(m.confirm, asked, "{what}");
+            }
+        }
     }
 
     #[test]
@@ -1600,7 +1758,6 @@ mod tests {
 
     #[test]
     fn a_quit_question_stays_while_a_queued_batch_takes_over_and_goes_after_the_last() {
-        let status = |m: &Review| m.status_text();
         let mut m = scanning();
         for (ep, run) in [(1, "r"), (2, "s")] {
             m.confirm = Some(Confirm::Recheck {
@@ -1643,10 +1800,7 @@ mod tests {
             now(),
         );
         // The question now asks about the batch that took over.
-        assert_eq!(
-            status(&m).as_deref(),
-            Some("scan is on 0/1 · 1 queued to check again — stop it and quit? y/n")
-        );
+        assert_eq!(m.question(), Some(Question::Quit(scan_on(0, 1, 1))));
         // r's batch ends and s's cannot start: nothing is left to stop, so the question goes.
         update(
             &mut m,
@@ -2753,8 +2907,11 @@ mod tests {
         };
         update(&mut m, found, now());
         assert_eq!(
-            m.status_text().as_deref(),
-            Some("check E02 again with claude? y/n")
+            m.question(),
+            Some(Question::Recheck {
+                label: "E02".into(),
+                backend: "claude".into(),
+            })
         );
         // A no lets it go.
         assert_eq!(act(&mut m, Action::Answer(false)), []);
@@ -2986,6 +3143,38 @@ mod tests {
     }
 
     #[test]
+    fn open_view_asks_for_the_view_its_words_select_but_not_while_a_job_runs() {
+        let words = vec!["r".to_string(), "/m".to_string()];
+        let mut m = sample();
+        assert_eq!(
+            act(&mut m, Action::OpenView(words.clone())),
+            [Effect::Task(Task::Switch(Switch::Selector(words.clone())))]
+        );
+        let mut m = scanning();
+        assert_eq!(act(&mut m, Action::OpenView(words.clone())), []);
+        assert_eq!(m.status.as_deref(), Some("the scan is still running"));
+        let mut m = accepted();
+        act(&mut m, Action::Apply { dry_run: true });
+        assert_eq!(act(&mut m, Action::OpenView(words.clone())), []);
+        assert_eq!(m.status.as_deref(), Some("apply is still running"));
+        // Under a question it only lets the question go, as every action but an answer does.
+        let mut m = sample();
+        m.confirm = Some(Confirm::Apply);
+        assert_eq!(act(&mut m, Action::OpenView(words)), []);
+        assert_eq!(m.confirm, None);
+    }
+
+    // Its path and stamp say what mpv has open whatever the view: the next `o` on it seeks.
+    #[test]
+    fn another_view_keeps_the_file_the_player_last_loaded() {
+        let mut m = sample();
+        m.loaded = Some((path(1), (1, now())));
+        let view = tests_support::run();
+        update(&mut m, Input::Switched(Ok((view, HashMap::new()))), now());
+        assert_eq!(m.loaded, Some((path(1), (1, now()))));
+    }
+
+    #[test]
     fn a_view_that_cannot_be_read_leaves_the_screen_as_it_was() {
         let mut m = sample();
         let before = m.run.clone();
@@ -3036,10 +3225,13 @@ mod tests {
     fn a_asks_with_the_counts_then_applies_the_view_as_it_stands() {
         let mut m = accepted();
         assert_eq!(act(&mut m, Action::Apply { dry_run: false }), []);
-        assert_eq!(m.confirm, Some(Confirm::Apply));
         assert_eq!(
-            m.status_text().as_deref(),
-            Some("apply 2 fixes in 2 files (1 applied already), keeping each .orig? y/n")
+            m.question(),
+            Some(Question::Apply {
+                fixes: 2,
+                files: 2,
+                applied: 1,
+            })
         );
         // A no lets it go.
         assert_eq!(act(&mut m, Action::Answer(false)), []);
@@ -3059,17 +3251,6 @@ mod tests {
         assert_eq!(
             m.progress.apply.as_ref().unwrap().resume,
             "subcheck apply 2026-10-17T04-39-18"
-        );
-    }
-
-    #[test]
-    fn one_fix_in_one_file_is_asked_of_in_the_singular() {
-        let mut m = accepted();
-        m.run.decisions.remove(&3);
-        act(&mut m, Action::Apply { dry_run: false });
-        assert_eq!(
-            m.status_text().as_deref(),
-            Some("apply 1 fix in 1 file, keeping each .orig? y/n")
         );
     }
 
@@ -3138,8 +3319,8 @@ mod tests {
             now(),
         );
         assert_eq!(
-            m.status_text().as_deref(),
-            Some("dry run is on E01 (plan), 0/1 — stop it and quit? y/n")
+            m.question(),
+            Some(Question::Quit(applying_on(true, apply::Stage::Plan)))
         );
         // Apply ending lets the question go: nothing is left to stop.
         update(
@@ -3175,8 +3356,8 @@ mod tests {
         act(&mut m, Action::Interrupt);
         assert!(!m.should_quit);
         assert_eq!(
-            m.status_text().as_deref(),
-            Some("apply is on E01 (remux), 0/1 — stop it and quit? y/n")
+            m.question(),
+            Some(Question::Quit(applying_on(false, apply::Stage::Remux)))
         );
         act(&mut m, Action::Answer(false));
         assert!(!m.should_quit && m.confirm.is_none());

@@ -468,7 +468,7 @@ fn c_checks_a_file_again_and_a_decision_on_a_finding_that_comes_back_is_kept() {
             &mut player,
         );
     }
-    let asked = model.status_text().unwrap();
+    let asked = screen::status(&model).unwrap();
     assert!(
         asked.starts_with("check ") && asked.ends_with("? y/n"),
         "{asked}"

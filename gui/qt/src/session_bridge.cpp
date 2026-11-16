@@ -268,8 +268,8 @@ void SessionBridge::letGo() {
         try {
             session->close();
         } catch (const std::exception &) {
-            // Nothing reaches this today: close only queues two messages, and takes no text, so
-            // its generated call throws only on a Rust panic, or on a contract mismatch, which
+            // Nothing reaches this today: close takes no text and returns nothing, so its
+            // generated call throws only on a Rust panic, or on a contract mismatch, which
             // open, the first call, would have met. Were it reached, the stream might never end,
             // so the pump is let go of, neither joined, which could wait for good, nor destroyed
             // running, which aborts; it would still hold this bridge, and emit what it reads on a

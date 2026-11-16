@@ -146,7 +146,7 @@ fn d_then_a_on_the_screen() {
     // A, then y: made, and shown applied from the store.
     s.key('A');
     assert_eq!(
-        s.m.status_text().as_deref(),
+        screen::status(&s.m).as_deref(),
         Some("apply 2 fixes in 1 file, keeping each .orig? y/n")
     );
     s.key('y');

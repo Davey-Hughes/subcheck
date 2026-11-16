@@ -252,7 +252,7 @@ impl Applying {
         if self.dry_run { "dry run" } else { "applying" }
     }
 
-    /// What the quit question and the outro call it: `apply` or `dry run`.
+    /// What the outro calls it: `apply` or `dry run`.
     fn noun(&self) -> &'static str {
         if self.dry_run { "dry run" } else { "apply" }
     }
@@ -287,16 +287,37 @@ impl Applying {
     }
 }
 
-/// Where the screen's apply is, for the quit question and the outro.
-enum Whereabouts<'p> {
+/// Where the screen's apply is, for the quit question and the outro: a file by the name the list
+/// gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyAt {
     /// A file at a stage.
-    On(&'p str, apply::Stage),
+    On { file: String, stage: apply::Stage },
     /// No file at a stage: the next it goes to.
-    Before(&'p str),
+    Before { file: String },
     /// Past its last file.
     Finishing,
     /// It has not said its files yet.
     Starting,
+}
+
+/// The job a quit would stop, and how far it is, for the quit question ([`Progress::stopping`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stopping {
+    /// The scan: the files done of those it checks, and the files `c` queued for after it, which
+    /// quitting leaves unchecked.
+    Scan {
+        done: usize,
+        queued: usize,
+        again: usize,
+    },
+    /// Apply, or with `dry_run` a dry run: the files done of those with fixes, and where it is.
+    Apply {
+        dry_run: bool,
+        done: usize,
+        queued: usize,
+        at: ApplyAt,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -622,22 +643,22 @@ impl Progress {
                 .is_some_and(|a| a.failed > 0 || matches!(a.ended, Some(Err(_))))
     }
 
-    /// What `q` asks while apply runs: the file it is on (by `label`'s name for it) and the
-    /// stage, else the file it goes to next, and how far it is.
-    pub fn apply_question(&self, label: &dyn Fn(&str) -> String) -> String {
-        let Some(a) = &self.apply else {
-            return String::new();
-        };
-        let count = format!("{}/{}", a.done, a.queued);
-        let at = match self.whereabouts() {
-            Whereabouts::On(path, stage) => {
-                format!("on {} ({}), {count}", label(path), stage.word())
-            }
-            Whereabouts::Before(path) => format!("starting {}, {count}", label(path)),
-            Whereabouts::Finishing => format!("finishing, {count}"),
-            Whereabouts::Starting => "starting".into(),
-        };
-        format!("{} is {at} — stop it and quit? y/n", a.noun())
+    /// What a quit would stop now: apply while it runs, with the file it is on (by `label`'s name
+    /// for it) and the stage, else the file it goes to next; else the scan.
+    pub fn stopping(&self, label: &dyn Fn(&str) -> String) -> Stopping {
+        match self.apply.as_ref().filter(|a| a.ended.is_none()) {
+            Some(a) => Stopping::Apply {
+                dry_run: a.dry_run,
+                done: a.done,
+                queued: a.queued,
+                at: self.whereabouts(label),
+            },
+            None => Stopping::Scan {
+                done: self.done,
+                queued: self.queued,
+                again: self.again.len(),
+            },
+        }
     }
 
     /// What the terminal gets of the screen's applies on leaving, after [`Progress::outro`]'s:
@@ -655,17 +676,13 @@ impl Progress {
         }
         lines.extend(self.apply_failures());
         let (noun, count) = (a.noun(), format!("{}/{} files done:", a.done, a.queued));
-        lines.push(match self.whereabouts() {
-            Whereabouts::On(path, stage) => {
-                format!(
-                    "{noun} stopped on {} ({}), {count}",
-                    label(path),
-                    stage.word()
-                )
+        lines.push(match self.whereabouts(label) {
+            ApplyAt::On { file, stage } => {
+                format!("{noun} stopped on {file} ({}), {count}", stage.word())
             }
-            Whereabouts::Before(path) => format!("{noun} stopped before {}, {count}", label(path)),
-            Whereabouts::Finishing => format!("{noun} stopped after the last file, {count}"),
-            Whereabouts::Starting => format!("{noun} stopped before its first file:"),
+            ApplyAt::Before { file } => format!("{noun} stopped before {file}, {count}"),
+            ApplyAt::Finishing => format!("{noun} stopped after the last file, {count}"),
+            ApplyAt::Starting => format!("{noun} stopped before its first file:"),
         });
         lines.push(apply::summary_line(&a.so_far(), !a.dry_run));
         lines.push(format!("Finish it with: {}", a.resume));
@@ -707,12 +724,15 @@ impl Progress {
         })
     }
 
-    /// Where apply is: the file at a stage; else the next file, the one after those done, as
-    /// apply goes through them in order; else past the last; or, before apply has said its
-    /// files, starting.
-    fn whereabouts(&self) -> Whereabouts<'_> {
+    /// Where apply is, each file by `label`'s name for it: the file at a stage; else the next
+    /// file, the one after those done, as apply goes through them in order; else past the last;
+    /// or, before apply has said its files, starting.
+    fn whereabouts(&self, label: &dyn Fn(&str) -> String) -> ApplyAt {
         if let Some((path, stage)) = self.apply_at() {
-            return Whereabouts::On(path, stage);
+            return ApplyAt::On {
+                file: label(path),
+                stage,
+            };
         }
         let Some(Applying {
             order: Some(order),
@@ -720,11 +740,11 @@ impl Progress {
             ..
         }) = &self.apply
         else {
-            return Whereabouts::Starting;
+            return ApplyAt::Starting;
         };
         match order.get(*done) {
-            Some(path) => Whereabouts::Before(path),
-            None => Whereabouts::Finishing,
+            Some(path) => ApplyAt::Before { file: label(path) },
+            None => ApplyAt::Finishing,
         }
     }
 
@@ -831,18 +851,6 @@ impl Progress {
             Scan::Ended(Ok(s)) => scan::summary_lines(s, self.adding).into_iter().next(),
             Scan::Ended(Err(e)) => Some(format!("the scan failed: {e}")),
         }
-    }
-
-    /// What `q` asks while the scan runs, with the files `c` queued counted: quitting drops them.
-    pub fn quit_question(&self) -> String {
-        let queued = match self.again.len() {
-            0 => String::new(),
-            n => format!(" · {n} queued to check again"),
-        };
-        format!(
-            "scan is on {}/{}{queued} — stop it and quit? y/n",
-            self.done, self.queued
-        )
     }
 
     /// What the terminal gets on leaving the screen: what the scans ended with (see `ended`),
@@ -1325,13 +1333,15 @@ mod tests {
             "/m/E01.mkv".into(),
             "/m/E02.mkv".into(),
         ]));
-        assert_eq!(p.quit_question(), "scan is on 0/2 — stop it and quit? y/n");
+        let scan = |again| Stopping::Scan {
+            done: 0,
+            queued: 2,
+            again,
+        };
+        assert_eq!(p.stopping(&short), scan(0));
         p.queue_again("/m/E03.mkv", "r");
         p.queue_again("/m/E04.mkv", "s");
-        assert_eq!(
-            p.quit_question(),
-            "scan is on 0/2 · 2 queued to check again — stop it and quit? y/n"
-        );
+        assert_eq!(p.stopping(&short), scan(2));
     }
 
     #[test]
@@ -1554,8 +1564,16 @@ mod tests {
         ));
         assert_eq!(p.files[0].label('⠙'), "✗ failed: disk full");
         assert_eq!(
-            p.apply_question(&short),
-            "apply is on E02 (remux), 1/2 — stop it and quit? y/n"
+            p.stopping(&short),
+            Stopping::Apply {
+                dry_run: false,
+                done: 1,
+                queued: 2,
+                at: ApplyAt::On {
+                    file: "E02".into(),
+                    stage: apply::Stage::Remux,
+                },
+            }
         );
         assert_eq!(
             p.apply_outro(&short),
@@ -1610,7 +1628,14 @@ mod tests {
     fn with_no_file_at_a_stage_the_question_and_the_outro_say_where_apply_is() {
         for dry_run in [false, true] {
             let noun = if dry_run { "dry run" } else { "apply" };
-            let said = |p: &Progress| (p.apply_question(&short), p.apply_outro(&short)[0].clone());
+            let said = |p: &Progress| (p.stopping(&short), p.apply_outro(&short)[0].clone());
+            let stopping = |done, queued, at| Stopping::Apply {
+                dry_run,
+                done,
+                queued,
+                at,
+            };
+            let file = |name: &str| name.to_string();
             // Before apply has said its files.
             let mut p = Progress::of_run(&Run {
                 files: vec![
@@ -1623,7 +1648,7 @@ mod tests {
             assert_eq!(
                 said(&p),
                 (
-                    format!("{noun} is starting — stop it and quit? y/n"),
+                    stopping(0, 0, ApplyAt::Starting),
                     format!("{noun} stopped before its first file:"),
                 )
             );
@@ -1632,7 +1657,7 @@ mod tests {
             assert_eq!(
                 said(&p),
                 (
-                    format!("{noun} is starting E01, 0/2 — stop it and quit? y/n"),
+                    stopping(0, 2, ApplyAt::Before { file: file("E01") }),
                     format!("{noun} stopped before E01, 0/2 files done:"),
                 )
             );
@@ -1641,10 +1666,14 @@ mod tests {
                 "/m/E01.mkv".into(),
                 apply::Stage::Plan,
             ));
+            let on = ApplyAt::On {
+                file: file("E01"),
+                stage: apply::Stage::Plan,
+            };
             assert_eq!(
                 said(&p),
                 (
-                    format!("{noun} is on E01 (plan), 0/2 — stop it and quit? y/n"),
+                    stopping(0, 2, on),
                     format!("{noun} stopped on E01 (plan), 0/2 files done:"),
                 )
             );
@@ -1653,7 +1682,7 @@ mod tests {
             assert_eq!(
                 said(&p),
                 (
-                    format!("{noun} is starting E02, 1/2 — stop it and quit? y/n"),
+                    stopping(1, 2, ApplyAt::Before { file: file("E02") }),
                     format!("{noun} stopped before E02, 1/2 files done:"),
                 )
             );
@@ -1662,7 +1691,7 @@ mod tests {
             assert_eq!(
                 said(&p),
                 (
-                    format!("{noun} is finishing, 2/2 — stop it and quit? y/n"),
+                    stopping(2, 2, ApplyAt::Finishing),
                     format!("{noun} stopped after the last file, 2/2 files done:"),
                 )
             );

@@ -11,14 +11,14 @@ use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use jiff::Timestamp;
 
 use super::jobs::panic_text;
 use super::model::{Entry, EntryKey, Review};
 use super::runner::{self, Runner};
-use super::update::{self, Action, Effect, Input};
+use super::update::{self, Action, Effect, Input, Task};
 use crate::group;
 use crate::player::{self, PlayState, PlayerCommand, PlayerError};
 use crate::store::{self, Selector, State, Store};
@@ -35,7 +35,10 @@ pub enum Event {
     /// For the UI's player, which runs it and says how it went ([`Session::report`]).
     Player(PlayerCommand),
     /// The last event: why review could not go on, if it could not, and what is left to say of the
-    /// jobs it ran ([`Review::outro`]). A job's process groups are ended before it comes.
+    /// jobs it ran ([`Review::outro`]). A job's process groups are ended before it comes. After
+    /// [`Session::close`], it is `close`'s, with no `fatal` and the outro as of the last step
+    /// review finished; unless review, ending by itself as `close` ran, put its own on the stream
+    /// first, which says the same of the jobs and can carry review's `fatal`.
     Ended {
         fatal: Option<String>,
         outro: Vec<String>,
@@ -238,9 +241,42 @@ struct Stream {
     over: bool,
 }
 
+/// What [`Session::close`] knows of the core thread without waiting on it: only that thread holds
+/// the `Review`, and it can be stuck in a task. Neither holds the lock across slow work.
+#[derive(Default)]
+struct Shared {
+    /// `close` has run: no effect runs after it, and the session's end is its.
+    closed: bool,
+    /// A job runs or is starting, or review would end its groups anyway: `close` ends them.
+    job: bool,
+    /// What `close` says of the jobs ([`Review::outro`]), as of the last step the core thread
+    /// finished: what the jobs said since, queued behind a task the thread is stuck in, or a job
+    /// the step under way is starting, is not in it.
+    outro: Vec<String>,
+}
+
+impl Shared {
+    /// `close`'s part under the lock: whether this is the first `close`, whether a job runs or is
+    /// starting (for a later `close`, whether one did for the first), and the outro to end with.
+    fn close(&mut self) -> (bool, bool, Vec<String>) {
+        let first = !std::mem::replace(&mut self.closed, true);
+        (first, self.job, std::mem::take(&mut self.outro))
+    }
+}
+
+/// `shared`, locked. A panic while it was held left it whole: each change is one assignment.
+fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
+    shared.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What a session says that opens once the process's groups have ended: no job of its could start.
+const GROUPS_ENDED: &str =
+    "a review in this process stopped a job, or failed, so no other can open here";
+
 /// One run under review, for a UI on any thread. `Send + Sync`: `next_event` blocks, so a UI calls
-/// it from a thread of its own, and the others from wherever it likes. One per process:
-/// [`group::end`] stops new process groups for the life of the process.
+/// it from a thread of its own, and the others from wherever it likes. One per process at a time:
+/// once one has ended the groups (it stopped a job, or failed), [`group::end`] has stopped new
+/// process groups for the life of the process, and a session opened after that ends at once.
 pub struct Session {
     inputs: Sender<Msg>,
     /// `close`'s way onto the stream. It also means the channel never disconnects, not even once
@@ -248,6 +284,7 @@ pub struct Session {
     /// `Stream::over` is what ends the stream.
     events: Sender<Item>,
     stream: Mutex<Stream>,
+    shared: Arc<Mutex<Shared>>,
 }
 
 /// What the core thread serves: all it needs, once the slow part of opening is done.
@@ -279,8 +316,9 @@ fn opened(
 impl Session {
     /// Open the view `selector` names (`[run | paths…]`, as `subcheck review` takes it) in the
     /// process's store. Returns at once and cannot fail: what goes wrong opening it is
-    /// [`Event::Ended`], and actions sent before then wait their turn. `karaoke`: its apply
-    /// re-spaces per-letter karaoke, as `apply --karaoke` does.
+    /// [`Event::Ended`], as is opening in a process whose groups an earlier session ended; actions
+    /// sent before then wait their turn. `karaoke`: its apply re-spaces per-letter karaoke, as
+    /// `apply --karaoke` does.
     pub fn open(selector: Vec<String>, karaoke: bool) -> Session {
         Session::start(move || {
             let state = store::state_dir()?;
@@ -295,11 +333,21 @@ impl Session {
     fn start(open: impl FnOnce() -> anyhow::Result<Opened> + Send + 'static) -> Session {
         let (inputs, queue) = mpsc::channel();
         let (events, items) = mpsc::channel();
+        let shared = Arc::new(Mutex::new(Shared::default()));
         let session = Session {
             inputs: inputs.clone(),
             events: events.clone(),
             stream: Mutex::new(Stream { items, over: false }),
+            shared: Arc::clone(&shared),
         };
+        // Its jobs would wait for good to start a group: it ends before it opens anything.
+        if group::ended() {
+            let _ = events.send(Item::Event(Event::Ended {
+                fatal: Some(GROUPS_ENDED.into()),
+                outro: Vec::new(),
+            }));
+            return session;
+        }
         let on_thread = events.clone();
         let spawned = std::thread::Builder::new()
             .name("review".into())
@@ -308,13 +356,17 @@ impl Session {
                 // panicking, say. The stream must end whatever happens here: for a UI that never
                 // calls `close`, nothing else ends it.
                 let last = panic::catch_unwind(AssertUnwindSafe(|| {
-                    core(open, &queue, inputs, &on_thread)
+                    core(open, &queue, inputs, &on_thread, &shared)
                 }))
-                .unwrap_or_else(|panic| Event::Ended {
-                    fatal: Some(panicked(panic.as_ref())),
-                    outro: Vec::new(),
+                .unwrap_or_else(|panic| {
+                    Some(Event::Ended {
+                        fatal: Some(panicked(panic.as_ref())),
+                        outro: Vec::new(),
+                    })
                 });
-                let _ = on_thread.send(Item::Event(last));
+                if let Some(last) = last {
+                    let _ = on_thread.send(Item::Event(last));
+                }
             });
         if let Err(e) = spawned {
             let _ = events.send(Item::Event(Event::Ended {
@@ -342,7 +394,7 @@ impl Session {
     }
 
     /// The next event, waiting for one; `None` once the session is over, every time and at once:
-    /// after [`Event::Ended`], and after what was queued before a [`Session::close`].
+    /// after [`Event::Ended`], which [`Session::close`] puts after what was queued before it.
     pub fn next_event(&self) -> Option<Event> {
         let mut stream = self.stream.lock().unwrap_or_else(PoisonError::into_inner);
         if stream.over {
@@ -357,13 +409,38 @@ impl Session {
         event
     }
 
-    /// End the stream at once and stop the core thread when it can next be stopped: closing a
-    /// window cannot hang on a stalled mount, since the marker does not wait for that thread. A
-    /// job's process groups end as the thread stops, so a process that exits first leaves them
-    /// running. The process's exit ends the thread, if it is still stuck by then.
+    /// End the stream and stop the core thread when it can next be stopped; nothing the core
+    /// thread was to do runs after this, a job's start among it. This never waits for the core
+    /// thread, which can be stuck in a task on a stalled mount: with no job running or starting,
+    /// and review not failed, it returns at once. Otherwise it first ends the process groups
+    /// ([`group::end`]), so that a process that exits at once leaves none running, and that can
+    /// wait, for a start stuck in exec or a file to remove on a stalled mount. Its own
+    /// [`Event::Ended`] ends the stream, with the outro, which says how to finish a job it stopped,
+    /// and with no `fatal`, whatever the groups ended for; unless review, ending by itself as this
+    /// ran, put its own `Ended` on the stream first, which can carry review's `fatal`. A later
+    /// call writes nothing, and returns once the groups the first is ending have ended, at once
+    /// when the first ended none; letting the session go after a `close` returns at once. The
+    /// core thread, if still stuck, ends with the process.
     pub fn close(&self) {
+        // The core thread checks `closed` under the same lock before it starts a job, and marks
+        // the job first: either it sees `closed` and starts nothing, or this sees the job.
+        let (first, job, outro) = lock(&self.shared).close();
+        // A later `close` too, so that it keeps the promise: `group::end` runs once, and a second
+        // call returns once the first's is done, even one that panicked.
+        if job {
+            group::end();
+        }
+        // Only the first `close` writes to the stream: a later one's marker, from another thread,
+        // could come before the first's `Ended` and end the stream there, without the outro that
+        // says how to finish the job.
+        if !first {
+            return;
+        }
         // Sends alone: `next_event` holds `stream`'s lock while it waits, so taking it here would
         // wait for the very event this ends.
+        let _ = self
+            .events
+            .send(Item::Event(Event::Ended { fatal: None, outro }));
         let _ = self.events.send(Item::End);
         let _ = self.inputs.send(Msg::Stop);
     }
@@ -371,8 +448,13 @@ impl Session {
 
 impl Drop for Session {
     /// A session let go of ends as a closed one does: the runner keeps the queue open, so the core
-    /// thread would otherwise wait on it for good, with any job it started left running.
+    /// thread would otherwise wait on it for good, with any job it started left running. After a
+    /// `close`, it returns at once: that `close` ends the groups, and letting go, on whichever
+    /// thread does it, must not wait for them on a stalled mount.
     fn drop(&mut self) {
+        if lock(&self.shared).closed {
+            return;
+        }
         self.close();
     }
 }
@@ -382,13 +464,16 @@ fn panicked(panic: &(dyn std::any::Any + Send)) -> String {
     format!("review panicked: {}", panic_text(panic))
 }
 
-/// The core thread: open, serve, and end; returns the last event.
+/// The core thread: open, serve, and end; returns the last event. None once `close` has run while
+/// review was served, as `close`'s own is then the stream's end; an open that fails returns its
+/// end all the same, which no one reads after a `close`.
 fn core(
     open: impl FnOnce() -> anyhow::Result<Opened>,
     queue: &Receiver<Msg>,
     inputs: Sender<Msg>,
     events: &Sender<Item>,
-) -> Event {
+    shared: &Mutex<Shared>,
+) -> Option<Event> {
     let Opened {
         store,
         state,
@@ -396,38 +481,42 @@ fn core(
     } = match open() {
         Ok(opened) => opened,
         Err(e) => {
-            return Event::Ended {
+            return Some(Event::Ended {
                 fatal: Some(format!("{e:#}")),
                 outro: Vec::new(),
-            };
+            });
         }
     };
     let mut runner = Runner::new(store, state, inputs);
     let served = panic::catch_unwind(AssertUnwindSafe(|| {
-        serve(&mut review, &mut runner, queue, events);
+        serve(&mut review, &mut runner, queue, events, shared);
     }));
     let crash = served.err().map(|panic| panicked(panic.as_ref()));
+    // `close` has ended the groups if a job ran, and no job started after it.
+    if lock(shared).closed {
+        return None;
+    }
     // As the terminal's UI ends, on every way out: a job left running would outlive the process,
-    // its mkvmerge or LLM calls being process groups of their own. As there, `crash` is not
-    // tested: testing it would reach `group::end` from the panic tests run in-process, and under
-    // `cargo test` every later test that starts a group would then wait forever.
-    let job_stopped = review.progress.busy();
-    if job_stopped || review.fatal.is_some() {
+    // its mkvmerge or LLM calls being process groups of their own. `crash` decides the outro
+    // alone, as there ([`Review::ending`]): were a panic in the loop to end the groups, the panic
+    // tests run in-process would reach `group::end`, and under `cargo test` every later test that
+    // starts a group would then wait forever.
+    let ending = review.ending(crash.is_some());
+    if ending.groups {
         group::end();
     }
     let fatal = crash.or_else(|| review.fatal.take());
-    // A clean end, or a job this one stopped, which the outro says how to finish; else an error
-    // that speaks for itself. After a panic, the outro is caught on its own: should it panic too,
-    // the outer catch would report that one, and the first panic's text is the one that says what
-    // went wrong. A clean end's is left to the outer catch, which reports its panic as fatal.
-    let outro = if fatal.is_none() {
-        review.outro()
-    } else if job_stopped {
-        panic::catch_unwind(AssertUnwindSafe(|| review.outro())).unwrap_or_default()
-    } else {
+    // After a panic, the outro is caught on its own: should it panic too, the outer catch would
+    // report that one, and the first panic's text is the one that says what went wrong. A clean
+    // end's is left to the outer catch, which reports its panic as fatal.
+    let outro = if !ending.outro {
         Vec::new()
+    } else if fatal.is_none() {
+        review.outro()
+    } else {
+        panic::catch_unwind(AssertUnwindSafe(|| review.outro())).unwrap_or_default()
     };
-    Event::Ended { fatal, outro }
+    Some(Event::Ended { fatal, outro })
 }
 
 /// Publish the opening state, then take each input until `update` quits or the UI stops it.
@@ -436,19 +525,63 @@ fn serve(
     runner: &mut Runner<Msg>,
     queue: &Receiver<Msg>,
     events: &Sender<Item>,
+    shared: &Mutex<Shared>,
 ) {
     let mut sent = Sent::default();
     let mut emit = |event| {
         let _ = events.send(Item::Event(event));
     };
+    // The record as it opens is `Shared::default()`'s: no job, and no outro yet.
     sent.publish(review, &mut emit);
     while !review.should_quit {
         // The runner holds a sender, so `recv` cannot fail while this runs.
         let Ok(Msg::Input(input)) = queue.recv() else {
             break;
         };
-        step(review, runner, &mut sent, input, &mut emit);
+        step(review, runner, &mut sent, input, &mut emit, shared);
+        // What `close` left queued is dropped.
+        if note(review, shared) {
+            break;
+        }
     }
+}
+
+/// `review` as `close` needs it after a step ([`Review::ending`]): whether ending now would end
+/// the groups, and the outro. Whether `close` has run.
+fn note(review: &Review, shared: &Mutex<Shared>) -> bool {
+    let ending = review.ending(false);
+    // An outro that panics, which only the end needs, must not end review in the middle: the
+    // record keeps none, and the end makes it again, where its panic is reported.
+    let outro = if ending.outro {
+        panic::catch_unwind(AssertUnwindSafe(|| review.outro())).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut shared = lock(shared);
+    // Once closed, the record stays as the first `close` read it: a later `close` ends the groups
+    // by it, and must end none the first left alone, as when review says a job runs whose start
+    // `close` stopped.
+    if !shared.closed {
+        shared.job = ending.groups;
+        shared.outro = outro;
+    }
+    shared.closed
+}
+
+/// Whether `effect` may run: none after `close`. A job's start is marked under the lock that
+/// `close` takes, before the job starts, so that `close` ends its groups.
+fn may_run(effect: &Effect, shared: &Mutex<Shared>) -> bool {
+    let mut shared = lock(shared);
+    if shared.closed {
+        return false;
+    }
+    if matches!(
+        effect,
+        Effect::Task(Task::StartApply { .. } | Task::Recheck { .. })
+    ) {
+        shared.job = true;
+    }
+    true
 }
 
 /// One input: through `update`, the change published before any effect runs, so that a UI shows
@@ -461,10 +594,14 @@ fn step(
     sent: &mut Sent,
     input: Input,
     emit: &mut dyn FnMut(Event),
+    shared: &Mutex<Shared>,
 ) {
     let mut effects: VecDeque<Effect> = update::update(review, input, Timestamp::now()).into();
     sent.publish(review, emit);
     while let Some(effect) = effects.pop_front() {
+        if !may_run(&effect, shared) {
+            return;
+        }
         match effect {
             Effect::Task(task) => {
                 let result = runner.run(task);
@@ -481,10 +618,12 @@ mod tests {
     use super::*;
 
     use std::collections::HashMap;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
-    use std::sync::{Arc, TryLockError};
+    use std::sync::TryLockError;
     use std::time::{Duration, Instant};
 
     use rustix::process::{Resource, Rlimit, setrlimit};
@@ -845,16 +984,20 @@ mod tests {
         store.save(&attempt, vec![made]).unwrap();
     }
 
-    fn begin(store: &mut Store, paths: &[PathBuf]) -> ScanRow {
-        let header = RunHeader {
+    /// The header of the runs these tests make.
+    fn header() -> RunHeader {
+        RunHeader {
             started: Timestamp::UNIX_EPOCH,
             backend: "claude".into(),
             command: vec![],
             prompt_version: 1,
             version: "0".into(),
             langs: vec!["eng".into()],
-        };
-        store.begin_scan(&header, paths).unwrap()
+        }
+    }
+
+    fn begin(store: &mut Store, paths: &[PathBuf]) -> ScanRow {
+        store.begin_scan(&header(), paths).unwrap()
     }
 
     /// A database in `dir` with the sample run's findings saved in it (IDs 1 to 4, as the sample's;
@@ -1036,6 +1179,83 @@ mod tests {
         );
     }
 
+    // Another review in the same session, as `v` swaps the view: B's rows in place of A's, in one
+    // splice, under B's name; words that select nothing leave the view as it was, and say why.
+    #[test]
+    fn open_view_shows_another_run_in_place_of_the_one_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, a) = seeded(dir.path());
+        let record = tests_support::file(5);
+        let b = begin(&mut store, &[PathBuf::from(&record.path)]);
+        save(
+            &mut store,
+            b.id,
+            &record,
+            vec![finding(0, 5, TYPO, FIXED, 1_000)],
+        );
+        let state = dir.path().join("state");
+        let s = Arc::new(Session::start(move || opened(store, state, &[a], false)));
+        assert_eq!(next_change(&s).0.unwrap().inserted.len(), 2);
+        s.send(Action::OpenView(vec![b.name.clone()]));
+        let (rows, summary) = next_change(&s);
+        let rows = rows.unwrap();
+        assert_eq!((rows.at, rows.removed, rows.inserted.len()), (0, 2, 1));
+        assert_eq!(summary.title, format!("run {}", b.name));
+        s.send(Action::OpenView(vec!["nope".into()]));
+        let (rows, summary) = next_change(&s);
+        assert_eq!(rows, None);
+        assert_eq!(
+            summary.status.as_deref(),
+            Some("could not switch views: no run named nope")
+        );
+    }
+
+    // `close`'s locked part first, with the core thread between `o`'s change and its stat: neither
+    // the stat nor the player's command it would lead to runs. No job runs, so no group ends in
+    // this process.
+    #[test]
+    fn nothing_the_core_thread_was_to_do_runs_after_close() {
+        let dir = tempfile::tempdir().unwrap();
+        // E01 on disk, under its own name, so that the stat finds it and the open would go out.
+        let e01 = dir.path().join("K-On! - E01 - Episode.mkv");
+        std::fs::write(&e01, "1").unwrap();
+        let on_disk = e01.to_string_lossy().into_owned();
+        let s = session(dir.path(), move |m| {
+            for f in &mut m.run.findings {
+                if f.file == tests_support::path(1) {
+                    f.file.clone_from(&on_disk);
+                }
+            }
+        });
+        next(&s);
+        let mut held = lock(&s.shared);
+        s.send(Action::Play);
+        assert_eq!(
+            next_change(&s).1.status.as_deref(),
+            Some("opening E01 at 0:02:45.060")
+        );
+        assert!(matches!(held.close(), (true, false, _)));
+        drop(held);
+        let stopped = Arc::clone(&s);
+        within(move || {
+            while stopped.inputs.send(Msg::Stop).is_ok() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        // With the core thread gone, all it sent is on the channel, and nothing else writes to it:
+        // the `close` played here was the first, and a later one writes nothing.
+        let stream = s.stream.lock().unwrap();
+        let after: Vec<Option<Event>> = stream
+            .items
+            .try_iter()
+            .map(|item| match item {
+                Item::Event(event) => Some(event),
+                Item::End => None,
+            })
+            .collect();
+        assert_eq!(after, []);
+    }
+
     #[test]
     fn an_input_that_changes_nothing_is_silent_and_a_clean_quit_ends_with_nothing_to_say() {
         let dir = tempfile::tempdir().unwrap();
@@ -1142,6 +1362,11 @@ mod tests {
             }));
         });
         next_change(&s);
+        // Each step makes the record's outro too: review goes on all the same.
+        s.send(Action::Undo);
+        assert_eq!(next_change(&s).1.status.as_deref(), Some("nothing to undo"));
+        s.send(Action::Dismiss);
+        next_change(&s);
         s.send(Action::Quit);
         let events = to_the_end(&s);
         assert_eq!(events.len(), 1, "{events:?}");
@@ -1195,7 +1420,14 @@ mod tests {
         });
         let closing = Arc::clone(&s);
         within(move || closing.close());
-        assert_eq!(waiting.recv_timeout(LIMIT).unwrap(), None);
+        // `close`'s own end: review had not opened, so it has nothing to say.
+        assert_eq!(
+            waiting.recv_timeout(LIMIT).unwrap(),
+            Some(Event::Ended {
+                fatal: None,
+                outro: vec![],
+            })
+        );
         assert_eq!(next(&s), None);
         // Twice is harmless, and so is what comes after.
         s.close();
@@ -1220,6 +1452,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let mut runner = Runner::new(store, state, tx);
         let mut sent = Sent::default();
+        let open = Mutex::new(Shared::default());
         let mut copy: Vec<EntryView> = Vec::new();
         // As a UI does it, whatever the event's order.
         let apply = |event: Event, copy: &mut Vec<EntryView>| {
@@ -1236,7 +1469,14 @@ mod tests {
             |review: &mut Review, sent: &mut Sent, input: Input, copy: &mut Vec<EntryView>| {
                 let what = format!("{input:?}");
                 let mut heard = Vec::new();
-                step(review, &mut runner, sent, input, &mut |e| heard.push(e));
+                step(
+                    review,
+                    &mut runner,
+                    sent,
+                    input,
+                    &mut |e| heard.push(e),
+                    &open,
+                );
                 for event in heard {
                     apply(event, copy);
                 }
@@ -1325,7 +1565,9 @@ mod tests {
     }
 
     /// A session with a dry run under way that never ends (see [`stalled`]), `change` done to its
-    /// review as it opens; and the name of its run. Returns once the review says a job runs.
+    /// review as it opens; and the name of its run. Returns once the review says a job runs and
+    /// its start is marked, so that a `close` after it sees the job: the change comes before the
+    /// effect that starts it.
     fn during_a_job(
         dir: &Path,
         change: impl FnOnce(&mut Review) + Send + 'static,
@@ -1340,6 +1582,12 @@ mod tests {
         }));
         s.send(Action::Apply { dry_run: true });
         while !next_change(&s).1.busy {}
+        let marked = Arc::clone(&s);
+        within(move || {
+            while !lock(&marked.shared).job {
+                std::thread::yield_now();
+            }
+        });
         (s, name)
     }
 
@@ -1366,6 +1614,63 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{status}");
     }
 
+    /// Whether `group` dies of a SIGKILL within `limit`.
+    fn killed_within(group: &mut Child, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if let Some(status) = group.try_wait().unwrap() {
+                return status.signal() == Some(libc::SIGKILL);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// The store in `dir` held by a write of another connection's, as another process can hold
+    /// it: review's writes wait for it, up to the store's busy timeout.
+    fn hold_the_store(dir: &Path) -> rusqlite::Connection {
+        let held = rusqlite::Connection::open(dir.join("subcheck.db")).unwrap();
+        held.execute_batch("BEGIN IMMEDIATE").unwrap();
+        held
+    }
+
+    /// Whether something reads `fifo` within `limit`: the stalled dry run, had it started.
+    fn read_within(fifo: &Path, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            // With no reader, a writer's open that does not wait fails.
+            let open = OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(fifo);
+            if open.is_ok() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// A file in `dir` whose making waits until the returned sender sends or goes: `group::end`
+    /// removes the files last, under the lock the making holds, so an `end` started after this
+    /// waits in it, once the groups are dead, until then.
+    fn holding_end(dir: &Path) -> Sender<()> {
+        let (entered, inside) = mpsc::channel();
+        let (let_go, held) = mpsc::channel::<()>();
+        let file = dir.join("being-made");
+        std::thread::spawn(move || {
+            let made = group::create_removing(&file, |path| {
+                let _ = entered.send(());
+                let _ = held.recv();
+                std::fs::write(path, "")
+            });
+            // Dropped after `end`, it would wait forever.
+            std::mem::forget(made);
+        });
+        inside.recv_timeout(LIMIT).unwrap();
+        let_go
+    }
+
     /// That `outro`, of a job stopped on run `name`, ends on the command that finishes it.
     fn says_how_to_finish(outro: &[String], name: &str) {
         let finish = format!("Finish it with: subcheck apply {name} --dry-run");
@@ -1388,15 +1693,176 @@ mod tests {
         let dir = dir.as_path();
         match how.to_str().unwrap() {
             "close" => {
-                let (s, _) = during_a_job(dir, |_| {});
-                let group = a_group();
+                let (s, name) = during_a_job(dir, |_| {});
+                // The core thread stuck in a write, on a store another process holds: a message
+                // first, so that the write's step shows by letting it go. The dry run's own steps
+                // change what shows too, and leave the message.
+                let undone = Some("nothing to undo".to_string());
+                s.send(Action::Undo);
+                while next_change(&s).1.status != undone {}
+                let held = hold_the_store(dir);
+                s.send(Action::Reject);
+                while next_change(&s).1.status == undone {}
+                let mut group = a_group();
                 let closing = Arc::clone(&s);
                 within(move || closing.close());
-                // What was queued before the marker, and then the end of the stream, with the job
-                // still stuck.
-                while next(&s).is_some() {}
-                assert_ended(group);
+                // Not when the core thread could next stop, the write's busy timeout away.
+                assert!(killed_within(&mut group, Duration::from_secs(2)));
+                // What was queued before, then `close`'s end, with how to finish the dry run.
+                let events = to_the_end(&s);
+                let (fatal, outro) = end_of(&events);
+                assert_eq!(fatal, None);
+                says_how_to_finish(outro, &name);
                 assert_eq!(next(&s), None);
+                drop(held);
+            }
+            "gate" => {
+                let (store, name) = stalled(dir);
+                let state = dir.join("state");
+                let s = Arc::new(Session::start(move || opened(store, state, &[name], false)));
+                next(&s);
+                // The dry run's start waits on the lock, after the change that says it runs.
+                let mut held = lock(&s.shared);
+                s.send(Action::Apply { dry_run: true });
+                assert!(next_change(&s).1.busy);
+                // As `close` does, first: the record is the step before's, with no job.
+                assert!(matches!(held.close(), (true, false, _)));
+                drop(held);
+                // The core thread ends with nothing started: its queue goes with it.
+                let stopped = Arc::clone(&s);
+                within(move || {
+                    while stopped.inputs.send(Msg::Stop).is_ok() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                });
+                // A later `close` goes by what the first read, no job, though review says the dry
+                // run whose start the first stopped runs: it ends no group.
+                s.close();
+                assert!(!read_within(
+                    &dir.join("stalled.mkv"),
+                    Duration::from_secs(2)
+                ));
+                assert!(!group::ended());
+            }
+            "start" => {
+                // A run of one file on disk, its LLM `false`, so that no real one is ever asked.
+                let file = dir.join("E01.mkv");
+                std::fs::write(&file, "1").unwrap();
+                let path = file.to_string_lossy().into_owned();
+                let mut store = Store::open_at(&dir.join("subcheck.db")).unwrap();
+                let header = RunHeader {
+                    backend: "cmd:false".into(),
+                    ..header()
+                };
+                let scan = store
+                    .begin_scan(&header, std::slice::from_ref(&file))
+                    .unwrap();
+                let record = FileRecord {
+                    path: path.clone(),
+                    ..tests_support::file(1)
+                };
+                let found = Finding {
+                    file: path.clone(),
+                    ..finding(0, 1, TYPO, FIXED, 0)
+                };
+                save(&mut store, scan.id, &record, vec![found]);
+                let state = dir.join("state");
+                let name = scan.name;
+                let s = Arc::new(Session::start(move || opened(store, state, &[name], false)));
+                next(&s);
+                // `c`'s start writes the store on the core thread before any group can start:
+                // held, it waits there, its start marked.
+                let held = hold_the_store(dir);
+                s.send(Action::ShowPane(Pane::Files));
+                s.send(Action::SelectFile(path));
+                s.send(Action::Recheck);
+                s.send(Action::Answer(true));
+                let marked = Arc::clone(&s);
+                within(move || {
+                    while !lock(&marked.shared).job {
+                        std::thread::yield_now();
+                    }
+                });
+                let closing = Arc::clone(&s);
+                within(move || closing.close());
+                assert!(group::ended(), "close saw no job starting");
+                drop(held);
+            }
+            "reopen" => {
+                let (s, _) = during_a_job(dir, |_| {});
+                s.close();
+                let again = Arc::new(Session::start(|| panic!("opened after the groups ended")));
+                assert_eq!(
+                    next(&again),
+                    Some(Event::Ended {
+                        fatal: Some(GROUPS_ENDED.into()),
+                        outro: vec![],
+                    })
+                );
+                assert_eq!(next(&again), None);
+            }
+            "close-twice" => {
+                let (s, name) = during_a_job(dir, |_| {});
+                // The step that started the dry run finished too, so that the record's outro, as of
+                // the last step finished, is the one that says how to finish it.
+                let noted = Arc::clone(&s);
+                within(move || {
+                    while lock(&noted.shared).outro.is_empty() {
+                        std::thread::yield_now();
+                    }
+                });
+                let let_go = holding_end(dir);
+                let mut group = a_group();
+                let first = Arc::clone(&s);
+                let closing = std::thread::spawn(move || first.close());
+                assert!(killed_within(&mut group, LIMIT));
+                // A second, on a thread of its own, while the first is still in `group::end`: it
+                // waits for the groups the first is ending, as the first does.
+                let (started, began) = mpsc::channel();
+                let (returned, back) = mpsc::channel();
+                let second = Arc::clone(&s);
+                let again = std::thread::spawn(move || {
+                    let _ = started.send(());
+                    second.close();
+                    let _ = returned.send(());
+                });
+                began.recv_timeout(LIMIT).unwrap();
+                // Had it returned at once, it would be back well within this.
+                assert!(matches!(
+                    back.recv_timeout(Duration::from_secs(1)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                let_go.send(()).unwrap();
+                back.recv_timeout(LIMIT).unwrap();
+                within(move || closing.join().unwrap());
+                within(move || again.join().unwrap());
+                // What was queued before, then the first's end, with how to finish the dry run:
+                // the second wrote nothing.
+                let events = to_the_end(&s);
+                let (fatal, outro) = end_of(&events);
+                assert_eq!(fatal, None);
+                says_how_to_finish(outro, &name);
+                assert_eq!(next(&s), None);
+            }
+            "drop-after-close" => {
+                let (s, _) = during_a_job(dir, |_| {});
+                // A `close` held in `group::end`, as `close-twice`'s first, played in its two
+                // parts, as the session must be let go of while it is held: a real `close` holds a
+                // reference to it.
+                assert!(matches!(lock(&s.shared).close(), (true, true, _)));
+                let let_go = holding_end(dir);
+                let mut group = a_group();
+                let ending = std::thread::spawn(group::end);
+                assert!(killed_within(&mut group, LIMIT));
+                // Letting go returns while the groups still end.
+                let (dropped, gone) = mpsc::channel();
+                std::thread::spawn(move || {
+                    drop(s);
+                    let _ = dropped.send(());
+                });
+                gone.recv_timeout(LIMIT).unwrap();
+                let_go.send(()).unwrap();
+                within(move || ending.join().unwrap());
             }
             "drop" => {
                 let (s, _) = during_a_job(dir, |_| {});
@@ -1534,8 +2000,33 @@ mod tests {
     }
 
     #[test]
-    fn close_during_a_dry_run_ends_its_groups() {
+    fn close_during_a_job_ends_its_groups_before_it_returns_and_says_how_to_finish_it() {
         ended("close");
+    }
+
+    #[test]
+    fn a_job_that_would_start_after_close_does_not() {
+        ended("gate");
+    }
+
+    #[test]
+    fn close_during_a_jobs_start_ends_its_groups() {
+        ended("start");
+    }
+
+    #[test]
+    fn a_session_opened_after_the_groups_ended_ends_at_once_and_says_why() {
+        ended("reopen");
+    }
+
+    #[test]
+    fn a_second_close_while_the_first_ends_the_groups_leaves_the_stream_to_the_first() {
+        ended("close-twice");
+    }
+
+    #[test]
+    fn a_drop_after_a_close_returns_at_once_while_the_groups_still_end() {
+        ended("drop-after-close");
     }
 
     #[test]

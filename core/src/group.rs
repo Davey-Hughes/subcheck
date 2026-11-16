@@ -62,6 +62,8 @@ static ENDING: AtomicBool = AtomicBool::new(false);
 /// Set by [`end`]: the ending is a quit, not a signal, so [`finish`] lets subcheck end its own
 /// way.
 static QUIT: AtomicBool = AtomicBool::new(false);
+/// [`end`]'s, once: its registry is held for good, so a second `end_all` would wait for it.
+static END: Once = Once::new();
 
 /// Wait for the end, should a signal be ending subcheck.
 fn wait_if_ending() {
@@ -262,12 +264,26 @@ fn end_all() -> Held {
 /// good, so no group starts after. A thread that comes back through this module waits for the
 /// end, as under a signal: an LLM call killed under a worker is not recorded as a failure.
 /// Unlike a signal, it does not end subcheck: the caller says what it did and returns from main,
-/// where [`finish`] lets it.
+/// where [`finish`] lets it. A second call, from any thread, returns once the first has ended the
+/// groups, or has panicked trying: a review session's `close` and its own thread can both end a
+/// job, and a later `close` must not panic, in `Drop` or across the FFI.
 ///
 /// Call it last: a guard of this module dropped after it (review's player) would wait forever.
 pub fn end() {
-    QUIT.store(true, Ordering::SeqCst);
-    std::mem::forget(end_all());
+    END.call_once_force(|once| {
+        // The cleanup runs once, whatever came of it: run again, it could wait for good on a
+        // registry the first left held.
+        if once.is_poisoned() {
+            return;
+        }
+        QUIT.store(true, Ordering::SeqCst);
+        std::mem::forget(end_all());
+    });
+}
+
+/// Whether the groups have ended, by a signal or [`end`]: no group starts again in this process.
+pub fn ended() -> bool {
+    ENDING.load(Ordering::SeqCst)
 }
 
 #[cfg(test)]
@@ -408,8 +424,21 @@ mod tests {
                 // Nothing of this module is dropped after `end`: review's screen drops its player
                 // before it.
                 std::mem::forget((removing, running));
+                assert!(!ended());
                 end();
+                // As a session's `close` and its own thread can: the second returns.
+                end();
+                assert!(ended());
                 finish();
+                return;
+            }
+            // A first `end` that panicked: a second returns, and runs no cleanup of its own.
+            "end-failed" => {
+                let failed = std::panic::catch_unwind(|| END.call_once(|| panic!("an end failed")));
+                assert!(failed.is_err());
+                ready();
+                end();
+                assert!(!ended());
                 return;
             }
             // Held far longer: only a second signal ends it before the hold does. And a group
@@ -812,6 +841,15 @@ mod tests {
         assert!(ends_within(&group_ended, DIES), "the groups were killed");
         assert!(!path.exists(), "the file was removed");
         assert!(!path.with_extension("acted").exists(), "the worker went on");
+    }
+
+    #[test]
+    fn an_end_after_one_that_panicked_returns_and_cleans_up_nothing_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("half.mkv");
+        let mut child = start(&path, "end-failed");
+        let status = assert_ends(&mut child, DIES);
+        assert!(status.success(), "{status}");
     }
 
     #[test]

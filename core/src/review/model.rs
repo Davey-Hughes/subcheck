@@ -6,11 +6,23 @@ use std::ops::Range;
 
 use jiff::Timestamp;
 
-use super::progress::Progress;
+use super::progress::{Progress, Stopping};
 use crate::apply::patch::Outcome;
 use crate::list::{self, Filter};
 use crate::store::{Decision, Finding, Run, State, TrackRecord};
 use crate::timing::frame_count;
+
+/// How review ends now, whichever UI ends it ([`Review::ending`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ending {
+    /// The process groups review's jobs started end (`group::end`): a job runs, whose mkvmerge or
+    /// LLM calls would outlive the process, or review failed ([`Review::fatal`]: a job's thread,
+    /// or the UI's own input), after which nothing it started is known to be over.
+    pub groups: bool,
+    /// Its outro is said ([`Review::outro`]): on a clean end, or when the end stops a job, which
+    /// the outro says how to finish. An error that stopped none speaks for itself.
+    pub outro: bool,
+}
 
 /// Findings decided together, as one row. Repeats are common: typos with the same original and
 /// suggestion (an OP lyric is a finding in every episode), and timing findings on the same-named
@@ -66,6 +78,23 @@ pub enum Confirm {
     },
     /// Apply the view's accepted fixes: `A`.
     Apply,
+}
+
+/// The open question as data, for a UI to word ([`Review::question`]): what a yes does, with what
+/// its words need. Files are named as the list names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Question {
+    /// Quit, stopping the job under way.
+    Quit(Stopping),
+    /// Check file `label` again, with `backend`, the LLM its run was scanned with.
+    Recheck { label: String, backend: String },
+    /// Apply the view's accepted fixes: `fixes` of them, in `files` files, `applied` of them in
+    /// their files already.
+    Apply {
+        fixes: usize,
+        files: usize,
+        applied: usize,
+    },
 }
 
 /// What the screen's last apply or dry run said of a finding, for its mark ([`Review::mark`]).
@@ -222,6 +251,19 @@ impl Review {
         let mut lines = self.progress.outro();
         lines.extend(self.progress.apply_outro(&|p| self.label(p)));
         lines
+    }
+
+    /// How review ends now, `failed` when its UI's own loop failed or panicked: the terminal's
+    /// loop and a session both end by this. `failed` decides the outro alone: a job the loop
+    /// started runs until it reports its end, so it ends the groups whatever ended the loop, and
+    /// with none running, the loop's failure has left none behind.
+    pub fn ending(&self, failed: bool) -> Ending {
+        let job = self.progress.busy();
+        let error = failed || self.fatal.is_some();
+        Ending {
+            groups: job || self.fatal.is_some(),
+            outro: job || !error,
+        }
     }
 
     /// Every finding, decided or not, with the first row that has a pending one selected: a
@@ -412,11 +454,12 @@ impl Review {
             .collect()
     }
 
-    /// Take `view`, the other view of the screen's findings (`v`), with its files' `notes`. What
-    /// pointed at a finding carries over by its ID, which both views share: the selection, else the
-    /// first row with a pending finding, as on opening; the expanded rows; and the undo steps, less
-    /// the findings this view does not show (a step left empty goes). The filter and the pane stay.
-    /// The files view shows the new view's files, the selected file kept where it is one of them.
+    /// Take `view`, another view of the findings (`v`'s other one, or `OpenView`'s), with its
+    /// files' `notes`. What pointed at a finding carries over by its ID, where the view has it:
+    /// the selection, else the first row with a pending finding, as on opening; the expanded rows;
+    /// and the undo steps, less the findings this view does not show (a step left empty goes). The
+    /// filter, the pane, the marks and the file the player last loaded stay. The files view shows
+    /// the new view's files, the selected file kept where it is one of them.
     pub fn switch(&mut self, view: Run, notes: HashMap<String, FileNote>) {
         let selected = self.selected_key();
         let expanded: Vec<EntryKey> = self
@@ -605,36 +648,31 @@ impl Review {
         (fixes.len(), paths.len(), already)
     }
 
-    /// What review has for the status line: the question waiting for `y`; else its message; else
-    /// how far the latest scan or apply is, or how it ended. With none of these, a UI may show its
-    /// own there.
+    /// The open question ([`Review::confirm`]), with what its words need now: the quit question's
+    /// counts follow the job as it goes on.
+    pub fn question(&self) -> Option<Question> {
+        Some(match self.confirm.as_ref()? {
+            Confirm::Quit => Question::Quit(self.progress.stopping(&|p| self.label(p))),
+            Confirm::Recheck { path, backend, .. } => Question::Recheck {
+                label: self.label(path),
+                backend: backend.clone(),
+            },
+            Confirm::Apply => {
+                // `paths`, not `files`: clippy's `similar_names` takes that for a slip of `fixes`.
+                let (fixes, paths, applied) = self.apply_counts();
+                Question::Apply {
+                    fixes,
+                    files: paths,
+                    applied,
+                }
+            }
+        })
+    }
+
+    /// What review has for the status line but a question, which a UI shows over it
+    /// ([`Review::question`]): its message; else how far the latest scan or apply is, or how it
+    /// ended. With neither, a UI may show its own there.
     pub fn status_text(&self) -> Option<String> {
-        if let Some(confirm) = &self.confirm {
-            return Some(match confirm {
-                Confirm::Quit if self.progress.applying() => {
-                    self.progress.apply_question(&|p| self.label(p))
-                }
-                Confirm::Quit => self.progress.quit_question(),
-                Confirm::Recheck { path, backend, .. } => {
-                    format!("check {} again with {backend}? y/n", self.label(path))
-                }
-                Confirm::Apply => {
-                    let (fixes, paths, already) = self.apply_counts();
-                    let count = |n: usize, one: &str, many: &str| {
-                        format!("{n} {}", if n == 1 { one } else { many })
-                    };
-                    let already = match already {
-                        0 => String::new(),
-                        n => format!(" ({n} applied already)"),
-                    };
-                    format!(
-                        "apply {} in {}{already}, keeping each .orig? y/n",
-                        count(fixes, "fix", "fixes"),
-                        count(paths, "file", "files")
-                    )
-                }
-            });
-        }
         match &self.status {
             Some(message) => Some(message.clone()),
             None => self.progress.line(),
@@ -1276,6 +1314,23 @@ mod tests {
     fn label(a: &str, b: &str) -> String {
         let (ra, rb) = changed(a, b);
         format!("{} → {}", &a[ra], &b[rb])
+    }
+
+    // What every UI's end comes to: a job running ends the groups and says how to finish it; a
+    // job's failure ends them too; an error that stopped no job has no outro.
+    #[test]
+    fn a_job_or_a_fatal_error_ends_the_groups_and_an_error_alone_keeps_no_outro() {
+        let mut m = tests_support::sample();
+        let end = |groups, outro| Ending { groups, outro };
+        assert_eq!(m.ending(false), end(false, true));
+        assert_eq!(m.ending(true), end(false, false));
+        m.fatal = Some("the scan panicked: boom".into());
+        assert_eq!(m.ending(false), end(true, false));
+        m.fatal = None;
+        m.progress
+            .start_apply(true, "subcheck apply r --dry-run".into());
+        assert_eq!(m.ending(false), end(true, true));
+        assert_eq!(m.ending(true), end(true, true));
     }
 
     #[test]

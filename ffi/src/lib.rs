@@ -11,11 +11,12 @@ use std::sync::Arc;
 
 use subcheck_core::player;
 use subcheck_core::review::{model, session, update};
-use subcheck_core::store;
+use subcheck_core::{group, store};
 
 uniffi::setup_scaffolding!();
 
-/// One run under review, for a UI on any thread; a UI opens one per process ([`session::Session`]).
+/// One run under review, for a UI on any thread; a UI opens one per process, and switches the view
+/// inside it (`Action::OpenView`) rather than open another ([`session::Session`]).
 ///
 /// `next_event` blocks, so a UI calls it from a thread of its own. On every way out, a UI calls
 /// `close`, then waits for that thread to return, then lets go. A `next_event` that waits holds a
@@ -49,12 +50,28 @@ impl Session {
         self.0.next_event().map(Event::from)
     }
 
-    /// End the stream at once, whatever the session is doing, and stop the session when it can
-    /// next be stopped. What was queued before still comes out of `next_event` first, a player
-    /// command among them, so a UI ignores what it reads after calling this.
+    /// End the stream, and stop the session when it can next be stopped. With no job running or
+    /// starting, and review not failed, it returns at once, whatever the session is doing.
+    /// Otherwise it first ends the process groups, which can wait for a start stuck in exec or a
+    /// file to remove on a stalled mount. What was queued before still comes out of `next_event`
+    /// first, a player command among them, so a UI ignores what it reads after calling this, but
+    /// for the last event, an `Ended`. It is this call's, whose outro says how to finish a job it
+    /// stopped and whose `fatal` is none, whatever the groups ended for; unless review, ending by
+    /// itself as this ran, put its own first, which can carry review's `fatal`. A later call adds
+    /// nothing to the stream, and returns once the groups the first is ending have ended; at once
+    /// when the first ended none. Letting the session go after this returns at once.
     pub fn close(&self) {
         self.0.close();
     }
+}
+
+/// To call as the app's main returns, once its session is let go of, as the terminal's main does:
+/// while a signal is ending the process, it waits for the signal's cleanup to end it, so that the
+/// process does not exit first, with a status of its own, leaving a job's process groups running
+/// ([`group::finish`]). At once otherwise.
+#[uniffi::export]
+pub fn finish() {
+    group::finish();
 }
 
 /// An entry by its findings' IDs, which outlast a remake of the rows: a row by every member's, so
@@ -232,6 +249,11 @@ pub enum Action {
     },
     /// Quit. No action here starts a job, so review never asks first.
     Quit,
+    /// Open the view these words select (`[run | paths…]`, as `Session::open` takes them) in place
+    /// of the one shown. Should it fail, the view stays, and the status line says why.
+    OpenView {
+        selector: Vec<String>,
+    },
 }
 
 /// One of mpv's options for the one file a load opens ([`player::FileOption`]), as `--name=value`
@@ -499,6 +521,7 @@ impl From<Action> for update::Action {
             Action::ClosePlayer => update::Action::ClosePlayer,
             Action::Playback { playback } => update::Action::Playback(playback.into()),
             Action::Quit => update::Action::Quit,
+            Action::OpenView { selector } => update::Action::OpenView(selector),
         }
     }
 }
@@ -784,6 +807,12 @@ mod tests {
                 update::Action::Playback(player::Playback::Seek(5)),
             ),
             (Action::Quit, update::Action::Quit),
+            (
+                Action::OpenView {
+                    selector: vec!["r".into(), "/m/E01.mkv".into()],
+                },
+                update::Action::OpenView(vec!["r".into(), "/m/E01.mkv".into()]),
+            ),
         ];
         for (ffi, core) in cases {
             assert_eq!(update::Action::from(ffi), core);
@@ -976,6 +1005,14 @@ mod tests {
             change().1.status.as_deref(),
             Some("mpv has no file open (o opens one)")
         );
+        s.send(Action::OpenView {
+            selector: vec!["nope".into()],
+        });
+        assert_eq!(change().1.status, None);
+        assert_eq!(
+            change().1.status.as_deref(),
+            Some("could not switch views: no run named nope")
+        );
         s.send(Action::Quit);
         assert_eq!(change().1.status, None);
         let end = Event::Ended {
@@ -985,11 +1022,15 @@ mod tests {
         assert_eq!(next(), end);
         assert_eq!(s.next_event(), None);
         // A second session in one process, which `Session`'s doc rules out, is safe here: neither
-        // reaches `group::end`, which is what makes it one per process. What was queued before
-        // `close` may still come out, and then nothing.
+        // stopped a job, so neither ended the groups. What was queued before `close` may still
+        // come out, then `close`'s end, with nothing to say of a job, and then nothing.
         let closed = Session::open(vec![name]);
         closed.close();
-        while closed.next_event().is_some() {}
+        let mut last = None;
+        while let Some(event) = closed.next_event() {
+            last = Some(event);
+        }
+        assert_eq!(last, Some(end));
         assert_eq!(closed.next_event(), None);
         // What the parent checks: a `CHILD` that names no test would pass with nothing run.
         std::fs::write(PathBuf::from(dir).join("ran"), "").unwrap();

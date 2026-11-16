@@ -14,6 +14,7 @@
 #include <QtQml/QQmlExtensionPlugin>
 
 #include <chrono>
+#include <exception>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -23,7 +24,10 @@ using namespace std::chrono_literals;
 // The QML module is a static library's, so its plugin is linked in and imported by name.
 Q_IMPORT_QML_PLUGIN(SubcheckPlugin)
 
-int main(int argc, char **argv) {
+namespace {
+
+// The window, from its start to its end: its status.
+int run(int argc, char **argv) {
     // MpvQt draws mpv's frames with OpenGL, which Qt Quick must be asked for before it makes the
     // first window: Linux's default, but not macOS's, which is Metal.
     QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
@@ -58,4 +62,21 @@ int main(int argc, char **argv) {
     }
     bridge.start();
     return QGuiApplication::exec();
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+    const int status = run(argc, argv);
+    // As the terminal's main, once the window and its session are gone: while a signal is ending
+    // the process, its cleanup ends it, rather than this status before a job's groups are ended.
+    // The first call into the library when the window failed before opening a session, so a
+    // contract mismatch throws here, which the bridge would have caught at open.
+    try {
+        subcheck_ffi::finish();
+    } catch (const std::exception &e) {
+        std::cerr << "subcheck-qt: " << e.what() << '\n';
+        return 1;
+    }
+    return status;
 }

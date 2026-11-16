@@ -224,7 +224,13 @@ filter, to the next row).
 The mouse works too. Click a row to select it, and double-click to open it in mpv. The wheel moves
 the selection over the list and scrolls the detail pane. `? help` at the end of the status line, and
 the editor's `⏎ accept · Esc cancel` there, are clickable. Since review takes the mouse, select text
-in the terminal with Shift+drag.
+in the terminal with Shift+drag. A question on the status line (`… y/n`) takes the next key: `y`
+answers it; Ctrl-C or Ctrl-D quits, but while a scan or apply runs asks to quit in the question's
+place, unless it asks that already; Ctrl-U and the other Ctrl and Alt keys leave it open; and any
+other key only lets it go. So do a click on a row, a file or `? help`, and a turn of the wheel over
+the list; other clicks, and the wheel over the detail pane, leave it open. While the editor is open,
+the mouse lets it go only by a click on `? help`; while the box of keys is open, a click only closes
+the box.
 
 Whatever `mpv.conf` says (or, for the window, `mpvqt.conf`), a file `o` loads gets, beside its
 start, `sub-visibility=yes` and, when the finding names one, its subtitle track, three more options

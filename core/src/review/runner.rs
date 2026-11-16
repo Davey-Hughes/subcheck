@@ -15,7 +15,7 @@ use super::progress;
 use super::update::{Input, Job, Switch, Task};
 use crate::llm::Backend;
 use crate::scan::{self, file_stamp};
-use crate::store::{Run, Store};
+use crate::store::{Run, Selector, Store};
 
 /// Runs `update`'s tasks for a UI: through `store`, the connection review writes through; with
 /// `state`, the state directory, where apply writes the fixed tracks; and with `tx`, a sender on
@@ -126,8 +126,9 @@ pub fn file_notes(run: &Run) -> HashMap<String, FileNote> {
     notes
 }
 
-/// The view [`Task::Switch`] asks for, read from the store: a run's folders, or the newest run that
-/// named a file.
+/// The view [`Task::Switch`] asks for, read from the store: a run's folders, the newest run that
+/// named a file, or what a selector's words select, as `Session::open` reads its first. The words
+/// are read here, not in `update`: a word that is a path on disk is a path.
 fn other_view(store: &Store, to: &Switch) -> anyhow::Result<Run> {
     match to {
         Switch::FoldersOf(name) => {
@@ -142,6 +143,7 @@ fn other_view(store: &Store, to: &Switch) -> anyhow::Result<Run> {
                 .with_context(|| format!("{}: no run named it", model::episode(path)))?;
             Ok(store.run_view(&scan)?)
         }
+        Switch::Selector(words) => store.view(&Selector::parse(words)?),
     }
 }
 
@@ -244,6 +246,68 @@ mod tests {
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert_eq!(notes[&run.files[1].path], FileNote::Changed);
         assert_eq!(notes[&run.files[2].path], FileNote::Missing);
+    }
+
+    // As `Session::open` reads its selector: a run by its name; a path on disk as a path, with
+    // what is recorded under it or, with nothing, why; or why there is no such run.
+    #[test]
+    fn a_selector_opens_the_view_its_words_select_or_says_why_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_at(&dir.path().join("subcheck.db")).unwrap();
+        let header = crate::store::RunHeader {
+            started: jiff::Timestamp::UNIX_EPOCH,
+            backend: "claude".into(),
+            command: vec![],
+            prompt_version: 1,
+            version: "0".into(),
+            langs: vec!["eng".into()],
+        };
+        let name = store.begin_scan(&header, &[]).unwrap().name;
+        // A file on disk, a finding recorded in it.
+        let file = dir.path().join("E01.mkv");
+        std::fs::write(&file, "1").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let scan = store
+            .begin_scan(&header, std::slice::from_ref(&file))
+            .unwrap();
+        let record = crate::store::FileRecord {
+            path: path.clone(),
+            ..model::tests_support::file(1)
+        };
+        let attempt = crate::store::Attempt {
+            scan: scan.id,
+            path: &record.path,
+            size: record.size,
+            mtime: record.mtime,
+            tracks: &record.tracks,
+            truncated: None,
+            at: jiff::Timestamp::UNIX_EPOCH,
+        };
+        let made = crate::store::Made {
+            with: crate::store::CheckedWith::new("claude", &["eng".into()], 1),
+            lines: 1,
+            findings: vec![crate::store::Finding {
+                file: path.clone(),
+                ..model::tests_support::finding(0, 1, "a", "b", 0)
+            }],
+        };
+        store.save(&attempt, vec![made]).unwrap();
+        let (tx, _rx) = mpsc::channel::<Input>();
+        let mut runner = Runner::new(store, dir.path().join("state"), tx);
+        let mut open = |words: Vec<String>| match runner.run(Task::Switch(Switch::Selector(words)))
+        {
+            Input::Switched(view) => view.map(|(run, _)| (run.shown_name(), run.findings.len())),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(open(vec![name.clone()]), Ok((format!("run {name}"), 0)));
+        assert_eq!(open(vec![path]), Ok(("E01.mkv".to_string(), 1)));
+        let folder = dir.path().join("empty");
+        std::fs::create_dir(&folder).unwrap();
+        let folder = folder.to_string_lossy().into_owned();
+        let said = open(vec![folder.clone()]).unwrap_err();
+        assert!(said.starts_with("nothing recorded under "), "{said}");
+        assert!(said.contains(&folder), "{said}");
+        assert_eq!(open(vec!["nope".into()]), Err("no run named nope".into()));
     }
 
     #[test]

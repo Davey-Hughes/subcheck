@@ -315,7 +315,7 @@ pub fn run(open: Open, store: Store, state: &Path, karaoke: bool) -> anyhow::Res
     // The mpv this review started is closed, and its registration let go, before `group::end`: one
     // let go after it would wait forever.
     drop(player);
-    if model.progress.busy() || model.fatal.is_some() {
+    if model.ending(false).groups {
         group::end();
     }
     let looped = looped.unwrap_or_else(|panic| panic::resume_unwind(panic));
@@ -337,20 +337,16 @@ fn outcome(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> anyhow::Result<ExitCode> {
-    let outro = model.outro();
+    if model.ending(looped.is_err()).outro {
+        for line in model.outro() {
+            writeln!(err, "{line}")?;
+        }
+    }
     if let Some(e) = looped
         .err()
         .or_else(|| model.fatal.take().map(anyhow::Error::msg))
     {
-        if model.progress.busy() {
-            for line in outro {
-                writeln!(err, "{line}")?;
-            }
-        }
         return Err(e);
-    }
-    for line in outro {
-        writeln!(err, "{line}")?;
     }
     let (pending, accepted, rejected) = model.counts();
     writeln!(
