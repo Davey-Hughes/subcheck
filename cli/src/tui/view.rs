@@ -1,5 +1,6 @@
 //! Pure render of a `Review` and its `Screen` into a ratatui frame.
 
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::ops::Range;
 
@@ -316,9 +317,12 @@ fn list_pane(m: &Review, s: &Screen, f: &mut Frame, area: Rect) {
         f.render_widget(Paragraph::new(hint).block(block), area);
         return;
     }
+    // Once a draw, not once an entry: `Progress::checked` walks every file, and while a scan runs
+    // hashes each one it is checking.
+    let checked = m.progress.checked();
     let items: Vec<ListItem> = entries
         .iter()
-        .map(|&e| ListItem::new(entry_line(m, e, spinner)))
+        .map(|&e| ListItem::new(entry_line(m, e, spinner, &checked)))
         .collect();
     let list = List::new(items)
         .block(block)
@@ -351,19 +355,17 @@ fn mark(state: Option<State>) -> &'static str {
     }
 }
 
-fn entry_line(m: &Review, e: Entry, spinner: char) -> Line<'static> {
-    entry_text(m, e, spinner).style(colour(m.entry_state(e)))
+fn entry_line(m: &Review, e: Entry, spinner: char, checked: &HashSet<&str>) -> Line<'static> {
+    entry_text(m, e, spinner, checked).style(colour(m.entry_state(e)))
 }
 
-fn entry_text(m: &Review, e: Entry, spinner: char) -> Line<'static> {
-    // A file the scan is checking again has the spinner on its name: its findings here are the
-    // earlier check's until the new ones are saved.
-    let spin = |file: &str| {
-        if m.progress.checking(file).is_some() {
-            spinner.to_string()
-        } else {
-            String::new()
-        }
+fn entry_text(m: &Review, e: Entry, spinner: char, checked: &HashSet<&str>) -> Line<'static> {
+    // A file the scan is checking again has the spinner on its name, or on its row's count: its
+    // findings here are the earlier check's until the new ones are saved.
+    let turning = if m.checking_among(e, checked) {
+        spinner.to_string()
+    } else {
+        String::new()
     };
     match e {
         Entry::Row(r) => {
@@ -372,25 +374,9 @@ fn entry_text(m: &Review, e: Entry, spinner: char) -> Line<'static> {
             let shown = m.shown_members(r);
             let first = shown[0];
             let who = match (all, shown.len()) {
-                (1, _) => {
-                    let file = &m.finding(first).file;
-                    format!("{}{}", m.label(file), spin(file))
-                }
-                (all, n) => {
-                    let checking = shown
-                        .iter()
-                        .any(|&i| m.progress.checking(&m.finding(i).file).is_some());
-                    let turning = if checking {
-                        spinner.to_string()
-                    } else {
-                        String::new()
-                    };
-                    if n == all {
-                        format!("×{all}{turning}")
-                    } else {
-                        format!("×{n}/{all}{turning}")
-                    }
-                }
+                (1, _) => format!("{}{turning}", m.label(&m.finding(first).file)),
+                (all, n) if n == all => format!("×{all}{turning}"),
+                (all, n) => format!("×{n}/{all}{turning}"),
             };
             let f = m.finding(first);
             // What apply did, or would do, with the row's fixes.
@@ -423,10 +409,9 @@ fn entry_text(m: &Review, e: Entry, spinner: char) -> Line<'static> {
             };
             let outcome = m.mark(i).map_or_else(String::new, |t| format!("  {t}"));
             Line::from(format!(
-                "    {} {}{} {what}{outcome}",
+                "    {} {}{turning} {what}{outcome}",
                 mark(Some(m.state(i))),
                 m.label(&m.finding(i).file),
-                spin(&m.finding(i).file)
             ))
         }
     }

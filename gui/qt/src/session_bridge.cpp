@@ -31,7 +31,11 @@ SessionBridge::SessionBridge(std::vector<std::string> selector, PlayerPort &play
     connect(&quitWait, &QTimer::timeout, this, &SessionBridge::giveUp);
 }
 
-SessionBridge::~SessionBridge() { letGo(); }
+SessionBridge::~SessionBridge() {
+    if (std::optional<Event::kEnded> end = letGo()) {
+        say(*end);
+    }
+}
 
 // Every call into the session can throw: a contract mismatch at the first, a Rust panic, or text
 // that is not UTF-8. Nothing may throw through Qt's event loop, so a throw ends review as a fatal
@@ -45,19 +49,32 @@ template <typename Call> void SessionBridge::guarded(Call call) {
 }
 
 void SessionBridge::start() {
-    guarded([this] { session = Session::open(selector); });
+    // The window offers no apply yet, nor a way to ask for karaoke's re-spacing.
+    guarded([this] { session = Session::open(selector, false); });
     if (!session) {
         return;
     }
-    // The pump reads a session it holds itself, never the bridge's, which letGo lets go of. A
-    // throw is a Rust panic, which ends review as a fatal end does.
-    pump.reset(QThread::create([this, session = session] {
+    relay = std::make_shared<Relay>();
+    relay->to = this;
+    // The pump reads a session it holds itself, never the bridge's, which letGo lets go of, and
+    // hands what it reads on through the relay. A throw is a Rust panic, which ends review as a
+    // fatal end does.
+    pump.reset(QThread::create([relay = relay, session = session] {
+        const auto pass = [&relay](const Event &e) {
+            const std::lock_guard<std::mutex> held(relay->lock);
+            if (const auto *end = std::get_if<Event::kEnded>(&e.get_variant())) {
+                relay->end = *end;
+            }
+            if (relay->to) {
+                emit relay->to->eventArrived(e);
+            }
+        };
         try {
             while (std::optional<Event> e = session->next_event()) {
-                emit eventArrived(*e);
+                pass(*e);
             }
         } catch (const std::exception &e) {
-            emit eventArrived(Event(Event::kEnded{std::string(e.what()), {}}));
+            pass(Event(Event::kEnded{std::string(e.what()), {}}));
         }
     }));
     pump->start();
@@ -175,7 +192,11 @@ void SessionBridge::quit() {
     }
     quitting = true;
     emit summaryChanged();
-    send(Action(Action::kQuit{}));
+    // Two `Interrupt`s: the first quits, or with a job running asks, and the second quits, stopping
+    // the job. A `Quit` under a question would only let the question go, and the window would wait
+    // out the give-up.
+    send(Action(Action::kInterrupt{}));
+    send(Action(Action::kInterrupt{}));
     // A send that threw has ended review as a fatal end, whose dialog waits for the person.
     if (session) {
         quitWait.start();
@@ -215,9 +236,7 @@ void SessionBridge::ended(const Event::kEnded &end) {
     letGo();
     // As the terminal: what is left to say of the jobs on stderr; then the error, on stderr, or
     // the decisions' counts, on stdout.
-    for (const std::string &line : end.outro) {
-        err << line << '\n';
-    }
+    say(end);
     if (end.fatal) {
         fail(*end.fatal);
         return;
@@ -242,7 +261,9 @@ void SessionBridge::report(PlayerReport report) {
 }
 
 void SessionBridge::fail(const std::string &why) {
-    letGo();
+    if (std::optional<Event::kEnded> end = letGo()) {
+        say(*end);
+    }
     const std::string said = why.empty() ? std::string(noReason) : why;
     err << "subcheck-qt: " << said << '\n';
     err.flush();
@@ -251,7 +272,9 @@ void SessionBridge::fail(const std::string &why) {
 }
 
 void SessionBridge::giveUp() {
-    letGo();
+    if (std::optional<Event::kEnded> end = letGo()) {
+        say(*end);
+    }
     err << "subcheck-qt: review had not ended "
         << std::chrono::duration<double>(quitWait.intervalAsDuration()).count()
         << " s after quitting, so it was closed\n";
@@ -259,29 +282,49 @@ void SessionBridge::giveUp() {
     finish(1);
 }
 
+void SessionBridge::closeSession(Session &session) { session.close(); }
+
 // On every way out: close, so that the pump's wait ends whatever the core thread is doing; join
 // the pump; then let go. A pump left waiting would hold the session and its core thread for good.
-void SessionBridge::letGo() {
+// Returns the stream's last end, which the pump keeps: close's own, whose outro says how to finish
+// a job the close stopped, or review's, should it have come first. None with no session, or after
+// a close that threw.
+std::optional<Event::kEnded> SessionBridge::letGo() {
     quitWait.stop();
     port.release();
-    if (session) {
-        try {
-            session->close();
-        } catch (const std::exception &) {
-            // Nothing reaches this today: close takes no text and returns nothing, so its
-            // generated call throws only on a Rust panic, or on a contract mismatch, which
-            // open, the first call, would have met. Were it reached, the stream might never end,
-            // so the pump is let go of, neither joined, which could wait for good, nor destroyed
-            // running, which aborts; it would still hold this bridge, and emit what it reads on a
-            // destroyed object.
-            static_cast<void>(pump.release());
-        }
+    if (!session) {
+        return std::nullopt;
     }
-    if (pump) {
-        pump->wait();
-        pump.reset();
+    std::optional<Event::kEnded> end;
+    try {
+        closeSession(*session);
+        if (pump) {
+            pump->wait();
+            pump.reset();
+        }
+        end = std::move(relay->end);
+    } catch (const std::exception &) {
+        // Close's generated call throws only on a Rust panic, or on a contract mismatch, which
+        // open, the first call, would have met. The stream might then never end, so the pump is
+        // let go of, neither joined, which could wait for good, nor destroyed running, which
+        // aborts; and the relay no longer hands it on to this bridge, which may be gone by then.
+        {
+            const std::lock_guard<std::mutex> held(relay->lock);
+            relay->to = nullptr;
+        }
+        static_cast<void>(pump.release());
     }
     session.reset();
+    return end;
+}
+
+// An end's outro, on stderr, as the terminal says it: what the jobs came to, and how to finish one
+// the end stopped.
+void SessionBridge::say(const Event::kEnded &end) {
+    for (const std::string &line : end.outro) {
+        err << line << '\n';
+    }
+    err.flush();
 }
 
 void SessionBridge::finish(int status) {

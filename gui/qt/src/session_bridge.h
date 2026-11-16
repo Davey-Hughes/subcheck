@@ -14,6 +14,8 @@
 
 #include <chrono>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -72,9 +74,12 @@ public:
     void play();
     void closePlayer();
     void playback(subcheck_ffi::Playback playback);
-    // Asks review to end, and says so on the status line until it has. If it has not within the
-    // bridge's wait, the session is closed and the window ends anyway, with status 1: what the
-    // last decisions came to is unknown.
+    // Any of review's actions, as the window's keys send theirs. After the session is let go of,
+    // it goes nowhere.
+    void send(subcheck_ffi::Action action);
+    // Asks review to end, stopping a job under way, and says so on the status line until it has.
+    // If it has not within the bridge's wait, the session is closed and the window ends anyway,
+    // with status 1: what the last decisions came to is unknown.
     Q_INVOKABLE void quit();
     // The fatal end's dialog has closed.
     Q_INVOKABLE void dismiss();
@@ -87,16 +92,31 @@ signals:
     // The window is done, and the process exits with `status`.
     void finished(int status);
 
+protected:
+    // Closes the session: a call that throws only on a Rust panic, which no test can make a real
+    // session's close do, so a test's bridge throws its own. The destructor's close is always
+    // this one, as a destructor calls no override.
+    virtual void closeSession(subcheck_ffi::Session &session);
+
 private:
+    // What the pump hands on, which it holds with the bridge: a pump let go of, after a close that
+    // threw, reaches nothing of a bridge that has let go of it. `end` is the stream's last event,
+    // when it is an end: close's own, or review's should it come first.
+    struct Relay {
+        std::mutex lock;
+        SessionBridge *to = nullptr;
+        std::optional<subcheck_ffi::Event::kEnded> end;
+    };
+
     void apply(const subcheck_ffi::Event &event);
     void changed(const subcheck_ffi::Event::kChanged &change);
     void ended(const subcheck_ffi::Event::kEnded &end);
     template <typename Call> void guarded(Call call);
-    void send(subcheck_ffi::Action action);
     void report(subcheck_ffi::PlayerReport report);
     void fail(const std::string &why);
     void giveUp();
-    void letGo();
+    std::optional<subcheck_ffi::Event::kEnded> letGo();
+    void say(const subcheck_ffi::Event::kEnded &end);
     void finish(int status);
 
     std::vector<std::string> selector;
@@ -105,6 +125,7 @@ private:
     std::ostream &err;
     FindingsModel list;
     std::shared_ptr<subcheck_ffi::Session> session;
+    std::shared_ptr<Relay> relay;
     std::unique_ptr<QThread> pump;
     QTimer quitWait;
     subcheck_ffi::Summary summary{};

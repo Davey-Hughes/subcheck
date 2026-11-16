@@ -7,7 +7,7 @@
 //! one it was cut from corrupts the rows. The rows are compared, not reported: `update` would have
 //! to name every row it touches, and one it missed would leave the UI silently out of step.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -16,15 +16,18 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use jiff::Timestamp;
 
 use super::jobs::panic_text;
-use super::model::{Entry, EntryKey, Review};
+use super::model::{Entry, EntryKey, FileNote, Pane, Question, Review};
+use super::progress::Job;
 use super::runner::{self, Runner};
 use super::update::{self, Action, Effect, Input, Task};
 use crate::group;
+use crate::list::Filter;
 use crate::player::{self, PlayState, PlayerCommand, PlayerError};
 use crate::store::{self, Selector, State, Store};
 
 /// What a UI hears, in order ([`Session::next_event`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // each is made once and moved to the UI: a box adds only noise
 pub enum Event {
     /// What the UI shows changed. `rows` is `None` when the list did not, but never in the
     /// first event.
@@ -53,14 +56,15 @@ pub struct Splice {
     pub inserted: Vec<EntryView>,
 }
 
-/// What a UI shows beside the list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a UI shows beside the list. Sent whole, with any change to it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Summary {
     /// What the view is called ([`crate::store::Run::shown_name`]).
     pub title: String,
     /// An index into the rows the UI holds; `None` when it holds none.
     pub selected: Option<usize>,
-    /// The status line ([`Review::status_text`]).
+    /// Review's message ([`Review::status`]): the question and the job are fields of their own,
+    /// which a UI words.
     pub status: Option<String>,
     /// Findings pending, accepted and rejected ([`Review::counts`]): the whole view's, whatever
     /// the filter shows.
@@ -69,10 +73,30 @@ pub struct Summary {
     pub rejected: usize,
     /// Whether a job runs ([`crate::review::progress::Progress::busy`]).
     pub busy: bool,
+    /// The findings the list shows.
+    pub filter: Filter,
+    /// Which list the UI shows.
+    pub pane: Pane,
+    /// The edit under way: none once it ends, or when what it edits has gone.
+    pub edit: Option<Editing>,
+    /// The open question ([`Review::question`]).
+    pub question: Option<Question>,
+    /// The job under way, or the last to end ([`Job`]), its files by the list's names for them.
+    pub job: Option<Job>,
+}
+
+/// An edit under way, for a UI's editor ([`Review::editing`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Editing {
+    /// The entry it was opened on, which `Reword` decides.
+    pub entry: EntryKey,
+    /// The wording to start from ([`Review::edit_wording`]).
+    pub wording: String,
 }
 
 /// One line of the list, as a UI shows it: a row, or a member of an expanded row.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // each says a thing of its own that a UI shows
 pub struct EntryView {
     /// What names it to [`Action::Select`].
     pub key: EntryKey,
@@ -97,25 +121,38 @@ pub struct EntryView {
     pub track: String,
     /// A timing finding's fix in short ([`Review::fix_summary`]).
     pub fix: Option<String>,
+    /// A scan is checking its file again ([`Review::checking_among`]): any shown member's, for
+    /// a row.
+    pub checking: bool,
+    /// How its file differs from when it was scanned: of a row's first shown member, as `label`.
+    pub note: Option<FileNote>,
+    /// Its shown members' decisions differ ([`Review::shown_state`]): never a member's.
+    pub mixed: bool,
 }
 
 /// The list as `m` shows it now.
 fn entry_views(m: &Review) -> Vec<EntryView> {
-    m.entries().into_iter().map(|e| entry_view(m, e)).collect()
+    let checked = m.progress.checked();
+    m.entries()
+        .into_iter()
+        .map(|e| entry_view(m, e, &checked))
+        .collect()
 }
 
-fn entry_view(m: &Review, e: Entry) -> EntryView {
+/// Entry `e` as a UI shows it, given the files a scan is checking (`Progress::checked`).
+fn entry_view(m: &Review, e: Entry, checked: &HashSet<&str>) -> EntryView {
     let shown = m.targets(e);
     let first = shown[0];
     let f = m.finding(first);
-    let (is_member, expanded, total, mark) = match e {
+    let (is_member, expanded, total, mark, mixed) = match e {
         // As `entries` has it: an expanded row that a re-check left with one member shows none.
         Entry::Row(r) => {
             let total = m.rows[r].members.len();
             let expanded = total > 1 && m.expanded.contains(&r);
-            (false, expanded, total, m.row_mark(r))
+            let mixed = m.shown_state(r).is_none();
+            (false, expanded, total, m.row_mark(r), mixed)
         }
-        Entry::Member(_, i) => (true, false, 1, m.mark(i).map(str::to_string)),
+        Entry::Member(_, i) => (true, false, 1, m.mark(i).map(str::to_string), false),
     };
     EntryView {
         key: m.entry_key(e),
@@ -132,6 +169,9 @@ fn entry_view(m: &Review, e: Entry) -> EntryView {
         mark,
         track: m.track_name(first).to_string(),
         fix: f.timing.is_some().then(|| m.fix_summary(&shown)),
+        checking: m.checking_among(e, checked),
+        note: m.notes.get(&f.file).copied(),
+        mixed,
     }
 }
 
@@ -141,11 +181,21 @@ fn summary(m: &Review, rows: usize) -> Summary {
     Summary {
         title: m.run.shown_name(),
         selected: (m.selected < rows).then_some(m.selected),
-        status: m.status_text(),
+        status: m.status.clone(),
         pending,
         accepted,
         rejected,
         busy: m.progress.busy(),
+        filter: m.filter,
+        pane: m.pane,
+        edit: m.editing.as_ref().and_then(|edit| {
+            Some(Editing {
+                entry: edit.entry.clone(),
+                wording: m.edit_wording()?.to_string(),
+            })
+        }),
+        question: m.question(),
+        job: m.progress.job(&|p| m.label(p)),
     }
 }
 
@@ -230,6 +280,7 @@ impl From<Input> for Msg {
 }
 
 /// What the event channel carries: an event, or [`Session::close`]'s end marker.
+#[allow(clippy::large_enum_variant)] // as `Event`, which it carries
 enum Item {
     Event(Event),
     End,
@@ -628,11 +679,12 @@ mod tests {
 
     use rustix::process::{Resource, Rlimit, setrlimit};
 
+    use crate::apply;
     use crate::list::Filter;
     use crate::player::{How, Moment, Playback};
+    use crate::review::model::Row;
     use crate::review::model::tests_support::{self, finding, many, sample, with_timing};
-    use crate::review::model::{Pane, Row};
-    use crate::review::progress::Scan;
+    use crate::review::progress::{ApplyAt, Scan};
     use crate::review::update::tests_support::{FIXED, TYPO, decide_as, now, saved, taken};
     use crate::scan;
     use crate::store::{
@@ -675,6 +727,11 @@ mod tests {
                 accepted: 0,
                 rejected: 0,
                 busy: false,
+                filter: Filter::All,
+                pane: Pane::Findings,
+                edit: None,
+                question: None,
+                job: None,
             }
         );
     }
@@ -924,6 +981,112 @@ mod tests {
         let views = entry_views(&m);
         assert_eq!(views.len(), 1, "as `entries` has it");
         assert!(!views[0].expanded);
+    }
+
+    #[test]
+    fn a_views_file_being_checked_again_its_note_and_its_members_differing_are_data() {
+        let mut m = sample();
+        m.expanded.insert(0);
+        m.notes.insert(tests_support::path(1), FileNote::Missing);
+        m.notes.insert(tests_support::path(3), FileNote::Changed);
+        decide_as(&mut m, &[1], State::Accepted, None);
+        // E02 read again: the lyric's row, which shows it, its member E02, and E02's snacks row.
+        m.progress
+            .scan_event(&scan::Event::Queued(vec![tests_support::path(2).into()]));
+        m.progress
+            .scan_event(&scan::Event::Reading(tests_support::path(2).into()));
+        let views = entry_views(&m);
+        let what = |v: &EntryView| (v.label.clone(), v.checking, v.note, v.mixed);
+        assert_eq!(
+            views.iter().map(what).collect::<Vec<_>>(),
+            [
+                ("E01".into(), true, Some(FileNote::Missing), true),
+                ("E01".into(), false, Some(FileNote::Missing), false),
+                ("E02".into(), true, None, false),
+                ("E03".into(), false, Some(FileNote::Changed), false),
+                ("E02".into(), true, None, false),
+            ]
+        );
+        // Still to do, as a member is pending, though its decided member differs.
+        assert_eq!(views[0].state, Some(State::Pending));
+        // Shown alone, E01 is the row: not being checked, and one decision.
+        m.filter = Filter::Only(State::Accepted);
+        let row = &entry_views(&m)[0];
+        assert_eq!((row.checking, row.mixed), (false, false));
+    }
+
+    #[test]
+    fn the_summary_says_the_filter_the_pane_the_edit_and_the_question_as_each_changes() {
+        let mut m = sample();
+        let mut sent = told(&m);
+        act(&mut m, Action::SetFilter(Filter::Only(State::Pending)));
+        assert_eq!(
+            changed(&mut sent, &m).1.filter,
+            Filter::Only(State::Pending)
+        );
+        act(&mut m, Action::SetFilter(Filter::All));
+        changed(&mut sent, &m);
+        act(&mut m, Action::ShowPane(Pane::Files));
+        assert_eq!(changed(&mut sent, &m).1.pane, Pane::Files);
+        act(&mut m, Action::ShowPane(Pane::Findings));
+        changed(&mut sent, &m);
+        // An edit starts from the wording its findings have: the user's, here.
+        decide_as(&mut m, &[1, 2, 4], State::Accepted, Some("My own."));
+        changed(&mut sent, &m);
+        act(&mut m, Action::Edit);
+        assert_eq!(
+            changed(&mut sent, &m).1.edit,
+            Some(Editing {
+                entry: EntryKey::Row(vec![1, 2, 4]),
+                wording: "My own.".into(),
+            })
+        );
+        act(&mut m, Action::CancelEdit);
+        assert_eq!(changed(&mut sent, &m).1.edit, None);
+        act(&mut m, Action::Apply { dry_run: false });
+        assert_eq!(
+            changed(&mut sent, &m).1.question,
+            Some(Question::Apply {
+                fixes: 3,
+                files: 3,
+                applied: 0,
+            })
+        );
+        act(&mut m, Action::Answer(false));
+        assert_eq!(changed(&mut sent, &m).1.question, None);
+        assert_eq!(sent.change(&m), None, "nothing since");
+    }
+
+    // The status line's words for a job are the terminal's: the summary leaves them out, and
+    // carries the job as data, as it runs and once it has ended.
+    #[test]
+    fn the_summary_carries_the_job_and_its_status_is_reviews_message_alone() {
+        let mut m = sample();
+        let mut sent = told(&m);
+        decide_as(&mut m, &[3], State::Accepted, None);
+        changed(&mut sent, &m);
+        act(&mut m, Action::Apply { dry_run: true });
+        let summary = changed(&mut sent, &m).1;
+        assert_eq!(m.status_text().as_deref(), Some("dry run 0/0"));
+        assert_eq!(summary.status, None);
+        assert_eq!(
+            summary.job,
+            Some(Job::Applying {
+                dry_run: true,
+                done: 0,
+                queued: 0,
+                at: ApplyAt::Starting,
+                so_far: apply::Summary::default(),
+            })
+        );
+        update::update(&mut m, Input::ApplyEnded(Err("no threads".into())), now());
+        assert_eq!(
+            changed(&mut sent, &m).1.job,
+            Some(Job::Applied {
+                dry_run: true,
+                ended: Err("no threads".into()),
+            })
+        );
     }
 
     /// How long a test waits for what should come at once: a session that hangs fails its test,
@@ -1439,6 +1602,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // every action, a scan's inputs, then a file read back
     fn every_splice_applied_to_a_copy_of_the_rows_makes_the_real_list() {
         let dir = tempfile::tempdir().unwrap();
         let (store, name) = seeded(dir.path());
@@ -1519,6 +1683,27 @@ mod tests {
         ] {
             go(&mut review, &mut sent, Input::Action(action), &mut copy);
         }
+        // A scan of E02 and E03: the rows of their findings turn as it checks them, the lyric's
+        // still for E03 once E02 is done, and none once the scan has failed with E03 left queued.
+        let turning = |copy: &[EntryView]| copy.iter().filter(|v| v.checking).count();
+        let queued = scan::Event::Queued(vec![
+            tests_support::path(2).into(),
+            tests_support::path(3).into(),
+        ]);
+        go(&mut review, &mut sent, Input::Scan(queued), &mut copy);
+        let all = turning(&copy);
+        assert!(all > 1, "{copy:?}");
+        let done = scan::Event::Finished {
+            path: tests_support::path(2).into(),
+            error: None,
+            findings: 0,
+            lines: vec![],
+        };
+        go(&mut review, &mut sent, Input::Scan(done), &mut copy);
+        assert!((1..all).contains(&turning(&copy)), "{copy:?}");
+        let failed = Input::ScanEnded(Err("the store is locked".into()));
+        go(&mut review, &mut sent, failed, &mut copy);
+        assert_eq!(turning(&copy), 0, "{copy:?}");
         // E02 checked again, on another connection as a scan's thread has: the lyric back, the
         // snacks line gone, a new line early on. The rows are made again from the store.
         let mut scans = Store::open_at(&db).unwrap();

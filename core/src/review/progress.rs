@@ -2,6 +2,7 @@
 //! counts. Pure: `update` feeds it the jobs' events. Opened on a run with no scan (`review`), it
 //! holds the run's files as recorded.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::apply::{self, patch::Outcome};
@@ -111,6 +112,65 @@ pub enum Checking {
     Asking {
         answered: usize,
         chunks: usize,
+    },
+}
+
+impl Checking {
+    /// Where a file at `stage` is, while a scan runs; `None` for one not under it.
+    fn of(stage: &Stage) -> Option<Checking> {
+        match *stage {
+            Stage::Queued => Some(Checking::Queued),
+            Stage::Reading => Some(Checking::Reading),
+            Stage::Asking { answered, chunks } => Some(Checking::Asking { answered, chunks }),
+            _ => None,
+        }
+    }
+}
+
+/// A file a scan is reading, or asking the LLM about, by the name the list gives it, and where the
+/// scan is with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnderWay {
+    pub file: String,
+    pub stage: Checking,
+}
+
+/// The job under way, or the last to end, as a UI shows it ([`Progress::job`]): what the status
+/// line says of it, kept until the next job starts, or the view changes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Job {
+    /// A scan running into run `run`; `adding` when it adds to that run, as a re-check does. Of the
+    /// files it checks, those done, and of those the ones that failed; the findings it found; the
+    /// files it is on; and what its LLM calls have used.
+    Scanning {
+        run: String,
+        adding: bool,
+        done: usize,
+        queued: usize,
+        failed: usize,
+        findings: usize,
+        under_way: Vec<UnderWay>,
+        spent: Spent,
+    },
+    /// The last scan, ended: what it came to, or why it failed.
+    Scanned {
+        run: String,
+        adding: bool,
+        ended: Result<scan::Summary, String>,
+    },
+    /// Apply running, or with `dry_run` a dry run: the files done of those with fixes, where it is,
+    /// and what the files done came to.
+    Applying {
+        dry_run: bool,
+        done: usize,
+        queued: usize,
+        at: ApplyAt,
+        so_far: apply::Summary,
+    },
+    /// The last apply or dry run, ended: what it came to, or why it failed as a whole.
+    Applied {
+        dry_run: bool,
+        ended: Result<apply::Summary, String>,
     },
 }
 
@@ -788,14 +848,86 @@ impl Progress {
     /// While the scan runs, where it is with `path`. `None` once the scan has ended, even if it
     /// left the file queued or being read, and for a file it is not checking or is done with.
     pub fn checking(&self, path: &str) -> Option<Checking> {
+        self.under_scan(self.files.iter().find(|f| f.path == path)?)
+    }
+
+    /// The paths of the files the scan is checking while it runs, as [`Progress::checking`] says
+    /// of each: for a caller that asks of many files, which would each be looked for in turn.
+    pub fn checked(&self) -> HashSet<&str> {
+        self.files
+            .iter()
+            .filter(|f| self.under_scan(f).is_some())
+            .map(|f| f.path.as_str())
+            .collect()
+    }
+
+    /// Where the scan is with `file`, while it runs: the one rule of [`Progress::checking`] and
+    /// [`Progress::checked`]. A scan that ended, as one that failed, can leave files queued that
+    /// it will never check.
+    fn under_scan(&self, file: &FileProgress) -> Option<Checking> {
         if !self.running() {
             return None;
         }
-        match &self.files.iter().find(|f| f.path == path)?.stage {
-            Stage::Queued => Some(Checking::Queued),
-            Stage::Reading => Some(Checking::Reading),
-            &Stage::Asking { answered, chunks } => Some(Checking::Asking { answered, chunks }),
-            _ => None,
+        Checking::of(&file.stage)
+    }
+
+    /// The job the status line speaks of ([`Progress::line`]), as data: the latest to start, as it
+    /// runs or as it ended; `None` before the first since this view was shown. Files by `label`'s
+    /// name for them.
+    pub fn job(&self, label: &dyn Fn(&str) -> String) -> Option<Job> {
+        if let Some(a) = self.latest_apply() {
+            return Some(match &a.ended {
+                None => Job::Applying {
+                    dry_run: a.dry_run,
+                    done: a.done,
+                    queued: a.queued,
+                    at: self.whereabouts(label),
+                    so_far: a.so_far(),
+                },
+                Some(ended) => Job::Applied {
+                    dry_run: a.dry_run,
+                    ended: ended.clone(),
+                },
+            });
+        }
+        match &self.scan {
+            Scan::None => None,
+            Scan::Running => Some(Job::Scanning {
+                run: self.run.clone(),
+                adding: self.adding,
+                done: self.done,
+                queued: self.queued,
+                failed: self.failed,
+                findings: self.findings,
+                // A queued file is not under way yet.
+                under_way: self
+                    .files
+                    .iter()
+                    .filter_map(|f| match Checking::of(&f.stage)? {
+                        Checking::Queued => None,
+                        stage => Some(UnderWay {
+                            file: label(&f.path),
+                            stage,
+                        }),
+                    })
+                    .collect(),
+                spent: self.spent.clone(),
+            }),
+            Scan::Ended(ended) => Some(Job::Scanned {
+                run: self.run.clone(),
+                adding: self.adding,
+                ended: ended.clone(),
+            }),
+        }
+    }
+
+    /// The screen's apply when the status line speaks of it: started after the last scan, and no
+    /// scan running.
+    fn latest_apply(&self) -> Option<&Applying> {
+        if self.apply_latest && !self.running() {
+            self.apply.as_ref()
+        } else {
+            None
         }
     }
 
@@ -842,11 +974,7 @@ impl Progress {
     /// it failed. `None` with no scan. Once apply has started (and no scan since), apply's instead
     /// (see `Applying::line`).
     pub fn line(&self) -> Option<String> {
-        // Apply's, when it started after the last scan and no scan runs.
-        if self.apply_latest
-            && !self.running()
-            && let Some(a) = &self.apply
-        {
+        if let Some(a) = self.latest_apply() {
             return Some(a.line());
         }
         match &self.scan {
@@ -1309,8 +1437,10 @@ mod tests {
         let mut p = Progress::of_run(&Run::default());
         p.scan_event(&Event::Queued(vec!["/m/E01.mkv".into()]));
         assert_eq!(p.checking("/m/E01.mkv"), Some(Checking::Queued));
+        assert_eq!(p.checked(), HashSet::from(["/m/E01.mkv"]));
         p.scan = Scan::Ended(Err("disk full".into()));
         assert_eq!(p.checking("/m/E01.mkv"), None);
+        assert!(p.checked().is_empty(), "{:?}", p.checked());
     }
 
     #[test]
@@ -1471,6 +1601,126 @@ mod tests {
         path.trim_start_matches("/m/")
             .trim_end_matches(".mkv")
             .into()
+    }
+
+    // The job the status line speaks of, as data: a scan with the files it is on, then how it
+    // ended; apply started after it, where it is and what its files came to, then how it ended; and
+    // a scan started after that, which the line speaks of again.
+    #[test]
+    #[allow(clippy::too_many_lines)] // a scan, its end, apply and its end, in turn
+    fn the_job_is_the_one_the_status_line_speaks_of_as_data() {
+        let mut p = Progress::of_run(&Run::default());
+        assert_eq!(p.job(&short), None);
+        p.start("r", "subcheck scan --run r /m".into(), true);
+        p.scan_event(&Event::Queued(
+            ["/m/E01.mkv", "/m/E02.mkv", "/m/E03.mkv", "/m/E04.mkv"]
+                .map(PathBuf::from)
+                .to_vec(),
+        ));
+        p.scan_event(&Event::Reading("/m/E01.mkv".into()));
+        p.scan_event(&Event::Asking {
+            path: "/m/E02.mkv".into(),
+            answered: 1,
+            chunks: 3,
+        });
+        p.scan_event(&Event::Finished {
+            path: "/m/E03.mkv".into(),
+            error: Some("no subtitle track".into()),
+            findings: 0,
+            lines: vec![],
+        });
+        let usage = crate::llm::Usage {
+            input_tokens: 1000,
+            output_tokens: 10,
+            cost_usd: Some(3.21),
+            ..crate::llm::Usage::default()
+        };
+        p.scan_event(&Event::Appended(vec![Record::Usage(LlmCall {
+            file: "/m/E02.mkv".into(),
+            lines: 4,
+            usage: Some(usage),
+        })]));
+        let spent = p.spent.clone();
+        assert_eq!(spent.calls, 1);
+        // E04 is queued, not under way; E03 is done.
+        assert_eq!(
+            p.job(&short),
+            Some(Job::Scanning {
+                run: "r".into(),
+                adding: true,
+                done: 1,
+                queued: 4,
+                failed: 1,
+                findings: 0,
+                under_way: vec![
+                    UnderWay {
+                        file: "E01".into(),
+                        stage: Checking::Reading,
+                    },
+                    UnderWay {
+                        file: "E02".into(),
+                        stage: Checking::Asking {
+                            answered: 1,
+                            chunks: 3,
+                        },
+                    },
+                ],
+                spent,
+            })
+        );
+        p.scan = Scan::Ended(Err("the store is locked".into()));
+        assert_eq!(
+            p.job(&short),
+            Some(Job::Scanned {
+                run: "r".into(),
+                adding: true,
+                ended: Err("the store is locked".into()),
+            })
+        );
+        p.start_apply(true, "subcheck apply r --dry-run".into());
+        p.apply_event(&apply::Event::Queued(vec![
+            "/m/E01.mkv".into(),
+            "/m/E02.mkv".into(),
+        ]));
+        p.apply_event(&done("/m/E01.mkv", vec![(1, Outcome::Patched)], false));
+        p.apply_event(&apply::Event::Stage(
+            "/m/E02.mkv".into(),
+            apply::Stage::Check,
+        ));
+        assert_eq!(
+            p.job(&short),
+            Some(Job::Applying {
+                dry_run: true,
+                done: 1,
+                queued: 2,
+                at: ApplyAt::On {
+                    file: "E02".into(),
+                    stage: apply::Stage::Check,
+                },
+                so_far: Summary {
+                    fixed: 1,
+                    ..Summary::default()
+                },
+            })
+        );
+        let ended = Summary {
+            fixed: 1,
+            by_hand: 2,
+            ..Summary::default()
+        };
+        p.apply_ended(Ok(ended));
+        assert_eq!(
+            p.job(&short),
+            Some(Job::Applied {
+                dry_run: true,
+                ended: Ok(ended),
+            })
+        );
+        p.start("r", "subcheck scan --run r /m".into(), false);
+        assert!(matches!(
+            p.job(&short),
+            Some(Job::Scanning { adding: false, .. })
+        ));
     }
 
     #[test]

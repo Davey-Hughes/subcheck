@@ -133,11 +133,9 @@ if(APPLE)
     list(APPEND TEST_MPV_ENV "CFFIXED_USER_HOME=${TEST_HOME}")
 endif()
 
-# The smoke's run, made by the real `subcheck scan` with core's fake LLM over a copy of a fixture,
-# in a store of the build directory's own: a session given neither variable finds the user's. The
-# smoke decides a finding in it, so a test that counts on the run as seeded needs a run of its own:
-# CTest seeds a fixture once per run of the tests, and a RESOURCE_LOCK would keep two tests from
-# sharing the store at once, not the smoke's decision from being there when the other starts.
+# A run made by the real `subcheck scan` with core's fake LLM over a copy of a fixture, in a store
+# of the build directory's own: a session given neither variable finds the user's. A test that
+# decides findings needs a run of its own: CTest seeds a fixture once per run of the tests.
 set(SEEDED "${CMAKE_BINARY_DIR}/seeded")
 add_test(NAME seed_a_run
     COMMAND "${CMAKE_COMMAND}" -D "SUBCHECK=$<TARGET_FILE:subcheck>" -D "REPO_ROOT=${REPO_ROOT}"
@@ -146,12 +144,20 @@ set_tests_properties(seed_a_run PROPERTIES
     FIXTURES_SETUP seeded_run TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 set(SEEDED_ENV "SUBCHECK_DB=${SEEDED}/subcheck.db" "XDG_STATE_HOME=${SEEDED}/state")
 
+# The smoke decides findings and checks a file again, so its run is seeded at each of its starts,
+# in a directory of its own (tests/seeded.cmake): two copies of typos.mkv, so that a row has two
+# members whose decisions can differ.
+set(dir "${CMAKE_BINARY_DIR}/seeded-bindings_smoke")
 add_executable(bindings_smoke tests/bindings_smoke.cpp)
 target_link_libraries(bindings_smoke PRIVATE subcheck_bindings)
 subcheck_warnings(bindings_smoke)
-add_test(NAME bindings_smoke COMMAND bindings_smoke "${SEEDED}/media")
+add_test(NAME bindings_smoke
+    COMMAND "${CMAKE_COMMAND}" -D "SUBCHECK=$<TARGET_FILE:subcheck>" -D "REPO_ROOT=${REPO_ROOT}"
+            -D "DIR=${dir}" -D COPIES=2 -D "TEST=$<TARGET_FILE:bindings_smoke>"
+            -D "ARGS=${dir}/media" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/seeded.cmake")
 set_tests_properties(bindings_smoke PROPERTIES
-    FIXTURES_REQUIRED seeded_run ENVIRONMENT "${SEEDED_ENV}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+    ENVIRONMENT "SUBCHECK_DB=${dir}/subcheck.db;XDG_STATE_HOME=${dir}/state"
+    TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 
 # The list's model, on the splices it is given, with no session. Offscreen, as every Qt test here
 # is, so that none opens a window on the desktop of whoever runs them.
@@ -195,11 +201,42 @@ endfunction()
 subcheck_window_test(session_bridge_test)
 subcheck_window_test(window_test)
 
+# The bridge during a job, where review's end ends the process's groups, after which no session
+# opens in the process: each test function in a process of its own, on a run seeded at its start
+# (tests/seeded.cmake), whose file the test makes a FIFO. Built with the build directory, as the
+# only place it takes that run from.
+qt_add_executable(session_bridge_job_test tests/session_bridge_job_test.cpp)
+target_compile_definitions(session_bridge_job_test PRIVATE
+    "SUBCHECK_BUILD_DIR=\"${CMAKE_BINARY_DIR}\"")
+target_link_libraries(session_bridge_job_test PRIVATE subcheck_window Qt6::Test)
+subcheck_warnings(session_bridge_job_test)
+foreach(function IN ITEMS quittingDuringADryRunStopsItAndSaysHowToFinishIt
+                          aFailureDuringADryRunStillSaysHowToFinishIt
+                          aGiveUpDuringADryRunStillSaysHowToFinishIt
+                          aBridgeLetGoOfDuringADryRunStillSaysHowToFinishIt)
+    set(dir "${CMAKE_BINARY_DIR}/seeded-${function}")
+    add_test(NAME session_bridge_job_test.${function}
+        COMMAND "${CMAKE_COMMAND}" -D "SUBCHECK=$<TARGET_FILE:subcheck>" -D "REPO_ROOT=${REPO_ROOT}"
+                -D "DIR=${dir}" -D "TEST=$<TARGET_FILE:session_bridge_job_test>"
+                -D "ARGS=${function}" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/seeded.cmake")
+    set(env "SUBCHECK_DB=${dir}/subcheck.db" "XDG_STATE_HOME=${dir}/state"
+        "SUBCHECK_TEST_MEDIA=${dir}/media" QT_QPA_PLATFORM=offscreen)
+    set_tests_properties(session_bridge_job_test.${function} PROPERTIES
+        ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+endforeach()
+
 # The app itself: one binary, and wired as main.cpp means it to be.
 add_test(NAME one_binary
     COMMAND "${CMAKE_COMMAND}" -D "APP=$<TARGET_FILE:subcheck-qt>"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/one_binary.cmake")
 set_tests_properties(one_binary PROPERTIES TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+# main.cpp calls the library's finish(), which main must as it returns (main.cpp says why):
+# subcheck-qt's objects need subcheck_ffi::finish() from the library. Deleting the call fails
+# this; moving it elsewhere in main.cpp does not.
+add_test(NAME app_calls_finish
+    COMMAND "${CMAKE_COMMAND}" -D "OBJECTS=$<TARGET_OBJECTS:subcheck-qt>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/calls_finish.cmake")
+set_tests_properties(app_calls_finish PROPERTIES TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 add_test(NAME app_starts
     COMMAND "${CMAKE_COMMAND}" -D "APP=$<TARGET_FILE:subcheck-qt>"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/app_starts.cmake")

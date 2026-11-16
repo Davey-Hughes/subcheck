@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -50,6 +51,22 @@ struct Opened {
 
     explicit Opened(std::vector<std::string> selector)
         : bridge(std::move(selector), player, out, err, std::chrono::seconds(1)) {}
+};
+
+// A bridge whose session's close throws, as a Rust panic in close would, before closing it: the
+// test closes it later, so that the pump, let go of, reads an end only once the bridge has let go.
+class ThrowingClose : public SessionBridge {
+public:
+    using SessionBridge::SessionBridge;
+
+    // The session the throwing close was given, which the pump still holds.
+    Session *unclosed = nullptr;
+
+protected:
+    void closeSession(Session &session) override {
+        unclosed = &session;
+        throw std::runtime_error("close panicked");
+    }
 };
 
 } // namespace
@@ -227,8 +244,8 @@ private slots:
         QCOMPARE(o.out.str(), "clean: 0 accepted, 0 rejected, 0 pending\n");
     }
 
-    // The window starts no job, so a real end has no outro: this one is made up, to show where
-    // it goes.
+    // Made up, to show where each part goes: an end that stops a job, whose outro says how to
+    // finish it, ends the process's groups, so session_bridge_job_test has its own.
     void anEndsOutroGoesToStderrAndTheCountsToStdout() {
         Opened o({media()});
         QSignalSpy finished(&o.bridge, &SessionBridge::finished);
@@ -386,6 +403,53 @@ private slots:
         QCOMPARE(mpv.last(), "stop");
         emit o.player.reported(PlayerReport(PlayerReport::kClosed{std::nullopt}));
         QCOMPARE(o.err.str(), "");
+    }
+
+    // A quit under a question, here `Recheck`'s: review ends at once, as no job runs, where a
+    // `Quit` would only let the question go and the window would wait out the give-up.
+    void quittingUnderAQuestionEndsReviewAtOnce() {
+        Opened o({media()});
+        QSignalSpy finished(&o.bridge, &SessionBridge::finished);
+        bool asked = false;
+        connect(&o.bridge, &SessionBridge::eventArrived, &o.bridge, [&asked](const Event &e) {
+            if (const auto *change = std::get_if<Event::kChanged>(&e.get_variant())) {
+                asked = change->summary.question.has_value();
+            }
+        });
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        o.bridge.send(Action(Action::kShowPane{Pane::kFiles}));
+        o.bridge.send(Action(Action::kSelectFile{media() + "/typos - E01.mkv"}));
+        o.bridge.send(Action(Action::kRecheck{}));
+        QTRY_VERIFY(asked);
+        o.bridge.quit();
+        QTRY_COMPARE(finished.count(), 1);
+        QCOMPARE(finished[0][0].toInt(), 0);
+        QCOMPARE(o.out.str(), "media: 0 accepted, 0 rejected, 4 pending\n");
+        QCOMPARE(o.err.str(), "");
+    }
+
+    // A close that throws: the pump is let go of, not joined, and what it reads after, close's
+    // end here, reaches nothing of the bridge, which could be gone by then.
+    void whatThePumpReadsAfterACloseThatThrewReachesNothing() {
+        std::ostringstream out;
+        std::ostringstream err;
+        PlayerPort player{std::chrono::milliseconds(100)};
+        ThrowingClose bridge({media()}, player, out, err, std::chrono::seconds(1));
+        QSignalSpy fatal(&bridge, &SessionBridge::fatalChanged);
+        bridge.start();
+        QTRY_COMPARE(bridge.findings()->rowCount(), 2);
+        QSignalSpy arrived(&bridge, &SessionBridge::eventArrived);
+        // Out of step: review is let go of, as a failure lets it go.
+        emit bridge.eventArrived(Event(Event::kChanged{Splice{3, 1, {}}, Summary{}}));
+        QTRY_COMPARE(fatal.count(), 1);
+        QCOMPARE(bridge.fatal(), "the list is out of step with review");
+        // The stream ended now: given the time its end takes to come, it does not, and the made-up
+        // change is all that arrived.
+        QVERIFY(bridge.unclosed);
+        bridge.unclosed->close();
+        QTest::qWait(500);
+        QCOMPARE(arrived.count(), 1);
     }
 
     void aSpliceThatDoesNotFitIsAFatalEnd() {

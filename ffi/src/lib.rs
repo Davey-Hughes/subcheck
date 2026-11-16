@@ -4,14 +4,13 @@
 //! Core has no UniFFI dependency, so each type that crosses has a mirror here. Each conversion
 //! names every variant and field of what it reads, and builds every field of what it makes, so a
 //! field added on either side, or a variant added to the side a conversion reads, fails the build
-//! here until it is handled. A core action with no mirror cannot be sent: [`Action`] is what the
-//! window offers.
+//! here until it is handled. Actions convert both ways, so that an action added to core fails the
+//! build here too: every one of them crosses.
 
 use std::sync::Arc;
 
-use subcheck_core::player;
-use subcheck_core::review::{model, session, update};
-use subcheck_core::{group, store};
+use subcheck_core::review::{model, progress, session, update};
+use subcheck_core::{apply, group, list, llm, player, scan, store};
 
 uniffi::setup_scaffolding!();
 
@@ -29,10 +28,11 @@ pub struct Session(session::Session);
 impl Session {
     /// Open the view `selector` names (`[run | paths…]`, as `subcheck review` takes it). Returns at
     /// once: what goes wrong opening it is the first event, an `Ended`, and actions sent before
-    /// then wait their turn. Apply is not offered, so karaoke's re-spacing is off.
+    /// then wait their turn. `karaoke`: its apply re-spaces per-letter karaoke, as
+    /// `apply --karaoke` does.
     #[uniffi::constructor]
-    pub fn open(selector: Vec<String>) -> Arc<Session> {
-        Arc::new(Session(session::Session::open(selector, false)))
+    pub fn open(selector: Vec<String>, karaoke: bool) -> Arc<Session> {
+        Arc::new(Session(session::Session::open(selector, karaoke)))
     }
 
     /// Queue `action` and return. After the end it goes nowhere.
@@ -90,7 +90,23 @@ pub enum State {
     Rejected,
 }
 
-/// What a playback key asks of the player ([`player::Playback`]).
+/// The findings the list shows ([`list::Filter`]): all, or those of one decision.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filter {
+    All,
+    Pending,
+    Accepted,
+    Rejected,
+}
+
+/// Which list a UI shows ([`model::Pane`]): the findings, or the run's files.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Findings,
+    Files,
+}
+
+/// What a `Playback` action asks of the player ([`player::Playback`]).
 #[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Playback {
     /// Pause, or resume.
@@ -150,6 +166,7 @@ pub enum PlayerCommand {
 /// One line of the list ([`session::EntryView`]), as a UI shows it: a row, or a member of an
 /// expanded row.
 #[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // as core's, each says a thing of its own
 pub struct EntryView {
     /// What names it to `Action::Select`.
     pub key: EntryKey,
@@ -175,6 +192,20 @@ pub struct EntryView {
     pub track: String,
     /// A timing finding's fix in short; none for others.
     pub fix: Option<String>,
+    /// A scan is checking its file again: any shown member's, for a row.
+    pub checking: bool,
+    /// How its file differs from when it was scanned: of a row's first shown member, as `label`.
+    pub note: Option<FileNote>,
+    /// Its shown members' decisions differ, which its `state` does not say of a row with one
+    /// pending: never a member's.
+    pub mixed: bool,
+}
+
+/// How a file differs from when it was scanned ([`model::FileNote`]).
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileNote {
+    Changed,
+    Missing,
 }
 
 /// A change to the rows the UI holds ([`session::Splice`]): the `removed` rows at `at` give
@@ -186,14 +217,14 @@ pub struct Splice {
     pub inserted: Vec<EntryView>,
 }
 
-/// What a UI shows beside the list ([`session::Summary`]).
-#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+/// What a UI shows beside the list ([`session::Summary`]), sent whole with any change to it.
+#[derive(uniffi::Record, Debug, Clone, PartialEq)]
 pub struct Summary {
     /// What the view is called.
     pub title: String,
     /// An index into the rows the UI holds; none when it holds none.
     pub selected: Option<u64>,
-    /// The status line; none when review has nothing to say there.
+    /// Review's message, none when it has none; the question and the job are words the UI makes.
     pub status: Option<String>,
     /// Findings pending, accepted and rejected: the whole view's, whatever the filter shows.
     pub pending: u64,
@@ -201,10 +232,190 @@ pub struct Summary {
     pub rejected: u64,
     /// Whether a job runs.
     pub busy: bool,
+    pub filter: Filter,
+    pub pane: Pane,
+    /// The edit under way; none once it ends, or when what it edits has gone.
+    pub edit: Option<Editing>,
+    /// The open question, which `Answer` answers.
+    pub question: Option<Question>,
+    /// The job under way, or the last to end, kept until the next starts, or the view changes.
+    pub job: Option<Job>,
+}
+
+/// An edit under way ([`session::Editing`]).
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct Editing {
+    /// The entry it was opened on, which `Reword` decides.
+    pub entry: EntryKey,
+    /// The wording to start from: the user's, else the suggestion.
+    pub wording: String,
+}
+
+/// The open question as data, for a UI to word ([`model::Question`]): what a yes does, with what
+/// its words need. Files by the names the list gives them.
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum Question {
+    /// Quit, stopping the job under way.
+    Quit { stopping: Stopping },
+    /// Check file `label` again, with `backend`, the LLM its run was scanned with.
+    Recheck { label: String, backend: String },
+    /// Apply the view's accepted fixes: `fixes` of them, in `files` files, `applied` of them in
+    /// their files already.
+    Apply {
+        fixes: u64,
+        files: u64,
+        applied: u64,
+    },
+}
+
+/// The job a quit would stop, and how far it is ([`progress::Stopping`]).
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum Stopping {
+    /// The scan: the files done of those it checks, and the files `Recheck` queued for after it,
+    /// which quitting leaves unchecked.
+    Scan { done: u64, queued: u64, again: u64 },
+    /// Apply, or with `dry_run` a dry run: the files done of those with fixes, and where it is.
+    Apply {
+        dry_run: bool,
+        done: u64,
+        queued: u64,
+        at: ApplyAt,
+    },
+}
+
+/// Where apply is ([`progress::ApplyAt`]), a file by the name the list gives it.
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum ApplyAt {
+    /// A file at a stage.
+    On { file: String, stage: ApplyStage },
+    /// No file at a stage: the next it goes to.
+    Before { file: String },
+    /// Past its last file.
+    Finishing,
+    /// It has not said its files yet.
+    Starting,
+}
+
+/// Where apply is with a file ([`apply::Stage`]).
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyStage {
+    /// Reading its tracks and finding each fix's events.
+    Plan,
+    /// Writing the fixed tracks and remuxing with mkvmerge.
+    Remux,
+    /// Checking the remux against the original.
+    Check,
+    /// Putting the remux in the original's place.
+    Swap,
+}
+
+/// Where a scan is with a file it checks ([`progress::Checking`]).
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checking {
+    Queued,
+    Reading,
+    /// Read; `answered` of the `chunks` its lines need have come back from the LLM.
+    Asking {
+        answered: u64,
+        chunks: u64,
+    },
+}
+
+/// A file a scan is on, by the name the list gives it ([`progress::UnderWay`]).
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct UnderWay {
+    pub file: String,
+    pub stage: Checking,
+}
+
+/// What a scan's LLM calls used ([`llm::Spent`]).
+#[derive(uniffi::Record, Debug, Clone, PartialEq)]
+pub struct Spent {
+    pub calls: u64,
+    /// Of them, those whose backend said nothing of what they used: the sums leave them out.
+    pub unreported: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// The calls that reported a price, and its sum in US dollars, at the provider's API rates.
+    pub priced: u64,
+    pub cost_usd: f64,
+}
+
+/// What a scan came to ([`scan::Summary`]).
+#[derive(uniffi::Record, Debug, Clone, PartialEq)]
+pub struct ScanSummary {
+    pub run: String,
+    pub files: u64,
+    pub checked: u64,
+    pub failed: u64,
+    /// Files unchanged since an earlier scan, so not checked again.
+    pub cached: u64,
+    pub findings: u64,
+    /// Of the findings, those of the timing check.
+    pub timing: u64,
+    pub spent: Spent,
+    /// The paths the scan was given, absolute.
+    pub paths: Vec<String>,
+}
+
+/// What apply came to ([`apply::Summary`]): fixes made (by a dry run, to make), in their files
+/// already, left for a fix by hand, and not found; files remuxed, and files it failed on.
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplySummary {
+    pub fixed: u64,
+    pub already: u64,
+    pub by_hand: u64,
+    pub not_found: u64,
+    pub remuxed: u64,
+    pub failed: u64,
+}
+
+/// The job under way, or the last to end ([`progress::Job`]), kept until the next starts, or the
+/// view changes.
+#[derive(uniffi::Enum, Debug, Clone, PartialEq)]
+pub enum Job {
+    /// A scan running into run `run`; `adding` when it adds to that run, as a re-check does. Of
+    /// the files it checks, those done, and of those the ones that failed; the findings it found;
+    /// the files it is reading or asking the LLM about; and what its LLM calls have used.
+    Scanning {
+        run: String,
+        adding: bool,
+        done: u64,
+        queued: u64,
+        failed: u64,
+        findings: u64,
+        under_way: Vec<UnderWay>,
+        spent: Spent,
+    },
+    /// The last scan, done: its run is its summary's.
+    ScanDone { adding: bool, summary: ScanSummary },
+    /// The last scan, failed, and why.
+    ScanFailed {
+        run: String,
+        adding: bool,
+        error: String,
+    },
+    /// Apply running, or with `dry_run` a dry run: the files done of those with fixes, where it
+    /// is, and what the files done came to.
+    Applying {
+        dry_run: bool,
+        done: u64,
+        queued: u64,
+        at: ApplyAt,
+        so_far: ApplySummary,
+    },
+    /// The last apply or dry run, done.
+    ApplyDone {
+        dry_run: bool,
+        summary: ApplySummary,
+    },
+    /// The last apply or dry run, failed as a whole, and why.
+    ApplyFailed { dry_run: bool, error: String },
 }
 
 /// What a UI hears, in order, from `Session::next_event` ([`session::Event`]).
-#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+#[derive(uniffi::Enum, Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // as core's, each is made once and moved across
 pub enum Event {
     /// What the UI shows changed. `rows` is none when the list did not, but never in the first
     /// event, which is a splice from an empty list even for a run with no findings.
@@ -222,9 +433,14 @@ pub enum Event {
     },
 }
 
-/// What the window asks of review ([`update::Action`]): the actions it offers, and no others.
+/// What a UI asks of review ([`update::Action`]): each of core's actions. While a question is
+/// open, every action but `Answer` and `Interrupt` lets it go and does nothing else.
 #[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    /// Quit; while a job runs, ask first (the summary's `question`).
+    Quit,
+    /// As `Quit`, asking first while a job runs; but a second, with the question open, quits.
+    Interrupt,
     /// Select the entry this key names. A member of a collapsed row selects its row; a key whose
     /// entry the list does not show leaves the selection where it is, and the status line says so.
     Select {
@@ -238,22 +454,64 @@ pub enum Action {
     },
     /// Expand the selected row into its members, or collapse it (from the row or a member).
     Toggle,
+    /// Show the findings under this filter, the selection kept on its finding's row.
+    SetFilter {
+        filter: Filter,
+    },
+    /// Select the first entry of the next file in the list, or of the file before.
+    NextFile,
+    PreviousFile,
     Accept,
     Reject,
+    /// Put the selected entry's decided findings back to pending.
+    Clear,
     Undo,
+    /// Start rewording the selected entry: the summary's `edit` gives the wording to start from.
+    Edit,
+    /// Accept the edit's findings with this wording.
+    Reword {
+        wording: String,
+    },
+    CancelEdit,
+    ShowPane {
+        pane: Pane,
+    },
+    /// Open the other view of the findings: from a run's, the run's folders; from a paths view,
+    /// the newest run that named the selected file. Not while a job runs.
+    SwitchView,
+    /// Open the view these words select (`[run | paths…]`, as `Session::open` takes them) in place
+    /// of the one shown. Should it fail, the view stays, and the status line says why. Not while a
+    /// job runs.
+    OpenView {
+        selector: Vec<String>,
+    },
+    /// Apply the view's accepted fixes, once asked; with `dry_run`, at once, saying what would
+    /// change and writing nothing.
+    Apply {
+        dry_run: bool,
+    },
     /// Open the selected entry's moment in the player.
     Play,
     ClosePlayer,
     Playback {
         playback: Playback,
     },
-    /// Quit. No action here starts a job, so review never asks first.
-    Quit,
-    /// Open the view these words select (`[run | paths…]`, as `Session::open` takes them) in place
-    /// of the one shown. Should it fail, the view stays, and the status line says why.
-    OpenView {
-        selector: Vec<String>,
+    /// Answer the open question: yes, or let it go.
+    Answer {
+        yes: bool,
     },
+    /// Select the file at this path in the files list. A path the list does not have leaves the
+    /// selection where it is, and the status line says so.
+    SelectFile {
+        path: String,
+    },
+    /// The findings, on the first entry with one of the selected file's.
+    ShowFileFindings,
+    /// Check the selected file again, once asked.
+    Recheck,
+    /// Only lets the status message go: what a UI sends for a key, button or click with no action
+    /// of its own.
+    Dismiss,
 }
 
 /// One of mpv's options for the one file a load opens ([`player::FileOption`]), as `--name=value`
@@ -338,6 +596,46 @@ impl From<store::State> for State {
             store::State::Pending => State::Pending,
             store::State::Accepted => State::Accepted,
             store::State::Rejected => State::Rejected,
+        }
+    }
+}
+
+impl From<list::Filter> for Filter {
+    fn from(filter: list::Filter) -> Filter {
+        match filter {
+            list::Filter::All => Filter::All,
+            list::Filter::Only(store::State::Pending) => Filter::Pending,
+            list::Filter::Only(store::State::Accepted) => Filter::Accepted,
+            list::Filter::Only(store::State::Rejected) => Filter::Rejected,
+        }
+    }
+}
+
+impl From<Filter> for list::Filter {
+    fn from(filter: Filter) -> list::Filter {
+        match filter {
+            Filter::All => list::Filter::All,
+            Filter::Pending => list::Filter::Only(store::State::Pending),
+            Filter::Accepted => list::Filter::Only(store::State::Accepted),
+            Filter::Rejected => list::Filter::Only(store::State::Rejected),
+        }
+    }
+}
+
+impl From<model::Pane> for Pane {
+    fn from(pane: model::Pane) -> Pane {
+        match pane {
+            model::Pane::Findings => Pane::Findings,
+            model::Pane::Files => Pane::Files,
+        }
+    }
+}
+
+impl From<Pane> for model::Pane {
+    fn from(pane: Pane) -> model::Pane {
+        match pane {
+            Pane::Findings => model::Pane::Findings,
+            Pane::Files => model::Pane::Files,
         }
     }
 }
@@ -437,6 +735,9 @@ impl From<session::EntryView> for EntryView {
             mark,
             track,
             fix,
+            checking,
+            note,
+            mixed,
         } = view;
         EntryView {
             key: key.into(),
@@ -453,6 +754,18 @@ impl From<session::EntryView> for EntryView {
             mark,
             track,
             fix,
+            checking,
+            note: note.map(FileNote::from),
+            mixed,
+        }
+    }
+}
+
+impl From<model::FileNote> for FileNote {
+    fn from(note: model::FileNote) -> FileNote {
+        match note {
+            model::FileNote::Changed => FileNote::Changed,
+            model::FileNote::Missing => FileNote::Missing,
         }
     }
 }
@@ -482,6 +795,11 @@ impl From<session::Summary> for Summary {
             accepted,
             rejected,
             busy,
+            filter,
+            pane,
+            edit,
+            question,
+            job,
         } = summary;
         Summary {
             title,
@@ -491,6 +809,252 @@ impl From<session::Summary> for Summary {
             accepted: wide(accepted),
             rejected: wide(rejected),
             busy,
+            filter: filter.into(),
+            pane: pane.into(),
+            edit: edit.map(Editing::from),
+            question: question.map(Question::from),
+            job: job.map(Job::from),
+        }
+    }
+}
+
+impl From<session::Editing> for Editing {
+    fn from(edit: session::Editing) -> Editing {
+        let session::Editing { entry, wording } = edit;
+        Editing {
+            entry: entry.into(),
+            wording,
+        }
+    }
+}
+
+impl From<model::Question> for Question {
+    fn from(question: model::Question) -> Question {
+        match question {
+            model::Question::Quit(stopping) => Question::Quit {
+                stopping: stopping.into(),
+            },
+            model::Question::Recheck { label, backend } => Question::Recheck { label, backend },
+            model::Question::Apply {
+                fixes,
+                files,
+                applied,
+            } => Question::Apply {
+                fixes: wide(fixes),
+                files: wide(files),
+                applied: wide(applied),
+            },
+        }
+    }
+}
+
+impl From<progress::Stopping> for Stopping {
+    fn from(stopping: progress::Stopping) -> Stopping {
+        match stopping {
+            progress::Stopping::Scan {
+                done,
+                queued,
+                again,
+            } => Stopping::Scan {
+                done: wide(done),
+                queued: wide(queued),
+                again: wide(again),
+            },
+            progress::Stopping::Apply {
+                dry_run,
+                done,
+                queued,
+                at,
+            } => Stopping::Apply {
+                dry_run,
+                done: wide(done),
+                queued: wide(queued),
+                at: at.into(),
+            },
+        }
+    }
+}
+
+impl From<progress::ApplyAt> for ApplyAt {
+    fn from(at: progress::ApplyAt) -> ApplyAt {
+        match at {
+            progress::ApplyAt::On { file, stage } => ApplyAt::On {
+                file,
+                stage: stage.into(),
+            },
+            progress::ApplyAt::Before { file } => ApplyAt::Before { file },
+            progress::ApplyAt::Finishing => ApplyAt::Finishing,
+            progress::ApplyAt::Starting => ApplyAt::Starting,
+        }
+    }
+}
+
+impl From<apply::Stage> for ApplyStage {
+    fn from(stage: apply::Stage) -> ApplyStage {
+        match stage {
+            apply::Stage::Plan => ApplyStage::Plan,
+            apply::Stage::Remux => ApplyStage::Remux,
+            apply::Stage::Check => ApplyStage::Check,
+            apply::Stage::Swap => ApplyStage::Swap,
+        }
+    }
+}
+
+impl From<progress::Checking> for Checking {
+    fn from(checking: progress::Checking) -> Checking {
+        match checking {
+            progress::Checking::Queued => Checking::Queued,
+            progress::Checking::Reading => Checking::Reading,
+            progress::Checking::Asking { answered, chunks } => Checking::Asking {
+                answered: wide(answered),
+                chunks: wide(chunks),
+            },
+        }
+    }
+}
+
+impl From<progress::UnderWay> for UnderWay {
+    fn from(under_way: progress::UnderWay) -> UnderWay {
+        let progress::UnderWay { file, stage } = under_way;
+        UnderWay {
+            file,
+            stage: stage.into(),
+        }
+    }
+}
+
+impl From<llm::Spent> for Spent {
+    fn from(spent: llm::Spent) -> Spent {
+        let llm::Spent {
+            calls,
+            unreported,
+            input_tokens,
+            output_tokens,
+            priced,
+            cost_usd,
+        } = spent;
+        Spent {
+            calls: wide(calls),
+            unreported: wide(unreported),
+            input_tokens,
+            output_tokens,
+            priced: wide(priced),
+            cost_usd,
+        }
+    }
+}
+
+impl From<scan::Summary> for ScanSummary {
+    fn from(summary: scan::Summary) -> ScanSummary {
+        let scan::Summary {
+            run,
+            files,
+            checked,
+            failed,
+            cached,
+            findings,
+            timing,
+            spent,
+            paths,
+        } = summary;
+        ScanSummary {
+            run,
+            files: wide(files),
+            checked: wide(checked),
+            failed: wide(failed),
+            cached: wide(cached),
+            findings: wide(findings),
+            timing: wide(timing),
+            spent: spent.into(),
+            paths: paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+        }
+    }
+}
+
+impl From<apply::Summary> for ApplySummary {
+    fn from(summary: apply::Summary) -> ApplySummary {
+        let apply::Summary {
+            fixed,
+            already,
+            by_hand,
+            not_found,
+            remuxed,
+            failed,
+        } = summary;
+        ApplySummary {
+            fixed: wide(fixed),
+            already: wide(already),
+            by_hand: wide(by_hand),
+            not_found: wide(not_found),
+            remuxed: wide(remuxed),
+            failed: wide(failed),
+        }
+    }
+}
+
+impl From<progress::Job> for Job {
+    fn from(job: progress::Job) -> Job {
+        match job {
+            progress::Job::Scanning {
+                run,
+                adding,
+                done,
+                queued,
+                failed,
+                findings,
+                under_way,
+                spent,
+            } => Job::Scanning {
+                run,
+                adding,
+                done: wide(done),
+                queued: wide(queued),
+                failed: wide(failed),
+                findings: wide(findings),
+                under_way: under_way.into_iter().map(UnderWay::from).collect(),
+                spent: spent.into(),
+            },
+            // The run is named again in the summary, which a scan that ended keeps.
+            progress::Job::Scanned {
+                run: _,
+                adding,
+                ended: Ok(summary),
+            } => Job::ScanDone {
+                adding,
+                summary: summary.into(),
+            },
+            progress::Job::Scanned {
+                run,
+                adding,
+                ended: Err(error),
+            } => Job::ScanFailed { run, adding, error },
+            progress::Job::Applying {
+                dry_run,
+                done,
+                queued,
+                at,
+                so_far,
+            } => Job::Applying {
+                dry_run,
+                done: wide(done),
+                queued: wide(queued),
+                at: at.into(),
+                so_far: so_far.into(),
+            },
+            progress::Job::Applied {
+                dry_run,
+                ended: Ok(summary),
+            } => Job::ApplyDone {
+                dry_run,
+                summary: summary.into(),
+            },
+            progress::Job::Applied {
+                dry_run,
+                ended: Err(error),
+            } => Job::ApplyFailed { dry_run, error },
         }
     }
 }
@@ -511,17 +1075,73 @@ impl From<session::Event> for Event {
 impl From<Action> for update::Action {
     fn from(action: Action) -> update::Action {
         match action {
+            Action::Quit => update::Action::Quit,
+            Action::Interrupt => update::Action::Interrupt,
             Action::Select { key } => update::Action::Select(key.into()),
             Action::Move { by } => update::Action::Move(by),
             Action::Toggle => update::Action::Toggle,
+            Action::SetFilter { filter } => update::Action::SetFilter(filter.into()),
+            Action::NextFile => update::Action::NextFile,
+            Action::PreviousFile => update::Action::PreviousFile,
             Action::Accept => update::Action::Accept,
             Action::Reject => update::Action::Reject,
+            Action::Clear => update::Action::Clear,
             Action::Undo => update::Action::Undo,
+            Action::Edit => update::Action::Edit,
+            Action::Reword { wording } => update::Action::Reword(wording),
+            Action::CancelEdit => update::Action::CancelEdit,
+            Action::ShowPane { pane } => update::Action::ShowPane(pane.into()),
+            Action::SwitchView => update::Action::SwitchView,
+            Action::OpenView { selector } => update::Action::OpenView(selector),
+            Action::Apply { dry_run } => update::Action::Apply { dry_run },
             Action::Play => update::Action::Play,
             Action::ClosePlayer => update::Action::ClosePlayer,
             Action::Playback { playback } => update::Action::Playback(playback.into()),
-            Action::Quit => update::Action::Quit,
-            Action::OpenView { selector } => update::Action::OpenView(selector),
+            Action::Answer { yes } => update::Action::Answer(yes),
+            Action::SelectFile { path } => update::Action::SelectFile(path),
+            Action::ShowFileFindings => update::Action::ShowFileFindings,
+            Action::Recheck => update::Action::Recheck,
+            Action::Dismiss => update::Action::Dismiss,
+        }
+    }
+}
+
+/// The other way, which nothing sends: it names every core action, so that one added to core
+/// fails the build here until it crosses.
+impl From<update::Action> for Action {
+    fn from(action: update::Action) -> Action {
+        match action {
+            update::Action::Quit => Action::Quit,
+            update::Action::Interrupt => Action::Interrupt,
+            update::Action::Select(key) => Action::Select { key: key.into() },
+            update::Action::Move(by) => Action::Move { by },
+            update::Action::Toggle => Action::Toggle,
+            update::Action::SetFilter(filter) => Action::SetFilter {
+                filter: filter.into(),
+            },
+            update::Action::NextFile => Action::NextFile,
+            update::Action::PreviousFile => Action::PreviousFile,
+            update::Action::Accept => Action::Accept,
+            update::Action::Reject => Action::Reject,
+            update::Action::Clear => Action::Clear,
+            update::Action::Undo => Action::Undo,
+            update::Action::Edit => Action::Edit,
+            update::Action::Reword(wording) => Action::Reword { wording },
+            update::Action::CancelEdit => Action::CancelEdit,
+            update::Action::ShowPane(pane) => Action::ShowPane { pane: pane.into() },
+            update::Action::SwitchView => Action::SwitchView,
+            update::Action::OpenView(selector) => Action::OpenView { selector },
+            update::Action::Apply { dry_run } => Action::Apply { dry_run },
+            update::Action::Play => Action::Play,
+            update::Action::ClosePlayer => Action::ClosePlayer,
+            update::Action::Playback(playback) => Action::Playback {
+                playback: playback.into(),
+            },
+            update::Action::Answer(yes) => Action::Answer { yes },
+            update::Action::SelectFile(path) => Action::SelectFile { path },
+            update::Action::ShowFileFindings => Action::ShowFileFindings,
+            update::Action::Recheck => Action::Recheck,
+            update::Action::Dismiss => Action::Dismiss,
         }
     }
 }
@@ -587,6 +1207,9 @@ mod tests {
             mark: Some("would rewrite".into()),
             track: "English Full".into(),
             fix: None,
+            checking: true,
+            note: Some(model::FileNote::Missing),
+            mixed: false,
         }
     }
 
@@ -606,6 +1229,32 @@ mod tests {
             mark: Some("would rewrite".into()),
             track: "English Full".into(),
             fix: None,
+            checking: true,
+            note: Some(FileNote::Missing),
+            mixed: false,
+        }
+    }
+
+    /// What a scan's LLM calls used, each count its own.
+    fn core_spent() -> llm::Spent {
+        llm::Spent {
+            calls: 7,
+            unreported: 1,
+            input_tokens: 9000,
+            output_tokens: 300,
+            priced: 6,
+            cost_usd: 0.84,
+        }
+    }
+
+    fn spent() -> Spent {
+        Spent {
+            calls: 7,
+            unreported: 1,
+            input_tokens: 9000,
+            output_tokens: 300,
+            priced: 6,
+            cost_usd: 0.84,
         }
     }
 
@@ -625,6 +1274,32 @@ mod tests {
                 accepted: 2,
                 rejected: 3,
                 busy: true,
+                filter: list::Filter::Only(store::State::Accepted),
+                pane: model::Pane::Files,
+                edit: Some(session::Editing {
+                    entry: model::EntryKey::Member(9),
+                    wording: "My own, 字幕.".into(),
+                }),
+                question: Some(model::Question::Recheck {
+                    label: "E02".into(),
+                    backend: "claude".into(),
+                }),
+                job: Some(progress::Job::Scanning {
+                    run: "r".into(),
+                    adding: true,
+                    done: 4,
+                    queued: 24,
+                    failed: 1,
+                    findings: 31,
+                    under_way: vec![progress::UnderWay {
+                        file: "E05".into(),
+                        stage: progress::Checking::Asking {
+                            answered: 2,
+                            chunks: 3,
+                        },
+                    }],
+                    spent: core_spent(),
+                }),
             },
         };
         let expected = Event::Changed {
@@ -641,9 +1316,232 @@ mod tests {
                 accepted: 2,
                 rejected: 3,
                 busy: true,
+                filter: Filter::Accepted,
+                pane: Pane::Files,
+                edit: Some(Editing {
+                    entry: EntryKey::Member(9),
+                    wording: "My own, 字幕.".into(),
+                }),
+                question: Some(Question::Recheck {
+                    label: "E02".into(),
+                    backend: "claude".into(),
+                }),
+                job: Some(Job::Scanning {
+                    run: "r".into(),
+                    adding: true,
+                    done: 4,
+                    queued: 24,
+                    failed: 1,
+                    findings: 31,
+                    under_way: vec![UnderWay {
+                        file: "E05".into(),
+                        stage: Checking::Asking {
+                            answered: 2,
+                            chunks: 3,
+                        },
+                    }],
+                    spent: spent(),
+                }),
             },
         };
         assert_eq!(Event::from(event), expected);
+    }
+
+    #[test]
+    fn each_question_and_where_apply_is_cross() {
+        let at = |stage| progress::ApplyAt::On {
+            file: "E02".into(),
+            stage,
+        };
+        let crossed = |stage| ApplyAt::On {
+            file: "E02".into(),
+            stage,
+        };
+        let stopping = |at| {
+            model::Question::Quit(progress::Stopping::Apply {
+                dry_run: true,
+                done: 1,
+                queued: 2,
+                at,
+            })
+        };
+        let stops = |at| Question::Quit {
+            stopping: Stopping::Apply {
+                dry_run: true,
+                done: 1,
+                queued: 2,
+                at,
+            },
+        };
+        for (core, ffi) in [
+            (
+                model::Question::Quit(progress::Stopping::Scan {
+                    done: 3,
+                    queued: 9,
+                    again: 2,
+                }),
+                Question::Quit {
+                    stopping: Stopping::Scan {
+                        done: 3,
+                        queued: 9,
+                        again: 2,
+                    },
+                },
+            ),
+            (
+                stopping(at(apply::Stage::Plan)),
+                stops(crossed(ApplyStage::Plan)),
+            ),
+            (
+                stopping(at(apply::Stage::Remux)),
+                stops(crossed(ApplyStage::Remux)),
+            ),
+            (
+                stopping(at(apply::Stage::Check)),
+                stops(crossed(ApplyStage::Check)),
+            ),
+            (
+                stopping(at(apply::Stage::Swap)),
+                stops(crossed(ApplyStage::Swap)),
+            ),
+            (
+                stopping(progress::ApplyAt::Before { file: "E03".into() }),
+                stops(ApplyAt::Before { file: "E03".into() }),
+            ),
+            (
+                stopping(progress::ApplyAt::Finishing),
+                stops(ApplyAt::Finishing),
+            ),
+            (
+                stopping(progress::ApplyAt::Starting),
+                stops(ApplyAt::Starting),
+            ),
+            (
+                model::Question::Apply {
+                    fixes: 14,
+                    files: 11,
+                    applied: 3,
+                },
+                Question::Apply {
+                    fixes: 14,
+                    files: 11,
+                    applied: 3,
+                },
+            ),
+        ] {
+            assert_eq!(Question::from(core), ffi);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // each way a job ends, and the job under way, in turn
+    fn each_job_crosses() {
+        let so_far = apply::Summary {
+            fixed: 1,
+            already: 2,
+            by_hand: 3,
+            not_found: 4,
+            remuxed: 5,
+            failed: 6,
+        };
+        let crossed = ApplySummary {
+            fixed: 1,
+            already: 2,
+            by_hand: 3,
+            not_found: 4,
+            remuxed: 5,
+            failed: 6,
+        };
+        let summary = scan::Summary {
+            run: "r".into(),
+            files: 12,
+            checked: 10,
+            failed: 1,
+            cached: 2,
+            findings: 31,
+            timing: 4,
+            spent: core_spent(),
+            paths: vec!["/m/K-On!".into(), "/m/E01 字幕.mkv".into()],
+        };
+        for (core, ffi) in [
+            (
+                progress::Job::Scanned {
+                    run: "r".into(),
+                    adding: false,
+                    ended: Ok(summary),
+                },
+                Job::ScanDone {
+                    adding: false,
+                    summary: ScanSummary {
+                        run: "r".into(),
+                        files: 12,
+                        checked: 10,
+                        failed: 1,
+                        cached: 2,
+                        findings: 31,
+                        timing: 4,
+                        spent: spent(),
+                        paths: vec!["/m/K-On!".into(), "/m/E01 字幕.mkv".into()],
+                    },
+                },
+            ),
+            (
+                progress::Job::Scanned {
+                    run: "r".into(),
+                    adding: true,
+                    ended: Err("the store is locked".into()),
+                },
+                Job::ScanFailed {
+                    run: "r".into(),
+                    adding: true,
+                    error: "the store is locked".into(),
+                },
+            ),
+            (
+                progress::Job::Applying {
+                    dry_run: false,
+                    done: 3,
+                    queued: 9,
+                    at: progress::ApplyAt::Before { file: "E04".into() },
+                    so_far,
+                },
+                Job::Applying {
+                    dry_run: false,
+                    done: 3,
+                    queued: 9,
+                    at: ApplyAt::Before { file: "E04".into() },
+                    so_far: crossed,
+                },
+            ),
+            (
+                progress::Job::Applied {
+                    dry_run: true,
+                    ended: Ok(so_far),
+                },
+                Job::ApplyDone {
+                    dry_run: true,
+                    summary: crossed,
+                },
+            ),
+            (
+                progress::Job::Applied {
+                    dry_run: false,
+                    ended: Err("mkvmerge not found".into()),
+                },
+                Job::ApplyFailed {
+                    dry_run: false,
+                    error: "mkvmerge not found".into(),
+                },
+            ),
+        ] {
+            assert_eq!(Job::from(core), ffi);
+        }
+        for (core, ffi) in [
+            (progress::Checking::Queued, Checking::Queued),
+            (progress::Checking::Reading, Checking::Reading),
+        ] {
+            assert_eq!(Checking::from(core), ffi);
+        }
     }
 
     #[test]
@@ -663,6 +1561,11 @@ mod tests {
                 accepted: 0,
                 rejected: 0,
                 busy: false,
+                filter: list::Filter::All,
+                pane: model::Pane::Findings,
+                edit: None,
+                question: None,
+                job: None,
             },
         };
         let Event::Changed { rows, summary } = Event::from(event) else {
@@ -670,10 +1573,25 @@ mod tests {
         };
         assert_eq!(rows, None);
         assert_eq!((summary.selected, summary.status), (None, None));
+        assert_eq!(
+            (summary.filter, summary.pane),
+            (Filter::All, Pane::Findings)
+        );
+        assert_eq!(
+            (summary.edit, summary.question, summary.job),
+            (None, None, None)
+        );
+        core.checking = false;
+        core.note = Some(model::FileNote::Changed);
+        core.mixed = true;
         let crossed = EntryView::from(core);
         assert_eq!(crossed.key, EntryKey::Member(4));
         assert_eq!((crossed.state, crossed.mark), (None, None));
         assert_eq!(crossed.fix, Some(String::new()));
+        assert_eq!(
+            (crossed.checking, crossed.note, crossed.mixed),
+            (false, Some(FileNote::Changed), true)
+        );
     }
 
     #[test]
@@ -784,9 +1702,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn each_action_the_window_offers_is_cores() {
-        let cases = [
+    /// Each of core's actions, with a value of its own where it carries one, and its mirror.
+    fn every_action() -> Vec<(Action, update::Action)> {
+        vec![
+            (Action::Quit, update::Action::Quit),
+            (Action::Interrupt, update::Action::Interrupt),
             (
                 Action::Select {
                     key: EntryKey::Member(7),
@@ -795,9 +1715,41 @@ mod tests {
             ),
             (Action::Move { by: -3 }, update::Action::Move(-3)),
             (Action::Toggle, update::Action::Toggle),
+            (
+                Action::SetFilter {
+                    filter: Filter::Rejected,
+                },
+                update::Action::SetFilter(list::Filter::Only(store::State::Rejected)),
+            ),
+            (Action::NextFile, update::Action::NextFile),
+            (Action::PreviousFile, update::Action::PreviousFile),
             (Action::Accept, update::Action::Accept),
             (Action::Reject, update::Action::Reject),
+            (Action::Clear, update::Action::Clear),
             (Action::Undo, update::Action::Undo),
+            (Action::Edit, update::Action::Edit),
+            (
+                Action::Reword {
+                    wording: "Fixed, 字幕.".into(),
+                },
+                update::Action::Reword("Fixed, 字幕.".into()),
+            ),
+            (Action::CancelEdit, update::Action::CancelEdit),
+            (
+                Action::ShowPane { pane: Pane::Files },
+                update::Action::ShowPane(model::Pane::Files),
+            ),
+            (Action::SwitchView, update::Action::SwitchView),
+            (
+                Action::OpenView {
+                    selector: vec!["r".into(), "/m/E01.mkv".into()],
+                },
+                update::Action::OpenView(vec!["r".into(), "/m/E01.mkv".into()]),
+            ),
+            (
+                Action::Apply { dry_run: true },
+                update::Action::Apply { dry_run: true },
+            ),
             (Action::Play, update::Action::Play),
             (Action::ClosePlayer, update::Action::ClosePlayer),
             (
@@ -806,16 +1758,56 @@ mod tests {
                 },
                 update::Action::Playback(player::Playback::Seek(5)),
             ),
-            (Action::Quit, update::Action::Quit),
+            (Action::Answer { yes: true }, update::Action::Answer(true)),
             (
-                Action::OpenView {
-                    selector: vec!["r".into(), "/m/E01.mkv".into()],
+                Action::SelectFile {
+                    path: "/m/E02.mkv".into(),
                 },
-                update::Action::OpenView(vec!["r".into(), "/m/E01.mkv".into()]),
+                update::Action::SelectFile("/m/E02.mkv".into()),
             ),
-        ];
+            (Action::ShowFileFindings, update::Action::ShowFileFindings),
+            (Action::Recheck, update::Action::Recheck),
+            (Action::Dismiss, update::Action::Dismiss),
+        ]
+    }
+
+    #[test]
+    fn every_action_crosses_both_ways() {
+        let cases = every_action();
+        assert_eq!(cases.len(), 27, "core's actions");
         for (ffi, core) in cases {
-            assert_eq!(update::Action::from(ffi), core);
+            assert_eq!(update::Action::from(ffi.clone()), core);
+            assert_eq!(Action::from(core), ffi);
+        }
+        // The other value of each action that takes a flag or a pane.
+        for (ffi, core) in [
+            (
+                Action::Apply { dry_run: false },
+                update::Action::Apply { dry_run: false },
+            ),
+            (Action::Answer { yes: false }, update::Action::Answer(false)),
+            (
+                Action::ShowPane {
+                    pane: Pane::Findings,
+                },
+                update::Action::ShowPane(model::Pane::Findings),
+            ),
+        ] {
+            assert_eq!(update::Action::from(ffi.clone()), core);
+            assert_eq!(Action::from(core), ffi);
+        }
+    }
+
+    #[test]
+    fn each_filter_crosses_both_ways() {
+        for (ffi, core) in [
+            (Filter::All, list::Filter::All),
+            (Filter::Pending, list::Filter::Only(store::State::Pending)),
+            (Filter::Accepted, list::Filter::Only(store::State::Accepted)),
+            (Filter::Rejected, list::Filter::Only(store::State::Rejected)),
+        ] {
+            assert_eq!(list::Filter::from(ffi), core);
+            assert_eq!(Filter::from(core), ffi);
         }
     }
 
@@ -910,11 +1902,42 @@ mod tests {
     /// How long the child may take: a session that hangs fails the test, and does not hang the run.
     const LIMIT: Duration = Duration::from_secs(30);
 
+    /// One of review's sample paths, which are absolute, under `dir` instead of the root.
+    fn under(dir: &Path, path: &str) -> String {
+        dir.join(path.trim_start_matches('/'))
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// A database in `dir` holding review's sample run (four findings in two rows, the first of
-    /// three members), and the run's name.
+    /// three members, in files under `dir` not on disk) and a fifth finding, accepted, in a FIFO
+    /// under `dir` that nothing writes to, where a dry run waits for good; and the run's name.
+    /// Review's rows are ordered by their files' paths (`review::model::group`), so these paths
+    /// alone fix the rows' order: the FIFO's folder sorts before the sample's (`m`), and its row
+    /// is first wherever `dir` is.
     fn seeded(dir: &Path) -> String {
+        let held = dir.join("fifo");
+        std::fs::create_dir(&held).unwrap();
+        let fifo = held.join("stalled.mkv");
+        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+        let stalled = fifo.to_string_lossy().into_owned();
+        let mut sample = tests_support::run();
+        for file in &mut sample.files {
+            file.path = under(dir, &file.path);
+        }
+        for finding in &mut sample.findings {
+            finding.file = under(dir, &finding.file);
+        }
+        sample.files.push(store::FileRecord {
+            path: stalled.clone(),
+            ..tests_support::file(4)
+        });
+        sample.findings.push(store::Finding {
+            file: stalled,
+            ..tests_support::finding(5, 4, "A line no one reads.", "A line nobody reads.", 1000)
+        });
         let mut store = Store::open_at(&dir.join("subcheck.db")).unwrap();
-        let sample = tests_support::run();
         let paths: Vec<PathBuf> = sample
             .files
             .iter()
@@ -952,86 +1975,279 @@ mod tests {
             };
             store.save(&attempt, vec![made]).unwrap();
         }
+        let accepted = store::Decision {
+            finding: 5,
+            state: store::State::Accepted,
+            edited: None,
+            at: jiff::Timestamp::UNIX_EPOCH,
+        };
+        store.decide(&[accepted]).unwrap();
         scan.name
+    }
+
+    /// What a UI keeps of a session: the rows, each splice applied to them as it comes, the last
+    /// summary, and the player commands it was given.
+    #[derive(Default)]
+    struct Ui {
+        rows: Vec<EntryView>,
+        summary: Option<Summary>,
+        played: Vec<PlayerCommand>,
+    }
+
+    impl Ui {
+        /// Take events until `done` holds, after `what`; none may be the end.
+        fn until(&mut self, s: &Session, what: &str, done: impl Fn(&Ui) -> bool) {
+            let deadline = Instant::now() + LIMIT;
+            while !done(self) {
+                assert!(Instant::now() < deadline, "never came, after {what}");
+                match s.next_event() {
+                    Some(Event::Changed { rows, summary }) => {
+                        if let Some(Splice {
+                            at,
+                            removed,
+                            inserted,
+                        }) = rows
+                        {
+                            let at = usize::try_from(at).unwrap();
+                            let end = at + usize::try_from(removed).unwrap();
+                            self.rows.splice(at..end, inserted);
+                        }
+                        self.summary = Some(summary);
+                    }
+                    Some(Event::Player(command)) => self.played.push(command),
+                    other => panic!("after {what}: {other:?}"),
+                }
+            }
+        }
+
+        fn summary(&self) -> &Summary {
+            self.summary.as_ref().unwrap()
+        }
+
+        /// The selected entry, as the rows held say it.
+        fn selected(&self) -> &EntryView {
+            &self.rows[usize::try_from(self.summary().selected.unwrap()).unwrap()]
+        }
     }
 
     /// Run by `a_session_crosses_and_comes_back`. `Session::open` finds the store through the
     /// environment, which `Command::env` sets for the child alone: set in the test process, it
-    /// would reach every test running beside this one.
+    /// would reach every test running beside this one. Every action crosses, each with what it
+    /// changes, and each splice is applied to the rows held, as a UI applies them.
     #[test]
     #[ignore = "the child of the round trip"]
+    #[allow(clippy::too_many_lines)] // every action in turn, each with what it changes
     fn child_that_opens_a_session() {
         let Some(dir) = std::env::var_os("SUBCHECK_FFI_TEST_DIR") else {
             return;
         };
         let name = std::env::var("SUBCHECK_FFI_TEST_RUN").unwrap();
-        let s = Session::open(vec![name.clone()]);
-        let next = || s.next_event().expect("the stream ended before its end");
-        let change = || match next() {
-            Event::Changed { rows, summary } => (rows, summary),
-            other => panic!("not a change: {other:?}"),
+        // A second session in one process, which `Session`'s doc rules out, is safe here: it stops
+        // no job, so it ends no groups. What was queued before `close` may still come out, then
+        // `close`'s end, with nothing to say of a job, and then nothing. First, as the session
+        // below stops one.
+        let closed = Session::open(vec![name.clone()], false);
+        closed.close();
+        let mut last = None;
+        while let Some(event) = closed.next_event() {
+            last = Some(event);
+        }
+        let quiet = Event::Ended {
+            fatal: None,
+            outro: vec![],
         };
-        let (rows, summary) = change();
-        let rows = rows.unwrap();
-        assert_eq!((rows.at, rows.removed, rows.inserted.len()), (0, 0, 2));
-        assert_eq!(rows.inserted[0].key, EntryKey::Row(vec![1, 2, 4]));
-        assert_eq!(summary.title, format!("run {name}"));
-        assert_eq!((summary.selected, summary.pending), (Some(0), 4));
+        assert_eq!(last, Some(quiet));
+        assert_eq!(closed.next_event(), None);
+
+        let s = Session::open(vec![name.clone()], true);
+        let mut ui = Ui::default();
+        ui.until(&s, "opening", |ui| ui.summary.is_some());
+        let keys: Vec<EntryKey> = ui.rows.iter().map(|v| v.key.clone()).collect();
+        assert_eq!(
+            keys,
+            [
+                EntryKey::Row(vec![5]),
+                EntryKey::Row(vec![1, 2, 4]),
+                EntryKey::Row(vec![3])
+            ]
+        );
+        assert_eq!(ui.summary().title, format!("run {name}"));
+        assert_eq!((ui.summary().selected, ui.summary().pending), (Some(1), 4));
+        // The FIFO is on disk, but not as it was scanned; the sample's files are not.
+        assert_eq!(ui.rows[0].note, Some(FileNote::Changed));
+        assert_eq!(ui.rows[1].note, Some(FileNote::Missing));
+
         s.send(Action::Toggle);
-        let rows = change().0.unwrap();
-        assert_eq!((rows.at, rows.removed, rows.inserted.len()), (0, 1, 4));
+        ui.until(&s, "Toggle", |ui| ui.rows.len() == 6);
+        s.send(Action::Move { by: 2 });
+        ui.until(&s, "Move", |ui| ui.summary().selected == Some(3));
         s.send(Action::Select {
-            key: EntryKey::Member(2),
+            key: EntryKey::Member(4),
         });
-        let (rows, summary) = change();
-        assert_eq!((rows, summary.selected), (None, Some(2)));
+        ui.until(&s, "Select", |ui| ui.summary().selected == Some(4));
         s.send(Action::Accept);
-        let (rows, summary) = change();
-        let rows = rows.unwrap();
-        assert_eq!((rows.at, rows.removed, rows.inserted.len()), (2, 1, 1));
-        assert_eq!(rows.inserted[0].state, Some(State::Accepted));
-        assert_eq!((summary.pending, summary.accepted), (3, 1));
+        ui.until(&s, "Accept", |ui| ui.summary().accepted == 2);
+        assert!(
+            ui.rows[1].mixed,
+            "the row's members are decided differently"
+        );
+        s.send(Action::Reject);
+        ui.until(&s, "Reject", |ui| ui.summary().rejected == 1);
+        s.send(Action::Undo);
+        ui.until(&s, "Undo", |ui| ui.summary().rejected == 0);
+        s.send(Action::Select {
+            key: EntryKey::Member(4),
+        });
+        ui.until(&s, "Select", |ui| ui.summary().selected == Some(4));
+        s.send(Action::Clear);
+        ui.until(&s, "Clear", |ui| ui.summary().accepted == 1);
+        s.send(Action::SetFilter {
+            filter: Filter::Accepted,
+        });
+        ui.until(&s, "SetFilter", |ui| ui.rows.len() == 1);
+        assert_eq!(ui.summary().filter, Filter::Accepted);
+        s.send(Action::SetFilter {
+            filter: Filter::All,
+        });
+        ui.until(&s, "SetFilter", |ui| ui.rows.len() == 6);
+        s.send(Action::NextFile);
+        ui.until(&s, "NextFile", |ui| ui.selected().label == "E01");
+        s.send(Action::PreviousFile);
+        ui.until(&s, "PreviousFile", |ui| ui.selected().label == "stalled");
+        s.send(Action::Edit);
+        ui.until(&s, "Edit", |ui| ui.summary().edit.is_some());
+        s.send(Action::CancelEdit);
+        ui.until(&s, "CancelEdit", |ui| ui.summary().edit.is_none());
+        s.send(Action::Edit);
+        ui.until(&s, "Edit", |ui| ui.summary().edit.is_some());
+        let Some(Editing { entry, wording }) = ui.summary().edit.clone() else {
+            unreachable!();
+        };
+        assert_eq!(
+            (&entry, &wording),
+            (&ui.selected().key, &ui.selected().wording)
+        );
+        s.send(Action::Reword {
+            wording: "Fixed, by hand.".into(),
+        });
+        ui.until(&s, "Reword", |ui| ui.rows[0].wording == "Fixed, by hand.");
+        assert_eq!(ui.summary().edit, None);
+
+        s.send(Action::ShowPane { pane: Pane::Files });
+        ui.until(&s, "ShowPane", |ui| ui.summary().pane == Pane::Files);
+        s.send(Action::SelectFile {
+            path: under(Path::new(&dir), &tests_support::path(2)),
+        });
+        s.send(Action::Recheck);
+        ui.until(&s, "Recheck", |ui| ui.summary().question.is_some());
+        assert_eq!(
+            ui.summary().question,
+            Some(Question::Recheck {
+                label: "E02".into(),
+                backend: "claude".into(),
+            })
+        );
+        s.send(Action::Answer { yes: false });
+        ui.until(&s, "Answer", |ui| ui.summary().question.is_none());
+        s.send(Action::ShowFileFindings);
+        ui.until(&s, "ShowFileFindings", |ui| {
+            ui.summary().pane == Pane::Findings && ui.summary().selected == Some(1)
+        });
+
+        // The run's folders, then the run again.
+        s.send(Action::SwitchView);
+        ui.until(&s, "SwitchView", |ui| {
+            !ui.summary().title.starts_with("run ")
+        });
+        s.send(Action::OpenView {
+            selector: vec![name.clone()],
+        });
+        ui.until(&s, "OpenView", |ui| {
+            ui.summary().title == format!("run {name}")
+        });
+
+        // The FIFO's finding opens: it is on disk.
+        s.send(Action::Select {
+            key: EntryKey::Row(vec![5]),
+        });
+        ui.until(&s, "Select", |ui| {
+            ui.selected().key == EntryKey::Row(vec![5])
+        });
+        s.send(Action::Play);
+        ui.until(&s, "Play", |ui| !ui.played.is_empty());
+        s.send(Action::ClosePlayer);
+        s.send(Action::Playback {
+            playback: Playback::Pause,
+        });
+        ui.until(&s, "ClosePlayer and Playback", |ui| ui.played.len() == 3);
+        assert!(matches!(
+            ui.played.as_slice(),
+            [
+                PlayerCommand::Open { how: How::Load, .. },
+                PlayerCommand::Close,
+                PlayerCommand::Playback(Playback::Pause)
+            ]
+        ));
         s.report(PlayerReport::Played {
             state: PlayState {
                 paused: true,
                 at_ms: 171_060,
             },
         });
-        assert_eq!(change().1.status.as_deref(), Some("⏸ 0:02:51.060"));
+        ui.until(&s, "Played", |ui| {
+            ui.summary().status.as_deref() == Some("⏸ 0:02:51.060")
+        });
         s.report(PlayerReport::PlayFailed {
             error: PlayerError::NoFile,
         });
-        assert_eq!(
-            change().1.status.as_deref(),
-            Some("mpv has no file open (o opens one)")
-        );
-        s.send(Action::OpenView {
-            selector: vec!["nope".into()],
+        ui.until(&s, "PlayFailed", |ui| {
+            ui.summary().status.as_deref() == Some("mpv has no file open (o opens one)")
         });
-        assert_eq!(change().1.status, None);
-        assert_eq!(
-            change().1.status.as_deref(),
-            Some("could not switch views: no run named nope")
-        );
+        s.send(Action::Dismiss);
+        ui.until(&s, "Dismiss", |ui| ui.summary().status.is_none());
+
+        // A dry run of the one accepted fix, which waits on the FIFO.
+        s.send(Action::Apply { dry_run: true });
+        ui.until(&s, "Apply", |ui| {
+            matches!(
+                &ui.summary().job,
+                Some(Job::Applying {
+                    at: ApplyAt::On {
+                        stage: ApplyStage::Plan,
+                        file,
+                    },
+                    ..
+                }) if file == "stalled"
+            )
+        });
+        s.send(Action::Interrupt);
+        ui.until(&s, "Interrupt", |ui| ui.summary().question.is_some());
+        assert!(matches!(
+            ui.summary().question,
+            Some(Question::Quit {
+                stopping: Stopping::Apply { dry_run: true, .. }
+            })
+        ));
+        // Under the question, `Quit` only lets it go; a second `Interrupt` with it open quits.
         s.send(Action::Quit);
-        assert_eq!(change().1.status, None);
-        let end = Event::Ended {
-            fatal: None,
-            outro: vec![],
-        };
-        assert_eq!(next(), end);
-        assert_eq!(s.next_event(), None);
-        // A second session in one process, which `Session`'s doc rules out, is safe here: neither
-        // stopped a job, so neither ended the groups. What was queued before `close` may still
-        // come out, then `close`'s end, with nothing to say of a job, and then nothing.
-        let closed = Session::open(vec![name]);
-        closed.close();
-        let mut last = None;
-        while let Some(event) = closed.next_event() {
-            last = Some(event);
+        ui.until(&s, "Quit", |ui| ui.summary().question.is_none());
+        s.send(Action::Interrupt);
+        ui.until(&s, "Interrupt", |ui| ui.summary().question.is_some());
+        s.send(Action::Interrupt);
+        let mut end = None;
+        while let Some(event) = s.next_event() {
+            end = Some(event);
         }
-        assert_eq!(last, Some(end));
-        assert_eq!(closed.next_event(), None);
+        // Opened with karaoke, so the command that finishes the dry run asks for it too.
+        let Some(Event::Ended { fatal: None, outro }) = end else {
+            panic!("{end:?}");
+        };
+        assert_eq!(
+            outro.last(),
+            Some(&format!(
+                "Finish it with: subcheck apply {name} --dry-run --karaoke"
+            ))
+        );
         // What the parent checks: a `CHILD` that names no test would pass with nothing run.
         std::fs::write(PathBuf::from(dir).join("ran"), "").unwrap();
     }

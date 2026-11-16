@@ -813,6 +813,15 @@ impl Review {
         }
     }
 
+    /// Whether a scan is checking again the file of a finding entry `e` stands for, among the
+    /// files it is checking (`Progress::checked`), which a caller that asks of every entry works
+    /// out once: its findings shown are the earlier check's until the new ones are saved.
+    pub fn checking_among(&self, e: Entry, checked: &HashSet<&str>) -> bool {
+        self.targets(e)
+            .iter()
+            .any(|&i| checked.contains(self.finding(i).file.as_str()))
+    }
+
     /// All members' state when they agree; `None` when they do not.
     pub fn row_state(&self, row: usize) -> Option<State> {
         let mut states = self.rows[row].members.iter().map(|&i| self.state(i));

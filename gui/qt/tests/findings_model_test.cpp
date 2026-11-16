@@ -33,6 +33,9 @@ EntryView row(uint64_t id, std::optional<State> state = State::kPending) {
         .mark = std::nullopt,
         .track = "",
         .fix = std::nullopt,
+        .checking = false,
+        .note = std::nullopt,
+        .mixed = false,
     };
 }
 
