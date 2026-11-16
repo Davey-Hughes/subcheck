@@ -49,8 +49,8 @@ pub enum Input {
     },
     /// A [`Task::Switch`] finished: the view and its files' notes, or why it could not be read.
     Switched(Result<(Run, HashMap<String, FileNote>), String>),
-    /// A [`Task::Stamp`] finished: the moment `o` opens, and its file's size and mtime now, or none
-    /// when they could not be read.
+    /// A [`Task::Stamp`] finished: the moment `Play` opens, and its file's size and mtime now, or
+    /// none when they could not be read.
     Stamped {
         moment: Moment,
         stamp: Option<(u64, Timestamp)>,
@@ -82,7 +82,7 @@ pub enum Input {
 /// What a write was for, so its result can be applied.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WriteFor {
-    /// `a` `r` `e`, and `x`, which puts findings back to pending.
+    /// `Accept`, `Reject` and `Reword`, and `Clear`, which puts findings back to pending.
     Decide {
         entry: Entry,
         before: UndoStep,
@@ -98,7 +98,7 @@ pub enum WriteFor {
 /// rules below are the same whichever drives them. While a question is open
 /// ([`Review::question`]), every action but `Answer` and `Interrupt` lets it go and does nothing
 /// else; what a job or an effect has to say leaves it open, but that a quit question goes once
-/// nothing is left to stop, and the check-again question `c` found a run for
+/// nothing is left to stop, and the check-again question `Recheck` found a run for
 /// ([`Input::RunFound`]) takes the place of any other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -154,11 +154,12 @@ pub enum Action {
     ShowFileFindings,
     /// Check the selected file again, once asked.
     Recheck,
-    /// A key with no action of its own: only the status message goes, as on any key in a pane.
+    /// Only lets the status message go: what a UI sends for a key, button or click with no action
+    /// of its own.
     Dismiss,
 }
 
-/// A scan `c` started.
+/// A scan `Recheck` started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub run: String,
@@ -166,7 +167,7 @@ pub struct Job {
     pub resume: String,
 }
 
-/// The view `v`, or `OpenView`, opens.
+/// The view `SwitchView`, or `OpenView`, opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Switch {
     /// The folders of the run of this name.
@@ -199,16 +200,16 @@ pub enum Task {
     },
     /// Read a file back from the store, as it is now ([`Input::ReadBack`]).
     ReadBack(String),
-    /// Find the run `c` checks a file again into: `run`, the one the screen shows, or with none (a
-    /// paths view) the newest that named the file ([`Input::RunFound`]).
+    /// Find the run `Recheck` checks a file again into: `run`, the one the screen shows, or with
+    /// none (a paths view) the newest that named the file ([`Input::RunFound`]).
     FindRun { path: String, run: Option<String> },
     /// Check `paths` again into `run`, as `subcheck scan --run <run> --force <paths>`
     /// does ([`Input::Started`]).
     Recheck { run: String, paths: Vec<String> },
-    /// Open another view of the findings, the other one (`v`) or one a selector names
+    /// Open another view of the findings, the other one (`SwitchView`) or one a selector names
     /// (`OpenView`), read from the store with each file's note ([`Input::Switched`]).
     Switch(Switch),
-    /// Read the size and mtime of the file `o` opens, for review to say seek or load
+    /// Read the size and mtime of the file `Play` opens, for review to say seek or load
     /// ([`Input::Stamped`]): a stat, which can hang on a stalled mount, so a task. A session runs
     /// it on its own thread, not the window's; the terminal runs every task in its loop, which a
     /// stall holds.
@@ -315,8 +316,8 @@ fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
         return Vec::new();
     }
     // A message stays until the user does something else. An answer, the end of an edit and
-    // Ctrl-C leave it, so a message that came while a question or the editor held the line shows
-    // once they are done.
+    // `Interrupt` leave it, so a message that came while a question or the editor held the line
+    // shows once they are done.
     if !matches!(
         action,
         Action::Answer(_) | Action::Interrupt | Action::Reword(_) | Action::CancelEdit
@@ -325,7 +326,7 @@ fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
     }
     match action {
         Action::Quit => quit_or_ask(m),
-        // Ctrl-C or Ctrl-D: while a job runs it asks first, as `q` does; a second one, with the
+        // `Interrupt` asks first while a job runs, as `Quit` does; a second one, with the
         // question open, quits.
         Action::Interrupt => {
             if m.progress.busy() && m.confirm != Some(Confirm::Quit) {
@@ -435,7 +436,7 @@ fn answer(m: &mut Review, yes: bool) -> Vec<Effect> {
     }
 }
 
-/// `e`: the edit, on the selected entry. A timing fix is accepted or rejected, never reworded.
+/// `Edit`: the edit, on the selected entry. A timing fix is accepted or rejected, never reworded.
 fn open_editor(m: &mut Review) {
     let Some(entry) = m.selected_entry() else {
         return;
@@ -474,7 +475,7 @@ fn reword(m: &mut Review, text: &str, now: Timestamp) -> Vec<Effect> {
 }
 
 /// Decisions putting each of `findings` at `state` with that wording, but those that already are;
-/// and what each had before, for `u`.
+/// and what each had before, for `Undo`.
 fn changes(
     m: &Review,
     findings: Vec<usize>,
@@ -501,8 +502,9 @@ fn changes(
     (before, decisions)
 }
 
-/// `a` `r` `e` on `entry`: `findings` at `state`, with that wording. For `a` and `r` they are what
-/// the entry decides ([`Review::to_decide`]), for `e` the edit's.
+/// `Accept`, `Reject` or `Reword` on `entry`: `findings` at `state`, with that wording. For
+/// `Accept` and `Reject` they are what the entry decides ([`Review::to_decide`]), for `Reword`
+/// the edit's.
 fn decide(
     m: &mut Review,
     entry: Entry,
@@ -522,7 +524,7 @@ fn decide(
     })]
 }
 
-/// `x`: each finding `entry` stands for back to pending, but those that are.
+/// `Clear`: each finding `entry` stands for back to pending, but those that are.
 fn clear(m: &mut Review, entry: Entry, now: Timestamp) -> Vec<Effect> {
     let decided: Vec<usize> = m
         .targets(entry)
@@ -561,9 +563,9 @@ fn undo(m: &mut Review, now: Timestamp) -> Vec<Effect> {
     })]
 }
 
-/// A write's result: on success the decisions take effect, and after `a` `r` `e` or `x` the
-/// selection moves on. A decision the store found on a replaced finding went to its new one, or
-/// nowhere: its file is read back.
+/// A write's result: on success the decisions take effect, and after `Accept`, `Reject`, `Reword`
+/// or `Clear` the selection moves on. A decision the store found on a replaced finding went to its
+/// new one, or nowhere: its file is read back.
 #[allow(clippy::too_many_lines)] // the write's every consequence for the view, in order
 fn written(
     m: &mut Review,
@@ -599,8 +601,8 @@ fn written(
             m.status = Some(if state == State::Pending {
                 format!("cleared {what}")
             } else {
-                // `a` means the suggestion as written, so it replaces a rewording; say so, since
-                // `u` can bring it back.
+                // `Accept` means the suggestion as written, so it replaces a rewording; say so,
+                // since `Undo` can bring it back.
                 let replaced = before
                     .iter()
                     .zip(decisions)
@@ -615,8 +617,8 @@ fn written(
                 } else {
                     String::new()
                 };
-                // The members a row's key left alone, decided the other way on their own (or, for
-                // an edit, joined the row after it opened).
+                // The members a row's decision left alone, decided the other way on their own (or,
+                // for an edit, joined the row after it opened).
                 let kept: Vec<State> = m
                     .targets(entry)
                     .into_iter()
@@ -779,7 +781,7 @@ fn set_filter(m: &mut Review, filter: Filter) {
         .unwrap_or(0);
 }
 
-/// `⏎`: expand a group into its members, or collapse it (from the row or from a member).
+/// `Toggle`: expand a group into its members, or collapse it (from the row or from a member).
 fn toggle(m: &mut Review) {
     match m.selected_entry() {
         Some(Entry::Row(r)) if m.rows[r].members.len() > 1 => {
@@ -869,12 +871,12 @@ fn open(m: &mut Review) -> Vec<Effect> {
     vec![Effect::Task(Task::Stamp(moment))]
 }
 
-/// `o`'s file stat, and review's word to the player: a seek when review last had it load this
+/// `Play`'s file stat, and review's word to the player: a seek when review last had it load this
 /// file, unchanged on disk since, else a load. The player checks the seek against what its mpv
 /// has open, so a load forgotten too soon costs a reload, never a wrong frame. A file that is not
 /// there (whose size and mtime cannot be read) is not opened, as one whose note says it is missing
 /// is not: mpv could not read it either, and the terminal's player, which does not wait for a load
-/// to land, would say it opened. Its note is left as it is, so that the next `o` stats the file
+/// to land, would say it opened. Its note is left as it is, so that the next `Play` stats the file
 /// again: a mount back, it opens.
 fn stamped(m: &mut Review, moment: Moment, stamp: Option<(u64, Timestamp)>) -> Vec<Effect> {
     let Some(stamp) = stamp else {
@@ -922,7 +924,7 @@ fn player_words(m: &Review, asked: Asked, e: PlayerError) -> String {
     }
 }
 
-/// `q`: quit; while a job runs, ask first.
+/// `Quit`: quit; while a job runs, ask first.
 fn quit_or_ask(m: &mut Review) {
     if m.progress.busy() {
         m.confirm = Some(Confirm::Quit);
@@ -931,9 +933,10 @@ fn quit_or_ask(m: &mut Review) {
     }
 }
 
-/// `A` (or with `dry_run`, `D`): every accepted fix of the view on screen. Not while a scan runs
-/// (apply would contend with its reader for the disks, and findings are still coming) or apply
-/// does, nor with nothing accepted. `A` asks first; a dry run writes nothing, so it starts at once.
+/// `Apply` (or with `dry_run`, a dry run): every accepted fix of the view on screen. Not while a
+/// scan runs (apply would contend with its reader for the disks, and findings are still coming) or
+/// apply does, nor with nothing accepted. `Apply` asks first; a dry run writes nothing, so it
+/// starts at once.
 fn apply_key(m: &mut Review, dry_run: bool) -> Vec<Effect> {
     if m.progress.running() {
         m.status = Some("the scan is still running".into());
@@ -955,7 +958,7 @@ fn apply_key(m: &mut Review, dry_run: bool) -> Vec<Effect> {
 }
 
 /// Start apply (or a dry run) on the view as it stands: decisions made meanwhile count from the
-/// next. Running from here, so a `q` before its first step still asks.
+/// next. Running from here, so a `Quit` before its first step still asks.
 fn start_apply(m: &mut Review, dry_run: bool) -> Vec<Effect> {
     // A view's name is its run's, or its paths quoted: `subcheck apply` takes either back.
     let mut resume = format!("subcheck apply {}", m.run.name);
@@ -1001,7 +1004,7 @@ fn applied(m: &mut Review, event: apply::Event) -> Vec<Effect> {
             }
             m.run.applied.extend(marked);
             // Every model record for the path takes the new stamp, even if only one check kind
-            // moved: only `file_notes` reads it, and `v` re-reads the store.
+            // moved: only `file_notes` reads it, and another view re-reads the store.
             if let Some((size, mtime)) = restamped {
                 for r in m.run.files.iter_mut().filter(|r| r.path == path) {
                     r.size = size;
@@ -1027,8 +1030,8 @@ fn applied(m: &mut Review, event: apply::Event) -> Vec<Effect> {
     Vec::new()
 }
 
-/// The view `v` or `OpenView` asked for has been read, or could not be: take it, or say why the
-/// screen is as it was.
+/// The view `SwitchView` or `OpenView` asked for has been read, or could not be: take it, or say
+/// why the screen is as it was.
 fn switched(
     m: &mut Review,
     result: Result<(Run, HashMap<String, FileNote>), String>,
@@ -1040,10 +1043,10 @@ fn switched(
     Vec::new()
 }
 
-/// `v`: the other view of the screen's findings. From a run's view, the run's folders; from a paths
-/// view, the newest run that named the selected file: the selected entry's (a row's first
-/// member's), or in the files view, or with nothing selected in the list, the selected file's. Not
-/// while a job runs: its progress belongs to the view it started in.
+/// `SwitchView`: the other view of the screen's findings. From a run's view, the run's folders;
+/// from a paths view, the newest run that named the selected file: the selected entry's (a row's
+/// first member's), or in the files view, or with nothing selected in the list, the selected
+/// file's. Not while a job runs: its progress belongs to the view it started in.
 fn switch_view(m: &mut Review) -> Vec<Effect> {
     if refused_while_a_job_runs(m) {
         return Vec::new();
@@ -1075,7 +1078,7 @@ fn switch_view(m: &mut Review) -> Vec<Effect> {
         .collect()
 }
 
-/// The view `words` select, in place of the one shown; not while a job runs, as for `v`.
+/// The view `words` select, in place of the one shown; not while a job runs, as for `SwitchView`.
 fn open_view(m: &mut Review, words: Vec<String>) -> Vec<Effect> {
     if refused_while_a_job_runs(m) {
         return Vec::new();
@@ -1097,8 +1100,8 @@ fn refused_while_a_job_runs(m: &mut Review) -> bool {
     true
 }
 
-/// `c` on the selected file: find the run it is checked again into, then ask. A file the scan is
-/// checking is being checked already, and one `c` queued is queued already.
+/// `Recheck` on the selected file: find the run it is checked again into, then ask. A file the scan
+/// is checking is being checked already, and one `Recheck` queued is queued already.
 fn recheck(m: &mut Review) -> Vec<Effect> {
     // A check would read a file apply may be remuxing or swapping.
     if m.progress.applying() {
@@ -1125,7 +1128,7 @@ fn recheck(m: &mut Review) -> Vec<Effect> {
     vec![Effect::Task(Task::FindRun { path, run })]
 }
 
-/// `y` to checking `path` again into `run`: at once with no scan running, else once it ends.
+/// A yes to checking `path` again into `run`: at once with no scan running, else once it ends.
 fn again(m: &mut Review, path: String, run: String) -> Vec<Effect> {
     if !m.progress.running() {
         return vec![Effect::Task(Task::Recheck {
@@ -1141,7 +1144,7 @@ fn again(m: &mut Review, path: String, run: String) -> Vec<Effect> {
     Vec::new()
 }
 
-/// The run `c` checks a file again into, and its LLM, for the question; or why there is none.
+/// The run `Recheck` checks a file again into, and its LLM, for the question; or why there is none.
 fn run_found(m: &mut Review, path: String, found: Result<(String, String), String>) -> Vec<Effect> {
     match found {
         Ok((run, backend)) => m.confirm = Some(Confirm::Recheck { path, run, backend }),
@@ -1150,7 +1153,8 @@ fn run_found(m: &mut Review, path: String, found: Result<(String, String), Strin
     Vec::new()
 }
 
-/// The files `c` queued into the first run among them, as one scan; the rest wait for it to end.
+/// The files `Recheck` queued into the first run among them, as one scan; the rest wait for it
+/// to end.
 fn next_again(m: &mut Review) -> Vec<Effect> {
     m.progress
         .next_batch()
@@ -1159,9 +1163,9 @@ fn next_again(m: &mut Review) -> Vec<Effect> {
         .collect()
 }
 
-/// A scan `c` started, or why none did: then the files asked for that are still on disk fail with
-/// the reason (so `c` works on them again), and the next run's queued files go. A file left out is
-/// no longer on disk.
+/// A scan `Recheck` started, or why none did: then the files asked for that are still on disk fail
+/// with the reason (so `Recheck` works on them again), and the next run's queued files go. A file
+/// left out is no longer on disk.
 fn started(
     m: &mut Review,
     job: Result<Job, String>,
@@ -1192,16 +1196,16 @@ fn started(
 }
 
 /// A question to stop a job stays while a queued batch takes over: `effects` start it, and
-/// effects run before the next key is read. With nothing left to run it goes, so the status line
-/// shows how the job ended, or why the last batch did not start, and the next `q` quits at once.
+/// effects run before the next input is taken. With nothing left to run it goes, so the status line
+/// shows how the job ended, or why the last batch did not start, and the next `Quit` quits at once.
 fn settle_quit(m: &mut Review, effects: &[Effect]) {
     if m.confirm == Some(Confirm::Quit) && !m.progress.busy() && effects.is_empty() {
         m.confirm = None;
     }
 }
 
-/// `⏎` on a file: the findings, on the first entry with one of the file's, if the filter shows
-/// one.
+/// `ShowFileFindings`: the findings, on the first entry with one of the selected file's, if the
+/// filter shows one.
 fn file_findings(m: &mut Review) {
     let Some(path) = m
         .progress
@@ -1609,13 +1613,13 @@ mod tests {
         act(&mut m, Action::Quit);
         act(&mut m, Action::Answer(true));
         assert!(m.should_quit && m.progress.running());
-        // Ctrl-C asks too, and a second one quits.
+        // `Interrupt` asks too, and a second one quits.
         let mut m = scanning();
         act(&mut m, Action::Interrupt);
         assert!(!m.should_quit);
         act(&mut m, Action::Interrupt);
         assert!(m.should_quit);
-        // Once the scan has ended, q quits at once.
+        // Once the scan has ended, `Quit` quits at once.
         let mut m = scanning();
         update(
             &mut m,
@@ -1627,7 +1631,7 @@ mod tests {
     }
 
     /// Each question review asks, open on the sample with a scan under way, over an edit, as
-    /// Ctrl-C mid-edit opens one, and with a message that came while it was open.
+    /// `Interrupt` mid-edit opens one, and with a message that came while it was open.
     fn asking() -> Vec<Review> {
         let recheck = Confirm::Recheck {
             path: path(2),
@@ -1744,7 +1748,7 @@ mod tests {
             ..crate::scan::Summary::default()
         };
         update(&mut m, Input::ScanEnded(Ok(summary)), now());
-        // Nothing left to stop: the line gives the summary, and `q` quits at once.
+        // Nothing left to stop: the line gives the summary, and `Quit` quits at once.
         assert_eq!(m.confirm, None);
         assert_eq!(
             status(&m).as_deref(),
@@ -1876,7 +1880,7 @@ mod tests {
             },
             now(),
         );
-        // `y` over it quits, stopping the batch that took over.
+        // A yes over it quits, stopping the batch that took over.
         act(&mut m, Action::Answer(true));
         assert!(m.should_quit && m.progress.running());
     }
@@ -2175,7 +2179,7 @@ mod tests {
         m.selected = 2;
         let effects = act(&mut m, Action::Reject);
         written(&mut m, effects);
-        // The row shows E02's rejection too, but its key decides only the pending members.
+        // The row shows E02's rejection too, but `Accept` on it decides only the pending members.
         m.selected = 0;
         let effects = act(&mut m, Action::Accept);
         assert_eq!(
@@ -2372,7 +2376,8 @@ mod tests {
         );
     }
 
-    /// The player command review sends once `o`'s stat (the one task in `effects`) reads `stamp`.
+    /// The player command review sends once `Play`'s stat (the one task in `effects`)
+    /// reads `stamp`.
     fn stat(m: &mut Review, effects: Vec<Effect>, stamp: Option<(u64, Timestamp)>) -> Vec<Effect> {
         let [Effect::Task(Task::Stamp(moment))] = <[Effect; 1]>::try_from(effects).unwrap() else {
             panic!("expected the stat of the file to open");
@@ -2471,7 +2476,7 @@ mod tests {
         assert_eq!(how(&mut m, later), How::Load);
     }
 
-    // What review forgets lets the next `o` load: any close, and any open that failed, at once
+    // What review forgets lets the next `Play` load: any close, and any open that failed, at once
     // or later.
     #[test]
     fn review_forgets_its_load_once_the_player_closes_or_an_open_fails() {
@@ -3164,7 +3169,7 @@ mod tests {
         assert_eq!(m.confirm, None);
     }
 
-    // Its path and stamp say what mpv has open whatever the view: the next `o` on it seeks.
+    // Its path and stamp say what mpv has open whatever the view: the next `Play` on it seeks.
     #[test]
     fn another_view_keeps_the_file_the_player_last_loaded() {
         let mut m = sample();
@@ -3486,7 +3491,7 @@ mod tests {
             Input::ApplyEnded(Ok(apply::Summary::default())),
             now(),
         );
-        // Row 0 is the OP lyric (findings 1, 2 and 4): `r` rejects its pending 2 and 4, and a
+        // Row 0 is the OP lyric (findings 1, 2 and 4): `Reject` rejects its pending 2 and 4, and a
         // dry run's mark on 2 goes with its old decision.
         m.marks.insert(2, Mark::WouldFail("disk full".into()));
         m.selected = 0;
@@ -3500,8 +3505,8 @@ mod tests {
         let mut m = accepted();
         m.marks.insert(2, Mark::WouldApply);
         m.marks.insert(3, Mark::ByHand("a karaoke row".into()));
-        // Row 0 is the OP lyric (findings 1, 2 and 4: `r` rejects the pending 2 and 4); row 1 the
-        // snacks typo (3, accepted).
+        // Row 0 is the OP lyric (findings 1, 2 and 4: `Reject` rejects the pending 2 and 4); row 1
+        // the snacks typo (3, accepted).
         m.selected = 0;
         let effects = act(&mut m, Action::Reject);
         written(&mut m, effects);

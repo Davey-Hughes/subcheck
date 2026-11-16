@@ -230,23 +230,25 @@ if(NOT APPLE)
         "XDG_CONFIG_HOME=${PANE_CONFIG}")
     set_tests_properties(pane_test PROPERTIES ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 
+    # The test seeds its run itself, with seed.cmake, at each start: it decides a finding, so a run
+    # of it after another, as `ctest --repeat` makes, needs the run as seeded again.
     set(dir "${CMAKE_BINARY_DIR}/seeded-end_to_end_test")
-    add_test(NAME seed_end_to_end_test
-        COMMAND "${CMAKE_COMMAND}" -D "SUBCHECK=$<TARGET_FILE:subcheck>" -D "REPO_ROOT=${REPO_ROOT}"
-                -D "DIR=${dir}" -D FIXTURE=timing.mkv
-                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/seed.cmake")
-    set_tests_properties(seed_end_to_end_test PROPERTIES
-        FIXTURES_SETUP end_to_end_run TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
     qt_add_executable(end_to_end_test tests/end_to_end_test.cpp)
+    # The seed deletes the directory it is given before it makes the run there: built in, this path
+    # is the only one the test seeds, so an environment that names another folder fails the test
+    # with nothing deleted.
+    target_compile_definitions(end_to_end_test PRIVATE "SUBCHECK_E2E_DIR=\"${dir}\"")
     target_link_libraries(end_to_end_test PRIVATE Qt6::Network Qt6::Test)
     subcheck_warnings(end_to_end_test)
     add_test(NAME end_to_end_test COMMAND end_to_end_test)
     set(env "SUBCHECK_DB=${dir}/subcheck.db" "XDG_STATE_HOME=${dir}/state"
         "SUBCHECK_TEST_MEDIA=${dir}/media" "SUBCHECK_TEST_DIR=${dir}"
         "SUBCHECK_QT=$<TARGET_FILE:subcheck-qt>" "SUBCHECK_XVFB=${XVFB}"
-        "SUBCHECK_XDOTOOL=${XDOTOOL}")
+        "SUBCHECK_XDOTOOL=${XDOTOOL}" "SUBCHECK_CMAKE=${CMAKE_COMMAND}"
+        "SUBCHECK_SEED=${CMAKE_CURRENT_SOURCE_DIR}/tests/seed.cmake"
+        "SUBCHECK_CLI=$<TARGET_FILE:subcheck>" "SUBCHECK_REPO=${REPO_ROOT}")
     set_tests_properties(end_to_end_test PROPERTIES
-        FIXTURES_REQUIRED end_to_end_run ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+        ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 endif()
 
 # Every test runs with none of a desktop session's variables, as in CI, which has none. Qt's
@@ -260,8 +262,8 @@ endif()
 # this file, as it reaches only the tests above it.
 set(DESKTOP_SESSION_NAMES DISPLAY WAYLAND_DISPLAY PULSE_SERVER PIPEWIRE_REMOTE
     DBUS_SESSION_BUS_ADDRESS AT_SPI_BUS_ADDRESS XDG_CURRENT_DESKTOP QT_QPA_PLATFORMTHEME
-    SESSION_MANAGER DESKTOP_SESSION ICEAUTHORITY XAUTHORITY XDG_SEAT XDG_VTNR
-    KDE_FULL_SESSION KDE_SESSION_VERSION XDG_SESSION_TYPE)
+    SESSION_MANAGER DESKTOP_SESSION GNOME_DESKTOP_SESSION_ID ICEAUTHORITY XAUTHORITY XDG_SEAT
+    XDG_VTNR KDE_FULL_SESSION KDE_SESSION_VERSION XDG_SESSION_TYPE)
 list(TRANSFORM DESKTOP_SESSION_NAMES APPEND "=unset:" OUTPUT_VARIABLE unset_desktop_session)
 get_property(tests DIRECTORY PROPERTY TESTS)
 foreach(test IN LISTS tests)

@@ -59,10 +59,13 @@ static INSTALL: Once = Once::new();
 /// through this module (its child killed under it, say) waits for the end instead of acting on
 /// it.
 static ENDING: AtomicBool = AtomicBool::new(false);
-/// Set by [`end`]: the ending is a quit, not a signal, so [`finish`] lets subcheck end its own
-/// way.
+/// Set by [`end`] when its call runs the cleanup: the ending is a quit, not a signal, so
+/// [`finish`] lets subcheck end its own way. Set inside `END`'s `Once`: an `end` after a signal's
+/// cleanup leaves it unset, so `finish` waits for the signal to end subcheck, and a signalled
+/// process does not end with a status of its own.
 static QUIT: AtomicBool = AtomicBool::new(false);
-/// [`end`]'s, once: its registry is held for good, so a second `end_all` would wait for it.
+/// The cleanup's, once, whether [`end`] or a signal runs it: its registry is held for good, so a
+/// second `end_all` would wait for it.
 static END: Once = Once::new();
 
 /// Wait for the end, should a signal be ending subcheck.
@@ -143,7 +146,8 @@ pub fn create_removing(
 
 /// To call as subcheck's main returns. While a signal is ending subcheck, a run returning on the
 /// way would end it with a status of its own, and maybe before the cleanup is done: it waits for
-/// the signal to end it instead. After [`end`], a quit, it returns at once.
+/// the signal to end it instead. After an [`end`] that ran the cleanup, a quit, it returns at once;
+/// after one that came once a signal's cleanup had run, it waits for that signal too.
 pub fn finish() {
     if !QUIT.load(Ordering::SeqCst) {
         wait_if_ending();
@@ -224,9 +228,14 @@ fn ignored(sig: libc::c_int) -> bool {
 }
 
 /// Kill every registered group, then remove every registered file, then die of `sig` as if there
-/// were no handler.
+/// were no handler. Through [`end`]'s `Once`, as `end` holds the registry for good: after an `end`
+/// the cleanup is done, so it dies at once, and during one it waits for that cleanup to end, where
+/// a cleanup of its own would wait for a registry no one lets go of. Should `end`'s cleanup ever
+/// panic, which `end_all` cannot (each lock it takes recovers from poison), a later `end` marks the
+/// `Once` done with none run, and a signal after that dies with none.
 fn end_by_signal(sig: libc::c_int) {
-    let _held = end_all();
+    let mut held = None;
+    END.call_once_force(|_| held = Some(end_all()));
     let _ = emulate_default_handler(sig);
 }
 
@@ -266,7 +275,8 @@ fn end_all() -> Held {
 /// Unlike a signal, it does not end subcheck: the caller says what it did and returns from main,
 /// where [`finish`] lets it. A second call, from any thread, returns once the first has ended the
 /// groups, or has panicked trying: a review session's `close` and its own thread can both end a
-/// job, and a later `close` must not panic, in `Drop` or across the FFI.
+/// job, and a later `close` must not panic, in `Drop` or across the FFI. After a signal's cleanup,
+/// which ends subcheck, it returns at once.
 ///
 /// Call it last: a guard of this module dropped after it (review's player) would wait forever.
 pub fn end() {
@@ -430,6 +440,40 @@ mod tests {
                 end();
                 assert!(ended());
                 finish();
+                return;
+            }
+            // A quit's `end` done, as a window's review that stopped a job leaves it: the signal
+            // that comes after, the window still up, must end the process by itself. A group ran
+            // first, so that the signals are taken.
+            "after-end" => {
+                let (mut running, registered) = spawn(Command::new("sleep").arg("20")).unwrap();
+                // Dropped after `end`, it would wait forever.
+                std::mem::forget(registered);
+                end();
+                let _ = running.wait();
+                ready();
+                std::thread::sleep(Duration::from_secs(10));
+                return;
+            }
+            // A quit's `end` under way, held on the files by a file being made: the signal that
+            // comes then waits for that cleanup, and ends the process once it is done.
+            "during-end" => {
+                let (_, registered) = spawn(Command::new("sleep").arg("20")).unwrap();
+                std::mem::forget(registered);
+                let made = create_removing(&path, |path| {
+                    std::fs::write(path, "half a remux")?;
+                    std::thread::spawn(end);
+                    // `end` in its `Once`, which it sets `ENDING` in, waiting for the files.
+                    while !ended() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    ready();
+                    std::thread::sleep(HELD_PAST);
+                    Ok(())
+                })
+                .unwrap();
+                std::mem::forget(made);
+                std::thread::sleep(Duration::from_secs(10));
                 return;
             }
             // A first `end` that panicked: a second returns, and runs no cleanup of its own.
@@ -850,6 +894,25 @@ mod tests {
         let mut child = start(&path, "end-failed");
         let status = assert_ends(&mut child, DIES);
         assert!(status.success(), "{status}");
+    }
+
+    #[test]
+    fn a_signal_after_a_quits_end_ends_subcheck_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("half.mkv");
+        let mut child = signalled(&path, "after-end", Signal::TERM);
+        let status = assert_ends(&mut child, DIES);
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status}");
+    }
+
+    #[test]
+    fn a_signal_during_a_quits_end_waits_for_it_then_ends_subcheck() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("half.mkv");
+        let mut child = signalled(&path, "during-end", Signal::TERM);
+        let status = assert_ends(&mut child, DIES);
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status}");
+        assert!(!path.exists(), "the quit's cleanup ran");
     }
 
     #[test]

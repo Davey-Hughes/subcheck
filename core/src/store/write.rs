@@ -307,8 +307,8 @@ impl Store {
     }
 
     /// Decisions made in review, in one transaction. Each is a row, the latest a finding's current
-    /// one: an undo, or `x`, is a row too. A decision on a finding whose check another scan has
-    /// replaced since review read it follows the finding: it goes on the findings of the same
+    /// one: an undo, or a `Clear`, is a row too. A decision on a finding whose check another scan
+    /// has replaced since review read it follows the finding: it goes on the findings of the same
     /// [`CarryKey`] in the file's current check of that kind, however many checks came between,
     /// and on none when there are none. Returns what became of each, in order.
     pub fn decide(&mut self, decisions: &[Decision]) -> rusqlite::Result<Vec<Decided>> {

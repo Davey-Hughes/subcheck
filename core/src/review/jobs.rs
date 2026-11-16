@@ -1,8 +1,9 @@
 //! Review's jobs: the scan and apply, each on a thread of its own, sending what happens to the
-//! UI's channel as an `Input` or the UI's own message that one becomes. The runner starts them for
-//! `update`'s tasks, and a UI that opens on a scan starts that one itself. Each runs to its end or
-//! the process's: quitting with a job running ends its LLM calls or mkvmerge through `group::end`,
-//! and its threads with the process.
+//! channel `update`'s inputs come in on (the terminal's loop's, or a session's), as an `Input` or
+//! a message of that loop's own that one becomes. The runner starts them for `update`'s tasks, and
+//! a UI that opens on a scan starts that one itself. Each runs to its end or the process's:
+//! quitting with a job running ends its LLM calls or mkvmerge through `group::end`, and its
+//! threads with the process.
 
 use std::any::Any;
 use std::ffi::OsStr;

@@ -27,7 +27,7 @@ pub fn line_start_us(start_ms: i64) -> i64 {
     start_ms.saturating_mul(1000).saturating_add(PAST_A_LINE_US)
 }
 
-/// What a playback key asks of mpv.
+/// What a `Playback` action asks of mpv.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Playback {
     /// Pause, or resume.

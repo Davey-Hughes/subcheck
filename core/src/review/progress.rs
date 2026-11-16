@@ -15,7 +15,7 @@ use crate::store::{Check, FileRecord, Record, Run};
 pub enum Stage {
     /// Waiting for the reader.
     Queued,
-    /// Queued by `c` while a scan runs: checked again when it ends.
+    /// Queued by `Recheck` while a scan runs: checked again when it ends.
     QueuedAgain,
     Reading,
     /// Read; `answered` of the `chunks` its lines need have come back from the LLM.
@@ -100,6 +100,18 @@ fn short_paths(text: &str, path: &str, name: &str) -> String {
         Some(dir) if !dir.is_empty() => text.replace(&format!("{dir}/"), ""),
         _ => text,
     }
+}
+
+/// Where a scan is with a file it checks, while it runs ([`Progress::checking`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checking {
+    Queued,
+    Reading,
+    /// Read; `answered` of the `chunks` its lines need have come back from the LLM.
+    Asking {
+        answered: usize,
+        chunks: usize,
+    },
 }
 
 /// Whether a scan runs, and how it ended.
@@ -304,8 +316,8 @@ pub enum ApplyAt {
 /// The job a quit would stop, and how far it is, for the quit question ([`Progress::stopping`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stopping {
-    /// The scan: the files done of those it checks, and the files `c` queued for after it, which
-    /// quitting leaves unchecked.
+    /// The scan: the files done of those it checks, and the files `Recheck` queued for after it,
+    /// which quitting leaves unchecked.
     Scan {
         done: usize,
         queued: usize,
@@ -341,13 +353,13 @@ pub struct Progress {
     /// outro. Empty before the first scan.
     pub run: String,
     pub resume: String,
-    /// What the screen's earlier scans ended with, for the outro, oldest first: `c` starts another
-    /// once one has ended.
+    /// What the screen's earlier scans ended with, for the outro, oldest first: `Recheck` starts
+    /// another once one has ended.
     pub earlier: Vec<String>,
     /// An earlier scan of this screen failed, a file in it or the scan itself: `start` resets the
     /// counts, but the exit status still tells.
     pub earlier_failed: bool,
-    /// Files `c` queued while a scan ran, each with the run it is checked into, in the order
+    /// Files `Recheck` queued while a scan ran, each with the run it is checked into, in the order
     /// queued: they start when the scan ends, a scan for each run.
     pub again: Vec<(String, String)>,
     /// The screen's apply or dry run, as it runs or as the last ended; `None` before the first
@@ -511,10 +523,13 @@ impl Progress {
         }
     }
 
-    /// The files of another view (`v`), and no job: what the screen's scans and applies ended with
-    /// is kept, for the outro and the exit status.
+    /// The files of another view (`SwitchView`'s or `OpenView`'s), and no job: what the screen's
+    /// scans and applies ended with is kept, for the outro and the exit status.
     pub fn show(&mut self, run: &Run) {
-        debug_assert!(!self.busy(), "`v` waits for the jobs to end");
+        debug_assert!(
+            !self.busy(),
+            "`SwitchView` and `OpenView` are refused while a job runs"
+        );
         let earlier = self.ended();
         let earlier_failed =
             self.earlier_failed || self.failed > 0 || matches!(self.scan, Scan::Ended(Err(_)));
@@ -628,7 +643,7 @@ impl Progress {
         self.apply.as_ref().is_some_and(|a| a.ended.is_none())
     }
 
-    /// Whether a job runs, a scan or apply: the loop ticks, `q` asks, and quitting stops it.
+    /// Whether a job runs, a scan or apply: the loop ticks, `Quit` asks, and quitting stops it.
     pub fn busy(&self) -> bool {
         self.running() || self.applying()
     }
@@ -770,22 +785,21 @@ impl Progress {
         self.scan == Scan::Running
     }
 
-    /// While the scan runs, where it is with `path`, in the files view's words: `queued`,
-    /// `reading`, `LLM 1/3`. `None` once the scan has ended, even if it left the file queued or
-    /// being read, and for a file it is not checking or is done with.
-    pub fn checking(&self, path: &str) -> Option<String> {
+    /// While the scan runs, where it is with `path`. `None` once the scan has ended, even if it
+    /// left the file queued or being read, and for a file it is not checking or is done with.
+    pub fn checking(&self, path: &str) -> Option<Checking> {
         if !self.running() {
             return None;
         }
         match &self.files.iter().find(|f| f.path == path)?.stage {
-            Stage::Queued => Some("queued".into()),
-            Stage::Reading => Some("reading".into()),
-            Stage::Asking { answered, chunks } => Some(format!("LLM {answered}/{chunks}")),
+            Stage::Queued => Some(Checking::Queued),
+            Stage::Reading => Some(Checking::Reading),
+            &Stage::Asking { answered, chunks } => Some(Checking::Asking { answered, chunks }),
             _ => None,
         }
     }
 
-    /// `c` queued `path` to be checked again into run `run` when the scan ends.
+    /// `Recheck` queued `path` to be checked again into run `run` when the scan ends.
     pub fn queue_again(&mut self, path: &str, run: &str) {
         if let Some(f) = self.file_mut(path) {
             f.stage = Stage::QueuedAgain;
@@ -793,7 +807,7 @@ impl Progress {
         self.again.push((path.to_string(), run.to_string()));
     }
 
-    /// The files `c` queued into the first run among them, taken off the queue as one batch,
+    /// The files `Recheck` queued into the first run among them, taken off the queue as one batch,
     /// with that run; the rest stay queued. `None` with nothing queued.
     pub fn next_batch(&mut self) -> Option<(String, Vec<String>)> {
         let run = self.again.first()?.1.clone();
@@ -854,7 +868,7 @@ impl Progress {
     }
 
     /// What the terminal gets on leaving the screen: what the scans ended with (see `ended`),
-    /// then the command that checks the files `c` queued, for each run.
+    /// then the command that checks the files `Recheck` queued, for each run.
     pub fn outro(&self) -> Vec<String> {
         let mut lines = self.ended();
         lines.extend(self.not_checked_again());
@@ -902,9 +916,9 @@ impl Progress {
         lines
     }
 
-    /// For each run with files `c` queued, in the order first queued, the command that checks
+    /// For each run with files `Recheck` queued, in the order first queued, the command that checks
     /// them. `Finish it with` does not cover them: without `--force`, `--run` checks only files
-    /// the run has no good record of, and a file `c` queued has one, unless its last check
+    /// the run has no good record of, and a file `Recheck` queued has one, unless its last check
     /// failed.
     fn not_checked_again(&self) -> Vec<String> {
         let mut runs: Vec<&str> = Vec::new();
@@ -943,8 +957,8 @@ pub fn resume_command(run: &str, paths: &[PathBuf]) -> String {
     format!("subcheck scan --run {run} {}", quoted(paths))
 }
 
-/// The command that checks `paths` again into run `run`: for a `c` stopped partway, or for files
-/// `c` queued that never started.
+/// The command that checks `paths` again into run `run`: for a `Recheck` stopped partway, or for
+/// files `Recheck` queued that never started.
 pub fn again_command(run: &str, paths: &[PathBuf]) -> String {
     format!("subcheck scan --run {run} --force {}", quoted(paths))
 }
@@ -1265,15 +1279,21 @@ mod tests {
     fn a_file_is_being_checked_from_queued_until_it_is_done() {
         let mut p = Progress::of_run(&Run::default());
         p.scan_event(&Event::Queued(vec!["/m/E01.mkv".into()]));
-        assert_eq!(p.checking("/m/E01.mkv").as_deref(), Some("queued"));
+        assert_eq!(p.checking("/m/E01.mkv"), Some(Checking::Queued));
         p.scan_event(&Event::Reading("/m/E01.mkv".into()));
-        assert_eq!(p.checking("/m/E01.mkv").as_deref(), Some("reading"));
+        assert_eq!(p.checking("/m/E01.mkv"), Some(Checking::Reading));
         p.scan_event(&Event::Asking {
             path: "/m/E01.mkv".into(),
             answered: 1,
             chunks: 3,
         });
-        assert_eq!(p.checking("/m/E01.mkv").as_deref(), Some("LLM 1/3"));
+        assert_eq!(
+            p.checking("/m/E01.mkv"),
+            Some(Checking::Asking {
+                answered: 1,
+                chunks: 3
+            })
+        );
         p.scan_event(&Event::Finished {
             path: "/m/E01.mkv".into(),
             error: None,
@@ -1288,7 +1308,7 @@ mod tests {
     fn a_file_left_queued_by_a_scan_that_failed_is_not_being_checked() {
         let mut p = Progress::of_run(&Run::default());
         p.scan_event(&Event::Queued(vec!["/m/E01.mkv".into()]));
-        assert_eq!(p.checking("/m/E01.mkv").as_deref(), Some("queued"));
+        assert_eq!(p.checking("/m/E01.mkv"), Some(Checking::Queued));
         p.scan = Scan::Ended(Err("disk full".into()));
         assert_eq!(p.checking("/m/E01.mkv"), None);
     }

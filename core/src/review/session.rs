@@ -1093,7 +1093,7 @@ mod tests {
     #[test]
     fn a_change_is_published_before_its_effects_run_and_a_tasks_result_after_it() {
         let dir = tempfile::tempdir().unwrap();
-        // E01 on disk, under its own name, so that the stat `o` makes finds it.
+        // E01 on disk, under its own name, so that the stat `Play` makes finds it.
         let e01 = dir.path().join("K-On! - E01 - Episode.mkv");
         std::fs::write(&e01, "1").unwrap();
         let file = e01.to_string_lossy().into_owned();
@@ -1179,8 +1179,9 @@ mod tests {
         );
     }
 
-    // Another review in the same session, as `v` swaps the view: B's rows in place of A's, in one
-    // splice, under B's name; words that select nothing leave the view as it was, and say why.
+    // Another review in the same session, as `SwitchView` or `OpenView` swaps the view: B's rows in
+    // place of A's, in one splice, under B's name; words that select nothing leave the view as it
+    // was, and say why.
     #[test]
     fn open_view_shows_another_run_in_place_of_the_one_shown() {
         let dir = tempfile::tempdir().unwrap();
@@ -1210,9 +1211,9 @@ mod tests {
         );
     }
 
-    // `close`'s locked part first, with the core thread between `o`'s change and its stat: neither
-    // the stat nor the player's command it would lead to runs. No job runs, so no group ends in
-    // this process.
+    // `close`'s locked part first, with the core thread between `Play`'s change and its stat:
+    // neither the stat nor the player's command it would lead to runs. No job runs, so no group
+    // ends in this process.
     #[test]
     fn nothing_the_core_thread_was_to_do_runs_after_close() {
         let dir = tempfile::tempdir().unwrap();
@@ -1770,7 +1771,7 @@ mod tests {
                 let name = scan.name;
                 let s = Arc::new(Session::start(move || opened(store, state, &[name], false)));
                 next(&s);
-                // `c`'s start writes the store on the core thread before any group can start:
+                // `Recheck`'s start writes the store on the core thread before any group can start:
                 // held, it waits there, its start marked.
                 let held = hold_the_store(dir);
                 s.send(Action::ShowPane(Pane::Files));

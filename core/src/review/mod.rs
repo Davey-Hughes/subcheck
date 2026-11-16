@@ -4,6 +4,7 @@
 //! commands `update` gives it on a player of its own; the terminal's UI is `subcheck_cli::tui`. A
 //! UI whose own loop must not wait runs `update` and the runner behind a thread, through `session`.
 
+pub mod detail;
 pub mod jobs;
 pub mod model;
 pub mod progress;

@@ -111,9 +111,27 @@ class EndToEndTest : public QObject {
 private slots:
     void initTestCase() {
         // The app decides findings in whatever store it opens: without CTest's environment, that
-        // would be the user's own.
-        QVERIFY2(qEnvironmentVariableIsSet("SUBCHECK_DB") && !dir.isEmpty(),
-                 "run through ctest, which seeds a store of the test's own");
+        // would be the user's own. The seed below deletes the test's directory and makes it anew,
+        // so that directory may only be the one CMake made for the test in its build directory,
+        // whose path the test is built with: any other, a folder of the user's say, fails the test
+        // here with nothing deleted.
+        QVERIFY2(dir == QString::fromUtf8(SUBCHECK_E2E_DIR) &&
+                     qEnvironmentVariable("SUBCHECK_DB") == dir + "/subcheck.db",
+                 "run through ctest, on the directory CMake made for the test, " SUBCHECK_E2E_DIR
+                 ", and the store in it");
+        // The run seeded afresh, as the test decides a finding in it: a run of the test after
+        // another, as `ctest --repeat` makes, opens the run as the scan made it. The seed starts
+        // `dir` anew, so it comes before anything the test keeps there.
+        QProcess seed;
+        diesWithTheTest(seed);
+        seed.setProcessEnvironment(isolated(dir));
+        seed.setProcessChannelMode(QProcess::MergedChannels);
+        seed.start(env("SUBCHECK_CMAKE"), {"-D", "SUBCHECK=" + env("SUBCHECK_CLI"), "-D",
+                                           "REPO_ROOT=" + env("SUBCHECK_REPO"), "-D", "DIR=" + dir,
+                                           "-D", "FIXTURE=timing.mkv", "-P", env("SUBCHECK_SEED")});
+        QVERIFY2(seed.waitForFinished(30000) && seed.exitStatus() == QProcess::NormalExit &&
+                     seed.exitCode() == 0,
+                 qPrintable(QString::fromUtf8(seed.readAll())));
         QVERIFY(QDir().mkpath(dir + "/config/mpvqt") && QDir().mkpath(dir + "/run") &&
                 QDir().mkpath(dir + "/cache"));
         QVERIFY(QFile::setPermissions(dir + "/run", QFileDevice::ReadOwner |

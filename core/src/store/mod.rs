@@ -254,7 +254,7 @@ pub struct FixStretch {
     /// one with no lines of this track.
     pub first: Option<LineRef>,
     pub last: Option<LineRef>,
-    /// The time of the frame that shows the error, for `o`: a cut's first frame for a late
+    /// The time of the frame that shows the error, for `Play`: a cut's first frame for a late
     /// stretch, the frame before the cut for an early one.
     pub frame_ms: Option<i64>,
 }

@@ -1,6 +1,7 @@
 //! What review's tasks do ([`Runner`]): the store's reads and writes, and the jobs that check files
 //! again and apply fixes, each on a thread of its own ([`super::jobs`]). Nothing here knows the
-//! UI: the jobs send their inputs to whatever channel the UI gave the runner.
+//! UI: the jobs send their inputs to the channel the runner was given, the one `update`'s
+//! inputs come in on, the terminal's loop's or a session's.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -19,8 +20,9 @@ use crate::store::{Run, Selector, Store};
 
 /// Runs `update`'s tasks for a UI: through `store`, the connection review writes through; with
 /// `state`, the state directory, where apply writes the fixed tracks; and with `tx`, a sender on
-/// the UI's channel, where the jobs it starts send what they do. `T` is what that channel carries:
-/// an [`Input`], or a UI's own message that one becomes.
+/// the channel `update`'s inputs come in on (the terminal's loop's, or a session's), where the
+/// jobs it starts send what they do. `T` is what that channel carries: an [`Input`], or a message
+/// of that loop's own that one becomes.
 pub struct Runner<T> {
     store: Store,
     state: PathBuf,

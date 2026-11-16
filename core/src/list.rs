@@ -210,7 +210,7 @@ pub fn track_of<'a>(run: &'a Run, f: &Finding, id: usize) -> Option<&'a TrackRec
     tracks_of(run, &f.file).iter().find(|t| t.id == id)
 }
 
-/// Where review's `o` opens a timing finding.
+/// Where review's `Play` opens a timing finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimingMoment {
     pub at_ms: i64,
@@ -220,7 +220,7 @@ pub struct TimingMoment {
     pub on_frame: bool,
 }
 
-/// Where review's `o` opens a timing finding: the first frame that shows a shifted stretch's
+/// Where review's `Play` opens a timing finding: the first frame that shows a shifted stretch's
 /// error, else the first shifted stretch's first line. `None` for other findings.
 pub fn timing_moment(run: &Run, f: &Finding) -> Option<TimingMoment> {
     let t = f.timing.as_ref()?;

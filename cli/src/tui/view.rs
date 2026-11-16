@@ -14,10 +14,15 @@ use ratatui::widgets::{
 use super::files;
 use super::layout;
 use super::screen::Screen;
-use subcheck_core::list::{self, Filter, label};
+use subcheck_core::list::{Filter, TimingMoment, label};
 use subcheck_core::llm::Spent;
-use subcheck_core::review::model::{Entry, FileNote, Mark, Pane, Review, changed, fix_label};
-use subcheck_core::store::{State, TimingFix};
+use subcheck_core::mkv::shown_name;
+use subcheck_core::review::detail::{Group, Kind, Stretch, Times};
+use subcheck_core::review::model::{
+    Entry, FileNote, Fix, Marked, Pane, Review, changed, fix_label,
+};
+use subcheck_core::review::progress::Checking;
+use subcheck_core::store::State;
 use subcheck_core::text::{timestamp, timestamp_ms};
 use subcheck_core::timing::shift_label;
 
@@ -467,116 +472,116 @@ pub fn detail_lines(m: &Review, spinner: char) -> Vec<Line<'static>> {
     if m.pane == Pane::Files {
         return files::detail_lines(m, spinner);
     }
-    let Some(i) = m.focus() else {
+    let Some(d) = m.detail() else {
         return Vec::new();
     };
-    let finding = m.finding(i);
     let dim = Style::default().fg(Color::DarkGray);
     let mut lines: Vec<Line> = Vec::new();
 
-    lines.extend(group_line(m));
-    let (occurrence, track) = match &finding.timing {
-        // The whole track, not one line of it.
-        Some(t) => (None, list::track_of(&m.run, finding, t.track)),
-        None => list::shown_at(&m.run, finding),
-    };
-    let mut at = occurrence.map_or_else(String::new, |o| timestamp(o.start_ms));
-    if let Some(t) = track {
-        let _ = write!(at, "  {} [track {} · sid {}]", t.shown_name(), t.id, t.sid);
+    lines.extend(d.group.as_ref().map(group_line));
+    let mut at = d.at_ms.map_or_else(String::new, timestamp);
+    if let Some(t) = &d.track {
+        let name = shown_name(t.name.as_deref(), &t.language);
+        let _ = write!(at, "  {name} [track {} · sid {}]", t.id, t.sid);
     }
-    if finding.occurrences.len() > 1 && finding.timing.is_none() {
-        let _ = write!(at, "  (+{} more)", finding.occurrences.len() - 1);
+    if d.more > 0 {
+        let _ = write!(at, "  (+{} more)", d.more);
     }
     lines.push(Line::from(at.trim_start().to_string()));
-    match m.notes.get(&finding.file) {
+    match d.note {
         Some(FileNote::Changed) => lines.push(warn("file changed since scan")),
         Some(FileNote::Missing) => lines.push(warn("file missing")),
         None => {}
     }
-    if let Some(stage) = m.progress.checking(&finding.file) {
-        lines.push(warn(&format!("checking again: {stage}")));
+    if let Some(stage) = d.checking {
+        lines.push(warn(&format!("checking again: {}", checking_words(stage))));
     }
-    let record = m.run.files.iter().rev().find(|r| r.path == finding.file);
-    if let Some(t) = record.and_then(|r| r.truncated) {
+    if let Some(t) = d.truncated {
         lines.push(warn(&format!("scanned a partial copy: {}", t.shortfall())));
     }
-    let state = m.state(i);
-    let edited = m
-        .run
-        .decisions
-        .get(&finding.id)
-        .and_then(|d| d.edited.as_ref());
-    let outcome = m.mark(i).map_or_else(String::new, |t| format!(" · {t}"));
+    let outcome = d
+        .mark
+        .as_ref()
+        .map_or_else(String::new, |t| format!(" · {}", t.text()));
     lines.push(Line::from(format!(
         "state: {}{}{outcome}",
-        label(state),
-        if edited.is_some() {
-            " (your wording)"
-        } else {
-            ""
-        }
+        label(d.state),
+        if d.edited { " (your wording)" } else { "" }
     )));
-    if let Some(why) = m.marks.get(&finding.id).and_then(Mark::reason) {
+    if let Some(Marked::Said(mark)) = &d.mark
+        && let Some(why) = mark.reason()
+    {
         lines.push(warn(&why));
     }
     lines.push(Line::default());
 
-    let wording = m.wording(i);
-    let (ra, rb) = match finding.timing {
-        Some(_) => (0..finding.original.len(), 0..wording.len()),
-        None => changed(&finding.original, wording),
-    };
-    lines.push(marked("- ", &finding.original, ra, Color::Red));
-    lines.push(marked("+ ", wording, rb, Color::Green));
-    if !finding.reason.is_empty() {
-        lines.push(Line::from(format!("why: {}", finding.reason)));
+    let original = bytes(&d.original, &d.original_changed);
+    let wording = bytes(&d.wording, &d.wording_changed);
+    lines.push(marked("- ", &d.original, original, Color::Red));
+    lines.push(marked("+ ", &d.wording, wording, Color::Green));
+    if !d.reason.is_empty() {
+        lines.push(Line::from(format!("why: {}", d.reason)));
     }
     lines.push(Line::default());
-    if let Some(t) = &finding.timing {
-        lines.extend(stretch_lines(t));
-        lines.extend(opens_line(m, i));
-        return lines;
+    match d.kind {
+        Kind::Timing {
+            stretches,
+            unshifted,
+            opens,
+        } => {
+            lines.extend(stretch_lines(&stretches, &unshifted));
+            lines.extend(opens_line(opens));
+        }
+        Kind::Line { before, after } => {
+            lines.extend(before.into_iter().map(|l| Line::styled(l, dim)));
+            lines.push(Line::styled(
+                d.original,
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            lines.extend(after.into_iter().map(|l| Line::styled(l, dim)));
+        }
     }
-    lines.extend(finding.before.iter().map(|l| Line::styled(l.clone(), dim)));
-    lines.push(Line::styled(
-        finding.original.clone(),
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    lines.extend(finding.after.iter().map(|l| Line::styled(l.clone(), dim)));
     lines
 }
 
-/// For a row of several findings, what they are: a typo's files, a timing row's members' fixes.
-fn group_line(m: &Review) -> Option<Line<'static>> {
-    let Some(Entry::Row(r)) = m.selected_entry() else {
-        return None;
-    };
-    let all = m.rows[r].members.len();
-    let shown = m.shown_members(r);
-    if all < 2 {
-        return None;
+/// Where the scan checking a file again is with it, in the files view's words.
+fn checking_words(stage: Checking) -> String {
+    match stage {
+        Checking::Queued => "queued".into(),
+        Checking::Reading => "reading".into(),
+        Checking::Asking { answered, chunks } => format!("LLM {answered}/{chunks}"),
     }
-    let hidden = match all - shown.len() {
+}
+
+/// `range`, characters of `s`, as the bytes they take, to cut `s` by.
+fn bytes(s: &str, range: &Range<usize>) -> Range<usize> {
+    let at = |n: usize| s.char_indices().nth(n).map_or(s.len(), |(i, _)| i);
+    at(range.start)..at(range.end)
+}
+
+/// For a row of several findings, what they are: a typo's files, a timing row's members' fixes.
+fn group_line(g: &Group) -> Line<'static> {
+    let hidden = match g.hidden {
         0 => String::new(),
         n => format!(" (+{n} hidden by the filter)"),
     };
-    let each = |j: usize| m.label(&m.finding(j).file);
-    let files = if m.finding(shown[0]).timing.is_some() {
-        let fixes: Vec<String> = shown
+    let files = if g.members[0].fix.is_some() {
+        let fixes: Vec<String> = g
+            .members
             .iter()
-            .map(|&j| format!("{} {}", each(j), fix_label(m.finding(j))))
+            .map(|j| format!("{} {}", j.label, j.fix.map_or_else(String::new, Fix::label)))
             .collect();
         fixes.join(" · ")
     } else {
-        let episodes: Vec<String> = shown.iter().map(|&j| each(j)).collect();
-        format!("{} files: {}", shown.len(), episodes.join(" "))
+        let episodes: Vec<&str> = g.members.iter().map(|j| j.label.as_str()).collect();
+        format!("{} files: {}", g.members.len(), episodes.join(" "))
     };
-    Some(Line::from(format!("{files}{hidden}")))
+    Line::from(format!("{files}{hidden}"))
 }
 
-/// Where `o` opens timing finding `i`.
-fn opens_line(m: &Review, i: usize) -> Vec<Line<'static>> {
-    let Some(at) = list::timing_moment(&m.run, m.finding(i)) else {
+/// Where `o` opens a timing finding.
+fn opens_line(opens: Option<TimingMoment>) -> Vec<Line<'static>> {
+    let Some(at) = opens else {
         return Vec::new();
     };
     let on = if at.on_frame {
@@ -595,21 +600,18 @@ fn opens_line(m: &Review, i: usize) -> Vec<Line<'static>> {
 
 /// A timing fix's stretches, each from its first line's start to its last line's end with its
 /// shift, then the lines it leaves where they are.
-fn stretch_lines(t: &TimingFix) -> Vec<Line<'static>> {
-    let mut rows: Vec<(String, String, String)> = t
-        .stretches
+fn stretch_lines(stretches: &[Stretch], unshifted: &[Times]) -> Vec<Line<'static>> {
+    let mut rows: Vec<(String, String, String)> = stretches
         .iter()
         .map(|s| {
-            let from = s.from_ms.or(s.first.as_ref().map(|l| l.start_ms));
-            let to = s.to_ms.or(s.last.as_ref().map(|l| l.end_ms));
             (
                 shift_label(s.frames),
-                from.map_or_else(|| "start".into(), timestamp),
-                to.map_or_else(|| "end".into(), timestamp),
+                s.from_ms.map_or_else(|| "start".into(), timestamp),
+                s.to_ms.map_or_else(|| "end".into(), timestamp),
             )
         })
         .collect();
-    rows.extend(t.unshifted.iter().map(|l| {
+    rows.extend(unshifted.iter().map(|l| {
         (
             "not shifted".to_string(),
             timestamp(l.start_ms),
@@ -621,8 +623,8 @@ fn stretch_lines(t: &TimingFix) -> Vec<Line<'static>> {
         .into_iter()
         .map(|(label, from, to)| Line::from(format!("{label:<width$}  {from} – {to}")))
         .collect();
-    if !t.unshifted.is_empty() {
-        let note = if t.unshifted.len() == 1 {
+    if !unshifted.is_empty() {
+        let note = if unshifted.len() == 1 {
             "(the line not shifted: its times point both ways)"
         } else {
             "(lines not shifted: their times point both ways)"
@@ -1828,5 +1830,255 @@ mod tests {
         let line = screen.lines().nth(19).unwrap();
         assert!(line.starts_with("wording: abc "), "{screen}");
         assert!(line.ends_with(" ⏎ accept · Esc cancel"), "{screen}");
+    }
+
+    /// The detail pane's lines, as text.
+    fn detail_text(m: &Review) -> Vec<String> {
+        detail_lines(m, '⠋')
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    // Each line a line finding's detail can have, at once: a row of three that the filter shows
+    // one of, on a line of two occurrences, in a file changed since its scan, being checked again,
+    // scanned from a partial copy, reworded by the user, and left by hand by apply.
+    #[test]
+    fn a_line_findings_detail_says_all_it_has_line_for_line() {
+        use subcheck_core::mkv::Truncated;
+        use subcheck_core::review::update::tests_support::decide_as;
+        use subcheck_core::scan;
+        use subcheck_core::text::Occurrence;
+        let mut m = sample();
+        m.run.findings[0].occurrences.push(Occurrence {
+            track: 6,
+            start_ms: 170_000,
+            end_ms: 172_000,
+        });
+        m.notes.insert(path(1), FileNote::Changed);
+        m.progress.start("r", "subcheck scan --run r".into(), false);
+        m.progress
+            .scan_event(&scan::Event::Queued(vec![path(1).into()]));
+        m.progress.scan_event(&scan::Event::Asking {
+            path: path(1).into(),
+            answered: 1,
+            chunks: 3,
+        });
+        m.run.files[0].truncated = Some(Truncated {
+            declared_end: 2000,
+            file_size: 1000,
+        });
+        decide_as(
+            &mut m,
+            &[1],
+            State::Accepted,
+            Some("The beat gets thru to our mind"),
+        );
+        m.marks.insert(1, Mark::ByHand("a karaoke row".into()));
+        m.filter = Filter::Only(State::Accepted);
+        m.selected = 0;
+        assert_eq!(
+            detail_text(&m),
+            [
+                "1 files: E01 (+2 hidden by the filter)",
+                "0:02:45.06  English Full [track 5 · sid 1]  (+1 more)",
+                "⚠ file changed since scan",
+                "⚠ checking again: LLM 1/3",
+                concat!(
+                    "⚠ scanned a partial copy: ",
+                    "file has 1000 of the 2000 bytes its Segment declares (50.0%)"
+                ),
+                "state: accepted (your wording) · by hand",
+                "⚠ left for a fix by hand: a karaoke row",
+                "",
+                "- The beat gets trough to our mind",
+                "+ The beat gets thru to our mind",
+                "why: misspelling of \"through\"",
+                "",
+                "The line before.",
+                "The beat gets trough to our mind",
+                "The line after.",
+            ]
+        );
+    }
+
+    // A member of an expanded row: no group line; its file gone from disk, its fix in it.
+    #[test]
+    fn a_members_detail_says_its_file_is_missing_and_its_fix_applied_line_for_line() {
+        let mut m = sample();
+        m.expanded.insert(0);
+        m.selected = 2;
+        m.notes.insert(path(2), FileNote::Missing);
+        m.run.applied.insert(2);
+        assert_eq!(
+            detail_text(&m),
+            [
+                "0:02:45.06  English Full [track 5 · sid 1]",
+                "⚠ file missing",
+                "state: pending · applied",
+                "",
+                "- The beat gets trough to our mind",
+                "+ The beat gets through to our mind",
+                "why: misspelling of \"through\"",
+                "",
+                "The line before.",
+                "The beat gets trough to our mind",
+                "The line after.",
+            ]
+        );
+    }
+
+    // A timing row, then its partial member under a dry run's mark, then a member whose stretches
+    // name no frame, which `o` opens on its first moved line.
+    #[test]
+    fn a_timing_findings_detail_says_its_stretches_and_where_o_opens_it_line_for_line() {
+        let mut m = subcheck_core::review::model::tests_support::with_timing();
+        m.selected = 1;
+        assert_eq!(
+            detail_text(&m),
+            [
+                "E01 −1 frame · E02 partial · E03 −1 frame",
+                "English Full [track 5 · sid 1]",
+                "state: pending",
+                "",
+                "- 1 frame late",
+                "+ shift 1 frame earlier",
+                "why: cuts: 345 times, +1 in 5 of 9 windows",
+                "",
+                "1 frame late  0:00:01.00 – 0:23:22.00",
+                "",
+                "o opens 0:12:43.763 on the frame that shows the error",
+            ]
+        );
+        m.expanded.insert(1);
+        m.selected = 3;
+        m.marks.insert(12, Mark::WouldApply);
+        assert_eq!(
+            detail_text(&m),
+            [
+                "English Full [track 5 · sid 1]",
+                "state: pending · would apply",
+                "",
+                "- partial: 1 frame late, in sync, 1 frame late",
+                "+ shift 1 frame earlier: start – 0:07:55.78, 0:15:40.47 – end",
+                "why: cuts: 345 times, +1 in 5 of 9 windows",
+                "",
+                "1 frame late  0:00:01.00 – 0:07:55.78",
+                "in sync       0:08:03.51 – 0:15:39.00",
+                "1 frame late  0:15:40.47 – 0:23:22.00",
+                "not shifted   0:21:40.00 – 0:21:42.00",
+                "(the line not shifted: its times point both ways)",
+                "",
+                "o opens 0:04:06.788 on the frame that shows the error",
+            ]
+        );
+        for stretch in &mut m.run.findings[4].timing.as_mut().unwrap().stretches {
+            stretch.frame_ms = None;
+        }
+        m.selected = 2;
+        assert_eq!(
+            detail_text(&m),
+            [
+                "English Full [track 5 · sid 1]",
+                "state: pending",
+                "",
+                "- 1 frame late",
+                "+ shift 1 frame earlier",
+                "why: cuts: 345 times, +1 in 5 of 9 windows",
+                "",
+                "1 frame late  0:00:01.00 – 0:23:22.00",
+                "",
+                concat!(
+                    "o opens 0:00:01.000 on its first moved line ",
+                    "(no line of it ends or starts on a cut)"
+                ),
+            ]
+        );
+    }
+
+    // What differs is marked by character, whatever bytes come before it.
+    #[test]
+    fn the_changed_words_are_marked_in_each_wording() {
+        let mut m = sample();
+        let f = &mut m.run.findings[0];
+        f.original = "Ça va trés bien, 字幕.".into();
+        f.suggestion = "Ça va très bien, 字幕.".into();
+        let lines = detail_lines(&m, '⠋');
+        let spans = |line: &Line| -> Vec<String> {
+            line.spans.iter().map(|s| s.content.to_string()).collect()
+        };
+        let changed = |colour| {
+            Style::default()
+                .fg(colour)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        };
+        let minus = lines
+            .iter()
+            .find(|l| l.to_string().starts_with("- "))
+            .unwrap();
+        let plus = lines
+            .iter()
+            .find(|l| l.to_string().starts_with("+ "))
+            .unwrap();
+        assert_eq!(spans(minus), ["- ", "Ça va ", "trés", " bien, 字幕."]);
+        assert_eq!(spans(plus), ["+ ", "Ça va ", "très", " bien, 字幕."]);
+        assert_eq!(minus.spans[2].style, changed(Color::Red));
+        assert_eq!(plus.spans[2].style, changed(Color::Green));
+    }
+
+    // Where a scan checking the file again is with it, in the files view's words, at each stage.
+    #[test]
+    fn a_recheck_under_way_says_its_stage_in_the_files_views_words() {
+        use subcheck_core::scan;
+        let mut m = sample();
+        m.progress.start("r", "subcheck scan --run r".into(), false);
+        m.progress
+            .scan_event(&scan::Event::Queued(vec![path(1).into()]));
+        let said = |m: &Review| -> Vec<String> {
+            detail_text(m)
+                .into_iter()
+                .filter(|l| l.starts_with("⚠ checking again"))
+                .collect()
+        };
+        assert_eq!(said(&m), ["⚠ checking again: queued"]);
+        m.progress.scan_event(&scan::Event::Reading(path(1).into()));
+        assert_eq!(said(&m), ["⚠ checking again: reading"]);
+    }
+
+    // The detail pane words each stage of a re-check as the files view's label does, less its
+    // spinner: the two are worded apart, and one file must read the same in both.
+    #[test]
+    fn a_rechecks_stage_is_worded_as_the_files_view_words_it() {
+        use subcheck_core::scan;
+        let mut m = sample();
+        let file = path(1);
+        m.progress.start("r", "subcheck scan --run r".into(), false);
+        let events = [
+            scan::Event::Queued(vec![path(1).into()]),
+            scan::Event::Reading(path(1).into()),
+            scan::Event::Asking {
+                path: path(1).into(),
+                answered: 1,
+                chunks: 3,
+            },
+        ];
+        let mut stages = Vec::new();
+        for event in &events {
+            m.progress.scan_event(event);
+            let stage = m.progress.checking(&file).unwrap();
+            let shown = m.progress.files.iter().find(|f| f.path == file).unwrap();
+            let label = shown.label('⠋');
+            assert_eq!(
+                checking_words(stage),
+                label.trim_start_matches("⠋ "),
+                "{stage:?}"
+            );
+            stages.push(stage);
+        }
+        let asking = Checking::Asking {
+            answered: 1,
+            chunks: 3,
+        };
+        assert_eq!(stages, [Checking::Queued, Checking::Reading, asking]);
     }
 }

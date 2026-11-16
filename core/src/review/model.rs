@@ -61,22 +61,23 @@ pub enum FileNote {
 pub enum Pane {
     #[default]
     Findings,
-    /// Each file of the run, with where the scan, or apply, is with it (`Tab`).
+    /// Each file of the run, with where the scan, or apply, is with it (`ShowPane`).
     Files,
 }
 
-/// A question on the status line, waiting for `y`.
+/// A question on the status line, waiting for its `Answer`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confirm {
     /// Quit, stopping the scan or apply.
     Quit,
-    /// Check `path` again into run `run`, with its `backend`: `c` in the files view.
+    /// Check `path` again into run `run`, with its `backend`: `Recheck`'s question, in the
+    /// files view.
     Recheck {
         path: String,
         run: String,
         backend: String,
     },
-    /// Apply the view's accepted fixes: `A`.
+    /// Apply the view's accepted fixes: `Apply`'s question.
     Apply,
 }
 
@@ -170,7 +171,25 @@ impl Mark {
     }
 }
 
-/// What one `u` takes back: each finding a decision changed, with the decision it had before.
+/// A finding's mark as the list and the detail show it ([`Review::marked`]): what the screen's
+/// last apply or dry run said of it, else that its fix is in its file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Marked {
+    Said(Mark),
+    Applied,
+}
+
+impl Marked {
+    /// The mark as the list shows it.
+    pub fn text(&self) -> &'static str {
+        match self {
+            Marked::Said(mark) => mark.text(),
+            Marked::Applied => "applied",
+        }
+    }
+}
+
+/// What one `Undo` takes back: each finding a decision changed, with the decision it had before.
 pub type UndoStep = Vec<(u64, Option<Decision>)>;
 
 /// An entry by its findings' IDs, which outlast a remake of the rows ([`Review::refresh`]): a row
@@ -224,7 +243,7 @@ pub struct Review {
     /// `scan` and `review`).
     pub karaoke: bool,
     /// What the screen's applies and dry runs said of findings, by ID ([`Mark`]). By ID, so they
-    /// outlast a remake of the rows and `v`.
+    /// outlast a remake of the rows and another view.
     pub marks: HashMap<u64, Mark>,
     /// Why the screen ended early: a job's thread panicked, or the terminal could not be read.
     pub fatal: Option<String>,
@@ -238,7 +257,7 @@ pub struct Review {
     /// `refresh` carries what pointed at it.
     replaced_by: HashMap<u64, u64>,
     /// The file review last asked the player to load, and its size and mtime then, until the
-    /// player closes, an open fails, or `o`'s stat cannot read the size and mtime of the file it
+    /// player closes, an open fails, or `Play`'s stat cannot read the size and mtime of the file it
     /// opens: the same file, unchanged since, is sought, not loaded again (slow for a big file
     /// over NFS). A remux in place keeps the path, and after a fix of one letter even the size.
     pub loaded: Option<(String, (u64, Timestamp))>,
@@ -454,8 +473,8 @@ impl Review {
             .collect()
     }
 
-    /// Take `view`, another view of the findings (`v`'s other one, or `OpenView`'s), with its
-    /// files' `notes`. What pointed at a finding carries over by its ID, where the view has it:
+    /// Take `view`, another view of the findings (`SwitchView`'s other one, or `OpenView`'s), with
+    /// its files' `notes`. What pointed at a finding carries over by its ID, where the view has it:
     /// the selection, else the first row with a pending finding, as on opening; the expanded rows;
     /// and the undo steps, less the findings this view does not show (a step left empty goes). The
     /// filter, the pane, the marks and the file the player last loaded stay. The files view shows
@@ -597,14 +616,19 @@ impl Review {
             .any(|&i| self.state(i) == State::Pending)
     }
 
-    /// Finding `i`'s mark: what the screen's last apply or dry run said of it, else `applied` when
-    /// its fix is in its file, else none.
-    pub fn mark(&self, i: usize) -> Option<&'static str> {
+    /// Finding `i`'s mark: what the screen's last apply or dry run said of it, else
+    /// [`Marked::Applied`] when its fix is in its file, else none.
+    pub fn marked(&self, i: usize) -> Option<Marked> {
         let id = self.finding(i).id;
         match self.marks.get(&id) {
-            Some(mark) => Some(mark.text()),
-            None => self.run.applied.contains(&id).then_some("applied"),
+            Some(mark) => Some(Marked::Said(mark.clone())),
+            None => self.run.applied.contains(&id).then_some(Marked::Applied),
         }
+    }
+
+    /// Finding `i`'s mark ([`Review::marked`]) as the list shows it.
+    pub fn mark(&self, i: usize) -> Option<&'static str> {
+        self.marked(i).as_ref().map(Marked::text)
     }
 
     /// Row `r`'s mark, over the members the filter shows: theirs when they all agree; when they
@@ -630,7 +654,7 @@ impl Review {
         Some(parts.join(" · "))
     }
 
-    /// What `A` would apply, as its question counts it: the view's accepted fixes (typos and
+    /// What `Apply` would apply, as its question counts it: the view's accepted fixes (typos and
     /// timing fixes, whatever the filter), the files that hold them, and of the fixes those in
     /// their files already.
     pub fn apply_counts(&self) -> (usize, usize, usize) {
@@ -747,9 +771,9 @@ impl Review {
         }
     }
 
-    /// What `a` `r` `e` on an entry decide: of its targets, the pending ones; all of them when none
-    /// is, so that a decided group still flips as a whole. A member decided on its own keeps its
-    /// decision when its row is decided later.
+    /// What `Accept`, `Reject` or an edit on an entry decide: of its targets, the pending ones; all
+    /// of them when none is, so that a decided group still flips as a whole. A member decided on
+    /// its own keeps its decision when its row is decided later.
     pub fn to_decide(&self, e: Entry) -> Vec<usize> {
         let targets = self.targets(e);
         let pending: Vec<usize> = targets
@@ -764,8 +788,8 @@ impl Review {
         self.entries().get(self.selected).copied()
     }
 
-    /// The finding the detail pane shows and `o` opens: the selected member, or the selected row's
-    /// first shown member.
+    /// The finding the detail pane shows and `Play` opens: the selected member, or the selected
+    /// row's first shown member.
     pub fn focus(&self) -> Option<usize> {
         self.selected_entry()
             .and_then(|e| self.targets(e).first().copied())
@@ -882,17 +906,40 @@ fn track_names(run: &Run) -> Vec<String> {
         .collect()
 }
 
-/// A timing finding's fix in a word: `−1 frame` (its lines moved a frame earlier), `+2 frames`,
-/// `partial`. Empty for other findings.
-pub fn fix_label(f: &Finding) -> String {
-    match f.timing.as_ref().map(|t| t.stretches.as_slice()) {
-        Some([whole]) => {
-            let sign = if whole.frames > 0 { '−' } else { '+' };
-            format!("{sign}{}", frame_count(whole.frames))
-        }
-        Some(_) => "partial".into(),
-        None => String::new(),
+/// A timing finding's fix, as a member of its row says it ([`Fix::label`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fix {
+    /// The whole track, by its one stretch's frames, which are late when positive: the fix moves
+    /// it earlier.
+    Shift(i64),
+    /// Stretches of the track, each by its own frames, or none.
+    Partial,
+}
+
+impl Fix {
+    /// `f`'s fix; none for a finding that is not a timing finding.
+    pub fn of(f: &Finding) -> Option<Fix> {
+        Some(match f.timing.as_ref()?.stretches.as_slice() {
+            [whole] => Fix::Shift(whole.frames),
+            _ => Fix::Partial,
+        })
     }
+
+    /// The fix in a word: `−1 frame` (its lines moved a frame earlier), `+2 frames`, `partial`.
+    pub fn label(self) -> String {
+        match self {
+            Fix::Shift(frames) => {
+                let sign = if frames > 0 { '−' } else { '+' };
+                format!("{sign}{}", frame_count(frames))
+            }
+            Fix::Partial => "partial".into(),
+        }
+    }
+}
+
+/// A timing finding's fix in a word ([`Fix::label`]); empty for other findings.
+pub fn fix_label(f: &Finding) -> String {
+    Fix::of(f).map_or_else(String::new, Fix::label)
 }
 
 /// What puts findings in one row (see [`Row`]).
