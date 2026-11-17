@@ -36,6 +36,9 @@ EntryView row(uint64_t id, std::optional<State> state = State::kPending) {
         .checking = false,
         .note = std::nullopt,
         .mixed = false,
+        .check = Check::kLlm,
+        .original_changed = Span{16, 21},
+        .wording_changed = Span{16, 22},
     };
 }
 

@@ -25,7 +25,7 @@ use crate::mkv::{self, Truncated};
 use crate::text::Occurrence;
 
 pub use db::{BUSY_TIMEOUT, Location, SCHEMA_VERSION, Store, location, location_from};
-pub use view::Selector;
+pub use view::{Selector, ShowFolder};
 pub use write::{Attempt, Decided, Made, Saved, ScanRow, Swapped, is_busy};
 
 /// The state directory, from explicit inputs. An empty or relative `XDG_STATE_HOME` is ignored,
@@ -355,6 +355,14 @@ impl FileRecord {
     }
 }
 
+/// What a paths view of `path` alone is called ([`Run::shown_name`]): its last part, or the whole
+/// path when it has none, as `/` has not.
+pub fn path_name(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy())
+        .into_owned()
+}
+
 /// Some files as a view shows them ([`Store::view`]): a run's, or those under some paths; their
 /// current findings with the latest decision for each. Review's screen keeps one in memory.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -410,10 +418,7 @@ impl Run {
         let Some(first) = self.paths.first() else {
             return self.name.clone();
         };
-        let name = first
-            .file_name()
-            .map_or_else(|| first.to_string_lossy(), |n| n.to_string_lossy())
-            .into_owned();
+        let name = path_name(first);
         match self.paths.len() {
             1 => name,
             n => format!("{name} +{}", n - 1),

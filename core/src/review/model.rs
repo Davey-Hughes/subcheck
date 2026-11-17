@@ -530,12 +530,13 @@ impl Review {
             .collect()
     }
 
-    /// Take `view`, another view of the findings (`SwitchView`'s other one, or `OpenView`'s), with
-    /// its files' `notes`. What pointed at a finding carries over by its ID, where the view has it:
-    /// the selection, else the first row with a pending finding, as on opening; the expanded rows;
-    /// and the undo steps, less the findings this view does not show (a step left empty goes). The
-    /// filter, the pane, the marks and the file the player last loaded stay. The files view shows
-    /// the new view's files, the selected file kept where it is one of them.
+    /// Take `view`, another view of the findings (`SwitchView`'s other one, `OpenView`'s or
+    /// `OpenFolder`'s), with its files' `notes`. What pointed at a finding carries over by its ID,
+    /// where the view has it: the selection, else the first row with a pending finding, as on
+    /// opening; the expanded rows; and the undo steps, less the findings this view does not show
+    /// (a step left empty goes). The filter, the pane, the marks and the file the player last
+    /// loaded stay. The files view shows the new view's files, the selected file kept where it is
+    /// one of them.
     pub fn switch(&mut self, view: Run, notes: HashMap<String, FileNote>) {
         let selected = self.selected_key();
         let expanded: Vec<EntryKey> = self

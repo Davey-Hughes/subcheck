@@ -126,6 +126,55 @@ impl Store {
         self.shown_paths(&shown)
     }
 
+    /// Every file recorded under `folder`, as a paths view, whether or not it is on disk now: one
+    /// of [`Store::show_folders`], by its path, which `Selector::parse` would take for a run's name
+    /// were it not on disk.
+    pub fn folder_view(&self, folder: &Path) -> anyhow::Result<Run> {
+        self.shown_paths(&[(folder.to_path_buf(), true)])
+    }
+
+    /// The show folders, for a UI to open one of: the folders that hold the files every run named,
+    /// each run's as [`Store::folders_view`] takes them, and across runs as within one, a folder
+    /// inside another of them left out, as that one covers it. Newest first, by the newest run
+    /// that named a file under each; each with how many of the findings recorded under it are
+    /// pending, as its view counts them.
+    pub fn show_folders(&self) -> rusqlite::Result<Vec<ShowFolder>> {
+        let mut named = self
+            .conn
+            .prepare("SELECT path FROM scan_files WHERE scan = ?1 ORDER BY rowid")?;
+        let mut files = Vec::new();
+        for scan in self.scans_newest_first()? {
+            for path in named.query_map([scan.id], |r| r.get::<_, String>(0))? {
+                files.push(path?);
+            }
+        }
+        // A folder goes where the first file under it is: a newer run may name only a file in a
+        // folder inside it.
+        let mut shown: Vec<(usize, PathBuf)> = folders(&files)
+            .into_iter()
+            .map(|f| (files.iter().position(|p| Path::new(p).starts_with(&f)), f))
+            .map(|(first, f)| (first.unwrap_or(usize::MAX), f))
+            .collect();
+        shown.sort();
+        let mut pending = self.conn.prepare(
+            "SELECT COUNT(*) FROM checks c JOIN findings f ON f.\"check\" = c.id
+             WHERE c.replaced_by IS NULL AND c.error IS NULL AND c.path >= ?1 AND c.path < ?2
+                 AND COALESCE((SELECT d.state FROM decisions d WHERE d.finding = f.id
+                               ORDER BY d.id DESC LIMIT 1), 'pending') = 'pending'",
+        )?;
+        shown
+            .into_iter()
+            .map(|(_, path)| {
+                let (from, to) = under(&path);
+                let n: i64 = pending.query_row(params![from, to], |r| r.get(0))?;
+                Ok(ShowFolder {
+                    path,
+                    to_review: usize::try_from(n).unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
     /// The paths view of `paths`, each with whether it is a folder (every file recorded under it)
     /// or a file (that file alone).
     fn shown_paths(&self, paths: &[(PathBuf, bool)]) -> anyhow::Result<Run> {
@@ -134,13 +183,11 @@ impl Store {
         for (p, folder) in paths {
             let text = p.to_string_lossy();
             if *folder {
-                // Every path that starts `dir/`: from `dir/` up to `dir0`, `0` being the
-                // character after `/`. (`LIKE` would take a `_` in the path for any character.)
-                let dir = text.trim_end_matches('/');
+                let (from, to) = under(p);
                 tx.execute(
                     "INSERT OR IGNORE INTO temp.shown(path, pos)
                      SELECT DISTINCT path, 0 FROM checks WHERE path >= ?1 AND path < ?2",
-                    params![format!("{dir}/"), format!("{dir}0")],
+                    params![from, to],
                 )?;
             } else {
                 tx.execute(
@@ -179,6 +226,23 @@ impl Store {
         tx.commit()?;
         Ok(run)
     }
+}
+
+/// A show folder ([`Store::show_folders`]): its path, and how many of the findings recorded under
+/// it are pending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowFolder {
+    pub path: PathBuf,
+    pub to_review: usize,
+}
+
+/// The paths under folder `dir`, as the range of text they sort in: every path that starts
+/// `dir/`, from `dir/` up to `dir0`, `0` being the character after `/`. (`LIKE` would take a `_`
+/// in the path for any character.)
+fn under(dir: &Path) -> (String, String) {
+    let text = dir.to_string_lossy();
+    let dir = text.trim_end_matches('/');
+    (format!("{dir}/"), format!("{dir}0"))
 }
 
 /// The folders that hold `files`, in the order of the files, each once; a folder inside another of
@@ -725,6 +789,141 @@ mod tests {
         assert_eq!(view.paths, [PathBuf::from("/m/S2"), PathBuf::from("/m/S1")]);
         assert_eq!(view.shown_name(), "S2 +1");
         assert_eq!(view.files.len(), 4);
+    }
+
+    /// Each show folder's path and count.
+    fn shelf(store: &Store) -> Vec<(String, usize)> {
+        store
+            .show_folders()
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.path.to_string_lossy().into_owned(), f.to_review))
+            .collect()
+    }
+
+    // One per show: a run's folders, and a folder inside another left out across runs too; a
+    // folder whose name starts as another's is a show of its own. Newest first by the newest run
+    // that named a file under it, which can name only a file in a folder inside it.
+    #[test]
+    fn the_show_folders_are_every_runs_folders_newest_first_with_what_is_pending() {
+        let (_db, mut store) = store();
+        assert_eq!(shelf(&store), []);
+        let (e01, sp, near, s2) = (
+            "/m/S1/E01.mkv",
+            "/m/S1/Specials/SP1.mkv",
+            "/m/S1 Season 2/E01.mkv",
+            "/m/S2/E01.mkv",
+        );
+        let first = store
+            .begin_scan(
+                &header("2026-10-17T10:00:00Z"),
+                &[e01.into(), sp.into(), s2.into()],
+            )
+            .unwrap();
+        let ids = checked(
+            &mut store,
+            &first,
+            e01,
+            &[("befor", "before"), ("teh", "the")],
+        );
+        checked(&mut store, &first, sp, &[("trough", "through")]);
+        checked(&mut store, &first, s2, &[("adn", "and")]);
+        let second = store
+            .begin_scan(&header("2026-10-17T11:00:00Z"), &[near.into()])
+            .unwrap();
+        checked(&mut store, &second, near, &[("wiht", "with")]);
+        store
+            .decide(&[decision(ids[0], State::Accepted, None)])
+            .unwrap();
+        assert_eq!(
+            shelf(&store),
+            [
+                ("/m/S1 Season 2".into(), 1),
+                ("/m/S1".into(), 2),
+                ("/m/S2".into(), 1)
+            ]
+        );
+        store
+            .begin_scan(&header("2026-10-17T12:00:00Z"), &[sp.into()])
+            .unwrap();
+        assert_eq!(
+            shelf(&store),
+            [
+                ("/m/S1".into(), 2),
+                ("/m/S1 Season 2".into(), 1),
+                ("/m/S2".into(), 1)
+            ]
+        );
+        // Its view, not on disk: every file recorded under it, as the newest run's folders are.
+        let view = store.folder_view(Path::new("/m/S1")).unwrap();
+        assert_eq!(paths(&view), [e01, sp]);
+        assert_eq!(view.shown_name(), "S1");
+    }
+
+    // A folder's count is what its view counts as pending: each finding's latest decision, the
+    // findings of each file's current check alone, a file whose latest attempt failed still
+    // counting its check's.
+    #[test]
+    fn a_show_folders_count_is_what_its_view_has_pending() {
+        let (_db, mut store) = store();
+        let (a, b, c) = ("/m/S1/E01.mkv", "/m/S1/E02.mkv", "/m/S1/E03.mkv");
+        let scan = store
+            .begin_scan(
+                &header("2026-10-17T10:00:00Z"),
+                &[a.into(), b.into(), c.into()],
+            )
+            .unwrap();
+        let ids = checked(&mut store, &scan, a, &[("befor", "before"), ("teh", "the")]);
+        checked(&mut store, &scan, b, &[("trough", "through")]);
+        checked(
+            &mut store,
+            &scan,
+            b,
+            &[("trough", "through"), ("adn", "and")],
+        );
+        checked(&mut store, &scan, c, &[("wiht", "with")]);
+        store
+            .fail(
+                &attempt(scan.id, c, &[track("cues")], "2026-10-17T11:00:00Z"),
+                &[(llm(), 4)],
+                "LLM: boom",
+            )
+            .unwrap();
+        store
+            .decide(&[decision(ids[0], State::Rejected, None)])
+            .unwrap();
+        store
+            .decide(&[decision(ids[0], State::Pending, None)])
+            .unwrap();
+        store
+            .decide(&[decision(ids[1], State::Accepted, None)])
+            .unwrap();
+        let view = store.folder_view(Path::new("/m/S1")).unwrap();
+        let pending = view
+            .findings
+            .iter()
+            .filter(|f| view.state_of(f.id) == State::Pending)
+            .count();
+        assert_eq!(pending, 4);
+        assert_eq!(shelf(&store), [("/m/S1".into(), pending)]);
+    }
+
+    // As within one run: a run that names a file in the folder above the shows makes that folder
+    // their one entry, as it covers them.
+    #[test]
+    fn a_file_in_the_folder_above_the_shows_makes_that_folder_their_one_entry() {
+        let (_db, mut store) = store();
+        store
+            .begin_scan(
+                &header("2026-10-17T10:00:00Z"),
+                &["/m/S1/E01.mkv".into(), "/m/S2/E01.mkv".into()],
+            )
+            .unwrap();
+        assert_eq!(shelf(&store), [("/m/S1".into(), 0), ("/m/S2".into(), 0)]);
+        store
+            .begin_scan(&header("2026-10-17T09:00:00Z"), &["/m/extra.mkv".into()])
+            .unwrap();
+        assert_eq!(shelf(&store), [("/m".into(), 0)]);
     }
 
     #[test]

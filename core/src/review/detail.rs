@@ -132,12 +132,7 @@ impl Review {
             None => list::shown_at(&self.run, f),
         };
         let wording = self.wording(i);
-        let (original_changed, wording_changed) = if f.timing.is_some() {
-            (0..f.original.chars().count(), 0..wording.chars().count())
-        } else {
-            let (a, b) = changed(&f.original, wording);
-            (chars(&f.original, &a), chars(wording, &b))
-        };
+        let (original_changed, wording_changed) = self.changes(i);
         let kind = match &f.timing {
             Some(t) => Kind::Timing {
                 stretches: t
@@ -228,6 +223,21 @@ impl Review {
                 })
                 .collect(),
         })
+    }
+
+    /// The part of finding `i`'s original that differs from its wording, and the part of its
+    /// wording that differs from its original, in characters ([`changed`]); for a timing finding,
+    /// all of each, as its two sides are descriptions, not lines of the file. What a UI marks, in
+    /// the detail and on each row alike.
+    pub fn changes(&self, i: usize) -> (Range<usize>, Range<usize>) {
+        let f = self.finding(i);
+        let wording = self.wording(i);
+        if f.timing.is_some() {
+            (0..f.original.chars().count(), 0..wording.chars().count())
+        } else {
+            let (a, b) = changed(&f.original, wording);
+            (chars(&f.original, &a), chars(wording, &b))
+        }
     }
 }
 

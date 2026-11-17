@@ -250,7 +250,8 @@ private slots:
         QCOMPARE(o.out.str(), "media: 0 accepted, 0 rejected, 4 pending\n");
         QCOMPARE(o.err.str(), "");
         // Once let go, what the pump read is dropped, and a key does nothing.
-        emit o.bridge.eventArrived(Event(Event::kChanged{Splice{0, 2, {}}, Summary{}, {}, {}, {}}));
+        emit o.bridge.eventArrived(
+            Event(Event::kChanged{Splice{0, 2, {}}, Summary{}, {}, {}, {}, {}}));
         QVERIFY(o.bridge.key(Qt::Key_A, "a"));
         QCoreApplication::sendPostedEvents();
         QCOMPARE(o.bridge.findings()->rowCount(), 2);
@@ -289,6 +290,15 @@ private slots:
         QCOMPARE(finished[0][0].toInt(), 0);
         QCOMPARE(o.err.str(), "one\ntwo\n");
         QCOMPARE(o.out.str(), "media: 0 accepted, 0 rejected, 4 pending\n");
+    }
+
+    // No selector, as the app given no arguments has: review opens the newest run's folders, the
+    // run with no findings, which the seed made last.
+    void noSelectorOpensTheNewestRunsFolders() {
+        Opened o({});
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.title(), "clean");
+        QVERIFY(o.bridge.empty());
     }
 
     void aRunThatIsNotThereIsAFatalEnd() {
@@ -474,7 +484,8 @@ private slots:
         QTRY_COMPARE(bridge.findings()->rowCount(), 2);
         QSignalSpy arrived(&bridge, &SessionBridge::eventArrived);
         // Out of step: review is let go of, as a failure lets it go.
-        emit bridge.eventArrived(Event(Event::kChanged{Splice{3, 1, {}}, Summary{}, {}, {}, {}}));
+        emit bridge.eventArrived(
+            Event(Event::kChanged{Splice{3, 1, {}}, Summary{}, {}, {}, {}, {}}));
         QTRY_COMPARE(fatal.count(), 1);
         QCOMPARE(bridge.fatal(), "the list is out of step with review");
         // The stream ended now: given the time its end takes to come, it does not, and the made-up
@@ -490,7 +501,8 @@ private slots:
         QSignalSpy fatal(&o.bridge, &SessionBridge::fatalChanged);
         o.bridge.start();
         QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
-        emit o.bridge.eventArrived(Event(Event::kChanged{Splice{3, 1, {}}, Summary{}, {}, {}, {}}));
+        emit o.bridge.eventArrived(
+            Event(Event::kChanged{Splice{3, 1, {}}, Summary{}, {}, {}, {}, {}}));
         QTRY_COMPARE(fatal.count(), 1);
         QCOMPARE(o.bridge.fatal(), "the list is out of step with review");
         QCOMPARE(o.bridge.findings()->rowCount(), 2);

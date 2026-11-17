@@ -8,6 +8,7 @@
 //! to name every row it touches, and one it missed would leave the UI silently out of step.
 
 use std::collections::{HashSet, VecDeque};
+use std::ops::Range;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -24,16 +25,17 @@ use super::status::Status;
 use super::update::{self, Action, Effect, Input, Task};
 use crate::group;
 use crate::list::Filter;
+use crate::llm::Spent;
 use crate::player::{self, PlayState, PlayerCommand, PlayerError};
-use crate::store::{self, Selector, State, Store};
+use crate::store::{self, Check, Run, Selector, ShowFolder, State, Store};
 
 /// What a UI hears, in order ([`Session::next_event`]).
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // each is made once and moved to the UI: a box adds only noise
 #[allow(clippy::option_option)] // `detail`, `logs`: absent when as last sent; none is a change too
 pub enum Event {
-    /// What the UI shows changed. `rows`, `files`, `detail` and `logs` are `None` when they did
-    /// not, but never in the first event, which carries each.
+    /// What the UI shows changed. `rows`, `files`, `detail`, `logs` and `folders` are `None` when
+    /// they did not, but never in the first event, which carries each.
     Changed {
         rows: Option<Splice>,
         summary: Summary,
@@ -43,6 +45,8 @@ pub enum Event {
         files: Option<Splice<FileView>>,
         /// What the scan and apply wrote for the selected file; none when the files list is empty.
         logs: Option<Option<FileLogs>>,
+        /// The store's show folders, whole: a short list, sent again when any of it changes.
+        folders: Option<Vec<FolderView>>,
     },
     /// For the UI's player, which runs it and says how it went ([`Session::report`]).
     Player(PlayerCommand),
@@ -106,6 +110,12 @@ pub struct Summary {
     pub job: Option<Job>,
     /// An index into the files list the UI holds; `None` when it holds none.
     pub file_selected: Option<usize>,
+    /// What the view's LLM calls used ([`Run::spent`]), which the terminal's box of keys shows.
+    pub spent: Spent,
+    /// The view is of paths (a folder's, the newest run's folders, files), not a run's
+    /// ([`Run::of_paths`]): what `SwitchView` opens from it, the newest run that named the
+    /// selected file where a run's view opens the run's folders.
+    pub of_paths: bool,
 }
 
 /// An edit under way, for a UI's editor ([`Review::editing`]).
@@ -153,6 +163,15 @@ pub struct EntryView {
     pub note: Option<FileNote>,
     /// Its shown members' decisions differ ([`Review::shown_state`]): never a member's.
     pub mixed: bool,
+    /// The check that found it ([`store::Finding::check`]): of a row's first shown member, as
+    /// `original` is.
+    pub check: Check,
+    /// The part of `original` that differs from `wording`, in characters ([`Review::changes`]),
+    /// as the detail has it.
+    pub original_changed: Range<usize>,
+    /// The part of `wording` that differs from `original`, in characters ([`Review::changes`]),
+    /// as the detail has it.
+    pub wording_changed: Range<usize>,
 }
 
 /// The list as `m` shows it now.
@@ -169,6 +188,7 @@ fn entry_view(m: &Review, e: Entry, checked: &HashSet<&str>) -> EntryView {
     let shown = m.targets(e);
     let first = shown[0];
     let f = m.finding(first);
+    let (original_changed, wording_changed) = m.changes(first);
     let (is_member, expanded, total, mixed) = match e {
         // As `entries` has it: an expanded row that a re-check left with one member shows none.
         Entry::Row(r) => {
@@ -196,6 +216,9 @@ fn entry_view(m: &Review, e: Entry, checked: &HashSet<&str>) -> EntryView {
         checking: m.checking_among(e, checked),
         note: m.notes.get(&f.file).copied(),
         mixed,
+        check: f.check(),
+        original_changed,
+        wording_changed,
     }
 }
 
@@ -240,6 +263,31 @@ pub struct FileLogs {
     pub apply_log: Vec<String>,
 }
 
+/// One of the store's show folders, as a UI lists it to open ([`Store::show_folders`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderView {
+    /// The folder as the store names its files' paths, which `OpenFolder` takes.
+    pub path: String,
+    /// What its view is called once open ([`store::path_name`]).
+    pub name: String,
+    /// How many of the findings recorded under it are pending.
+    pub to_review: usize,
+    /// The view shown is of paths, one of which is this folder or a path inside it: a folder's
+    /// view, the newest run's folders, or a view of files in it. A run's view is no folder's.
+    pub open: bool,
+}
+
+impl FolderView {
+    fn of(folder: &ShowFolder, view: &Run) -> FolderView {
+        FolderView {
+            path: folder.path.to_string_lossy().into_owned(),
+            name: store::path_name(&folder.path),
+            to_review: folder.to_review,
+            open: view.of_paths && view.paths.iter().any(|p| p.starts_with(&folder.path)),
+        }
+    }
+}
+
 /// The files list as `m` shows it now.
 fn file_views(m: &Review) -> Vec<FileView> {
     m.progress
@@ -280,6 +328,8 @@ fn summary(m: &Review, rows: usize, files: usize) -> Summary {
         question: m.question(),
         job: m.progress.job(&|p| m.label(p)),
         file_selected: (m.file_selected < files).then_some(m.file_selected),
+        spent: m.run.spent.clone(),
+        of_paths: m.run.of_paths,
     }
 }
 
@@ -303,7 +353,8 @@ fn splice<T: PartialEq + Clone>(old: &[T], new: &[T]) -> Option<Splice<T>> {
     })
 }
 
-/// What the UI has been told, to work out what to tell it next.
+/// What the UI has been told, to work out what to tell it next; and the show folders as the store
+/// last gave them, which each change says with the view's own marked open.
 #[derive(Default)]
 struct Sent {
     rows: Vec<EntryView>,
@@ -312,27 +363,36 @@ struct Sent {
     summary: Option<Summary>,
     detail: Option<Detail>,
     logs: Option<FileLogs>,
+    folders: Vec<FolderView>,
+    shelf: Vec<ShowFolder>,
 }
 
 impl Sent {
     /// The event that brings the UI up to `m`; `None` when nothing it shows changed. The first
-    /// always comes, with a splice of each list even for none, and the detail and the logs even
-    /// when there are none: it tells the UI the run has opened, and what it starts from.
+    /// always comes, with a splice of each list even for none, and the detail, the logs and the
+    /// folders even when there are none: it tells the UI the run has opened, and what it starts at.
     fn change(&mut self, m: &Review) -> Option<Event> {
         let rows = entry_views(m);
         let files = file_views(m);
         let summary = summary(m, rows.len(), files.len());
         let detail = m.detail();
         let logs = file_logs(m);
+        let folders: Vec<FolderView> = self
+            .shelf
+            .iter()
+            .map(|f| FolderView::of(f, &m.run))
+            .collect();
         let first = self.summary.is_none();
         let row_splice = splice(&self.rows, &rows).or_else(|| first.then(Splice::default));
         let file_splice = splice(&self.files, &files).or_else(|| first.then(Splice::default));
         let detail_now = (first || detail != self.detail).then(|| detail.clone());
         let logs_now = (first || logs != self.logs).then(|| logs.clone());
+        let folders_now = (first || folders != self.folders).then(|| folders.clone());
         if row_splice.is_none()
             && file_splice.is_none()
             && detail_now.is_none()
             && logs_now.is_none()
+            && folders_now.is_none()
             && self.summary.as_ref() == Some(&summary)
         {
             return None;
@@ -342,13 +402,24 @@ impl Sent {
         self.summary = Some(summary.clone());
         self.detail = detail;
         self.logs = logs;
+        self.folders = folders;
         Some(Event::Changed {
             rows: row_splice,
             summary,
             detail: detail_now,
             files: file_splice,
             logs: logs_now,
+            folders: folders_now,
         })
+    }
+
+    /// The show folders as the store gives them now. A read that fails leaves the list as it
+    /// was, empty if no read has succeeded yet, and says nothing: the list only offers views to
+    /// open, and review goes on without it.
+    fn read(&mut self, folders: rusqlite::Result<Vec<ShowFolder>>) {
+        if let Ok(folders) = folders {
+            self.shelf = folders;
+        }
     }
 
     /// Tell `emit` what [`Sent::change`] finds, if it finds anything.
@@ -687,6 +758,7 @@ fn serve(
         let _ = events.send(Item::Event(event));
     };
     // The record as it opens is `Shared::default()`'s: no job, and no outro yet.
+    sent.read(runner.show_folders());
     sent.publish(review, &mut emit);
     while !review.should_quit {
         // The runner holds a sender, so `recv` cannot fail while this runs.
@@ -739,6 +811,19 @@ fn may_run(effect: &Effect, shared: &Mutex<Shared>) -> bool {
     true
 }
 
+/// Whether the show folders are read again after `input`: a decision written, whose finding a
+/// folder's count holds; a check or an apply ended, or another view taken, after which what
+/// another process recorded since shows too.
+fn moves_folders(input: &Input) -> bool {
+    matches!(
+        input,
+        Input::Written { result: Ok(_), .. }
+            | Input::ScanEnded(_)
+            | Input::ApplyEnded(_)
+            | Input::Switched(Ok(_))
+    )
+}
+
 /// One input: through `update`, the change published before any effect runs, so that a UI shows
 /// what is about to happen before it does ("opening E02…" before the player command); then each
 /// effect. A task's result goes back through `update` and is published in turn; a player command
@@ -751,7 +836,11 @@ fn step(
     emit: &mut dyn FnMut(Event),
     shared: &Mutex<Shared>,
 ) {
+    let moved = moves_folders(&input);
     let mut effects: VecDeque<Effect> = update::update(review, input, Timestamp::now()).into();
+    if moved {
+        sent.read(runner.show_folders());
+    }
     sent.publish(review, emit);
     while let Some(effect) = effects.pop_front() {
         if !may_run(&effect, shared) {
@@ -760,7 +849,11 @@ fn step(
         match effect {
             Effect::Task(task) => {
                 let result = runner.run(task);
+                let moved = moves_folders(&result);
                 effects.extend(update::update(review, result, Timestamp::now()));
+                if moved {
+                    sent.read(runner.show_folders());
+                }
                 sent.publish(review, emit);
             }
             Effect::Player(command) => emit(Event::Player(command)),
@@ -856,6 +949,8 @@ mod tests {
                 question: None,
                 job: None,
                 file_selected: Some(0),
+                spent: Spent::default(),
+                of_paths: false,
             }
         );
     }
@@ -953,6 +1048,147 @@ mod tests {
         assert_eq!(files, Some(Splice::default()));
         assert_eq!((detail, logs), (Some(None), Some(None)));
         assert_eq!(summary.file_selected, None);
+    }
+
+    /// Two show folders as the store would give them: S1, with three to review, and S2.
+    fn shelf() -> Vec<ShowFolder> {
+        vec![
+            ShowFolder {
+                path: "/m/S1".into(),
+                to_review: 3,
+            },
+            ShowFolder {
+                path: "/m/S2".into(),
+                to_review: 0,
+            },
+        ]
+    }
+
+    // The folders, whole, in the first event even when there are none, and again only when what
+    // the store gives or which the view shows changes them.
+    #[test]
+    fn the_folders_come_whole_first_and_again_when_they_change() {
+        let mut m = sample();
+        let mut sent = Sent::default();
+        let folders = |sent: &mut Sent, m: &Review| match sent.change(m) {
+            Some(Event::Changed { folders, .. }) => folders,
+            other => panic!("expected a change: {other:?}"),
+        };
+        assert_eq!(folders(&mut sent, &m), Some(vec![]));
+        sent.read(Ok(shelf()));
+        let s1 = |to_review, open| FolderView {
+            path: "/m/S1".into(),
+            name: "S1".into(),
+            to_review,
+            open,
+        };
+        let s2 = FolderView {
+            path: "/m/S2".into(),
+            name: "S2".into(),
+            to_review: 0,
+            open: false,
+        };
+        assert_eq!(folders(&mut sent, &m), Some(vec![s1(3, false), s2.clone()]));
+        // The store read again: unchanged is no event; a read that fails keeps them.
+        sent.read(Ok(shelf()));
+        assert_eq!(sent.change(&m), None);
+        sent.read(Err(rusqlite::Error::InvalidQuery));
+        assert_eq!(sent.change(&m), None);
+        // S1's view: S1 is open.
+        m.run.of_paths = true;
+        m.run.paths = vec!["/m/S1".into()];
+        assert_eq!(folders(&mut sent, &m), Some(vec![s1(3, true), s2.clone()]));
+        let mut fewer = shelf();
+        fewer[0].to_review = 2;
+        sent.read(Ok(fewer));
+        assert_eq!(folders(&mut sent, &m), Some(vec![s1(2, true), s2]));
+    }
+
+    // Open when the view is of paths, one of them the folder or a path inside it: a folder's own
+    // view, the newest run's folders, or a view of a file in it; a run's view is no folder's. A
+    // folder whose name starts as this one's, or the folder above it, is another.
+    #[test]
+    fn a_folder_is_open_when_the_view_is_of_it_or_of_a_path_inside_it() {
+        let s1 = &shelf()[0];
+        let view = |of_paths: bool, paths: &[&str]| Run {
+            of_paths,
+            paths: paths.iter().map(PathBuf::from).collect(),
+            ..Run::default()
+        };
+        let open = |view: &Run| FolderView::of(s1, view).open;
+        assert!(open(&view(true, &["/m/S1"])));
+        assert!(open(&view(true, &["/m/S2", "/m/S1/Specials"])));
+        assert!(open(&view(true, &["/m/S1/E01.mkv"])));
+        assert!(!open(&view(true, &["/m/S1 Season 2", "/m"])));
+        assert!(!open(&view(false, &[])));
+        assert!(!open(&view(false, &["/m/S1"])));
+        assert_eq!(
+            FolderView::of(s1, &view(false, &[])),
+            FolderView {
+                path: "/m/S1".into(),
+                name: "S1".into(),
+                to_review: 3,
+                open: false,
+            }
+        );
+    }
+
+    // A paths view says so, and a run's view does not: what a UI's switch between the two is
+    // called depends on it.
+    #[test]
+    fn the_summary_says_whether_the_view_is_of_paths() {
+        let mut m = sample();
+        let mut sent = Sent::default();
+        assert!(!changed(&mut sent, &m).1.of_paths);
+        m.run.of_paths = true;
+        assert!(changed(&mut sent, &m).1.of_paths);
+    }
+
+    // Each input after which the folders are read again, and some after which they are not: a
+    // write that failed, a view that could not be read, a file read back, a scan's step and an
+    // action of the user's.
+    #[test]
+    fn the_folders_are_read_again_after_a_decision_a_jobs_end_or_another_view() {
+        let written = |result| Input::Written {
+            purpose: update::WriteFor::Undo,
+            decisions: vec![],
+            result,
+        };
+        let cases = [
+            (written(Ok(vec![])), true),
+            (written(Err("locked".into())), false),
+            (Input::ScanEnded(Err("no LLM".into())), true),
+            (Input::ApplyEnded(Ok(apply::Summary::default())), true),
+            (Input::Switched(Ok((Run::default(), HashMap::new()))), true),
+            (Input::Switched(Err("disk I/O error".into())), false),
+            (
+                Input::ReadBack {
+                    path: tests_support::path(1),
+                    view: Err("gone".into()),
+                },
+                false,
+            ),
+            (Input::Scan(scan::Event::Queued(vec![])), false),
+            (Input::Action(Action::Dismiss), false),
+        ];
+        for (input, moves) in cases {
+            assert_eq!(moves_folders(&input), moves, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn the_summary_carries_what_the_views_llm_calls_used() {
+        let mut m = sample();
+        let mut sent = told(&m);
+        m.run.spent.add(Some(&crate::llm::Usage {
+            input_tokens: 1200,
+            output_tokens: 40,
+            cost_usd: Some(0.25),
+            ..crate::llm::Usage::default()
+        }));
+        let (_, summary) = changed(&mut sent, &m);
+        assert_eq!(summary.spent, m.run.spent);
+        assert_eq!((summary.spent.calls, summary.spent.priced), (1, 1));
     }
 
     #[test]
@@ -1192,6 +1428,20 @@ mod tests {
         assert_eq!(lyric.style, "OP en");
         assert_eq!((lyric.marks.as_slice(), &lyric.track), (&[][..], &None));
         assert_eq!(lyric.fixes, []);
+        // `trough` and `through`, in characters, as the detail marks them.
+        assert_eq!(lyric.check, Check::Llm);
+        assert_eq!(
+            (
+                lyric.original_changed.clone(),
+                lyric.wording_changed.clone()
+            ),
+            (14..20, 14..21)
+        );
+        let detail = m.detail().unwrap();
+        assert_eq!(
+            (detail.original_changed, detail.wording_changed),
+            (14..20, 14..21)
+        );
         // Decided differently, and a filter leaving two of three: the rule is the list's.
         decide_as(&mut m, &[1], State::Accepted, Some("My own."));
         decide_as(&mut m, &[2], State::Rejected, None);
@@ -1201,6 +1451,14 @@ mod tests {
         assert_eq!(lyric.state, None, "decided members differ");
         assert_eq!(lyric.wording, "My own.");
         assert_eq!(lyric.marks, [(MarkKind::Applied, 1)]);
+        // What changed is the user's wording against the line: all of both.
+        assert_eq!(
+            (
+                lyric.original_changed.clone(),
+                lyric.wording_changed.clone()
+            ),
+            (0..TYPO.chars().count(), 0..7)
+        );
         m.filter = Filter::Only(State::Rejected);
         let lyric = &entry_views(&m)[0];
         assert_eq!(lyric.state, Some(State::Rejected));
@@ -1243,6 +1501,15 @@ mod tests {
         };
         assert_eq!(row.track.as_ref(), Some(&english));
         assert_eq!(row.fixes, [(Fix::Shift(1), 2), (Fix::Partial, 1)]);
+        // A timing finding's two sides are descriptions: all of each is marked.
+        assert_eq!(row.check, Check::Timing);
+        assert_eq!(
+            (row.original_changed.clone(), row.wording_changed.clone()),
+            (
+                0..row.original.chars().count(),
+                0..row.wording.chars().count()
+            )
+        );
         m.expanded.insert(1);
         let partial = entry_views(&m)[3].clone();
         assert_eq!(partial.key, EntryKey::Member(12));
@@ -1686,6 +1953,51 @@ mod tests {
                 error: "no run named nope".into(),
             })
         );
+    }
+
+    // The store's show folders, as review opens and again in the change that shows a decision
+    // written, its count read then; a folder's view, opened by its path though it is not on disk,
+    // marks that folder open, and the store is read again for it: a decision another process
+    // wrote meanwhile is in the count.
+    #[test]
+    fn the_folders_come_as_review_opens_and_again_once_a_decision_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session(dir.path(), |_| {});
+        let k_on = |to_review, open| FolderView {
+            path: "/m/K-On!".into(),
+            name: "K-On!".into(),
+            to_review,
+            open,
+        };
+        let changed = |s: &Arc<Session>| match next(s) {
+            Some(Event::Changed {
+                summary, folders, ..
+            }) => (summary, folders),
+            other => panic!("expected a change: {other:?}"),
+        };
+        assert_eq!(changed(&s).1, Some(vec![k_on(4, false)]));
+        s.send(Action::Accept);
+        let (summary, folders) = changed(&s);
+        assert_eq!(summary.accepted, 3);
+        assert_eq!(folders, Some(vec![k_on(1, false)]));
+        // The last pending finding, E02's, rejected through a connection of its own, as another
+        // process would: nothing here reads the store for it until the view changes.
+        let mut other = Store::open_at(&dir.path().join("subcheck.db")).unwrap();
+        other
+            .decide(&[Decision {
+                finding: 3,
+                state: State::Rejected,
+                edited: None,
+                at: Timestamp::UNIX_EPOCH,
+            }])
+            .unwrap();
+        // The accept's message let go, while the view is still to read: the folders as they were.
+        s.send(Action::OpenFolder("/m/K-On!".into()));
+        let (summary, folders) = changed(&s);
+        assert_eq!((summary.status, folders), (None, None));
+        let (summary, folders) = changed(&s);
+        assert_eq!(summary.title, "K-On!");
+        assert_eq!(folders, Some(vec![k_on(0, true)]));
     }
 
     // `close`'s locked part first, with the core thread between `Play`'s change and its stat:
@@ -2136,6 +2448,41 @@ mod tests {
         let appended = scan::Event::Appended(vec![Record::File(record)]);
         go(&mut review, &mut sent, Input::Scan(appended), &mut held);
         assert!(held.rows.iter().any(|v| v.original == "An erly line."));
+        // A check's end, then an apply's, as they come from the queue: each reads the folders
+        // again before the change it leads to, which carries them, so that decisions another
+        // process made meanwhile, here on a connection of their own, are in the counts. Every
+        // finding to pending, then to rejected, so that each moves.
+        let ids: Vec<u64> = review.run.findings.iter().map(|f| f.id).collect();
+        let mut other = Store::open_at(&db).unwrap();
+        for (state, input) in [
+            (
+                State::Pending,
+                Input::ScanEnded(Ok(scan::Summary::default())),
+            ),
+            (
+                State::Rejected,
+                Input::ApplyEnded(Ok(apply::Summary::default())),
+            ),
+        ] {
+            let before = sent.shelf.clone();
+            let decisions: Vec<Decision> = ids
+                .iter()
+                .map(|&finding| Decision {
+                    finding,
+                    state,
+                    edited: None,
+                    at: Timestamp::UNIX_EPOCH,
+                })
+                .collect();
+            other.decide(&decisions).unwrap();
+            let now = other.show_folders().unwrap();
+            assert_ne!(before, now);
+            go(&mut review, &mut sent, input, &mut held);
+            assert_eq!(sent.shelf, now);
+            let told: Vec<FolderView> =
+                now.iter().map(|f| FolderView::of(f, &review.run)).collect();
+            assert_eq!(sent.folders, told);
+        }
     }
 
     const CHILD: &str = "review::session::tests::child_that_ends_a_session";

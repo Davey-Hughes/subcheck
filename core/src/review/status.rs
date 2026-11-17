@@ -129,7 +129,7 @@ pub enum Refusal {
 pub enum Failure {
     /// Writing the decisions: none was saved.
     Save,
-    /// Reading another view (`SwitchView`, `OpenView`): the view stays.
+    /// Reading another view (`SwitchView`, `OpenView`, `OpenFolder`): the view stays.
     Switch,
     /// Reading file `label` back from the store.
     ReadBack { label: String },

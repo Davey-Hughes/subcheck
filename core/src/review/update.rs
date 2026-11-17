@@ -137,6 +137,10 @@ pub enum Action {
     /// Open the view these words select (`[run | paths…]`, as `subcheck review` takes them) in
     /// place of the one shown, as `SwitchView` opens the other; not while a job runs.
     OpenView(Vec<String>),
+    /// Open the view of every file recorded under this folder, one of the store's show folders
+    /// ([`crate::store::Store::show_folders`]), as `OpenView` opens a view: a folder by its path,
+    /// whether or not it is on disk; not while a job runs.
+    OpenFolder(String),
     /// Apply the view's accepted fixes; with `dry_run`, say what would change and write nothing.
     Apply {
         dry_run: bool,
@@ -167,7 +171,7 @@ pub struct Job {
     pub resume: String,
 }
 
-/// The view `SwitchView`, or `OpenView`, opens.
+/// The view `SwitchView`, `OpenView` or `OpenFolder` opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Switch {
     /// The folders of the run of this name.
@@ -176,6 +180,8 @@ pub enum Switch {
     RunNaming(String),
     /// The view these words select, as `subcheck review` takes them ([`Action::OpenView`]).
     Selector(Vec<String>),
+    /// Every file recorded under the folder at this path ([`Action::OpenFolder`]).
+    Folder(String),
 }
 
 /// What `update` asks to have done; each comes back as an [`Input`].
@@ -206,8 +212,9 @@ pub enum Task {
     /// Check `paths` again into `run`, as `subcheck scan --run <run> --force <paths>`
     /// does ([`Input::Started`]).
     Recheck { run: String, paths: Vec<String> },
-    /// Open another view of the findings, the other one (`SwitchView`) or one a selector names
-    /// (`OpenView`), read from the store with each file's note ([`Input::Switched`]).
+    /// Open another view of the findings, the other one (`SwitchView`), one a selector names
+    /// (`OpenView`) or a folder's (`OpenFolder`), read from the store with its files' notes
+    /// ([`Input::Switched`] says how it went).
     Switch(Switch),
     /// Read the size and mtime of the file `Play` opens, for review to say seek or load
     /// ([`Input::Stamped`]): a stat, which can hang on a stalled mount, so a task. A session runs
@@ -360,6 +367,7 @@ fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
         Action::ShowPane(pane) => m.pane = pane,
         Action::SwitchView => return switch_view(m),
         Action::OpenView(words) => return open_view(m, words),
+        Action::OpenFolder(folder) => return open_folder(m, folder),
         Action::Apply { dry_run } => return apply_key(m, dry_run),
         Action::Play => return open(m),
         Action::ClosePlayer => return vec![Effect::Player(PlayerCommand::Close)],
@@ -1020,8 +1028,8 @@ fn applied(m: &mut Review, event: apply::Event) -> Vec<Effect> {
     Vec::new()
 }
 
-/// The view `SwitchView` or `OpenView` asked for has been read, or could not be: take it, or say
-/// why the screen is as it was.
+/// The view `SwitchView`, `OpenView` or `OpenFolder` asked for has been read, or could not be:
+/// take it, or say why the screen is as it was.
 fn switched(
     m: &mut Review,
     result: Result<(Run, HashMap<String, FileNote>), String>,
@@ -1079,6 +1087,14 @@ fn open_view(m: &mut Review, words: Vec<String>) -> Vec<Effect> {
         return Vec::new();
     }
     vec![Effect::Task(Task::Switch(Switch::Selector(words)))]
+}
+
+/// The view of `folder`, in place of the one shown; not while a job runs, as for `SwitchView`.
+fn open_folder(m: &mut Review, folder: String) -> Vec<Effect> {
+    if refused_while_a_job_runs(m) {
+        return Vec::new();
+    }
+    vec![Effect::Task(Task::Switch(Switch::Folder(folder)))]
 }
 
 /// Whether a new view is refused, for a scan or apply that runs: its progress belongs to the view
@@ -3315,6 +3331,28 @@ mod tests {
         let mut m = sample();
         m.confirm = Some(Confirm::Apply);
         assert_eq!(act(&mut m, Action::OpenView(words)), []);
+        assert_eq!(m.confirm, None);
+    }
+
+    #[test]
+    fn open_folder_asks_for_the_folders_view_but_not_while_a_job_runs() {
+        let mut m = sample();
+        assert_eq!(
+            act(&mut m, Action::OpenFolder("/m/K-On!".into())),
+            [Effect::Task(Task::Switch(Switch::Folder(
+                "/m/K-On!".into()
+            )))]
+        );
+        let mut m = scanning();
+        assert_eq!(act(&mut m, Action::OpenFolder("/m/K-On!".into())), []);
+        assert_eq!(m.status, Some(Status::Refused(Refusal::ScanRunning)));
+        let mut m = accepted();
+        act(&mut m, Action::Apply { dry_run: true });
+        assert_eq!(act(&mut m, Action::OpenFolder("/m/K-On!".into())), []);
+        assert_eq!(m.status, Some(Status::Refused(Refusal::ApplyRunning)));
+        let mut m = sample();
+        m.confirm = Some(Confirm::Apply);
+        assert_eq!(act(&mut m, Action::OpenFolder("/m/K-On!".into())), []);
         assert_eq!(m.confirm, None);
     }
 

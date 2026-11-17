@@ -77,19 +77,26 @@ impl Store {
             .optional()
     }
 
-    /// The scan that started last. Found by its start as a time: as text it would not sort, a
-    /// second's fraction having as many digits as it needs.
+    /// The scan that started last (`Store::scans_newest_first`'s first).
     pub fn newest_scan(&self) -> rusqlite::Result<Option<ScanRow>> {
+        Ok(self.scans_newest_first()?.into_iter().next())
+    }
+
+    /// Every scan, the one that started last first. Ordered by start as a time: as text it would
+    /// not sort, a second's fraction having as many digits as it needs.
+    pub(super) fn scans_newest_first(&self) -> rusqlite::Result<Vec<ScanRow>> {
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT {SCAN_COLUMNS} FROM scans"))?;
-        let scans = stmt
+        let mut scans = stmt
             .query_map([], scan_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(scans.into_iter().max_by_key(|s| (s.header.started, s.id)))
+        scans.sort_by_key(|s| std::cmp::Reverse((s.header.started, s.id)));
+        Ok(scans)
     }
 
-    /// Of the scans that named `path`, the one that started last (see [`Store::newest_scan`]).
+    /// Of the scans that named `path`, the one that started last: by its start as a time, then
+    /// by its ID.
     pub fn newest_scan_naming(&self, path: &str) -> rusqlite::Result<Option<ScanRow>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {SCAN_COLUMNS} FROM scans

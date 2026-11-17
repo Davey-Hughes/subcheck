@@ -1,10 +1,11 @@
 // The generated bindings over a real session, on a run seeded afresh at each start of the test
 // (tests/seeded.cmake) in the folder argv[1] names: two copies of typos.mkv, E01 and E02, so that
 // each of its two rows has a member in each. The first event; of a change, the summary's filter,
-// pane, edit, question and job, and the rows' note, checking and mixed; a decision, a dry run, a
-// question, a re-check, the player's round (open, its reports, a seek, a report), another view
-// that is not there, the end; then a session closed, a run that is not there, and the process's
-// finish. Every call goes through the generated code, whose first call checks that it was
+// pane, edit, question, job, LLM costs and kind of view, the rows' note, checking, mixed, check
+// and marked change, and the show folders; a decision, a dry run, a question, a re-check, the
+// player's round (open, its reports, a seek, a report), another view that is not there, the run's
+// view and the folder's again, the end; then a session closed, a run that is not there, and the
+// process's finish. Every call goes through the generated code, whose first call checks that it was
 // generated from this library. Three sessions in one process, where a UI opens one: none stops a
 // job, so none ends the groups, which is what makes that the rule.
 #include "subcheck_ffi.hpp"
@@ -57,7 +58,7 @@ std::string came(const std::optional<Event> &e) {
 }
 
 // What a UI keeps of a session: each list, each splice applied as it comes, the last summary, the
-// detail and the logs as last sent, and the player commands it was given.
+// detail, the logs and the folders as last sent, and the player commands it was given.
 struct Ui {
     Session &s;
     std::vector<EntryView> rows{};
@@ -65,6 +66,7 @@ struct Ui {
     std::optional<Summary> summary{};
     std::optional<Detail> detail{};
     std::optional<FileLogs> logs{};
+    std::vector<FolderView> folders{};
     std::vector<PlayerCommand> played{};
 
     // Takes events until `done` holds, after `what`; none may be the end.
@@ -84,6 +86,9 @@ struct Ui {
                 }
                 if (c->logs) {
                     logs = c->logs->logs;
+                }
+                if (c->folders) {
+                    folders = *c->folders;
                 }
                 summary = c->summary;
             } else if (const Event::kPlayer *p = e ? as<Event::kPlayer>(*e) : nullptr) {
@@ -143,7 +148,23 @@ void a_run_opens_and_each_part_of_a_change_crosses(const std::string &folder) {
         check(row.note == FileNote::kChanged && ui.rows[1].note == FileNote::kChanged,
               "E01's note, on both rows E01 is the first member of");
         check(!row.checking && !row.mixed, "nothing checked again, and one decision");
+        check(row.check == Check::kLlm && row.original_changed.start == 16u &&
+                  row.original_changed.end == 21u && row.wording_changed.start == 16u &&
+                  row.wording_changed.end == 22u,
+              "the LLM's finding, befor and before marked on its row");
     }
+    // The store's one show folder, the seeded run's, which the view is of.
+    check(ui.folders.size() == 1, "one show folder");
+    if (ui.folders.size() == 1) {
+        const FolderView &media = ui.folders[0];
+        check(media.path == folder && media.name == "media" && media.to_review == 4 && media.open,
+              "the run's folder, named as its view is, four to review, open");
+    }
+    // The seed's LLM, a plain command, records no calls, so the view's costs are all zero: this
+    // shows the field crosses, not its values, which the FFI's own conversion test pins.
+    check(first.spent.calls == 0 && first.spent.priced == 0 && first.spent.cost_usd == 0.0,
+          "the view's LLM calls, none recorded");
+    check(first.of_paths, "a folder's view is of paths");
     check(first.selected == 0u && first.pending == 4 && first.accepted == 0, "four pending");
     // The files list, its first file selected, and that file's log; the selected row's detail.
     check(ui.files.size() == 2 && first.file_selected == 0u, "the run's two files, E01 selected");
@@ -197,6 +218,8 @@ void a_run_opens_and_each_part_of_a_change_crosses(const std::string &folder) {
     check(decided && decided->state == State::kAccepted && decided->findings == 1 &&
               decided->replaced == 0 && !decided->kept,
           "the decision's message: one finding accepted, no wording replaced, no member kept");
+    check(ui.folders.size() == 1 && ui.folders[0].to_review == 3,
+          "the folder read again once the decision is written: three to review");
 
     s->send(Action(Action::kSetFilter{Filter::kAccepted}));
     check(ui.next("filtering").filter == Filter::kAccepted, "the filter crosses");
@@ -345,6 +368,16 @@ void a_run_opens_and_each_part_of_a_change_crosses(const std::string &folder) {
     check(notThere && std::holds_alternative<Failure::kSwitch>(notThere->what.get_variant()) &&
               notThere->error == "no run named no-such-run",
           "a view that is not there leaves the run shown, and says why in the store's words");
+
+    // The run's own view, which is no folder's; then the folder's again, by its path.
+    s->send(Action(Action::kSwitchView{}));
+    ui.until("the run's view", [](const Ui &ui) { return !ui.summary->of_paths; });
+    check(ui.summary->title.starts_with("run "), "the run's view, by its name");
+    check(ui.folders.size() == 1 && !ui.folders[0].open, "no folder open in a run's view");
+    s->send(Action(Action::kOpenFolder{folder}));
+    ui.until("the folder's view", [](const Ui &ui) { return ui.summary->of_paths; });
+    check(ui.summary->title == "media", "the folder's view, by its name");
+    check(ui.folders.size() == 1 && ui.folders[0].open, "the folder open in its own view");
 
     s->send(Action(Action::kQuit{}));
     std::optional<Event> e;

@@ -583,12 +583,12 @@ impl Progress {
         }
     }
 
-    /// The files of another view (`SwitchView`'s or `OpenView`'s), and no job: what the screen's
-    /// scans and applies ended with is kept, for the outro and the exit status.
+    /// The files of another view (`SwitchView`'s, `OpenView`'s or `OpenFolder`'s), and no job: what
+    /// the screen's scans and applies ended with is kept, for the outro and the exit status.
     pub fn show(&mut self, run: &Run) {
         debug_assert!(
             !self.busy(),
-            "`SwitchView` and `OpenView` are refused while a job runs"
+            "`SwitchView`, `OpenView` and `OpenFolder` are refused while a job runs"
         );
         let earlier = self.ended();
         let earlier_failed =

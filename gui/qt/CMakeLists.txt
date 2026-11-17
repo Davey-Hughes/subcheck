@@ -246,11 +246,22 @@ add_test(NAME app_calls_finish
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/calls_finish.cmake")
 set_tests_properties(app_calls_finish PROPERTIES TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 add_test(NAME app_starts
-    COMMAND "${CMAKE_COMMAND}" -D "APP=$<TARGET_FILE:subcheck-qt>"
+    COMMAND "${CMAKE_COMMAND}" -D "APP=$<TARGET_FILE:subcheck-qt>" -D ARGS=no-such-run
+            -D "SAYS=subcheck-qt: no run named no-such-run"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/app_starts.cmake")
 set_tests_properties(app_starts PROPERTIES
     FIXTURES_REQUIRED seeded_run
     ENVIRONMENT "${SEEDED_ENV};${TEST_MPV_ENV};QT_QPA_PLATFORM=offscreen"
+    TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+# Given no arguments, in a store with no runs: nothing to open, and the app says why.
+set(dir "${CMAKE_BINARY_DIR}/nothing-to-open")
+add_test(NAME app_starts_with_nothing_to_open
+    COMMAND "${CMAKE_COMMAND}" -D "APP=$<TARGET_FILE:subcheck-qt>" -D "DIR=${dir}"
+            -D "SAYS=subcheck-qt: no runs yet"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/app_starts.cmake")
+set_tests_properties(app_starts_with_nothing_to_open PROPERTIES
+    ENVIRONMENT
+        "SUBCHECK_DB=${dir}/subcheck.db;XDG_STATE_HOME=${dir}/state;${TEST_MPV_ENV};QT_QPA_PLATFORM=offscreen"
     TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 
 # The tests on real mpv, each on an X display of its own: the pane as the player's mpv

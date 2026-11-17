@@ -202,6 +202,19 @@ pub struct EntryView {
     /// Its shown members' decisions differ, which its `state` does not say of a row with one
     /// pending: never a member's.
     pub mixed: bool,
+    /// The check that found it: of a row's first shown member, as `original` is.
+    pub check: Check,
+    /// The part of `original` that differs from `wording`, in UTF-16 code units, as `Detail`'s.
+    pub original_changed: Span,
+    /// The part of `wording` that differs from `original`, in UTF-16 code units, as `Detail`'s.
+    pub wording_changed: Span,
+}
+
+/// What found a finding ([`store::Check`]): the LLM, or the timing check.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Check {
+    Llm,
+    Timing,
 }
 
 /// A kind of mark, and how many of the findings an entry shows have it.
@@ -286,6 +299,12 @@ pub struct Summary {
     pub job: Option<Job>,
     /// An index into the files list the UI holds; none when it holds none.
     pub file_selected: Option<u64>,
+    /// What the view's LLM calls used, which the terminal's box of keys shows.
+    pub spent: Spent,
+    /// The view is of paths (a folder's, the newest run's folders, files), not a run's: what
+    /// `SwitchView` opens from it, the newest run that named the selected file where a run's view
+    /// opens the run's folders.
+    pub of_paths: bool,
 }
 
 /// An edit under way ([`session::Editing`]).
@@ -510,7 +529,7 @@ pub struct UnderWay {
     pub stage: Checking,
 }
 
-/// What a scan's LLM calls used ([`llm::Spent`]).
+/// What some LLM calls used ([`llm::Spent`]): a scan's, or the view's.
 #[derive(uniffi::Record, Debug, Clone, PartialEq)]
 pub struct Spent {
     pub calls: u64,
@@ -599,9 +618,10 @@ pub enum Job {
 #[derive(uniffi::Enum, Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // as core's, each is made once and moved across
 pub enum Event {
-    /// What the UI shows changed. `rows`, `files`, `detail` and `logs` are none when they did not,
-    /// but never in the first event, which carries a splice of each list from empty even for a run
-    /// with no findings, and the detail and the logs even when there are none.
+    /// What the UI shows changed. `rows`, `files`, `detail`, `logs` and `folders` are none when
+    /// they did not, but never in the first event, which carries a splice of each list from empty
+    /// even for a run with no findings, and the detail, the logs and the folders even when there
+    /// are none.
     Changed {
         rows: Option<Splice>,
         summary: Summary,
@@ -611,6 +631,8 @@ pub enum Event {
         files: Option<FilesSplice>,
         /// The selected file's logs, when they changed.
         logs: Option<LogsNow>,
+        /// The store's show folders, newest first, the whole list when any of it changed.
+        folders: Option<Vec<FolderView>>,
     },
     /// For the UI's player, which runs it and says how it went through `Session::report`.
     Player(PlayerCommand),
@@ -889,6 +911,20 @@ pub struct FileLogs {
     pub apply_log: Vec<String>,
 }
 
+/// One of the store's show folders ([`session::FolderView`]): the folders every run's files sit
+/// in, a folder inside another left out, for a UI to open one with `OpenFolder`.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct FolderView {
+    /// The folder as the store names its files' paths, which `OpenFolder` takes.
+    pub path: String,
+    /// What its view is called once open.
+    pub name: String,
+    /// How many of the findings recorded under it are pending.
+    pub to_review: u64,
+    /// The view shown is of paths, one of which is this folder or a path inside it.
+    pub open: bool,
+}
+
 /// What a UI asks of review ([`update::Action`]): each of core's actions. While a question is
 /// open, every action but `Answer` and `Interrupt` lets it go and does nothing else.
 #[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
@@ -940,6 +976,13 @@ pub enum Action {
     /// job runs.
     OpenView {
         selector: Vec<String>,
+    },
+    /// Open the view of every file recorded under this folder, a `FolderView`'s path, in place of
+    /// the one shown, whether or not the folder is on disk: words naming a folder that is not
+    /// would name a run. Should it fail, the view stays, and the status line says why. Not while a
+    /// job runs.
+    OpenFolder {
+        folder: String,
     },
     /// Apply the view's accepted fixes, once asked; with `dry_run`, at once, saying what would
     /// change and writing nothing.
@@ -1211,6 +1254,9 @@ impl From<session::EntryView> for EntryView {
             checking,
             note,
             mixed,
+            check,
+            original_changed,
+            wording_changed,
         } = view;
         EntryView {
             key: key.into(),
@@ -1221,6 +1267,8 @@ impl From<session::EntryView> for EntryView {
             shown: wide(shown),
             total: wide(total),
             at_ms,
+            original_changed: utf16(&original, &original_changed),
+            wording_changed: utf16(&wording, &wording_changed),
             original,
             wording,
             style,
@@ -1242,6 +1290,16 @@ impl From<session::EntryView> for EntryView {
             checking,
             note: note.map(FileNote::from),
             mixed,
+            check: check.into(),
+        }
+    }
+}
+
+impl From<store::Check> for Check {
+    fn from(check: store::Check) -> Check {
+        match check {
+            store::Check::Llm => Check::Llm,
+            store::Check::Timing => Check::Timing,
         }
     }
 }
@@ -1319,6 +1377,8 @@ impl From<session::Summary> for Summary {
             question,
             job,
             file_selected,
+            spent,
+            of_paths,
         } = summary;
         Summary {
             title,
@@ -1334,6 +1394,8 @@ impl From<session::Summary> for Summary {
             question: question.map(Question::from),
             job: job.map(Job::from),
             file_selected: file_selected.map(wide),
+            spent: spent.into(),
+            of_paths,
         }
     }
 }
@@ -1710,6 +1772,7 @@ impl From<session::Event> for Event {
                 detail,
                 files,
                 logs,
+                folders,
             } => Event::Changed {
                 rows: rows.map(Splice::from),
                 summary: summary.into(),
@@ -1720,6 +1783,7 @@ impl From<session::Event> for Event {
                 logs: logs.map(|now| LogsNow {
                     logs: now.map(FileLogs::from),
                 }),
+                folders: folders.map(|all| all.into_iter().map(FolderView::from).collect()),
             },
             session::Event::Player(command) => Event::Player(command.into()),
             session::Event::Ended { fatal, outro } => Event::Ended { fatal, outro },
@@ -2000,6 +2064,23 @@ impl From<session::FileLogs> for FileLogs {
     }
 }
 
+impl From<session::FolderView> for FolderView {
+    fn from(folder: session::FolderView) -> FolderView {
+        let session::FolderView {
+            path,
+            name,
+            to_review,
+            open,
+        } = folder;
+        FolderView {
+            path,
+            name,
+            to_review: wide(to_review),
+            open,
+        }
+    }
+}
+
 impl From<Action> for update::Action {
     fn from(action: Action) -> update::Action {
         match action {
@@ -2021,6 +2102,7 @@ impl From<Action> for update::Action {
             Action::ShowPane { pane } => update::Action::ShowPane(pane.into()),
             Action::SwitchView => update::Action::SwitchView,
             Action::OpenView { selector } => update::Action::OpenView(selector),
+            Action::OpenFolder { folder } => update::Action::OpenFolder(folder),
             Action::Apply { dry_run } => update::Action::Apply { dry_run },
             Action::Play => update::Action::Play,
             Action::ClosePlayer => update::Action::ClosePlayer,
@@ -2059,6 +2141,7 @@ impl From<update::Action> for Action {
             update::Action::ShowPane(pane) => Action::ShowPane { pane: pane.into() },
             update::Action::SwitchView => Action::SwitchView,
             update::Action::OpenView(selector) => Action::OpenView { selector },
+            update::Action::OpenFolder(folder) => Action::OpenFolder { folder },
             update::Action::Apply { dry_run } => Action::Apply { dry_run },
             update::Action::Play => Action::Play,
             update::Action::ClosePlayer => Action::ClosePlayer,
@@ -2118,7 +2201,10 @@ mod tests {
     use subcheck_core::review::model::tests_support;
     use subcheck_core::store::{Attempt, CheckedWith, Made, RunHeader, Store};
 
-    /// Each field a value of its own, so a conversion that crossed two would show.
+    /// Each field a value of its own, so a conversion that crossed two would show. Characters past
+    /// U+FFFF at the start of each line, two in the original and one in the wording, set the UTF-16
+    /// code units of its parts apart from their count in characters, and a span counted along one
+    /// line apart from the same span counted along the other.
     fn core_view() -> session::EntryView {
         session::EntryView {
             key: model::EntryKey::Row(vec![3, u64::MAX]),
@@ -2129,8 +2215,8 @@ mod tests {
             shown: 2,
             total: usize::MAX,
             at_ms: i64::MIN,
-            original: "befor".into(),
-            wording: "before".into(),
+            original: "𝄞𝄞 befor".into(),
+            wording: "𝄞 before".into(),
             style: "OP en".into(),
             marks: vec![
                 (model::MarkKind::WouldBeByHand, 4),
@@ -2146,6 +2232,9 @@ mod tests {
             checking: true,
             note: Some(model::FileNote::Missing),
             mixed: false,
+            check: store::Check::Timing,
+            original_changed: 3..8,
+            wording_changed: 0..8,
         }
     }
 
@@ -2159,8 +2248,8 @@ mod tests {
             shown: 2,
             total: u64::MAX,
             at_ms: i64::MIN,
-            original: "befor".into(),
-            wording: "before".into(),
+            original: "𝄞𝄞 befor".into(),
+            wording: "𝄞 before".into(),
             style: "OP en".into(),
             marks: vec![
                 MarkCount {
@@ -2191,6 +2280,9 @@ mod tests {
             checking: true,
             note: Some(FileNote::Missing),
             mixed: false,
+            check: Check::Timing,
+            original_changed: Span { start: 5, end: 10 },
+            wording_changed: Span { start: 0, end: 9 },
         }
     }
 
@@ -2269,6 +2361,15 @@ mod tests {
                     spent: core_spent(),
                 }),
                 file_selected: Some(6),
+                spent: llm::Spent {
+                    calls: 11,
+                    unreported: 2,
+                    input_tokens: 12_345,
+                    output_tokens: 678,
+                    priced: 9,
+                    cost_usd: 1.5,
+                },
+                of_paths: false,
             },
             detail: Some(Some(core_detail())),
             files: Some(session::Splice {
@@ -2280,6 +2381,20 @@ mod tests {
                 log: vec!["400 lines, 2 findings".into()],
                 apply_log: vec!["E02: would apply 1".into()],
             })),
+            folders: Some(vec![
+                session::FolderView {
+                    path: "/m/Yuru Camp".into(),
+                    name: "Yuru Camp".into(),
+                    to_review: 4,
+                    open: true,
+                },
+                session::FolderView {
+                    path: "/m/K-On!".into(),
+                    name: "K-On! 字幕".into(),
+                    to_review: 0,
+                    open: false,
+                },
+            ]),
         };
         let expected = Event::Changed {
             rows: Some(Splice {
@@ -2330,6 +2445,15 @@ mod tests {
                     spent: spent(),
                 }),
                 file_selected: Some(6),
+                spent: Spent {
+                    calls: 11,
+                    unreported: 2,
+                    input_tokens: 12_345,
+                    output_tokens: 678,
+                    priced: 9,
+                    cost_usd: 1.5,
+                },
+                of_paths: false,
             },
             detail: Some(DetailNow {
                 detail: Some(detail()),
@@ -2345,6 +2469,20 @@ mod tests {
                     apply_log: vec!["E02: would apply 1".into()],
                 }),
             }),
+            folders: Some(vec![
+                FolderView {
+                    path: "/m/Yuru Camp".into(),
+                    name: "Yuru Camp".into(),
+                    to_review: 4,
+                    open: true,
+                },
+                FolderView {
+                    path: "/m/K-On!".into(),
+                    name: "K-On! 字幕".into(),
+                    to_review: 0,
+                    open: false,
+                },
+            ]),
         };
         assert_eq!(Event::from(event), expected);
     }
@@ -2893,6 +3031,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // every part of a change, each with nothing set
     fn a_change_with_nothing_set_crosses_as_nothing() {
         let mut core = core_view();
         core.key = model::EntryKey::Member(4);
@@ -2905,6 +3044,9 @@ mod tests {
             apart: false,
         });
         core.fixes = vec![];
+        core.check = store::Check::Llm;
+        core.original_changed = 0..0;
+        core.wording_changed = 0..0;
         let summary = session::Summary {
             title: String::new(),
             selected: None,
@@ -2919,15 +3061,19 @@ mod tests {
             question: None,
             job: None,
             file_selected: None,
+            spent: llm::Spent::default(),
+            of_paths: false,
         };
-        // Unchanged, and now none: the detail unchanged and the logs none, then the other way.
-        let change = |detail, logs| {
+        // Unchanged, and now none: the detail unchanged and the logs none, then the other way;
+        // the folders unchanged, then none now.
+        let change = |detail, logs, folders| {
             Event::from(session::Event::Changed {
                 rows: None,
                 summary: summary.clone(),
                 detail,
                 files: None,
                 logs,
+                folders,
             })
         };
         let Event::Changed {
@@ -2936,20 +3082,31 @@ mod tests {
             detail,
             files,
             logs,
-        } = change(None, Some(None))
+            folders,
+        } = change(None, Some(None), None)
         else {
             panic!("not a change");
         };
         assert_eq!(rows, None);
         assert_eq!(summary.file_selected, None);
         assert_eq!(
-            (detail, files, logs),
-            (None, None, Some(LogsNow { logs: None }))
+            (detail, files, logs, folders),
+            (None, None, Some(LogsNow { logs: None }), None)
         );
-        let Event::Changed { detail, logs, .. } = change(Some(None), None) else {
+        let Event::Changed {
+            detail,
+            logs,
+            folders,
+            ..
+        } = change(Some(None), None, Some(vec![]))
+        else {
             panic!("not a change");
         };
-        assert_eq!((detail, logs), (Some(DetailNow { detail: None }), None));
+        assert_eq!(
+            (detail, logs, folders),
+            (Some(DetailNow { detail: None }), None, Some(vec![]))
+        );
+        assert_eq!(summary.spent, Spent::from(llm::Spent::default()));
         assert_eq!((summary.selected, summary.status), (None, None));
         assert_eq!(
             (summary.filter, summary.pane),
@@ -2980,6 +3137,18 @@ mod tests {
         assert_eq!(
             (crossed.checking, crossed.note, crossed.mixed),
             (false, Some(FileNote::Changed), true)
+        );
+        assert_eq!(
+            (
+                crossed.check,
+                crossed.original_changed,
+                crossed.wording_changed
+            ),
+            (
+                Check::Llm,
+                Span { start: 0, end: 0 },
+                Span { start: 0, end: 0 }
+            )
         );
     }
 
@@ -3136,6 +3305,12 @@ mod tests {
                 update::Action::OpenView(vec!["r".into(), "/m/E01.mkv".into()]),
             ),
             (
+                Action::OpenFolder {
+                    folder: "/m/Yuru Camp".into(),
+                },
+                update::Action::OpenFolder("/m/Yuru Camp".into()),
+            ),
+            (
                 Action::Apply { dry_run: true },
                 update::Action::Apply { dry_run: true },
             ),
@@ -3163,7 +3338,7 @@ mod tests {
     #[test]
     fn every_action_crosses_both_ways() {
         let cases = every_action();
-        assert_eq!(cases.len(), 27, "core's actions");
+        assert_eq!(cases.len(), 28, "core's actions");
         for (ffi, core) in cases {
             assert_eq!(update::Action::from(ffi.clone()), core);
             assert_eq!(Action::from(core), ffi);
@@ -3661,7 +3836,7 @@ mod tests {
     }
 
     /// What a UI keeps of a session: each list, each splice applied to it as it comes, the last
-    /// summary, the detail and the logs as last sent, and the player commands it was given.
+    /// summary, the detail, the logs and the folders as last sent, and the player's commands.
     #[derive(Default)]
     struct Ui {
         rows: Vec<EntryView>,
@@ -3669,6 +3844,7 @@ mod tests {
         summary: Option<Summary>,
         detail: Option<Detail>,
         logs: Option<FileLogs>,
+        folders: Vec<FolderView>,
         played: Vec<PlayerCommand>,
     }
 
@@ -3685,6 +3861,7 @@ mod tests {
                         detail,
                         files,
                         logs,
+                        folders,
                     }) => {
                         let span = |at: u64, removed: u64| {
                             let at = usize::try_from(at).unwrap();
@@ -3702,6 +3879,9 @@ mod tests {
                         if let Some(now) = logs {
                             self.logs = now.logs;
                         }
+                        if let Some(now) = folders {
+                            self.folders = now;
+                        }
                         self.summary = Some(summary);
                     }
                     Some(Event::Player(command)) => self.played.push(command),
@@ -3712,6 +3892,14 @@ mod tests {
 
         fn summary(&self) -> &Summary {
             self.summary.as_ref().unwrap()
+        }
+
+        /// Each folder held: its name, how many to review, and whether it is open.
+        fn folders(&self) -> Vec<(&str, u64, bool)> {
+            self.folders
+                .iter()
+                .map(|f| (f.name.as_str(), f.to_review, f.open))
+                .collect()
         }
 
         /// The selected entry, as the rows held say it.
@@ -3762,6 +3950,7 @@ mod tests {
             ]
         );
         assert_eq!(ui.summary().title, format!("run {name}"));
+        assert!(!ui.summary().of_paths);
         assert_eq!((ui.summary().selected, ui.summary().pending), (Some(1), 4));
         // The FIFO is on disk, but not as it was scanned; the sample's files are not.
         assert_eq!(ui.rows[0].note, Some(FileNote::Changed));
@@ -3779,6 +3968,10 @@ mod tests {
             ("E01", State::Pending)
         );
         assert_eq!(detail.group.map(|g| g.members.len()), Some(3));
+        // The run's folders, in the order it named their files; a run's view is no folder's.
+        assert_eq!(ui.folders(), [("K-On!", 4, false), ("fifo", 0, false)]);
+        let fifo = Path::new(&dir).join("fifo").to_string_lossy().into_owned();
+        assert_eq!(ui.folders[1].path, fifo);
 
         s.send(Action::Toggle);
         ui.until(&s, "Toggle", |ui| ui.rows.len() == 6);
@@ -3795,6 +3988,8 @@ mod tests {
             ui.rows[1].mixed,
             "the row's members are decided differently"
         );
+        // Read again once the decision is written, in the change that shows it.
+        assert_eq!(ui.folders(), [("K-On!", 3, false), ("fifo", 0, false)]);
         s.send(Action::Reject);
         ui.until(&s, "Reject", |ui| ui.summary().rejected == 1);
         s.send(Action::Undo);
@@ -3867,12 +4062,22 @@ mod tests {
         });
         // A paths view lists its files by path: the FIFO's folder first.
         assert_eq!(labels(&ui), ["stalled", "E01", "E02", "E03"]);
+        assert_eq!(ui.folders(), [("K-On!", 4, true), ("fifo", 0, true)]);
+        assert!(ui.summary().of_paths);
+        s.send(Action::OpenFolder {
+            folder: fifo.clone(),
+        });
+        ui.until(&s, "OpenFolder", |ui| ui.summary().title == "fifo");
+        assert!(ui.summary().of_paths);
+        assert_eq!(labels(&ui), ["stalled"]);
+        assert_eq!(ui.folders(), [("K-On!", 4, false), ("fifo", 0, true)]);
         s.send(Action::OpenView {
             selector: vec![name.clone()],
         });
         ui.until(&s, "OpenView", |ui| {
             ui.summary().title == format!("run {name}")
         });
+        assert!(!ui.summary().of_paths);
 
         // The FIFO's finding opens: it is on disk.
         s.send(Action::Select {

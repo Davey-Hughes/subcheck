@@ -16,7 +16,7 @@ use super::progress;
 use super::update::{Input, Job, Switch, Task};
 use crate::llm::Backend;
 use crate::scan::{self, file_stamp};
-use crate::store::{Run, Selector, Store};
+use crate::store::{Run, Selector, ShowFolder, Store};
 
 /// Runs `update`'s tasks for a UI: through `store`, the connection review writes through; with
 /// `state`, the state directory, where apply writes the fixed tracks; and with `tx`, a sender on
@@ -32,6 +32,12 @@ pub struct Runner<T> {
 impl<T: From<Input> + Send + 'static> Runner<T> {
     pub fn new(store: Store, state: PathBuf, tx: Sender<T>) -> Runner<T> {
         Runner { store, state, tx }
+    }
+
+    /// The store's show folders ([`Store::show_folders`]), read through the connection review's
+    /// tasks write through.
+    pub fn show_folders(&self) -> rusqlite::Result<Vec<ShowFolder>> {
+        self.store.show_folders()
     }
 
     /// Run `task` and say how it went. A job it starts (`Recheck`, `StartApply`) runs on a
@@ -129,8 +135,8 @@ pub fn file_notes(run: &Run) -> HashMap<String, FileNote> {
 }
 
 /// The view [`Task::Switch`] asks for, read from the store: a run's folders, the newest run that
-/// named a file, or what a selector's words select, as `Session::open` reads its first. The words
-/// are read here, not in `update`: a word that is a path on disk is a path.
+/// named a file, what a selector's words select, as `Session::open` reads its first, or a folder's
+/// files. The words are read here, not in `update`: a word that is a path on disk is a path.
 fn other_view(store: &Store, to: &Switch) -> anyhow::Result<Run> {
     match to {
         Switch::FoldersOf(name) => {
@@ -146,6 +152,7 @@ fn other_view(store: &Store, to: &Switch) -> anyhow::Result<Run> {
             Ok(store.run_view(&scan)?)
         }
         Switch::Selector(words) => store.view(&Selector::parse(words)?),
+        Switch::Folder(folder) => store.folder_view(Path::new(folder)),
     }
 }
 
@@ -310,6 +317,59 @@ mod tests {
         assert!(said.starts_with("nothing recorded under "), "{said}");
         assert!(said.contains(&folder), "{said}");
         assert_eq!(open(vec!["nope".into()]), Err("no run named nope".into()));
+    }
+
+    // A folder not on disk, as a share not mounted is: by its path it opens, where the same path
+    // as a selector's words names a run.
+    #[test]
+    fn a_folder_opens_by_its_path_whether_or_not_it_is_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_at(&dir.path().join("subcheck.db")).unwrap();
+        let header = crate::store::RunHeader {
+            started: jiff::Timestamp::UNIX_EPOCH,
+            backend: "claude".into(),
+            command: vec![],
+            prompt_version: 1,
+            version: "0".into(),
+            langs: vec!["eng".into()],
+        };
+        let record = model::tests_support::file(1);
+        let scan = store
+            .begin_scan(&header, &[PathBuf::from(&record.path)])
+            .unwrap();
+        let attempt = crate::store::Attempt {
+            scan: scan.id,
+            path: &record.path,
+            size: record.size,
+            mtime: record.mtime,
+            tracks: &record.tracks,
+            truncated: None,
+            at: jiff::Timestamp::UNIX_EPOCH,
+        };
+        let made = crate::store::Made {
+            with: crate::store::CheckedWith::new("claude", &["eng".into()], 1),
+            lines: 1,
+            findings: vec![model::tests_support::finding(0, 1, "a", "b", 0)],
+        };
+        store.save(&attempt, vec![made]).unwrap();
+        let (tx, _rx) = mpsc::channel::<Input>();
+        let mut runner = Runner::new(store, dir.path().join("state"), tx);
+        let folder = "/m/K-On!".to_string();
+        assert!(!Path::new(&folder).exists());
+        let mut open = |to: Switch| match runner.run(Task::Switch(to)) {
+            Input::Switched(view) => view.map(|(run, _)| (run.shown_name(), run.findings.len())),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            open(Switch::Folder(folder.clone())),
+            Ok(("K-On!".to_string(), 1))
+        );
+        assert_eq!(
+            open(Switch::Selector(vec![folder])),
+            Err("no run named /m/K-On!".into())
+        );
+        let said = open(Switch::Folder("/m/Nothing".into())).unwrap_err();
+        assert_eq!(said, "nothing recorded under '/m/Nothing'");
     }
 
     #[test]
