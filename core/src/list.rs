@@ -185,6 +185,12 @@ fn track_label(run: &Run, f: &Finding, id: usize) -> String {
 /// tells it apart, being a name of its own no other track of the file has. `None` when it is not
 /// among them.
 pub fn track_name_in(tracks: &[TrackRecord], id: usize) -> Option<(String, bool)> {
+    track_in(tracks, id).map(|(t, apart)| (t.shown_name(), apart))
+}
+
+/// Track `id` among a file record's `tracks`, and whether its own name tells it apart, no other
+/// track of the file having that name. `None` when it is not among them.
+pub fn track_in(tracks: &[TrackRecord], id: usize) -> Option<(&TrackRecord, bool)> {
     let t = tracks.iter().find(|t| t.id == id)?;
     let own = mkv::own_name(t.name.as_deref());
     let apart = own.is_some_and(|own| {
@@ -194,7 +200,7 @@ pub fn track_name_in(tracks: &[TrackRecord], id: usize) -> Option<(String, bool)
             .count()
             == 1
     });
-    Some((t.shown_name(), apart))
+    Some((t, apart))
 }
 
 /// The tracks the run's record of file `path` lists; none when it has no record of it.

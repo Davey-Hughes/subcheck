@@ -15,9 +15,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use jiff::Timestamp;
 
+use super::detail::Detail;
 use super::jobs::panic_text;
-use super::model::{Entry, EntryKey, FileNote, Pane, Question, Review};
-use super::progress::Job;
+use super::model::{Entry, EntryKey, FileNote, Fix, ListTrack, MarkKind, Pane, Question, Review};
+use super::progress::{ApplyStage, FileProgress, Job, Stage};
 use super::runner::{self, Runner};
 use super::update::{self, Action, Effect, Input, Task};
 use crate::group;
@@ -28,12 +29,19 @@ use crate::store::{self, Selector, State, Store};
 /// What a UI hears, in order ([`Session::next_event`]).
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // each is made once and moved to the UI: a box adds only noise
+#[allow(clippy::option_option)] // `detail`, `logs`: absent when as last sent; none is a change too
 pub enum Event {
-    /// What the UI shows changed. `rows` is `None` when the list did not, but never in the
-    /// first event.
+    /// What the UI shows changed. `rows`, `files`, `detail` and `logs` are `None` when they did
+    /// not, but never in the first event, which carries each.
     Changed {
         rows: Option<Splice>,
         summary: Summary,
+        /// The selected finding's detail ([`Review::detail`]); none when nothing is selected.
+        detail: Option<Option<Detail>>,
+        /// The files list's change, as `rows` is the findings list's.
+        files: Option<Splice<FileView>>,
+        /// What the scan and apply wrote for the selected file; none when the files list is empty.
+        logs: Option<Option<FileLogs>>,
     },
     /// For the UI's player, which runs it and says how it went ([`Session::report`]).
     Player(PlayerCommand),
@@ -48,12 +56,24 @@ pub enum Event {
     },
 }
 
-/// A change to the rows the UI holds: `removed` rows at `at` give way to `inserted`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Splice {
+/// A change to a list the UI holds, the rows unless it says so: the `removed` items at `at` give
+/// way to `inserted`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Splice<T = EntryView> {
     pub at: usize,
     pub removed: usize,
-    pub inserted: Vec<EntryView>,
+    pub inserted: Vec<T>,
+}
+
+// By hand: a derived default would ask the same of the items.
+impl<T> Default for Splice<T> {
+    fn default() -> Splice<T> {
+        Splice {
+            at: 0,
+            removed: 0,
+            inserted: Vec::new(),
+        }
+    }
 }
 
 /// What a UI shows beside the list. Sent whole, with any change to it.
@@ -83,6 +103,8 @@ pub struct Summary {
     pub question: Option<Question>,
     /// The job under way, or the last to end ([`Job`]), its files by the list's names for them.
     pub job: Option<Job>,
+    /// An index into the files list the UI holds; `None` when it holds none.
+    pub file_selected: Option<usize>,
 }
 
 /// An edit under way, for a UI's editor ([`Review::editing`]).
@@ -115,12 +137,14 @@ pub struct EntryView {
     pub original: String,
     pub wording: String,
     pub style: String,
-    /// What apply did or would do with it ([`Review::row_mark`], [`Review::mark`]).
-    pub mark: Option<String>,
-    /// A timing finding's track; empty for others.
-    pub track: String,
-    /// A timing finding's fix in short ([`Review::fix_summary`]).
-    pub fix: Option<String>,
+    /// What apply did or would do with the findings it shows ([`Review::mark_counts`]): each kind
+    /// with how many have it; none when none has a mark.
+    pub marks: Vec<(MarkKind, usize)>,
+    /// A timing finding's track, as the list tells it apart; none for others.
+    pub track: Option<ListTrack>,
+    /// A timing finding's fixes, of the findings it shows ([`Review::fixes`]): each with how many
+    /// have it, the most common first; none for others.
+    pub fixes: Vec<(Fix, usize)>,
     /// A scan is checking its file again ([`Review::checking_among`]): any shown member's, for
     /// a row.
     pub checking: bool,
@@ -144,15 +168,14 @@ fn entry_view(m: &Review, e: Entry, checked: &HashSet<&str>) -> EntryView {
     let shown = m.targets(e);
     let first = shown[0];
     let f = m.finding(first);
-    let (is_member, expanded, total, mark, mixed) = match e {
+    let (is_member, expanded, total, mixed) = match e {
         // As `entries` has it: an expanded row that a re-check left with one member shows none.
         Entry::Row(r) => {
             let total = m.rows[r].members.len();
             let expanded = total > 1 && m.expanded.contains(&r);
-            let mixed = m.shown_state(r).is_none();
-            (false, expanded, total, m.row_mark(r), mixed)
+            (false, expanded, total, m.shown_state(r).is_none())
         }
-        Entry::Member(_, i) => (true, false, 1, m.mark(i).map(str::to_string), false),
+        Entry::Member(..) => (true, false, 1, false),
     };
     EntryView {
         key: m.entry_key(e),
@@ -166,17 +189,76 @@ fn entry_view(m: &Review, e: Entry, checked: &HashSet<&str>) -> EntryView {
         original: f.original.clone(),
         wording: m.wording(first).to_string(),
         style: f.style.clone(),
-        mark,
-        track: m.track_name(first).to_string(),
-        fix: f.timing.is_some().then(|| m.fix_summary(&shown)),
+        marks: m.mark_counts(e),
+        track: m.list_track(first).cloned(),
+        fixes: m.fixes(&shown),
         checking: m.checking_among(e, checked),
         note: m.notes.get(&f.file).copied(),
         mixed,
     }
 }
 
-/// What `m` shows beside a list of `rows` rows.
-fn summary(m: &Review, rows: usize) -> Summary {
+/// One line of the files list, as a UI shows it: a file of the run, and where the scan and apply
+/// are with it ([`FileProgress`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileView {
+    /// The file as the store names it, which `SelectFile` takes.
+    pub path: String,
+    /// The name it goes by in the list.
+    pub label: String,
+    /// Where the scan is with it; for a file not scanned since the view opened, as recorded.
+    pub stage: Stage,
+    /// Where the latest apply or dry run is with it, which a UI shows in place of `stage`: none
+    /// until that apply queues it, and once a later scan checks it again.
+    pub applying: Option<ApplyStage>,
+    /// Distinct lines checked, from its record.
+    pub lines: Option<usize>,
+    /// Checked for timing alone, with no lines checked by the LLM to count.
+    pub timing_only: bool,
+}
+
+impl FileView {
+    fn of(m: &Review, file: &FileProgress) -> FileView {
+        FileView {
+            path: file.path.clone(),
+            label: m.label(&file.path),
+            stage: file.stage.clone(),
+            applying: file.applying.clone(),
+            lines: file.lines,
+            timing_only: file.timing_only,
+        }
+    }
+}
+
+/// What the scan and the screen's applies wrote for the selected file, for a UI to show beside the
+/// files list ([`FileProgress::log`], [`FileProgress::apply_log`]): lines of text, as the jobs
+/// wrote them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileLogs {
+    pub log: Vec<String>,
+    pub apply_log: Vec<String>,
+}
+
+/// The files list as `m` shows it now.
+fn file_views(m: &Review) -> Vec<FileView> {
+    m.progress
+        .files
+        .iter()
+        .map(|file| FileView::of(m, file))
+        .collect()
+}
+
+/// The selected file's logs; none when the files list is empty.
+fn file_logs(m: &Review) -> Option<FileLogs> {
+    let file = m.progress.files.get(m.file_selected)?;
+    Some(FileLogs {
+        log: file.log.clone(),
+        apply_log: file.apply_log.clone(),
+    })
+}
+
+/// What `m` shows beside a list of `rows` rows and `files` files.
+fn summary(m: &Review, rows: usize, files: usize) -> Summary {
     let (pending, accepted, rejected) = m.counts();
     Summary {
         title: m.run.shown_name(),
@@ -196,13 +278,14 @@ fn summary(m: &Review, rows: usize) -> Summary {
         }),
         question: m.question(),
         job: m.progress.job(&|p| m.label(p)),
+        file_selected: (m.file_selected < files).then_some(m.file_selected),
     }
 }
 
-/// `old` into `new` as one splice, the rows between their matching start and their matching end;
-/// `None` when they are the same. Two far-apart changes resend the rows between them: a UI applies
+/// `old` into `new` as one splice, the items between their matching start and their matching end;
+/// `None` when they are the same. Two far-apart changes resend the items between them: a UI applies
 /// any splice the same way, and that costs less than a second kind of event would.
-fn splice(old: &[EntryView], new: &[EntryView]) -> Option<Splice> {
+fn splice<T: PartialEq + Clone>(old: &[T], new: &[T]) -> Option<Splice<T>> {
     let at = old.iter().zip(new).take_while(|(a, b)| a == b).count();
     let tail = old[at..]
         .iter()
@@ -223,27 +306,47 @@ fn splice(old: &[EntryView], new: &[EntryView]) -> Option<Splice> {
 #[derive(Default)]
 struct Sent {
     rows: Vec<EntryView>,
+    files: Vec<FileView>,
     /// `None` until the first event.
     summary: Option<Summary>,
+    detail: Option<Detail>,
+    logs: Option<FileLogs>,
 }
 
 impl Sent {
     /// The event that brings the UI up to `m`; `None` when nothing it shows changed. The first
-    /// always comes, with a splice even for no rows: it tells the UI the run has opened, and that
-    /// a run with no findings has none.
+    /// always comes, with a splice of each list even for none, and the detail and the logs even
+    /// when there are none: it tells the UI the run has opened, and what it starts from.
     fn change(&mut self, m: &Review) -> Option<Event> {
         let rows = entry_views(m);
-        let summary = summary(m, rows.len());
+        let files = file_views(m);
+        let summary = summary(m, rows.len(), files.len());
+        let detail = m.detail();
+        let logs = file_logs(m);
         let first = self.summary.is_none();
-        let splice = splice(&self.rows, &rows);
-        if splice.is_none() && self.summary.as_ref() == Some(&summary) {
+        let row_splice = splice(&self.rows, &rows).or_else(|| first.then(Splice::default));
+        let file_splice = splice(&self.files, &files).or_else(|| first.then(Splice::default));
+        let detail_now = (first || detail != self.detail).then(|| detail.clone());
+        let logs_now = (first || logs != self.logs).then(|| logs.clone());
+        if row_splice.is_none()
+            && file_splice.is_none()
+            && detail_now.is_none()
+            && logs_now.is_none()
+            && self.summary.as_ref() == Some(&summary)
+        {
             return None;
         }
         self.rows = rows;
+        self.files = files;
         self.summary = Some(summary.clone());
+        self.detail = detail;
+        self.logs = logs;
         Some(Event::Changed {
-            rows: splice.or_else(|| first.then(Splice::default)),
+            rows: row_splice,
             summary,
+            detail: detail_now,
+            files: file_splice,
+            logs: logs_now,
         })
     }
 
@@ -682,9 +785,9 @@ mod tests {
     use crate::apply;
     use crate::list::Filter;
     use crate::player::{How, Moment, Playback};
-    use crate::review::model::Row;
     use crate::review::model::tests_support::{self, finding, many, sample, with_timing};
-    use crate::review::progress::{ApplyAt, Scan};
+    use crate::review::model::{Mark, Row};
+    use crate::review::progress::{ApplyAt, Counts, Scan};
     use crate::review::update::tests_support::{FIXED, TYPO, decide_as, now, saved, taken};
     use crate::scan;
     use crate::store::{
@@ -698,7 +801,7 @@ mod tests {
     /// `sent` up to `m`, what it says of the rows, and the summary; an event must be due.
     fn changed(sent: &mut Sent, m: &Review) -> (Option<Splice>, Summary) {
         match sent.change(m) {
-            Some(Event::Changed { rows, summary }) => (rows, summary),
+            Some(Event::Changed { rows, summary, .. }) => (rows, summary),
             other => panic!("expected a change: {other:?}"),
         }
     }
@@ -732,6 +835,7 @@ mod tests {
                 edit: None,
                 question: None,
                 job: None,
+                file_selected: Some(0),
             }
         );
     }
@@ -766,6 +870,153 @@ mod tests {
             })
         );
         assert_eq!(summary.selected, None);
+    }
+
+    #[test]
+    fn the_first_event_carries_the_files_the_detail_and_the_selected_files_logs() {
+        let m = sample();
+        let Some(Event::Changed {
+            summary,
+            detail,
+            files,
+            logs,
+            ..
+        }) = Sent::default().change(&m)
+        else {
+            panic!("no change");
+        };
+        let files = files.unwrap();
+        assert_eq!((files.at, files.removed), (0, 0));
+        let labels: Vec<&str> = files.inserted.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(labels, ["E01", "E02", "E03"]);
+        assert_eq!(
+            files.inserted[1],
+            FileView {
+                path: tests_support::path(2),
+                label: "E02".into(),
+                stage: Stage::Done { findings: 2 },
+                applying: None,
+                lines: Some(400),
+                timing_only: false,
+            }
+        );
+        assert_eq!(summary.file_selected, Some(0));
+        assert_eq!(detail, Some(m.detail()));
+        assert_eq!(detail.flatten().unwrap().label, "E01");
+        assert_eq!(
+            logs,
+            Some(Some(FileLogs {
+                log: vec![
+                    "400 lines, 1 finding".into(),
+                    "    track 5 English Full: cues".into(),
+                    "    track 6 English Signs: cues".into(),
+                ],
+                apply_log: vec![],
+            }))
+        );
+        // A run with no files: each part says so, and nothing is selected in either list.
+        let run = Run {
+            name: "r".into(),
+            ..Run::default()
+        };
+        let empty = Review::new(run, HashMap::new());
+        let Some(Event::Changed {
+            summary,
+            detail,
+            files,
+            logs,
+            ..
+        }) = Sent::default().change(&empty)
+        else {
+            panic!("no change");
+        };
+        assert_eq!(files, Some(Splice::default()));
+        assert_eq!((detail, logs), (Some(None), Some(None)));
+        assert_eq!(summary.file_selected, None);
+    }
+
+    #[test]
+    fn the_detail_is_sent_when_it_changes_and_none_once_nothing_is_selected() {
+        let mut m = sample();
+        let mut sent = told(&m);
+        // The files list shown: the detail is still the findings list's selection's, unchanged.
+        act(&mut m, Action::ShowPane(Pane::Files));
+        let Some(Event::Changed {
+            summary, detail, ..
+        }) = sent.change(&m)
+        else {
+            panic!("no change");
+        };
+        assert_eq!((summary.pane, detail), (Pane::Files, None));
+        act(&mut m, Action::ShowPane(Pane::Findings));
+        changed(&mut sent, &m);
+        act(&mut m, Action::Move(1));
+        let Some(Event::Changed { detail, .. }) = sent.change(&m) else {
+            panic!("no change");
+        };
+        assert_eq!(
+            detail.flatten().unwrap().original,
+            "Let's have snacks together everyday."
+        );
+        // A filter that shows nothing: none, which is a change too.
+        act(&mut m, Action::SetFilter(Filter::Only(State::Accepted)));
+        let Some(Event::Changed { detail, .. }) = sent.change(&m) else {
+            panic!("no change");
+        };
+        assert_eq!(detail, Some(None));
+        assert_eq!(sent.change(&m), None, "nothing since");
+    }
+
+    #[test]
+    fn the_files_and_the_selected_files_logs_are_sent_when_they_change() {
+        let mut m = sample();
+        let mut sent = told(&m);
+        // Another file selected: its logs, and the list itself left out.
+        act(&mut m, Action::SelectFile(tests_support::path(2)));
+        let Some(Event::Changed {
+            summary,
+            files,
+            logs,
+            ..
+        }) = sent.change(&m)
+        else {
+            panic!("no change");
+        };
+        assert_eq!((summary.file_selected, files), (Some(1), None));
+        assert_eq!(logs.flatten().unwrap().log[0], "400 lines, 2 findings");
+        // A scan of E02: its line, and its logs, as it goes.
+        m.progress.start("r", "subcheck scan --run r".into(), true);
+        let queued = scan::Event::Queued(vec![tests_support::path(2).into()]);
+        update::update(&mut m, Input::Scan(queued), now());
+        let Some(Event::Changed { files, logs, .. }) = sent.change(&m) else {
+            panic!("no change");
+        };
+        let files = files.unwrap();
+        assert_eq!((files.at, files.removed, files.inserted.len()), (1, 1, 1));
+        assert_eq!(files.inserted[0].stage, Stage::Queued);
+        assert_eq!(logs.flatten().unwrap().log, Vec::<String>::new());
+        let done = scan::Event::Finished {
+            path: tests_support::path(2).into(),
+            error: None,
+            findings: 0,
+            lines: vec!["E02: no findings".into()],
+        };
+        update::update(&mut m, Input::Scan(done), now());
+        let Some(Event::Changed { files, logs, .. }) = sent.change(&m) else {
+            panic!("no change");
+        };
+        assert_eq!(
+            files.unwrap().inserted[0].stage,
+            Stage::Done { findings: 0 }
+        );
+        assert_eq!(logs.flatten().unwrap().log, ["E02: no findings"]);
+        // A decision touches neither.
+        let effects = act(&mut m, Action::Accept);
+        update::update(&mut m, taken(effects), now());
+        let Some(Event::Changed { files, logs, .. }) = sent.change(&m) else {
+            panic!("no change");
+        };
+        assert_eq!((files, logs), (None, None));
     }
 
     #[test]
@@ -919,9 +1170,8 @@ mod tests {
         assert_eq!(lyric.original, TYPO);
         assert_eq!(lyric.wording, FIXED);
         assert_eq!(lyric.style, "OP en");
-        assert_eq!(lyric.mark, None);
-        assert_eq!(lyric.track, "");
-        assert_eq!(lyric.fix, None);
+        assert_eq!((lyric.marks.as_slice(), &lyric.track), (&[][..], &None));
+        assert_eq!(lyric.fixes, []);
         // Decided differently, and a filter leaving two of three: the rule is the list's.
         decide_as(&mut m, &[1], State::Accepted, Some("My own."));
         decide_as(&mut m, &[2], State::Rejected, None);
@@ -930,7 +1180,7 @@ mod tests {
         let lyric = &entry_views(&m)[0];
         assert_eq!(lyric.state, None, "decided members differ");
         assert_eq!(lyric.wording, "My own.");
-        assert_eq!(lyric.mark.as_deref(), Some("applied 1"));
+        assert_eq!(lyric.marks, [(MarkKind::Applied, 1)]);
         m.filter = Filter::Only(State::Rejected);
         let lyric = &entry_views(&m)[0];
         assert_eq!(lyric.state, Some(State::Rejected));
@@ -951,7 +1201,7 @@ mod tests {
         assert!(e02.is_member && !e02.expanded);
         assert_eq!(e02.label, "E02");
         assert_eq!((e02.shown, e02.total), (1, 1));
-        assert_eq!(e02.mark.as_deref(), Some("applied"));
+        assert_eq!(e02.marks, [(MarkKind::Applied, 1)]);
         assert_eq!(
             views[0].state,
             Some(State::Pending),
@@ -965,13 +1215,44 @@ mod tests {
         let mut m = with_timing();
         let row = entry_views(&m)[1].clone();
         assert_eq!(row.key, EntryKey::Row(vec![11, 12, 13]));
-        assert_eq!(row.track, "English Full");
-        assert_eq!(row.fix.as_deref(), Some("−1 frame ×2 · partial ×1"));
+        let english = ListTrack {
+            id: 5,
+            name: Some("English Full".into()),
+            language: Some("eng".into()),
+            apart: true,
+        };
+        assert_eq!(row.track.as_ref(), Some(&english));
+        assert_eq!(row.fixes, [(Fix::Shift(1), 2), (Fix::Partial, 1)]);
         m.expanded.insert(1);
         let partial = entry_views(&m)[3].clone();
         assert_eq!(partial.key, EntryKey::Member(12));
-        assert_eq!(partial.track, "English Full");
-        assert_eq!(partial.fix.as_deref(), Some("partial"));
+        assert_eq!(partial.track, Some(english));
+        assert_eq!(partial.fixes, [(Fix::Partial, 1)]);
+    }
+
+    // A row's marks as data: by kind, so that two findings left by hand for different reasons
+    // count as one, with members that have none left out; a member's own, counting itself.
+    #[test]
+    fn a_rows_marks_count_each_kind_its_shown_members_have() {
+        let mut m = sample();
+        m.marks
+            .insert(1, Mark::ByHand("two fixes on one line".into()));
+        m.marks
+            .insert(2, Mark::ByHand("the fix has markup characters".into()));
+        let views = entry_views(&m);
+        assert_eq!(views[0].marks, [(MarkKind::ByHand, 2)]);
+        m.run.applied.insert(4);
+        m.expanded.insert(0);
+        let views = entry_views(&m);
+        assert_eq!(
+            views[0].marks,
+            [(MarkKind::ByHand, 2), (MarkKind::Applied, 1)]
+        );
+        assert_eq!(views[3].marks, [(MarkKind::Applied, 1)]);
+        // The filter's members alone.
+        decide_as(&mut m, &[4], State::Accepted, None);
+        m.filter = Filter::Only(State::Accepted);
+        assert_eq!(entry_views(&m)[0].marks, [(MarkKind::Applied, 1)]);
     }
 
     #[test]
@@ -1198,7 +1479,7 @@ mod tests {
     /// The next event, a change; what it says of the rows, and the summary.
     fn next_change(s: &Arc<Session>) -> (Option<Splice>, Summary) {
         match next(s) {
-            Some(Event::Changed { rows, summary }) => (rows, summary),
+            Some(Event::Changed { rows, summary, .. }) => (rows, summary),
             other => panic!("expected a change: {other:?}"),
         }
     }
@@ -1601,9 +1882,60 @@ mod tests {
         drop(let_go);
     }
 
+    /// What a UI holds of a session: each list, each splice applied to it as it comes, and the
+    /// detail and the logs as last sent.
+    #[derive(Debug, Default, PartialEq)]
+    struct Held {
+        rows: Vec<EntryView>,
+        files: Vec<FileView>,
+        detail: Option<Detail>,
+        logs: Option<FileLogs>,
+    }
+
+    impl Held {
+        /// What `m` shows now, as a UI that has applied every change would hold it.
+        fn of(m: &Review) -> Held {
+            Held {
+                rows: entry_views(m),
+                files: file_views(m),
+                detail: m.detail(),
+                logs: file_logs(m),
+            }
+        }
+
+        /// `event` taken in, as a UI does, whatever its order.
+        fn take(&mut self, event: Event) {
+            let Event::Changed {
+                rows,
+                detail,
+                files,
+                logs,
+                ..
+            } = event
+            else {
+                return;
+            };
+            if let Some(s) = rows {
+                self.rows.splice(s.at..s.at + s.removed, s.inserted);
+            }
+            if let Some(s) = files {
+                self.files.splice(s.at..s.at + s.removed, s.inserted);
+            }
+            if let Some(detail) = detail {
+                self.detail = detail;
+            }
+            if let Some(logs) = logs {
+                self.logs = logs;
+            }
+        }
+    }
+
+    // Each kind of action but three (`Quit` and `Interrupt` end review, `Playback` is the
+    // player's), and no yes to `Recheck` or `Apply`, which would start a real job: a scan's
+    // inputs and a dry run's follow the actions, fed in as their jobs send them.
     #[test]
-    #[allow(clippy::too_many_lines)] // every action, a scan's inputs, then a file read back
-    fn every_splice_applied_to_a_copy_of_the_rows_makes_the_real_list() {
+    #[allow(clippy::too_many_lines)] // the actions, a scan's and a dry run's inputs, a read-back
+    fn every_change_applied_to_what_a_ui_holds_makes_both_lists_the_detail_and_the_logs() {
         let dir = tempfile::tempdir().unwrap();
         let (store, name) = seeded(dir.path());
         let db = store.path().to_path_buf();
@@ -1618,35 +1950,25 @@ mod tests {
         let mut runner = Runner::new(store, state, tx);
         let mut sent = Sent::default();
         let open = Mutex::new(Shared::default());
-        let mut copy: Vec<EntryView> = Vec::new();
-        // As a UI does it, whatever the event's order.
-        let apply = |event: Event, copy: &mut Vec<EntryView>| {
-            if let Event::Changed {
-                rows: Some(splice), ..
-            } = event
-            {
-                copy.splice(splice.at..splice.at + splice.removed, splice.inserted);
+        let mut held = Held::default();
+        held.take(sent.change(&review).unwrap());
+        assert_eq!(held, Held::of(&review));
+        let mut go = |review: &mut Review, sent: &mut Sent, input: Input, held: &mut Held| {
+            let what = format!("{input:?}");
+            let mut heard = Vec::new();
+            step(
+                review,
+                &mut runner,
+                sent,
+                input,
+                &mut |e| heard.push(e),
+                &open,
+            );
+            for event in heard {
+                held.take(event);
             }
+            assert_eq!(*held, Held::of(review), "after {what}");
         };
-        apply(sent.change(&review).unwrap(), &mut copy);
-        assert_eq!(copy, entry_views(&review));
-        let mut go =
-            |review: &mut Review, sent: &mut Sent, input: Input, copy: &mut Vec<EntryView>| {
-                let what = format!("{input:?}");
-                let mut heard = Vec::new();
-                step(
-                    review,
-                    &mut runner,
-                    sent,
-                    input,
-                    &mut |e| heard.push(e),
-                    &open,
-                );
-                for event in heard {
-                    apply(event, copy);
-                }
-                assert_eq!(*copy, entry_views(review), "after {what}");
-            };
         let only = |state| Action::SetFilter(Filter::Only(state));
         for action in [
             Action::Toggle,
@@ -1678,32 +2000,96 @@ mod tests {
             Action::Play,
             Action::ClosePlayer,
             Action::ShowPane(Pane::Files),
+            Action::SelectFile(tests_support::path(3)),
+            Action::SelectFile(tests_support::path(2)),
+            Action::ShowFileFindings,
             Action::ShowPane(Pane::Findings),
             Action::Dismiss,
+            Action::Move(1),
+            Action::Edit,
+            Action::CancelEdit,
+            Action::ShowPane(Pane::Files),
         ] {
-            go(&mut review, &mut sent, Input::Action(action), &mut copy);
+            go(&mut review, &mut sent, Input::Action(action), &mut held);
+        }
+        // Each question opens, and a no lets it go.
+        for (action, asks) in [
+            (Action::Recheck, true),
+            (Action::Answer(false), false),
+            (Action::ShowPane(Pane::Findings), false),
+            (Action::Apply { dry_run: false }, true),
+            (Action::Answer(false), false),
+        ] {
+            let what = format!("{action:?}");
+            go(&mut review, &mut sent, Input::Action(action), &mut held);
+            assert_eq!(review.question().is_some(), asks, "after {what}");
+        }
+        // The run's view opened again.
+        for action in [Action::OpenView(vec![run.clone()]), Action::Move(-1)] {
+            go(&mut review, &mut sent, Input::Action(action), &mut held);
         }
         // A scan of E02 and E03: the rows of their findings turn as it checks them, the lyric's
         // still for E03 once E02 is done, and none once the scan has failed with E03 left queued.
-        let turning = |copy: &[EntryView]| copy.iter().filter(|v| v.checking).count();
+        let turning = |held: &Held| held.rows.iter().filter(|v| v.checking).count();
         let queued = scan::Event::Queued(vec![
             tests_support::path(2).into(),
             tests_support::path(3).into(),
         ]);
-        go(&mut review, &mut sent, Input::Scan(queued), &mut copy);
-        let all = turning(&copy);
-        assert!(all > 1, "{copy:?}");
+        go(&mut review, &mut sent, Input::Scan(queued), &mut held);
+        let all = turning(&held);
+        assert!(all > 1, "{held:?}");
+        let reading = scan::Event::Reading(tests_support::path(2).into());
+        go(&mut review, &mut sent, Input::Scan(reading), &mut held);
         let done = scan::Event::Finished {
             path: tests_support::path(2).into(),
             error: None,
             findings: 0,
-            lines: vec![],
+            lines: vec!["E02: no findings".into()],
         };
-        go(&mut review, &mut sent, Input::Scan(done), &mut copy);
-        assert!((1..all).contains(&turning(&copy)), "{copy:?}");
+        go(&mut review, &mut sent, Input::Scan(done), &mut held);
+        assert!((1..all).contains(&turning(&held)), "{held:?}");
         let failed = Input::ScanEnded(Err("the store is locked".into()));
-        go(&mut review, &mut sent, failed, &mut copy);
-        assert_eq!(turning(&copy), 0, "{copy:?}");
+        go(&mut review, &mut sent, failed, &mut held);
+        assert_eq!(turning(&held), 0, "{held:?}");
+        // A dry run of E02's fix: its file's stage and log, and its findings' marks.
+        review
+            .progress
+            .start_apply(true, format!("subcheck apply {run} --dry-run"));
+        let dry = [
+            apply::Event::Queued(vec![tests_support::path(2)]),
+            apply::Event::Stage(tests_support::path(2), apply::Stage::Plan),
+            apply::Event::Done {
+                path: tests_support::path(2),
+                outcomes: vec![(2, apply::patch::Outcome::Patched)],
+                remuxed: false,
+                marked: vec![],
+                restamped: None,
+                text: "E02: would apply 1".into(),
+            },
+        ];
+        for event in dry {
+            go(&mut review, &mut sent, Input::Apply(event), &mut held);
+        }
+        let ended = Input::ApplyEnded(Ok(apply::Summary {
+            fixed: 1,
+            ..apply::Summary::default()
+        }));
+        go(&mut review, &mut sent, ended, &mut held);
+        assert_eq!(
+            held.files[1].applying,
+            Some(ApplyStage::Done {
+                dry_run: true,
+                remuxed: false,
+                counts: Counts {
+                    applied: 1,
+                    ..Counts::default()
+                },
+            })
+        );
+        assert_eq!(
+            held.logs.as_ref().unwrap().apply_log,
+            ["E02: would apply 1"]
+        );
         // E02 checked again, on another connection as a scan's thread has: the lyric back, the
         // snacks line gone, a new line early on. The rows are made again from the store.
         let mut scans = Store::open_at(&db).unwrap();
@@ -1715,8 +2101,8 @@ mod tests {
         ];
         save(&mut scans, scan.id, &record, e02);
         let appended = scan::Event::Appended(vec![Record::File(record)]);
-        go(&mut review, &mut sent, Input::Scan(appended), &mut copy);
-        assert!(copy.iter().any(|v| v.original == "An erly line."));
+        go(&mut review, &mut sent, Input::Scan(appended), &mut held);
+        assert!(held.rows.iter().any(|v| v.original == "An erly line."));
     }
 
     const CHILD: &str = "review::session::tests::child_that_ends_a_session";

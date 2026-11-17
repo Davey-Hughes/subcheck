@@ -9,6 +9,7 @@ use jiff::Timestamp;
 use super::progress::{Progress, Stopping};
 use crate::apply::patch::Outcome;
 use crate::list::{self, Filter};
+use crate::mkv;
 use crate::store::{Decision, Finding, Run, State, TrackRecord};
 use crate::timing::frame_count;
 
@@ -131,17 +132,17 @@ impl Mark {
         })
     }
 
-    /// The mark as the list shows it.
-    pub fn text(&self) -> &'static str {
+    /// What it says, without apply's reason.
+    pub fn kind(&self) -> MarkKind {
         match self {
-            Mark::ByHand(_) => "by hand",
-            Mark::NotFound => "not found",
-            Mark::WouldApply => "would apply",
-            Mark::AlreadyApplied => "already applied",
-            Mark::WouldBeByHand(_) => "would be by hand",
-            Mark::WouldNotBeFound => "would not be found",
-            Mark::Failed(_) => "failed",
-            Mark::WouldFail(_) => "would fail",
+            Mark::ByHand(_) => MarkKind::ByHand,
+            Mark::NotFound => MarkKind::NotFound,
+            Mark::WouldApply => MarkKind::WouldApply,
+            Mark::AlreadyApplied => MarkKind::AlreadyApplied,
+            Mark::WouldBeByHand(_) => MarkKind::WouldBeByHand,
+            Mark::WouldNotBeFound => MarkKind::WouldNotBeFound,
+            Mark::Failed(_) => MarkKind::Failed,
+            Mark::WouldFail(_) => MarkKind::WouldFail,
         }
     }
 
@@ -180,11 +181,65 @@ pub enum Marked {
 }
 
 impl Marked {
+    /// What it says, without apply's reason: what the list counts.
+    pub fn kind(&self) -> MarkKind {
+        match self {
+            Marked::Said(mark) => mark.kind(),
+            Marked::Applied => MarkKind::Applied,
+        }
+    }
+
     /// The mark as the list shows it.
     pub fn text(&self) -> &'static str {
+        self.kind().text()
+    }
+}
+
+/// A finding's mark as the list counts it ([`Review::mark_counts`]): what it says, without apply's
+/// reason, so that two findings left by hand for different reasons count as one kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkKind {
+    ByHand,
+    NotFound,
+    WouldApply,
+    AlreadyApplied,
+    WouldBeByHand,
+    WouldNotBeFound,
+    Failed,
+    WouldFail,
+    Applied,
+}
+
+impl MarkKind {
+    /// The mark as the list shows it.
+    pub fn text(self) -> &'static str {
         match self {
-            Marked::Said(mark) => mark.text(),
-            Marked::Applied => "applied",
+            MarkKind::ByHand => "by hand",
+            MarkKind::NotFound => "not found",
+            MarkKind::WouldApply => "would apply",
+            MarkKind::AlreadyApplied => "already applied",
+            MarkKind::WouldBeByHand => "would be by hand",
+            MarkKind::WouldNotBeFound => "would not be found",
+            MarkKind::Failed => "failed",
+            MarkKind::WouldFail => "would fail",
+            MarkKind::Applied => "applied",
+        }
+    }
+}
+
+/// An entry's marks as the list shows them ([`Review::mark_counts`]), of the `shown` findings it
+/// stands for: the one alone when all of them have it, else each with how many have it
+/// (`applied 5 · by hand 1`); none with none.
+pub fn marks_text(marks: &[(MarkKind, usize)], shown: usize) -> Option<String> {
+    match marks {
+        [] => None,
+        [(kind, n)] if *n == shown => Some(kind.text().to_string()),
+        _ => {
+            let parts: Vec<String> = marks
+                .iter()
+                .map(|(kind, n)| format!("{} {n}", kind.text()))
+                .collect();
+            Some(parts.join(" · "))
         }
     }
 }
@@ -217,8 +272,9 @@ pub struct Edit {
 pub struct Review {
     pub run: Run,
     pub rows: Vec<Row>,
-    /// Each finding's [`track_name`], by index; the list draws them on every redraw.
-    track_names: Vec<String>,
+    /// Each finding's track as the list tells it apart, by index ([`ListTrack`]); worked out once,
+    /// as the list asks on every redraw and the session on every step.
+    tracks: Vec<Option<ListTrack>>,
     pub expanded: HashSet<usize>,
     pub filter: Filter,
     /// Index into `entries()`.
@@ -288,13 +344,13 @@ impl Review {
     /// Every finding, decided or not, with the first row that has a pending one selected: a
     /// half-reviewed run opens where the work is.
     pub fn new(run: Run, notes: HashMap<String, FileNote>) -> Review {
-        let (rows, track_names) = group(&run);
+        let (rows, tracks) = group(&run);
         let labels = labels(&run);
         let progress = Progress::of_run(&run);
         let mut m = Review {
             run,
             rows,
-            track_names,
+            tracks,
             labels,
             expanded: HashSet::new(),
             filter: Filter::All,
@@ -397,9 +453,9 @@ impl Review {
         }
         // The store has just read it as it is on disk.
         self.notes.remove(path);
-        let (rows, names) = group(&self.run);
+        let (rows, tracks) = group(&self.run);
         self.rows = rows;
-        self.track_names = names;
+        self.tracks = tracks;
         self.labels = labels(&self.run);
 
         let index: HashMap<u64, usize> = self
@@ -491,9 +547,9 @@ impl Review {
             .files
             .get(self.file_selected)
             .map(|f| f.path.clone());
-        let (rows, names) = group(&view);
+        let (rows, tracks) = group(&view);
         self.rows = rows;
-        self.track_names = names;
+        self.tracks = tracks;
         self.labels = labels(&view);
         self.progress.show(&view);
         self.run = view;
@@ -631,27 +687,29 @@ impl Review {
         self.marked(i).as_ref().map(Marked::text)
     }
 
-    /// Row `r`'s mark, over the members the filter shows: theirs when they all agree; when they
-    /// differ, each mark with how many have it, in the order the members come
-    /// (`applied 5 · by hand 1`), leaving out members with none.
-    pub fn row_mark(&self, r: usize) -> Option<String> {
-        let marks: Vec<Option<&str>> = self
-            .shown_members(r)
-            .iter()
-            .map(|&i| self.mark(i))
-            .collect();
-        if marks.iter().all(|m| *m == marks[0]) {
-            return marks[0].map(str::to_string);
-        }
-        let mut counts: Vec<(&str, usize)> = Vec::new();
-        for mark in marks.into_iter().flatten() {
-            match counts.iter_mut().find(|(t, _)| *t == mark) {
+    /// The marks of the findings entry `e` stands for: each kind with how many have it, in the
+    /// order its findings come, leaving out those with none.
+    pub fn mark_counts(&self, e: Entry) -> Vec<(MarkKind, usize)> {
+        let mut counts: Vec<(MarkKind, usize)> = Vec::new();
+        for kind in self
+            .targets(e)
+            .into_iter()
+            .filter_map(|i| self.marked(i).as_ref().map(Marked::kind))
+        {
+            match counts.iter_mut().find(|(k, _)| *k == kind) {
                 Some((_, n)) => *n += 1,
-                None => counts.push((mark, 1)),
+                None => counts.push((kind, 1)),
             }
         }
-        let parts: Vec<String> = counts.iter().map(|(t, n)| format!("{t} {n}")).collect();
-        Some(parts.join(" · "))
+        counts
+    }
+
+    /// Row `r`'s mark, over the members the filter shows, as the list shows it ([`marks_text`]).
+    pub fn row_mark(&self, r: usize) -> Option<String> {
+        marks_text(
+            &self.mark_counts(Entry::Row(r)),
+            self.shown_members(r).len(),
+        )
     }
 
     /// What `Apply` would apply, as its question counts it: the view's accepted fixes (typos and
@@ -860,50 +918,104 @@ impl Review {
             .map_or(0, |o| o.start_ms)
     }
 
-    /// A timing finding's track (see [`track_name`]).
-    pub fn track_name(&self, i: usize) -> &str {
-        &self.track_names[i]
+    /// A timing finding's track, as the list tells it apart; none for other findings.
+    pub fn list_track(&self, i: usize) -> Option<&ListTrack> {
+        self.tracks[i].as_ref()
     }
 
-    /// The fixes of timing findings `members` in short, the most common first: `−1 frame ×23 ·
-    /// partial ×1`, or one `−1 frame` when they all agree.
-    pub fn fix_summary(&self, members: &[usize]) -> String {
-        let mut counts: Vec<(String, usize)> = Vec::new();
-        for &i in members {
-            let label = fix_label(self.finding(i));
-            match counts.iter_mut().find(|(l, _)| *l == label) {
+    /// A timing finding's track as the list names it ([`ListTrack::label`]); empty for others.
+    pub fn track_name(&self, i: usize) -> String {
+        self.list_track(i)
+            .map_or_else(String::new, ListTrack::label)
+    }
+
+    /// The fixes of timing findings `members`, each with how many have it, the most common first,
+    /// those as common in the order they come; none for findings that are not timing findings.
+    pub fn fixes(&self, members: &[usize]) -> Vec<(Fix, usize)> {
+        let mut counts: Vec<(Fix, usize)> = Vec::new();
+        for fix in members.iter().filter_map(|&i| Fix::of(self.finding(i))) {
+            match counts.iter_mut().find(|(f, _)| *f == fix) {
                 Some((_, n)) => *n += 1,
-                None => counts.push((label, 1)),
+                None => counts.push((fix, 1)),
             }
-        }
-        if let [(only, _)] = counts.as_slice() {
-            return only.clone();
         }
         // Stable: equal counts keep the order they came in.
         counts.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
-        let parts: Vec<String> = counts.iter().map(|(l, n)| format!("{l} ×{n}")).collect();
-        parts.join(" · ")
+        counts
+    }
+
+    /// The fixes of timing findings `members` in short ([`fixes_text`]).
+    pub fn fix_summary(&self, members: &[usize]) -> String {
+        fixes_text(&self.fixes(members))
     }
 }
 
-/// A timing finding's track among its file record's `tracks`: its name, `English Full`; with its ID
-/// before it when the name is not its own (no name, `track 6 (eng)`, or one another track of the
-/// file shares, `track 6 English`), so that it is told apart in the list as in its row; else its
-/// ID alone. Empty for other findings.
-pub fn track_name(tracks: &[TrackRecord], f: &Finding) -> String {
-    let Some(t) = &f.timing else {
-        return String::new();
-    };
-    let id = t.track;
-    match list::track_name_in(tracks, id) {
-        Some((name, true)) => name,
-        Some((name, false)) => format!("track {id} {name}"),
-        None => format!("track {id}"),
+/// Fixes counted as [`Review::fixes`] counts them, in short: `−1 frame ×23 · partial ×1`, or one
+/// `−1 frame` when they all agree.
+pub fn fixes_text(fixes: &[(Fix, usize)]) -> String {
+    if let [(only, _)] = fixes {
+        return only.label();
+    }
+    let parts: Vec<String> = fixes
+        .iter()
+        .map(|(fix, n)| format!("{} ×{n}", fix.label()))
+        .collect();
+    parts.join(" · ")
+}
+
+/// A timing finding's track as the list tells it apart ([`ListTrack::label`]): its ID; its own
+/// name and its language, as a detail's track has them, when its file's record lists it; and
+/// whether that name is the only one of its file's tracks with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListTrack {
+    /// mkvmerge's ID of the track.
+    pub id: usize,
+    pub name: Option<String>,
+    /// None when the record of its file does not list the track.
+    pub language: Option<String>,
+    /// No other track of its file has its name.
+    pub apart: bool,
+}
+
+impl ListTrack {
+    /// Track `id` among a file record's `tracks`.
+    pub fn of(tracks: &[TrackRecord], id: usize) -> ListTrack {
+        let Some((t, apart)) = list::track_in(tracks, id) else {
+            return ListTrack {
+                id,
+                name: None,
+                language: None,
+                apart: false,
+            };
+        };
+        ListTrack {
+            id,
+            name: mkv::own_name(t.name.as_deref()).map(str::to_string),
+            language: Some(
+                mkv::shown_language(&t.language, t.language_bcp47.as_deref()).to_string(),
+            ),
+            apart,
+        }
+    }
+
+    /// Its name in the list: `English Full`; with its ID before it when the name is not its own
+    /// (no name, `track 6 (eng)`, or one another track of the file shares, `track 6 English`), so
+    /// that it is told apart in the list as in its row; else its ID alone.
+    pub fn label(&self) -> String {
+        let id = self.id;
+        match (&self.name, &self.language) {
+            (Some(name), _) if self.apart => name.clone(),
+            (Some(name), _) => format!("track {id} {name}"),
+            // By the reports' rule, so that this list and `subcheck list` name it alike.
+            (None, Some(language)) => format!("track {id} {}", mkv::shown_name(None, language)),
+            (None, None) => format!("track {id}"),
+        }
     }
 }
 
-/// Each finding's [`track_name`], by index, through one look-up of the files by path.
-fn track_names(run: &Run) -> Vec<String> {
+/// Each finding's track, by index ([`ListTrack`]), through one look-up of the files by path; none
+/// for a finding that is not a timing finding.
+fn list_tracks(run: &Run) -> Vec<Option<ListTrack>> {
     let by_path: HashMap<&str, &[TrackRecord]> = run
         .files
         .iter()
@@ -911,7 +1023,10 @@ fn track_names(run: &Run) -> Vec<String> {
         .collect();
     run.findings
         .iter()
-        .map(|f| track_name(by_path.get(f.file.as_str()).copied().unwrap_or(&[]), f))
+        .map(|f| {
+            let tracks = by_path.get(f.file.as_str()).copied().unwrap_or(&[]);
+            f.timing.as_ref().map(|t| ListTrack::of(tracks, t.track))
+        })
         .collect()
 }
 
@@ -955,14 +1070,19 @@ pub fn fix_label(f: &Finding) -> String {
 #[derive(PartialEq, Eq, Hash)]
 enum Key<'a> {
     Text(&'a str, &'a str),
-    /// A folder and a [`track_name`], which carries the ID where the name alone is not the track's.
+    /// A folder and a track's [`ListTrack::label`], which carries the ID where the name alone is
+    /// not the track's.
     Track(&'a str, &'a str),
 }
 
 /// The run's findings as rows (see [`Row`]), each where its first member is; and each finding's
-/// [`track_name`], by index, which timing findings are grouped by.
-pub fn group(run: &Run) -> (Vec<Row>, Vec<String>) {
-    let names = track_names(run);
+/// track ([`ListTrack`]), by index, whose name in the list timing findings are grouped by.
+pub fn group(run: &Run) -> (Vec<Row>, Vec<Option<ListTrack>>) {
+    let tracks = list_tracks(run);
+    let names: Vec<String> = tracks
+        .iter()
+        .map(|t| t.as_ref().map_or_else(String::new, ListTrack::label))
+        .collect();
     let mut order: Vec<usize> = (0..run.findings.len()).collect();
     order.sort_by_cached_key(|&i| {
         let f = &run.findings[i];
@@ -987,7 +1107,7 @@ pub fn group(run: &Run) -> (Vec<Row>, Vec<String>) {
             }
         }
     }
-    (rows, names)
+    (rows, tracks)
 }
 
 /// The `E02` in a file's stem: `E` and digits, as in `- E02 -` or `S01E02`.
@@ -1472,14 +1592,14 @@ mod tests {
                 t.track = 6;
             }
             m.run.findings.push(signs);
-            let (rows, names) = group(&m.run);
+            let (rows, tracks) = group(&m.run);
             let timing_rows: Vec<Vec<usize>> = rows
                 .into_iter()
                 .map(|r| r.members)
                 .filter(|members| members.iter().all(|&i| m.run.findings[i].timing.is_some()))
                 .collect();
             assert_eq!(timing_rows, [vec![4, 5, 6], vec![7]], "{name:?}");
-            let labels = [4, 7].map(|i| names[i].as_str());
+            let labels = [4, 7].map(|i| tracks[i].as_ref().unwrap().label());
             match name {
                 None => assert_eq!(labels, ["track 5 (eng)", "track 6 (eng)"]),
                 Some(_) => assert_eq!(labels, ["track 5 English", "track 6 English"]),
@@ -1507,6 +1627,135 @@ mod tests {
         assert_eq!(m.entry_state(row), None);
         m.filter = Filter::Only(State::Rejected);
         assert_eq!(m.entry_state(row), Some(State::Rejected));
+    }
+
+    // A row's mark in the list: the one alone when every member it shows has it; else each with
+    // how many have it, in the order its members come, those with none left out.
+    #[test]
+    fn a_rows_mark_is_one_alone_when_every_member_shown_has_it_else_each_with_its_count() {
+        use crate::review::update::tests_support::decide_as;
+        let mut m = tests_support::sample();
+        assert_eq!(m.row_mark(0), None);
+        m.run.applied.extend([1, 2, 4]);
+        assert_eq!(m.row_mark(0).as_deref(), Some("applied"));
+        m.run.applied.remove(&4);
+        assert_eq!(m.row_mark(0).as_deref(), Some("applied 2"));
+        // What apply said comes before the store's mark; left by hand for two reasons, one kind.
+        m.marks
+            .insert(1, Mark::ByHand("two fixes on one line".into()));
+        m.marks
+            .insert(4, Mark::ByHand("per-letter typesetting".into()));
+        assert_eq!(m.row_mark(0).as_deref(), Some("by hand 2 · applied 1"));
+        // Of the members the filter shows.
+        decide_as(&mut m, &[2], State::Accepted, None);
+        m.filter = Filter::Only(State::Pending);
+        assert_eq!(m.row_mark(0).as_deref(), Some("by hand"));
+    }
+
+    // A timing finding's track as the list names it: by its own name; with its ID before it when
+    // another track of its file has the name, or it has none; by its ID alone when its file's
+    // record does not list it.
+    #[test]
+    fn a_timing_findings_track_is_named_by_its_own_name_else_with_its_id() {
+        let tracks = made_up_tracks();
+        let on = |id| {
+            let mut f = tests_support::timing(1, 1, false);
+            if let Some(t) = &mut f.timing {
+                t.track = id;
+            }
+            f
+        };
+        assert_eq!(track_name(&tracks, &on(3)), "Signs");
+        assert_eq!(track_name(&tracks, &on(4)), "track 4 English");
+        assert_eq!(track_name(&tracks, &on(6)), "track 6 (en-US)");
+        assert_eq!(track_name(&tracks, &on(9)), "track 9");
+        let line = tests_support::finding(1, 1, "a", "b", 0);
+        assert_eq!(track_name(&tracks, &line), "");
+    }
+
+    /// A file's subtitle tracks, of each kind of name: one of its own, one two tracks share, and
+    /// none, with a BCP 47 tag.
+    fn made_up_tracks() -> Vec<TrackRecord> {
+        let track = |id, name: Option<&str>, bcp47: Option<&str>| TrackRecord {
+            id,
+            name: name.map(Into::into),
+            language: "eng".into(),
+            language_bcp47: bcp47.map(Into::into),
+            sid: id - 2,
+            default: false,
+            read: "cues".into(),
+        };
+        vec![
+            track(3, Some("Signs"), None),
+            track(4, Some("English"), None),
+            track(5, Some("English"), Some("en-GB")),
+            track(6, None, Some("en-US")),
+        ]
+    }
+
+    /// A timing finding's track among its file record's `tracks`, as the list names it
+    /// ([`ListTrack::label`]); empty for other findings.
+    fn track_name(tracks: &[TrackRecord], f: &Finding) -> String {
+        f.timing
+            .as_ref()
+            .map_or_else(String::new, |t| ListTrack::of(tracks, t.track).label())
+    }
+
+    #[test]
+    fn a_timing_findings_track_is_data_its_name_in_the_list_is_worded_from() {
+        let tracks = made_up_tracks();
+        let named = |id, name: Option<&str>, language: Option<&str>, apart| ListTrack {
+            id,
+            name: name.map(Into::into),
+            language: language.map(Into::into),
+            apart,
+        };
+        assert_eq!(
+            ListTrack::of(&tracks, 3),
+            named(3, Some("Signs"), Some("eng"), true)
+        );
+        assert_eq!(
+            ListTrack::of(&tracks, 5),
+            named(5, Some("English"), Some("en-GB"), false)
+        );
+        assert_eq!(
+            ListTrack::of(&tracks, 6),
+            named(6, None, Some("en-US"), false)
+        );
+        assert_eq!(ListTrack::of(&tracks, 9), named(9, None, None, false));
+        // Every form of its name in the list, those `of` never makes too (a name with no
+        // language, `apart` with no name), as a UI or a test may build any of them.
+        for (track, label) in [
+            (named(3, Some("Signs"), Some("eng"), true), "Signs"),
+            (named(3, Some("Signs"), None, true), "Signs"),
+            (
+                named(4, Some("English"), Some("eng"), false),
+                "track 4 English",
+            ),
+            (named(4, Some("English"), None, false), "track 4 English"),
+            (named(6, None, Some("en-US"), false), "track 6 (en-US)"),
+            (named(6, None, Some("en-US"), true), "track 6 (en-US)"),
+            (named(9, None, None, false), "track 9"),
+            (named(9, None, None, true), "track 9"),
+        ] {
+            assert_eq!(track.label(), label, "{track:?}");
+        }
+        let m = tests_support::with_timing();
+        assert_eq!(
+            m.list_track(4),
+            Some(&ListTrack::of(&m.run.files[0].tracks, 5))
+        );
+        assert_eq!(m.list_track(0), None);
+    }
+
+    // A row's fixes as data: by fix, the most common first, those as common in the order they
+    // come; none for a line finding.
+    #[test]
+    fn a_rows_fixes_are_counted_by_fix_the_most_common_first() {
+        let m = tests_support::with_timing();
+        assert_eq!(m.fixes(&[5, 4, 6]), [(Fix::Shift(1), 2), (Fix::Partial, 1)]);
+        assert_eq!(m.fixes(&[5, 4]), [(Fix::Partial, 1), (Fix::Shift(1), 1)]);
+        assert_eq!(m.fixes(&[0]), []);
     }
 
     #[test]

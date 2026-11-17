@@ -146,7 +146,8 @@ private slots:
         QSignalSpy fatal(o.bridge.get(), &SessionBridge::fatalChanged);
         const char *stuck = o.stalled();
         QVERIFY2(!stuck, stuck);
-        emit o.bridge->eventArrived(Event(Event::kChanged{Splice{3, 1, {}}, Summary{}}));
+        emit o.bridge->eventArrived(
+            Event(Event::kChanged{Splice{3, 1, {}}, Summary{}, {}, {}, {}}));
         QTRY_COMPARE(fatal.count(), 1);
         const std::string err = o.err.str();
         const std::string why = "subcheck-qt: the list is out of step with review\n";

@@ -9,10 +9,12 @@
 #include <QTest>
 
 #include <chrono>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <variant>
 #include <vector>
 
 using namespace subcheck_ffi;
@@ -187,6 +189,37 @@ private slots:
         QCOMPARE(line(o.bridge, 0), firstRow);
     }
 
+    // What a dry run says of a finding shows on its row, with how many of the row's findings it
+    // says it of, and on the finding's own line. The accept is undone before the lines are
+    // checked, so that the run is left as found; the dry run has ended by then, so that the
+    // bridge's close ends no job's groups, which would end them for every test after this.
+    void aDryRunsMarksShowOnTheRowAndTheMember() {
+        Opened o({media()});
+        std::optional<Job> job;
+        QObject::connect(
+            &o.bridge, &SessionBridge::eventArrived, &o.bridge, [&job](const Event &e) {
+                if (const auto *change = std::get_if<Event::kChanged>(&e.get_variant())) {
+                    job = change->summary.job;
+                }
+            });
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        QVERIFY(o.bridge.key(Qt::Key_Return, "\r"));
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 4);
+        o.bridge.move(1);
+        QTRY_COMPARE(o.bridge.selected(), 1);
+        QVERIFY(o.bridge.key(Qt::Key_A, "a"));
+        QTRY_COMPARE(decision(o.bridge, 1), "accepted");
+        o.bridge.send(Action(Action::kApply{true}));
+        QTRY_VERIFY(job && std::holds_alternative<Job::kApplyDone>(job->get_variant()));
+        const QString row = line(o.bridge, 0);
+        const QString member = line(o.bridge, 1);
+        QVERIFY(o.bridge.key(Qt::Key_U, "u"));
+        QTRY_COMPARE(decision(o.bridge, 1), "pending");
+        QCOMPARE(row, firstRow + "  would apply 1");
+        QCOMPARE(member, "    ✓ E01 0:00:01.00  would apply");
+    }
+
     void aDecisionShowsAndItsUndoPutsItBack() {
         Opened o({media()});
         o.bridge.start();
@@ -217,7 +250,7 @@ private slots:
         QCOMPARE(o.out.str(), "media: 0 accepted, 0 rejected, 4 pending\n");
         QCOMPARE(o.err.str(), "");
         // Once let go, what the pump read is dropped, and a key does nothing.
-        emit o.bridge.eventArrived(Event(Event::kChanged{Splice{0, 2, {}}, Summary{}}));
+        emit o.bridge.eventArrived(Event(Event::kChanged{Splice{0, 2, {}}, Summary{}, {}, {}, {}}));
         QVERIFY(o.bridge.key(Qt::Key_A, "a"));
         QCoreApplication::sendPostedEvents();
         QCOMPARE(o.bridge.findings()->rowCount(), 2);
@@ -441,7 +474,7 @@ private slots:
         QTRY_COMPARE(bridge.findings()->rowCount(), 2);
         QSignalSpy arrived(&bridge, &SessionBridge::eventArrived);
         // Out of step: review is let go of, as a failure lets it go.
-        emit bridge.eventArrived(Event(Event::kChanged{Splice{3, 1, {}}, Summary{}}));
+        emit bridge.eventArrived(Event(Event::kChanged{Splice{3, 1, {}}, Summary{}, {}, {}, {}}));
         QTRY_COMPARE(fatal.count(), 1);
         QCOMPARE(bridge.fatal(), "the list is out of step with review");
         // The stream ended now: given the time its end takes to come, it does not, and the made-up
@@ -457,7 +490,7 @@ private slots:
         QSignalSpy fatal(&o.bridge, &SessionBridge::fatalChanged);
         o.bridge.start();
         QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
-        emit o.bridge.eventArrived(Event(Event::kChanged{Splice{3, 1, {}}, Summary{}}));
+        emit o.bridge.eventArrived(Event(Event::kChanged{Splice{3, 1, {}}, Summary{}, {}, {}, {}}));
         QTRY_COMPARE(fatal.count(), 1);
         QCOMPARE(o.bridge.fatal(), "the list is out of step with review");
         QCOMPARE(o.bridge.findings()->rowCount(), 2);

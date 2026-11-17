@@ -211,6 +211,10 @@ impl Review {
             return None;
         }
         let shown = self.shown_members(r);
+        debug_assert!(
+            !shown.is_empty(),
+            "a row the filter wholly hides is not in the list, so it has no detail"
+        );
         Some(Group {
             hidden: all - shown.len(),
             members: shown
@@ -435,6 +439,17 @@ mod tests {
         m.marks.clear();
         m.run.applied.insert(1);
         assert_eq!(m.detail().unwrap().mark, Some(Marked::Applied));
+    }
+
+    // `detail` reaches a row's group only through the list's selection, which never holds a row
+    // the filter wholly hides.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a row the filter wholly hides is not in the list")]
+    fn a_rows_group_is_never_made_with_no_member_shown() {
+        let mut m = sample();
+        m.filter = Filter::Only(State::Rejected);
+        let _ = m.group(Entry::Row(0));
     }
 
     #[test]

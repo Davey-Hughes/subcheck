@@ -7,10 +7,11 @@
 //! here until it is handled. Actions convert both ways, so that an action added to core fails the
 //! build here too: every one of them crosses.
 
+use std::ops::Range;
 use std::sync::Arc;
 
-use subcheck_core::review::{model, progress, session, update};
-use subcheck_core::{apply, group, list, llm, player, scan, store};
+use subcheck_core::review::{detail, model, progress, session, update};
+use subcheck_core::{apply, group, list, llm, mkv, player, scan, store};
 
 uniffi::setup_scaffolding!();
 
@@ -186,12 +187,14 @@ pub struct EntryView {
     pub original: String,
     pub wording: String,
     pub style: String,
-    /// What apply did or would do with it, if anything.
-    pub mark: Option<String>,
-    /// A timing finding's track; empty for others.
-    pub track: String,
-    /// A timing finding's fix in short; none for others.
-    pub fix: Option<String>,
+    /// What apply did or would do with the findings it shows: each kind with how many have it, in
+    /// the order its findings come; none when none has a mark.
+    pub marks: Vec<MarkCount>,
+    /// A timing finding's track, as the list tells it apart; none for others.
+    pub track: Option<ListTrack>,
+    /// A timing finding's fixes, of the findings it shows: each with how many have it, the most
+    /// common first; none for others.
+    pub fixes: Vec<FixCount>,
     /// A scan is checking its file again: any shown member's, for a row.
     pub checking: bool,
     /// How its file differs from when it was scanned: of a row's first shown member, as `label`.
@@ -199,6 +202,46 @@ pub struct EntryView {
     /// Its shown members' decisions differ, which its `state` does not say of a row with one
     /// pending: never a member's.
     pub mixed: bool,
+}
+
+/// A kind of mark, and how many of the findings an entry shows have it.
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkCount {
+    pub kind: MarkKind,
+    pub findings: u64,
+}
+
+/// What a mark says, without apply's reason ([`model::MarkKind`]): what the list counts, so that
+/// two findings left by hand for different reasons count as one kind.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkKind {
+    ByHand,
+    NotFound,
+    WouldApply,
+    AlreadyApplied,
+    WouldBeByHand,
+    WouldNotBeFound,
+    Failed,
+    WouldFail,
+    Applied,
+}
+
+/// A timing finding's fix, and how many of the findings an entry shows have it.
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixCount {
+    pub fix: Fix,
+    pub findings: u64,
+}
+
+/// A timing finding's track as the list tells it apart ([`model::ListTrack`]): mkvmerge's ID; its
+/// own name and language, as `Detail`'s track has them, when its file's record lists the track
+/// (`language` none when not); and whether no other track of its file has that name.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct ListTrack {
+    pub id: u64,
+    pub name: Option<String>,
+    pub language: Option<String>,
+    pub apart: bool,
 }
 
 /// How a file differs from when it was scanned ([`model::FileNote`]).
@@ -240,6 +283,8 @@ pub struct Summary {
     pub question: Option<Question>,
     /// The job under way, or the last to end, kept until the next starts, or the view changes.
     pub job: Option<Job>,
+    /// An index into the files list the UI holds; none when it holds none.
+    pub file_selected: Option<u64>,
 }
 
 /// An edit under way ([`session::Editing`]).
@@ -417,11 +462,18 @@ pub enum Job {
 #[derive(uniffi::Enum, Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // as core's, each is made once and moved across
 pub enum Event {
-    /// What the UI shows changed. `rows` is none when the list did not, but never in the first
-    /// event, which is a splice from an empty list even for a run with no findings.
+    /// What the UI shows changed. `rows`, `files`, `detail` and `logs` are none when they did not,
+    /// but never in the first event, which carries a splice of each list from empty even for a run
+    /// with no findings, and the detail and the logs even when there are none.
     Changed {
         rows: Option<Splice>,
         summary: Summary,
+        /// The selected finding's detail, when it changed.
+        detail: Option<DetailNow>,
+        /// The files list's change, as `rows` is the findings list's.
+        files: Option<FilesSplice>,
+        /// The selected file's logs, when they changed.
+        logs: Option<LogsNow>,
     },
     /// For the UI's player, which runs it and says how it went through `Session::report`.
     Player(PlayerCommand),
@@ -431,6 +483,273 @@ pub enum Event {
         fatal: Option<String>,
         outro: Vec<String>,
     },
+}
+
+/// What a UI shows of the selected finding beside the list ([`detail::Detail`]), as data each UI
+/// words: the one the list has selected, or the first its selected row shows.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct Detail {
+    /// Its file, as the store names it.
+    pub file: String,
+    /// The name the list gives that file.
+    pub label: String,
+    /// What the row is when the list has a row of several selected.
+    pub group: Option<Group>,
+    /// Where its line starts, on the occurrence the list goes by; none for a timing finding,
+    /// whose fix is a whole track's.
+    pub at_ms: Option<i64>,
+    /// The track that occurrence is on, or a timing finding's track, when the record of its file
+    /// names that track.
+    pub track: Option<Track>,
+    /// Its line's other occurrences; none are counted for a timing finding.
+    pub more: u64,
+    pub note: Option<FileNote>,
+    /// Where the scan checking its file again is with that file.
+    pub checking: Option<Checking>,
+    /// The scan read a copy of its file that was cut short.
+    pub truncated: Option<Truncated>,
+    pub state: State,
+    /// The wording is the user's, not the suggestion.
+    pub edited: bool,
+    /// What apply did, or would do, with its fix.
+    pub mark: Option<Mark>,
+    pub original: String,
+    pub wording: String,
+    /// The part of `original` that differs from `wording`, in UTF-16 code units, as QML, NSString
+    /// and C# count a string; for a timing finding, all of it, as its two sides are descriptions,
+    /// not lines of the file.
+    pub original_changed: Span,
+    /// The part of `wording` that differs from `original`, in UTF-16 code units; for a timing
+    /// finding, all of it.
+    pub wording_changed: Span,
+    /// Why it was found; empty when nothing says.
+    pub reason: String,
+    pub kind: Kind,
+}
+
+/// The selected finding's detail as it is now: none when nothing is selected. A record of its own,
+/// so that "unchanged" (no `DetailNow` in a change) and "now none" stay two things in every
+/// language a binding is made for: an optional of an optional is one in some, and no type in C#.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct DetailNow {
+    pub detail: Option<Detail>,
+}
+
+/// The selected file's logs as they are now: none when the files list is empty. A record of its
+/// own, as `DetailNow` is.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct LogsNow {
+    pub logs: Option<FileLogs>,
+}
+
+/// A part of a string, from `start` up to `end`, in UTF-16 code units.
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: u64,
+    pub end: u64,
+}
+
+/// A row of several ([`detail::Group`]): the members the filter shows, in the row's order, never
+/// none, and how many it hides.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    pub members: Vec<Member>,
+    pub hidden: u64,
+}
+
+/// A member of a row ([`detail::Member`]): the name its file goes by in the list, and a timing
+/// finding's fix.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub label: String,
+    pub fix: Option<Fix>,
+}
+
+/// A timing finding's fix ([`model::Fix`]).
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fix {
+    /// The whole track, by its one stretch's frames, which are late when positive: the fix moves
+    /// it earlier.
+    Shift { frames: i64 },
+    /// Stretches of the track, each by its own frames, or none.
+    Partial,
+}
+
+/// A track of a finding's file, as its record has it ([`detail::Track`]): mkvmerge's ID, mpv's
+/// `sid`, its own name if it has one, and its language (the BCP 47 tag, when it has one).
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct Track {
+    pub id: u64,
+    pub sid: u64,
+    pub name: Option<String>,
+    pub language: String,
+}
+
+/// A copy of a file cut short ([`mkv::Truncated`]): the length its Segment declares, one past its
+/// last byte, and the file's own.
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Truncated {
+    pub declared_end: u64,
+    pub file_size: u64,
+}
+
+/// What apply said of a finding's fix, else that the fix is in its file ([`model::Marked`]). A
+/// reason is apply's own words, as a job's error is.
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum Mark {
+    /// Left for a fix by hand, and why.
+    ByHand {
+        why: String,
+    },
+    NotFound,
+    WouldApply,
+    /// A dry run found the fix in its file already.
+    AlreadyApplied,
+    WouldBeByHand {
+        why: String,
+    },
+    WouldNotBeFound,
+    /// Apply failed on its file, and why: the fix is not in it.
+    Failed {
+        why: String,
+    },
+    /// A dry run failed on its file, and why.
+    WouldFail {
+        why: String,
+    },
+    /// Nothing apply said since the view opened: the fix is in its file.
+    Applied,
+}
+
+/// What differs by kind of finding ([`detail::Kind`]).
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum Kind {
+    /// A line: the lines around it, in time order.
+    Line {
+        before: Vec<String>,
+        after: Vec<String>,
+    },
+    /// A track's timing: each stretch of it, the lines its fix leaves where they are, and where
+    /// `Play` opens it.
+    Timing {
+        stretches: Vec<Stretch>,
+        unshifted: Vec<Times>,
+        opens: Option<TimingMoment>,
+    },
+}
+
+/// Part of a track at one offset ([`detail::Stretch`]): how many frames late (early when negative;
+/// 0 in sync), from its first line's start to its last line's end; none from the track's start,
+/// or to its end.
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stretch {
+    pub frames: i64,
+    pub from_ms: Option<i64>,
+    pub to_ms: Option<i64>,
+}
+
+/// When a line starts and ends ([`detail::Times`]).
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Times {
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// Where `Play` opens a timing finding ([`list::TimingMoment`]): on the frame that shows the error,
+/// or else on the first line of a shifted stretch; on mpv's `sid` for its track.
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimingMoment {
+    pub at_ms: i64,
+    pub sid: Option<u64>,
+    pub on_frame: bool,
+}
+
+/// One line of the files list ([`session::FileView`]): a file of the run, and where the scan and
+/// apply are with it.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct FileView {
+    /// The file as the store names it, which `SelectFile` takes.
+    pub path: String,
+    /// The name it goes by in the list.
+    pub label: String,
+    /// Where the scan is with it; for a file not scanned since the view opened, as recorded.
+    pub stage: ScanStage,
+    /// Where the latest apply or dry run is with it, which a UI shows in place of `stage`: none
+    /// until that apply queues it, and once a later scan checks it again.
+    pub applying: Option<FileApply>,
+    /// Distinct lines checked, from its record.
+    pub lines: Option<u64>,
+    /// Checked for timing alone, with no lines checked by the LLM to count.
+    pub timing_only: bool,
+}
+
+/// Where a file is in the scan ([`progress::Stage`]). Unlike `Checking`, which is a row's and a
+/// detail's, it is the files list's, which shows each stage, and a stage left by a scan that ended.
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum ScanStage {
+    /// Waiting for the reader.
+    Queued,
+    /// Queued by `Recheck` while a scan runs: checked again when it ends.
+    QueuedAgain,
+    Reading,
+    /// Read; `answered` of the `chunks` its lines need have come back from the LLM.
+    Asking {
+        answered: u64,
+        chunks: u64,
+    },
+    Done {
+        findings: u64,
+    },
+    /// Why the scan could not check it, in the scan's words.
+    Failed {
+        error: String,
+    },
+}
+
+/// Where a file is in the latest apply or dry run ([`progress::ApplyStage`]).
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum FileApply {
+    /// It has fixes, and apply has not reached it.
+    Queued,
+    At {
+        stage: ApplyStage,
+    },
+    /// Done, by a dry run or not; whether it was remuxed, and what became of its fixes.
+    Done {
+        dry_run: bool,
+        remuxed: bool,
+        counts: ApplyCounts,
+    },
+    /// Why apply failed on it, in apply's words.
+    Failed {
+        error: String,
+    },
+}
+
+/// What apply said of a file's fixes, counted ([`progress::Counts`]): made (by a dry run, to
+/// make), in the file already, left for a fix by hand, and not found.
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplyCounts {
+    pub applied: u64,
+    pub already: u64,
+    pub by_hand: u64,
+    pub not_found: u64,
+}
+
+/// A change to the files list the UI holds ([`session::Splice`]), as `Splice` is to the rows.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct FilesSplice {
+    pub at: u64,
+    pub removed: u64,
+    pub inserted: Vec<FileView>,
+}
+
+/// What the scan and the screen's applies wrote for the selected file ([`session::FileLogs`]):
+/// lines of text, in the jobs' words.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct FileLogs {
+    pub log: Vec<String>,
+    pub apply_log: Vec<String>,
 }
 
 /// What a UI asks of review ([`update::Action`]): each of core's actions. While a question is
@@ -570,6 +889,16 @@ pub enum PlayerReport {
 /// than a u64.
 fn wide(n: usize) -> u64 {
     n as u64
+}
+
+/// `chars`, a range of `s`'s characters as core counts them (Rust's `char`s), in UTF-16 code
+/// units, as the UIs count: a character past U+FFFF takes two.
+fn utf16(s: &str, chars: &Range<usize>) -> Span {
+    let units = |n: usize| s.chars().take(n).map(char::len_utf16).sum::<usize>();
+    Span {
+        start: wide(units(chars.start)),
+        end: wide(units(chars.end)),
+    }
 }
 
 impl From<model::EntryKey> for EntryKey {
@@ -732,9 +1061,9 @@ impl From<session::EntryView> for EntryView {
             original,
             wording,
             style,
-            mark,
+            marks,
             track,
-            fix,
+            fixes,
             checking,
             note,
             mixed,
@@ -751,12 +1080,57 @@ impl From<session::EntryView> for EntryView {
             original,
             wording,
             style,
-            mark,
-            track,
-            fix,
+            marks: marks
+                .into_iter()
+                .map(|(kind, n)| MarkCount {
+                    kind: kind.into(),
+                    findings: wide(n),
+                })
+                .collect(),
+            track: track.map(ListTrack::from),
+            fixes: fixes
+                .into_iter()
+                .map(|(fix, n)| FixCount {
+                    fix: fix.into(),
+                    findings: wide(n),
+                })
+                .collect(),
             checking,
             note: note.map(FileNote::from),
             mixed,
+        }
+    }
+}
+
+impl From<model::MarkKind> for MarkKind {
+    fn from(kind: model::MarkKind) -> MarkKind {
+        match kind {
+            model::MarkKind::ByHand => MarkKind::ByHand,
+            model::MarkKind::NotFound => MarkKind::NotFound,
+            model::MarkKind::WouldApply => MarkKind::WouldApply,
+            model::MarkKind::AlreadyApplied => MarkKind::AlreadyApplied,
+            model::MarkKind::WouldBeByHand => MarkKind::WouldBeByHand,
+            model::MarkKind::WouldNotBeFound => MarkKind::WouldNotBeFound,
+            model::MarkKind::Failed => MarkKind::Failed,
+            model::MarkKind::WouldFail => MarkKind::WouldFail,
+            model::MarkKind::Applied => MarkKind::Applied,
+        }
+    }
+}
+
+impl From<model::ListTrack> for ListTrack {
+    fn from(track: model::ListTrack) -> ListTrack {
+        let model::ListTrack {
+            id,
+            name,
+            language,
+            apart,
+        } = track;
+        ListTrack {
+            id: wide(id),
+            name,
+            language,
+            apart,
         }
     }
 }
@@ -800,6 +1174,7 @@ impl From<session::Summary> for Summary {
             edit,
             question,
             job,
+            file_selected,
         } = summary;
         Summary {
             title,
@@ -814,6 +1189,7 @@ impl From<session::Summary> for Summary {
             edit: edit.map(Editing::from),
             question: question.map(Question::from),
             job: job.map(Job::from),
+            file_selected: file_selected.map(wide),
         }
     }
 }
@@ -1062,13 +1438,299 @@ impl From<progress::Job> for Job {
 impl From<session::Event> for Event {
     fn from(event: session::Event) -> Event {
         match event {
-            session::Event::Changed { rows, summary } => Event::Changed {
+            session::Event::Changed {
+                rows,
+                summary,
+                detail,
+                files,
+                logs,
+            } => Event::Changed {
                 rows: rows.map(Splice::from),
                 summary: summary.into(),
+                detail: detail.map(|now| DetailNow {
+                    detail: now.map(Detail::from),
+                }),
+                files: files.map(FilesSplice::from),
+                logs: logs.map(|now| LogsNow {
+                    logs: now.map(FileLogs::from),
+                }),
             },
             session::Event::Player(command) => Event::Player(command.into()),
             session::Event::Ended { fatal, outro } => Event::Ended { fatal, outro },
         }
+    }
+}
+
+impl From<detail::Detail> for Detail {
+    fn from(d: detail::Detail) -> Detail {
+        let detail::Detail {
+            file,
+            label,
+            group,
+            at_ms,
+            track,
+            more,
+            note,
+            checking,
+            truncated,
+            state,
+            edited,
+            mark,
+            original,
+            wording,
+            original_changed,
+            wording_changed,
+            reason,
+            kind,
+        } = d;
+        Detail {
+            file,
+            label,
+            group: group.map(Group::from),
+            at_ms,
+            track: track.map(Track::from),
+            more: wide(more),
+            note: note.map(FileNote::from),
+            checking: checking.map(Checking::from),
+            truncated: truncated.map(Truncated::from),
+            state: state.into(),
+            edited,
+            mark: mark.map(Mark::from),
+            original_changed: utf16(&original, &original_changed),
+            wording_changed: utf16(&wording, &wording_changed),
+            original,
+            wording,
+            reason,
+            kind: kind.into(),
+        }
+    }
+}
+
+impl From<detail::Group> for Group {
+    fn from(group: detail::Group) -> Group {
+        let detail::Group { members, hidden } = group;
+        Group {
+            members: members.into_iter().map(Member::from).collect(),
+            hidden: wide(hidden),
+        }
+    }
+}
+
+impl From<detail::Member> for Member {
+    fn from(member: detail::Member) -> Member {
+        let detail::Member { label, fix } = member;
+        Member {
+            label,
+            fix: fix.map(Fix::from),
+        }
+    }
+}
+
+impl From<model::Fix> for Fix {
+    fn from(fix: model::Fix) -> Fix {
+        match fix {
+            model::Fix::Shift(frames) => Fix::Shift { frames },
+            model::Fix::Partial => Fix::Partial,
+        }
+    }
+}
+
+impl From<detail::Track> for Track {
+    fn from(track: detail::Track) -> Track {
+        let detail::Track {
+            id,
+            sid,
+            name,
+            language,
+        } = track;
+        Track {
+            id: wide(id),
+            sid: wide(sid),
+            name,
+            language,
+        }
+    }
+}
+
+impl From<mkv::Truncated> for Truncated {
+    fn from(truncated: mkv::Truncated) -> Truncated {
+        let mkv::Truncated {
+            declared_end,
+            file_size,
+        } = truncated;
+        Truncated {
+            declared_end,
+            file_size,
+        }
+    }
+}
+
+impl From<model::Marked> for Mark {
+    fn from(marked: model::Marked) -> Mark {
+        match marked {
+            model::Marked::Said(model::Mark::ByHand(why)) => Mark::ByHand { why },
+            model::Marked::Said(model::Mark::NotFound) => Mark::NotFound,
+            model::Marked::Said(model::Mark::WouldApply) => Mark::WouldApply,
+            model::Marked::Said(model::Mark::AlreadyApplied) => Mark::AlreadyApplied,
+            model::Marked::Said(model::Mark::WouldBeByHand(why)) => Mark::WouldBeByHand { why },
+            model::Marked::Said(model::Mark::WouldNotBeFound) => Mark::WouldNotBeFound,
+            model::Marked::Said(model::Mark::Failed(why)) => Mark::Failed { why },
+            model::Marked::Said(model::Mark::WouldFail(why)) => Mark::WouldFail { why },
+            model::Marked::Applied => Mark::Applied,
+        }
+    }
+}
+
+impl From<detail::Kind> for Kind {
+    fn from(kind: detail::Kind) -> Kind {
+        match kind {
+            detail::Kind::Line { before, after } => Kind::Line { before, after },
+            detail::Kind::Timing {
+                stretches,
+                unshifted,
+                opens,
+            } => Kind::Timing {
+                stretches: stretches.into_iter().map(Stretch::from).collect(),
+                unshifted: unshifted.into_iter().map(Times::from).collect(),
+                opens: opens.map(TimingMoment::from),
+            },
+        }
+    }
+}
+
+impl From<detail::Stretch> for Stretch {
+    fn from(stretch: detail::Stretch) -> Stretch {
+        let detail::Stretch {
+            frames,
+            from_ms,
+            to_ms,
+        } = stretch;
+        Stretch {
+            frames,
+            from_ms,
+            to_ms,
+        }
+    }
+}
+
+impl From<detail::Times> for Times {
+    fn from(times: detail::Times) -> Times {
+        let detail::Times { start_ms, end_ms } = times;
+        Times { start_ms, end_ms }
+    }
+}
+
+impl From<list::TimingMoment> for TimingMoment {
+    fn from(moment: list::TimingMoment) -> TimingMoment {
+        let list::TimingMoment {
+            at_ms,
+            sid,
+            on_frame,
+        } = moment;
+        TimingMoment {
+            at_ms,
+            sid: sid.map(wide),
+            on_frame,
+        }
+    }
+}
+
+impl From<session::FileView> for FileView {
+    fn from(view: session::FileView) -> FileView {
+        let session::FileView {
+            path,
+            label,
+            stage,
+            applying,
+            lines,
+            timing_only,
+        } = view;
+        FileView {
+            path,
+            label,
+            stage: stage.into(),
+            applying: applying.map(FileApply::from),
+            lines: lines.map(wide),
+            timing_only,
+        }
+    }
+}
+
+impl From<progress::Stage> for ScanStage {
+    fn from(stage: progress::Stage) -> ScanStage {
+        match stage {
+            progress::Stage::Queued => ScanStage::Queued,
+            progress::Stage::QueuedAgain => ScanStage::QueuedAgain,
+            progress::Stage::Reading => ScanStage::Reading,
+            progress::Stage::Asking { answered, chunks } => ScanStage::Asking {
+                answered: wide(answered),
+                chunks: wide(chunks),
+            },
+            progress::Stage::Done { findings } => ScanStage::Done {
+                findings: wide(findings),
+            },
+            progress::Stage::Failed(error) => ScanStage::Failed { error },
+        }
+    }
+}
+
+impl From<progress::ApplyStage> for FileApply {
+    fn from(stage: progress::ApplyStage) -> FileApply {
+        match stage {
+            progress::ApplyStage::Queued => FileApply::Queued,
+            progress::ApplyStage::At(stage) => FileApply::At {
+                stage: stage.into(),
+            },
+            progress::ApplyStage::Done {
+                dry_run,
+                remuxed,
+                counts,
+            } => FileApply::Done {
+                dry_run,
+                remuxed,
+                counts: counts.into(),
+            },
+            progress::ApplyStage::Failed(error) => FileApply::Failed { error },
+        }
+    }
+}
+
+impl From<progress::Counts> for ApplyCounts {
+    fn from(counts: progress::Counts) -> ApplyCounts {
+        let progress::Counts {
+            applied,
+            already,
+            by_hand,
+            not_found,
+        } = counts;
+        ApplyCounts {
+            applied: wide(applied),
+            already: wide(already),
+            by_hand: wide(by_hand),
+            not_found: wide(not_found),
+        }
+    }
+}
+
+impl From<session::Splice<session::FileView>> for FilesSplice {
+    fn from(splice: session::Splice<session::FileView>) -> FilesSplice {
+        let session::Splice {
+            at,
+            removed,
+            inserted,
+        } = splice;
+        FilesSplice {
+            at: wide(at),
+            removed: wide(removed),
+            inserted: inserted.into_iter().map(FileView::from).collect(),
+        }
+    }
+}
+
+impl From<session::FileLogs> for FileLogs {
+    fn from(logs: session::FileLogs) -> FileLogs {
+        let session::FileLogs { log, apply_log } = logs;
+        FileLogs { log, apply_log }
     }
 }
 
@@ -1204,9 +1866,17 @@ mod tests {
             original: "befor".into(),
             wording: "before".into(),
             style: "OP en".into(),
-            mark: Some("would rewrite".into()),
-            track: "English Full".into(),
-            fix: None,
+            marks: vec![
+                (model::MarkKind::WouldBeByHand, 4),
+                (model::MarkKind::Applied, 1),
+            ],
+            track: Some(model::ListTrack {
+                id: 6,
+                name: Some("English Signs".into()),
+                language: Some("en-GB".into()),
+                apart: true,
+            }),
+            fixes: vec![(model::Fix::Shift(-3), 7), (model::Fix::Partial, 2)],
             checking: true,
             note: Some(model::FileNote::Missing),
             mixed: false,
@@ -1226,9 +1896,32 @@ mod tests {
             original: "befor".into(),
             wording: "before".into(),
             style: "OP en".into(),
-            mark: Some("would rewrite".into()),
-            track: "English Full".into(),
-            fix: None,
+            marks: vec![
+                MarkCount {
+                    kind: MarkKind::WouldBeByHand,
+                    findings: 4,
+                },
+                MarkCount {
+                    kind: MarkKind::Applied,
+                    findings: 1,
+                },
+            ],
+            track: Some(ListTrack {
+                id: 6,
+                name: Some("English Signs".into()),
+                language: Some("en-GB".into()),
+                apart: true,
+            }),
+            fixes: vec![
+                FixCount {
+                    fix: Fix::Shift { frames: -3 },
+                    findings: 7,
+                },
+                FixCount {
+                    fix: Fix::Partial,
+                    findings: 2,
+                },
+            ],
             checking: true,
             note: Some(FileNote::Missing),
             mixed: false,
@@ -1259,6 +1952,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // every part of a change, each with values of its own
     fn a_change_crosses_field_for_field() {
         let event = session::Event::Changed {
             rows: Some(session::Splice {
@@ -1300,7 +1994,18 @@ mod tests {
                     }],
                     spent: core_spent(),
                 }),
+                file_selected: Some(6),
             },
+            detail: Some(Some(core_detail())),
+            files: Some(session::Splice {
+                at: 2,
+                removed: 3,
+                inserted: vec![core_file()],
+            }),
+            logs: Some(Some(session::FileLogs {
+                log: vec!["400 lines, 2 findings".into()],
+                apply_log: vec!["E02: would apply 1".into()],
+            })),
         };
         let expected = Event::Changed {
             rows: Some(Splice {
@@ -1342,9 +2047,370 @@ mod tests {
                     }],
                     spent: spent(),
                 }),
+                file_selected: Some(6),
             },
+            detail: Some(DetailNow {
+                detail: Some(detail()),
+            }),
+            files: Some(FilesSplice {
+                at: 2,
+                removed: 3,
+                inserted: vec![file()],
+            }),
+            logs: Some(LogsNow {
+                logs: Some(FileLogs {
+                    log: vec!["400 lines, 2 findings".into()],
+                    apply_log: vec!["E02: would apply 1".into()],
+                }),
+            }),
         };
         assert_eq!(Event::from(event), expected);
+    }
+
+    /// A line finding's detail, each field a value of its own; a character past U+FFFF before
+    /// each part that changed sets its UTF-16 code units apart from its characters, and one in the
+    /// original's part sets each range apart from the same range counted along the other string.
+    fn core_detail() -> detail::Detail {
+        detail::Detail {
+            file: "/m/E02.mkv".into(),
+            label: "E02".into(),
+            group: Some(detail::Group {
+                members: vec![
+                    detail::Member {
+                        label: "E01".into(),
+                        fix: None,
+                    },
+                    detail::Member {
+                        label: "E03".into(),
+                        fix: Some(model::Fix::Shift(-2)),
+                    },
+                ],
+                hidden: 4,
+            }),
+            at_ms: Some(165_060),
+            track: Some(detail::Track {
+                id: 5,
+                sid: 1,
+                name: Some("English Full".into()),
+                language: "en-US".into(),
+            }),
+            more: 3,
+            note: Some(model::FileNote::Changed),
+            checking: Some(progress::Checking::Asking {
+                answered: 1,
+                chunks: 7,
+            }),
+            truncated: Some(mkv::Truncated {
+                declared_end: 2000,
+                file_size: 1000,
+            }),
+            state: store::State::Accepted,
+            edited: true,
+            mark: Some(model::Marked::Said(model::Mark::WouldBeByHand(
+                "two fixes on one line".into(),
+            ))),
+            original: "🎵 The beat gets 𝄞trough".into(),
+            wording: "🎵 The beat gets through it".into(),
+            original_changed: 16..23,
+            wording_changed: 16..26,
+            reason: "misspelling of \"through\"".into(),
+            kind: detail::Kind::Line {
+                before: vec!["The line before.".into()],
+                after: vec!["The line after.".into(), "And the next.".into()],
+            },
+        }
+    }
+
+    fn detail() -> Detail {
+        Detail {
+            file: "/m/E02.mkv".into(),
+            label: "E02".into(),
+            group: Some(Group {
+                members: vec![
+                    Member {
+                        label: "E01".into(),
+                        fix: None,
+                    },
+                    Member {
+                        label: "E03".into(),
+                        fix: Some(Fix::Shift { frames: -2 }),
+                    },
+                ],
+                hidden: 4,
+            }),
+            at_ms: Some(165_060),
+            track: Some(Track {
+                id: 5,
+                sid: 1,
+                name: Some("English Full".into()),
+                language: "en-US".into(),
+            }),
+            more: 3,
+            note: Some(FileNote::Changed),
+            checking: Some(Checking::Asking {
+                answered: 1,
+                chunks: 7,
+            }),
+            truncated: Some(Truncated {
+                declared_end: 2000,
+                file_size: 1000,
+            }),
+            state: State::Accepted,
+            edited: true,
+            mark: Some(Mark::WouldBeByHand {
+                why: "two fixes on one line".into(),
+            }),
+            original: "🎵 The beat gets 𝄞trough".into(),
+            wording: "🎵 The beat gets through it".into(),
+            original_changed: Span { start: 17, end: 25 },
+            wording_changed: Span { start: 17, end: 27 },
+            reason: "misspelling of \"through\"".into(),
+            kind: Kind::Line {
+                before: vec!["The line before.".into()],
+                after: vec!["The line after.".into(), "And the next.".into()],
+            },
+        }
+    }
+
+    /// A file of the files list, each field a value of its own.
+    fn core_file() -> session::FileView {
+        session::FileView {
+            path: "/m/E02.mkv".into(),
+            label: "E02 字幕".into(),
+            stage: progress::Stage::Asking {
+                answered: 2,
+                chunks: 5,
+            },
+            applying: Some(progress::ApplyStage::At(apply::Stage::Check)),
+            lines: Some(412),
+            timing_only: true,
+        }
+    }
+
+    fn file() -> FileView {
+        FileView {
+            path: "/m/E02.mkv".into(),
+            label: "E02 字幕".into(),
+            stage: ScanStage::Asking {
+                answered: 2,
+                chunks: 5,
+            },
+            applying: Some(FileApply::At {
+                stage: ApplyStage::Check,
+            }),
+            lines: Some(412),
+            timing_only: true,
+        }
+    }
+
+    #[test]
+    fn a_part_of_a_line_crosses_in_utf16_code_units() {
+        // `ü` and `字` are one unit each, `𝄞` (U+1D11E) two.
+        let s = "ü 字 𝄞 befor 𝄞";
+        let chars = 6..11;
+        assert_eq!(s.chars().skip(6).take(5).collect::<String>(), "befor");
+        assert_eq!(utf16(s, &chars), Span { start: 7, end: 12 });
+        assert_eq!(utf16(s, &(0..0)), Span { start: 0, end: 0 });
+        assert_eq!(utf16(s, &(0..13)), Span { start: 0, end: 15 });
+        // Empty, as where a wording only inserts: after one, and after both, past U+FFFF.
+        assert_eq!(utf16(s, &(11..11)), Span { start: 12, end: 12 });
+        assert_eq!(utf16(s, &(13..13)), Span { start: 15, end: 15 });
+    }
+
+    #[test]
+    fn a_timing_findings_kind_crosses() {
+        let core = detail::Kind::Timing {
+            stretches: vec![
+                detail::Stretch {
+                    frames: 1,
+                    from_ms: None,
+                    to_ms: Some(475_780),
+                },
+                detail::Stretch {
+                    frames: -2,
+                    from_ms: Some(483_510),
+                    to_ms: None,
+                },
+            ],
+            unshifted: vec![detail::Times {
+                start_ms: 1_300_000,
+                end_ms: 1_302_000,
+            }],
+            opens: Some(list::TimingMoment {
+                at_ms: 246_788,
+                sid: Some(3),
+                on_frame: true,
+            }),
+        };
+        assert_eq!(
+            Kind::from(core),
+            Kind::Timing {
+                stretches: vec![
+                    Stretch {
+                        frames: 1,
+                        from_ms: None,
+                        to_ms: Some(475_780),
+                    },
+                    Stretch {
+                        frames: -2,
+                        from_ms: Some(483_510),
+                        to_ms: None,
+                    },
+                ],
+                unshifted: vec![Times {
+                    start_ms: 1_300_000,
+                    end_ms: 1_302_000,
+                }],
+                opens: Some(TimingMoment {
+                    at_ms: 246_788,
+                    sid: Some(3),
+                    on_frame: true,
+                }),
+            }
+        );
+        let off = list::TimingMoment {
+            at_ms: 1000,
+            sid: None,
+            on_frame: false,
+        };
+        assert_eq!(
+            TimingMoment::from(off),
+            TimingMoment {
+                at_ms: 1000,
+                sid: None,
+                on_frame: false,
+            }
+        );
+        assert_eq!(Fix::from(model::Fix::Partial), Fix::Partial);
+    }
+
+    #[test]
+    fn each_mark_crosses() {
+        let said = |mark| model::Marked::Said(mark);
+        for (core, ffi) in [
+            (
+                said(model::Mark::ByHand("a".into())),
+                Mark::ByHand { why: "a".into() },
+            ),
+            (said(model::Mark::NotFound), Mark::NotFound),
+            (said(model::Mark::WouldApply), Mark::WouldApply),
+            (said(model::Mark::AlreadyApplied), Mark::AlreadyApplied),
+            (
+                said(model::Mark::WouldBeByHand("b".into())),
+                Mark::WouldBeByHand { why: "b".into() },
+            ),
+            (said(model::Mark::WouldNotBeFound), Mark::WouldNotBeFound),
+            (
+                said(model::Mark::Failed("c".into())),
+                Mark::Failed { why: "c".into() },
+            ),
+            (
+                said(model::Mark::WouldFail("d".into())),
+                Mark::WouldFail { why: "d".into() },
+            ),
+            (model::Marked::Applied, Mark::Applied),
+        ] {
+            assert_eq!(Mark::from(core), ffi);
+        }
+    }
+
+    #[test]
+    fn each_kind_of_mark_crosses() {
+        for (core, ffi) in [
+            (model::MarkKind::ByHand, MarkKind::ByHand),
+            (model::MarkKind::NotFound, MarkKind::NotFound),
+            (model::MarkKind::WouldApply, MarkKind::WouldApply),
+            (model::MarkKind::AlreadyApplied, MarkKind::AlreadyApplied),
+            (model::MarkKind::WouldBeByHand, MarkKind::WouldBeByHand),
+            (model::MarkKind::WouldNotBeFound, MarkKind::WouldNotBeFound),
+            (model::MarkKind::Failed, MarkKind::Failed),
+            (model::MarkKind::WouldFail, MarkKind::WouldFail),
+            (model::MarkKind::Applied, MarkKind::Applied),
+        ] {
+            assert_eq!(MarkKind::from(core), ffi);
+        }
+    }
+
+    #[test]
+    fn each_stage_of_a_file_crosses() {
+        for (core, ffi) in [
+            (progress::Stage::Queued, ScanStage::Queued),
+            (progress::Stage::QueuedAgain, ScanStage::QueuedAgain),
+            (progress::Stage::Reading, ScanStage::Reading),
+            (
+                progress::Stage::Asking {
+                    answered: 3,
+                    chunks: 4,
+                },
+                ScanStage::Asking {
+                    answered: 3,
+                    chunks: 4,
+                },
+            ),
+            (
+                progress::Stage::Done { findings: 9 },
+                ScanStage::Done { findings: 9 },
+            ),
+            (
+                progress::Stage::Failed("not a Matroska file".into()),
+                ScanStage::Failed {
+                    error: "not a Matroska file".into(),
+                },
+            ),
+        ] {
+            assert_eq!(ScanStage::from(core), ffi);
+        }
+        let counts = progress::Counts {
+            applied: 1,
+            already: 2,
+            by_hand: 3,
+            not_found: 4,
+        };
+        for (core, ffi) in [
+            (progress::ApplyStage::Queued, FileApply::Queued),
+            (
+                progress::ApplyStage::Done {
+                    dry_run: true,
+                    remuxed: false,
+                    counts,
+                },
+                FileApply::Done {
+                    dry_run: true,
+                    remuxed: false,
+                    counts: ApplyCounts {
+                        applied: 1,
+                        already: 2,
+                        by_hand: 3,
+                        not_found: 4,
+                    },
+                },
+            ),
+            (
+                progress::ApplyStage::Done {
+                    dry_run: false,
+                    remuxed: true,
+                    counts: progress::Counts::default(),
+                },
+                FileApply::Done {
+                    dry_run: false,
+                    remuxed: true,
+                    counts: ApplyCounts {
+                        applied: 0,
+                        already: 0,
+                        by_hand: 0,
+                        not_found: 0,
+                    },
+                },
+            ),
+            (
+                progress::ApplyStage::Failed("mkvmerge failed".into()),
+                FileApply::Failed {
+                    error: "mkvmerge failed".into(),
+                },
+            ),
+        ] {
+            assert_eq!(FileApply::from(core), ffi);
+        }
     }
 
     #[test]
@@ -1549,29 +2615,59 @@ mod tests {
         let mut core = core_view();
         core.key = model::EntryKey::Member(4);
         core.state = None;
-        core.mark = None;
-        core.fix = Some(String::new());
-        let event = session::Event::Changed {
-            rows: None,
-            summary: session::Summary {
-                title: String::new(),
-                selected: None,
-                status: None,
-                pending: 0,
-                accepted: 0,
-                rejected: 0,
-                busy: false,
-                filter: list::Filter::All,
-                pane: model::Pane::Findings,
-                edit: None,
-                question: None,
-                job: None,
-            },
+        core.marks = vec![];
+        core.track = Some(model::ListTrack {
+            id: 7,
+            name: None,
+            language: None,
+            apart: false,
+        });
+        core.fixes = vec![];
+        let summary = session::Summary {
+            title: String::new(),
+            selected: None,
+            status: None,
+            pending: 0,
+            accepted: 0,
+            rejected: 0,
+            busy: false,
+            filter: list::Filter::All,
+            pane: model::Pane::Findings,
+            edit: None,
+            question: None,
+            job: None,
+            file_selected: None,
         };
-        let Event::Changed { rows, summary } = Event::from(event) else {
+        // Unchanged, and now none: the detail unchanged and the logs none, then the other way.
+        let change = |detail, logs| {
+            Event::from(session::Event::Changed {
+                rows: None,
+                summary: summary.clone(),
+                detail,
+                files: None,
+                logs,
+            })
+        };
+        let Event::Changed {
+            rows,
+            summary,
+            detail,
+            files,
+            logs,
+        } = change(None, Some(None))
+        else {
             panic!("not a change");
         };
         assert_eq!(rows, None);
+        assert_eq!(summary.file_selected, None);
+        assert_eq!(
+            (detail, files, logs),
+            (None, None, Some(LogsNow { logs: None }))
+        );
+        let Event::Changed { detail, logs, .. } = change(Some(None), None) else {
+            panic!("not a change");
+        };
+        assert_eq!((detail, logs), (Some(DetailNow { detail: None }), None));
         assert_eq!((summary.selected, summary.status), (None, None));
         assert_eq!(
             (summary.filter, summary.pane),
@@ -1586,8 +2682,19 @@ mod tests {
         core.mixed = true;
         let crossed = EntryView::from(core);
         assert_eq!(crossed.key, EntryKey::Member(4));
-        assert_eq!((crossed.state, crossed.mark), (None, None));
-        assert_eq!(crossed.fix, Some(String::new()));
+        assert_eq!(
+            (crossed.state, crossed.marks, crossed.fixes),
+            (None, vec![], vec![])
+        );
+        assert_eq!(
+            crossed.track,
+            Some(ListTrack {
+                id: 7,
+                name: None,
+                language: None,
+                apart: false,
+            })
+        );
         assert_eq!(
             (crossed.checking, crossed.note, crossed.mixed),
             (false, Some(FileNote::Changed), true)
@@ -1985,12 +3092,15 @@ mod tests {
         scan.name
     }
 
-    /// What a UI keeps of a session: the rows, each splice applied to them as it comes, the last
-    /// summary, and the player commands it was given.
+    /// What a UI keeps of a session: each list, each splice applied to it as it comes, the last
+    /// summary, the detail and the logs as last sent, and the player commands it was given.
     #[derive(Default)]
     struct Ui {
         rows: Vec<EntryView>,
+        files: Vec<FileView>,
         summary: Option<Summary>,
+        detail: Option<Detail>,
+        logs: Option<FileLogs>,
         played: Vec<PlayerCommand>,
     }
 
@@ -2001,16 +3111,28 @@ mod tests {
             while !done(self) {
                 assert!(Instant::now() < deadline, "never came, after {what}");
                 match s.next_event() {
-                    Some(Event::Changed { rows, summary }) => {
-                        if let Some(Splice {
-                            at,
-                            removed,
-                            inserted,
-                        }) = rows
-                        {
+                    Some(Event::Changed {
+                        rows,
+                        summary,
+                        detail,
+                        files,
+                        logs,
+                    }) => {
+                        let span = |at: u64, removed: u64| {
                             let at = usize::try_from(at).unwrap();
-                            let end = at + usize::try_from(removed).unwrap();
-                            self.rows.splice(at..end, inserted);
+                            at..at + usize::try_from(removed).unwrap()
+                        };
+                        if let Some(s) = rows {
+                            self.rows.splice(span(s.at, s.removed), s.inserted);
+                        }
+                        if let Some(s) = files {
+                            self.files.splice(span(s.at, s.removed), s.inserted);
+                        }
+                        if let Some(now) = detail {
+                            self.detail = now.detail;
+                        }
+                        if let Some(now) = logs {
+                            self.logs = now.logs;
                         }
                         self.summary = Some(summary);
                     }
@@ -2076,6 +3198,19 @@ mod tests {
         // The FIFO is on disk, but not as it was scanned; the sample's files are not.
         assert_eq!(ui.rows[0].note, Some(FileNote::Changed));
         assert_eq!(ui.rows[1].note, Some(FileNote::Missing));
+        // The files in the order the run named them, the first selected; the selected row's
+        // detail, a row of three.
+        let labels =
+            |ui: &Ui| -> Vec<String> { ui.files.iter().map(|f| f.label.clone()).collect() };
+        assert_eq!(labels(&ui), ["E01", "E02", "E03", "stalled"]);
+        assert_eq!(ui.summary().file_selected, Some(0));
+        assert_eq!(ui.logs.as_ref().unwrap().log[0], "1 lines, 1 finding");
+        let detail = ui.detail.clone().unwrap();
+        assert_eq!(
+            (detail.label.as_str(), detail.state),
+            ("E01", State::Pending)
+        );
+        assert_eq!(detail.group.map(|g| g.members.len()), Some(3));
 
         s.send(Action::Toggle);
         ui.until(&s, "Toggle", |ui| ui.rows.len() == 6);
@@ -2085,6 +3220,7 @@ mod tests {
             key: EntryKey::Member(4),
         });
         ui.until(&s, "Select", |ui| ui.summary().selected == Some(4));
+        assert_eq!(ui.detail.as_ref().map(|d| d.label.as_str()), Some("E03"));
         s.send(Action::Accept);
         ui.until(&s, "Accept", |ui| ui.summary().accepted == 2);
         assert!(
@@ -2140,6 +3276,8 @@ mod tests {
         });
         s.send(Action::Recheck);
         ui.until(&s, "Recheck", |ui| ui.summary().question.is_some());
+        assert_eq!(ui.summary().file_selected, Some(1));
+        assert_eq!(ui.logs.as_ref().unwrap().log[0], "1 lines, 2 findings");
         assert_eq!(
             ui.summary().question,
             Some(Question::Recheck {
@@ -2159,6 +3297,8 @@ mod tests {
         ui.until(&s, "SwitchView", |ui| {
             !ui.summary().title.starts_with("run ")
         });
+        // A paths view lists its files by path: the FIFO's folder first.
+        assert_eq!(labels(&ui), ["stalled", "E01", "E02", "E03"]);
         s.send(Action::OpenView {
             selector: vec![name.clone()],
         });
@@ -2220,6 +3360,12 @@ mod tests {
                 }) if file == "stalled"
             )
         });
+        assert_eq!(
+            ui.files[3].applying,
+            Some(FileApply::At {
+                stage: ApplyStage::Plan,
+            })
+        );
         s.send(Action::Interrupt);
         ui.until(&s, "Interrupt", |ui| ui.summary().question.is_some());
         assert!(matches!(
