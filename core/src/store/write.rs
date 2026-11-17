@@ -37,7 +37,9 @@ impl Store {
         files: &[PathBuf],
     ) -> rusqlite::Result<ScanRow> {
         let tx = self.write()?;
-        let base = jiff::Zoned::now().strftime("%Y-%m-%dT%H-%M-%S").to_string();
+        let base = jiff::ZonedDateTime::now()
+            .strftime("%Y-%m-%dT%H-%M-%S")
+            .to_string();
         let mut n = 1;
         let (id, name) = loop {
             let name = if n == 1 {
