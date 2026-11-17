@@ -173,9 +173,16 @@ impl Screen {
 }
 
 /// The status line's text from review: the open question, as the terminal asks it ([`asked`]);
-/// else review's own ([`Review::status_text`]).
+/// else review's message, as the terminal words it ([`super::status::words`]); else how far the
+/// latest scan or apply is, or how it ended ([`Progress::line`]). With none, the screen may show
+/// its own there.
+///
+/// [`Progress::line`]: subcheck_core::review::progress::Progress::line
 pub fn status(m: &Review) -> Option<String> {
-    m.question().map(|q| asked(&q)).or_else(|| m.status_text())
+    m.question()
+        .map(|q| asked(&q))
+        .or_else(|| m.status.as_ref().map(super::status::words))
+        .or_else(|| m.progress.line())
 }
 
 /// Question `q` as the status line asks it, ending in `y/n`: `y` answers it.
@@ -529,6 +536,7 @@ pub(crate) mod tests {
     use subcheck_core::player::PlayerError;
     use subcheck_core::review::model::tests_support::{self, finding, path, sample};
     use subcheck_core::review::model::{Confirm, Entry};
+    use subcheck_core::review::status::Status;
     use subcheck_core::review::update::Task;
     use subcheck_core::review::update::tests_support::{
         FIXED, TYPO, decide_as, decided, now, saved, scanning, states, taken,
@@ -575,7 +583,6 @@ pub(crate) mod tests {
 
     #[test]
     fn the_status_line_follows_the_scan_then_gives_its_summary() {
-        let status = |m: &Review| m.status_text();
         let mut m = scanning();
         let mut s = Screen::default();
         assert_eq!(status(&m).as_deref(), Some("scan 0/2 · 0 findings"));
@@ -591,8 +598,8 @@ pub(crate) mod tests {
             Some("scan 1/2 · 0 findings · 1 failed")
         );
         // A message of its own takes the line until the next key.
-        m.status = Some("opened in mpv".into());
-        assert_eq!(status(&m).as_deref(), Some("opened in mpv"));
+        m.status = Some(Status::Closed);
+        assert_eq!(status(&m).as_deref(), Some("closed mpv"));
         press(&mut m, &mut s, 'j');
         let summary = subcheck_core::scan::Summary {
             run: "r".into(),
@@ -702,7 +709,7 @@ pub(crate) mod tests {
         send(&mut m, &mut s, e02(vec![lyric]), now());
         assert_eq!((&m.editing, &s.editor), (&None, &None));
         assert_eq!(
-            m.status.as_deref(),
+            status(&m).as_deref(),
             Some("E02 was checked again; its finding changed")
         );
     }
@@ -738,7 +745,7 @@ pub(crate) mod tests {
         assert_eq!(m.entries(), [Entry::Row(0), Entry::Row(1)]);
         assert_eq!((&m.editing, &s.editor), (&None, &None));
         assert_eq!(
-            m.status.as_deref(),
+            status(&m).as_deref(),
             Some("E02 was checked again; its finding changed")
         );
     }
@@ -784,7 +791,7 @@ pub(crate) mod tests {
         );
         send(&mut m, &mut s, taken(effects), now());
         assert_eq!(
-            m.status.as_deref(),
+            status(&m).as_deref(),
             Some("accepted 3 findings, 1 kept as pending")
         );
     }
@@ -998,11 +1005,11 @@ pub(crate) mod tests {
         let opens = |effects: &[Effect]| matches!(effects, [Effect::Task(Task::Stamp(_))]);
         let (mut m, mut s) = on_screen();
         m.confirm = Some(Confirm::Apply);
-        m.status = Some("opened in mpv, paused".into());
+        m.status = Some(Status::Opened { paused: true });
         assert_eq!(click(&mut m, &mut s, 5, 2, 0), []);
         assert_eq!(m.confirm, None);
         assert_eq!(m.selected, 0);
-        assert_eq!(m.status.as_deref(), Some("opened in mpv, paused"));
+        assert_eq!(status(&m).as_deref(), Some("opened in mpv, paused"));
         // A double-click under it: the first click lets it go, the second selects.
         m.confirm = Some(Confirm::Apply);
         assert_eq!(click(&mut m, &mut s, 5, 2, 1000), []);
@@ -1096,7 +1103,7 @@ pub(crate) mod tests {
     #[test]
     fn the_status_line_asks_the_open_question_over_reviews_message() {
         let mut m = scanning();
-        m.status = Some("opened in mpv, paused".into());
+        m.status = Some(Status::Opened { paused: true });
         m.confirm = Some(Confirm::Quit);
         assert_eq!(
             status(&m).as_deref(),
@@ -1176,7 +1183,7 @@ pub(crate) mod tests {
     fn question_mark_lets_the_message_go_as_any_key_in_a_pane_does() {
         let mut m = sample();
         let mut s = Screen::default();
-        m.status = Some("opened in mpv".into());
+        m.status = Some(Status::Closed);
         press(&mut m, &mut s, '?');
         assert!(s.help);
         assert_eq!(m.status, None);

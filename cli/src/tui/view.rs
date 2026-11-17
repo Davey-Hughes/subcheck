@@ -691,8 +691,10 @@ mod tests {
     use crate::tui::screen::tests::send;
     use crate::tui::screen::{self, Editor, Msg};
     use subcheck_core::apply::{self, patch::Outcome};
+    use subcheck_core::player::PlayState;
     use subcheck_core::review::model::Mark;
     use subcheck_core::review::model::tests_support::{path, sample};
+    use subcheck_core::review::status::{Failure, Status};
     use subcheck_core::review::update::Input;
     use subcheck_core::review::update::tests_support::now;
 
@@ -884,6 +886,14 @@ mod tests {
     /// `Tab` to the files view.
     fn key_into_files(m: &mut Review, s: &mut Screen) {
         send(m, s, Msg::Key(KeyCode::Tab), now());
+    }
+
+    /// A message whose words are `text` as it is: the scan's warning, with none more.
+    fn warned(text: String) -> Status {
+        Status::Warned {
+            first: text,
+            more: 0,
+        }
     }
 
     /// `m` drawn on a fresh screen of `width` by `height`, as text.
@@ -1089,7 +1099,10 @@ mod tests {
         let mut m = sample();
         m.notes
             .insert(m.run.findings[0].file.clone(), FileNote::Changed);
-        m.status = Some("not saved: disk full".into());
+        m.status = Some(Status::Failed {
+            what: Failure::Save,
+            error: "disk full".into(),
+        });
         let screen = render(&m, 160, 20);
         assert!(screen.contains("⚠ file changed since scan"), "{screen}");
         let lines: Vec<&str> = screen.lines().collect();
@@ -1159,24 +1172,27 @@ mod tests {
     #[test]
     fn the_status_line_ends_with_the_help_hint() {
         let mut m = sample();
-        m.status = Some("⏸ 0:02:51.06".into());
+        m.status = Some(Status::Played(PlayState {
+            paused: true,
+            at_ms: 171_060,
+        }));
         let screen = render(&m, 110, 20);
         let line = screen.lines().nth(19).unwrap();
-        assert!(line.starts_with("⏸ 0:02:51.06 "), "{screen}");
+        assert!(line.starts_with("⏸ 0:02:51.060 "), "{screen}");
         assert!(line.ends_with(" ? help"), "{screen}");
         // In the terminal's own colour, as the message is.
         let mut term = Terminal::new(TestBackend::new(110, 20)).unwrap();
         term.draw(|f| view(&m, &Screen::default(), f)).unwrap();
         assert_eq!(term.backend().buffer()[(104, 19)].fg, Color::Reset);
         // A message that fits stops a column short of it.
-        m.status = Some("x".repeat(103));
+        m.status = Some(warned("x".repeat(103)));
         let screen = render(&m, 110, 20);
         assert_eq!(
             screen.lines().nth(19).unwrap(),
             format!("{} ? help", "x".repeat(103))
         );
         // One too long for that takes the whole line.
-        m.status = Some(format!("{}y", "x".repeat(109)));
+        m.status = Some(warned(format!("{}y", "x".repeat(109))));
         let screen = render(&m, 110, 20);
         assert_eq!(
             screen.lines().nth(19).unwrap(),
@@ -1487,7 +1503,9 @@ mod tests {
         // Too narrow for even that beside the button: the price, and the button gives way.
         assert_eq!(last(&m, &s, 20), "LLM: $3.21 at API pr");
         // A message of its own takes the line.
-        m.status = Some("warning: /m/locked: skipped: Permission denied".into());
+        m.status = Some(warned(
+            "warning: /m/locked: skipped: Permission denied".into(),
+        ));
         assert!(
             last(&m, &s, 80).starts_with("warning: /m/locked"),
             "{}",

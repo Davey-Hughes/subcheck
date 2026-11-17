@@ -10,6 +10,7 @@ pub mod model;
 pub mod progress;
 pub mod runner;
 pub mod session;
+pub mod status;
 pub mod update;
 
 use crate::scan;

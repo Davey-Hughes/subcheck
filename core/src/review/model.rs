@@ -7,6 +7,7 @@ use std::ops::Range;
 use jiff::Timestamp;
 
 use super::progress::{Progress, Stopping};
+use super::status::Status;
 use crate::apply::patch::Outcome;
 use crate::list::{self, Filter};
 use crate::mkv;
@@ -285,7 +286,8 @@ pub struct Review {
     pub undo: Vec<UndoStep>,
     /// Files with findings that are not as they were scanned, by path.
     pub notes: HashMap<String, FileNote>,
-    pub status: Option<String>,
+    /// The status message, for each UI to word.
+    pub status: Option<Status>,
     pub should_quit: bool,
     /// The name each file goes by in the list.
     pub labels: HashMap<String, String>,
@@ -495,10 +497,9 @@ impl Review {
                     });
                 }
                 _ => {
-                    self.status = Some(format!(
-                        "{} was checked again; its finding changed",
-                        self.label(path)
-                    ));
+                    self.status = Some(Status::EditEnded {
+                        label: self.label(path),
+                    });
                 }
             }
         }
@@ -749,16 +750,6 @@ impl Review {
                 }
             }
         })
-    }
-
-    /// What review has for the status line but a question, which a UI shows over it
-    /// ([`Review::question`]): its message; else how far the latest scan or apply is, or how it
-    /// ended. With neither, a UI may show its own there.
-    pub fn status_text(&self) -> Option<String> {
-        match &self.status {
-            Some(message) => Some(message.clone()),
-            None => self.progress.line(),
-        }
     }
 
     /// The name a file goes by in the list (see [`labels`]).
@@ -1871,8 +1862,10 @@ mod tests {
         assert_eq!(m.resolve(&clicked), Some(Entry::Member(0, 2)));
         assert_eq!(m.editing, None);
         assert_eq!(
-            m.status.as_deref(),
-            Some("E02 was checked again; its finding changed")
+            m.status,
+            Some(Status::EditEnded {
+                label: "E02".into()
+            })
         );
         assert_eq!(m.undo, [vec![(5, None)]]);
         assert_eq!(m.notes.get(&path(2)), None, "just checked as it is");

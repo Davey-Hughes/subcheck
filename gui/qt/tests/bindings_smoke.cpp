@@ -39,6 +39,11 @@ template <typename V, typename E> const V *as(const E &e) {
     return std::get_if<V>(&e.get_variant());
 }
 
+// The summary's message as `V`, or none when it has none or another.
+template <typename V> const V *message(const Summary &summary) {
+    return summary.status ? as<V>(*summary.status) : nullptr;
+}
+
 // What came, for a failure's message. An end's fatal is why the session ended, and for a session
 // that failed to open it is all there is to go on.
 std::string came(const std::optional<Event> &e) {
@@ -188,6 +193,10 @@ void a_run_opens_and_each_part_of_a_change_crosses(const std::string &folder) {
           "the row's members differ");
     check(ui.rows.size() > 1 && ui.rows[1].state == State::kAccepted && !ui.rows[1].mixed,
           "the member accepted");
+    const Status::kDecided *decided = message<Status::kDecided>(*ui.summary);
+    check(decided && decided->state == State::kAccepted && decided->findings == 1 &&
+              decided->replaced == 0 && !decided->kept,
+          "the decision's message: one finding accepted, no wording replaced, no member kept");
 
     s->send(Action(Action::kSetFilter{Filter::kAccepted}));
     check(ui.next("filtering").filter == Filter::kAccepted, "the filter crosses");
@@ -293,7 +302,9 @@ void a_run_opens_and_each_part_of_a_change_crosses(const std::string &folder) {
     });
     s->send(Action(Action::kPlay{}));
     ui.until("playing", [](const Ui &ui) { return !ui.played.empty(); });
-    check(ui.summary->status == "opening E01 at 0:00:01.000", "the status line says what opens");
+    const Status::kOpening *opening = message<Status::kOpening>(*ui.summary);
+    check(opening && opening->label == "E01" && opening->at_ms == 1000,
+          "the status says what opens, and where");
     const PlayerCommand::kOpen *o = as<PlayerCommand::kOpen>(ui.played[0]);
     check(o && o->moment.file == e01 && o->moment.sid == 1u,
           "play opens the row's first file on its subtitle track");
@@ -305,11 +316,11 @@ void a_run_opens_and_each_part_of_a_change_crosses(const std::string &folder) {
           "with the options review gives every load, in their order");
 
     s->report(PlayerReport(PlayerReport::kOpened{false}));
-    check(ui.next("opened").status == "opened in mpv, playing",
-          "the report reaches review, with where mpv was left");
+    const Status::kOpened *opened = message<Status::kOpened>(ui.next("opened"));
+    check(opened && !opened->paused, "the report reaches review, with where mpv was left");
     s->report(PlayerReport(PlayerReport::kFailed{PlayerError(PlayerError::kCouldNotOpen{e01})}));
-    check(ui.next("failed").status == "mpv could not open E01",
-          "a late failure reaches review, which words it");
+    const Status::kCouldNotOpen *lost = message<Status::kCouldNotOpen>(ui.next("failed"));
+    check(lost && lost->label == "E01", "a late failure reaches review, its file by its label");
 
     s->send(Action(Action::kPlayback{Playback(Playback::kSeek{5})}));
     ui.until("seeking", [](const Ui &ui) { return ui.played.size() == 2; });
@@ -319,14 +330,21 @@ void a_run_opens_and_each_part_of_a_change_crosses(const std::string &folder) {
     check(!ui.summary->status, "a seek clears the status line");
 
     s->report(PlayerReport(PlayerReport::kPlayed{PlayState{true, 6000}}));
-    check(ui.next("played").status == "⏸ 0:00:06.000", "where it played, paused");
+    const Status::kPlayed *played = message<Status::kPlayed>(ui.next("played"));
+    check(played && played->state.paused && played->state.at_ms == 6000, "where it played, paused");
     s->report(PlayerReport(PlayerReport::kPlayFailed{PlayerError(PlayerError::kNoAnswer{})}));
-    check(ui.next("no answer").status == "mpv did not answer", "a typed failure");
+    check(message<Status::kNoAnswer>(ui.next("no answer")), "a typed failure");
+    s->send(Action(Action::kPreviousFile{}));
+    const Status::kRefused *refused = message<Status::kRefused>(ui.next("the file before"));
+    check(refused && std::holds_alternative<Refusal::kFirstFile>(refused->why.get_variant()),
+          "on the first file, the file before is refused, and why");
 
     s->send(Action(Action::kOpenView{{"no-such-run"}}));
     check(!ui.next("opening a view").status, "a view asked for clears the status line");
-    check(ui.next("a view not there").status == "could not switch views: no run named no-such-run",
-          "a view that is not there leaves the run shown, and says why");
+    const Status::kFailed *notThere = message<Status::kFailed>(ui.next("a view not there"));
+    check(notThere && std::holds_alternative<Failure::kSwitch>(notThere->what.get_variant()) &&
+              notThere->error == "no run named no-such-run",
+          "a view that is not there leaves the run shown, and says why in the store's words");
 
     s->send(Action(Action::kQuit{}));
     std::optional<Event> e;

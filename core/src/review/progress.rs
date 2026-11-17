@@ -1100,8 +1100,11 @@ fn quoted(paths: &[PathBuf]) -> String {
     paths.join(" ")
 }
 
-/// "1 finding", "3 findings".
-fn findings_text(n: usize) -> String {
+/// "1 finding", "3 findings": as a running scan's line and a stopped scan's outro, a file's stage
+/// in the files view and its record's log count them, and so do the terminal's words for review's
+/// messages (cli's `tui::status::words`). The window words those messages with a copy of its own
+/// (`counted`, in `gui/qt/src/status_words.cpp`), which a change here must reach.
+pub fn findings_text(n: usize) -> String {
     if n == 1 {
         "1 finding".into()
     } else {

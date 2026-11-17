@@ -10,7 +10,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use subcheck_core::review::{detail, model, progress, session, update};
+use subcheck_core::review::{detail, model, progress, session, status, update};
 use subcheck_core::{apply, group, list, llm, mkv, player, scan, store};
 
 uniffi::setup_scaffolding!();
@@ -267,8 +267,9 @@ pub struct Summary {
     pub title: String,
     /// An index into the rows the UI holds; none when it holds none.
     pub selected: Option<u64>,
-    /// Review's message, none when it has none; the question and the job are words the UI makes.
-    pub status: Option<String>,
+    /// Review's message, none when it has none: data the UI words, as it does the question and
+    /// the job.
+    pub status: Option<Status>,
     /// Findings pending, accepted and rejected: the whole view's, whatever the filter shows.
     pub pending: u64,
     pub accepted: u64,
@@ -294,6 +295,142 @@ pub struct Editing {
     pub entry: EntryKey,
     /// The wording to start from: the user's, else the suggestion.
     pub wording: String,
+}
+
+/// Review's message as data, for a UI to word ([`status::Status`]): what an action, a task or the
+/// player did, or why an action did nothing. Files by the names the list gives them, but a missing
+/// file's path; an error in the words of whoever made it.
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    /// `Accept`, `Reject` or `Reword` put `findings` findings at `state`: `replaced` of them had
+    /// the user's wording, which the suggestion replaced; `kept`, the row's members it left.
+    Decided {
+        state: State,
+        findings: u64,
+        replaced: u64,
+        kept: Option<Kept>,
+    },
+    /// `Clear` put `findings` findings back to pending.
+    Cleared { findings: u64 },
+    /// `Undo` put `findings` findings back, in the files `labels` names, each once.
+    Undone { findings: u64, labels: Vec<String> },
+    /// `findings` new findings of file `label` took their rows' decision, `state` the first's.
+    Inherited {
+        label: String,
+        findings: u64,
+        state: State,
+    },
+    /// A decision's finding was replaced by a check of file `label`: the decision went to the new
+    /// one, or with none (`gone`) nowhere.
+    Replaced { label: String, gone: bool },
+    /// A check of file `label` left the edit with none of its findings, and ended it.
+    EditEnded { label: String },
+    /// The action did nothing, for this reason.
+    Refused { why: Refusal },
+    /// File `label` is queued to be checked again once the scan ends.
+    QueuedAgain { label: String },
+    /// A check again left out file `label`, the first of those no longer on disk.
+    NoSuchFile { label: String },
+    /// `Play` asks the player to open file `label` at `at_ms`.
+    Opening { label: String, at_ms: i64 },
+    /// The player opened it, and left mpv paused or playing.
+    Opened { paused: bool },
+    /// Where playback is after a `Playback`.
+    Played { state: PlayState },
+    /// The player closed.
+    Closed,
+    /// The player has no mpv to ask, or none open to close; `asked` is what it was asked.
+    NotOpen { asked: Asked },
+    /// mpv has no file open.
+    NoFile,
+    /// mpv is still opening the file.
+    StillOpening,
+    /// mpv could not open file `label`.
+    CouldNotOpen { label: String },
+    /// mpv did not answer in the player's time.
+    NoAnswer,
+    /// mpv closed the connection without answering.
+    HungUp,
+    /// The video pane could not show video in the player's time.
+    NoVideo,
+    /// What failed, and its error in the words of whoever made it.
+    Failed { what: Failure, error: String },
+    /// What a scan warned of as it planned: the first warning, and how many more.
+    Warned { first: String, more: u64 },
+}
+
+/// The members a row's decision left as they were ([`status::Kept`]): how many, and the decision
+/// of the first.
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kept {
+    pub findings: u64,
+    pub state: State,
+}
+
+/// Why an action did nothing ([`status::Refusal`]).
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// `Select` named an entry whose findings went, or that the list no longer shows.
+    SelectionStays,
+    /// `SelectFile` named file `label`, which the files view does not have.
+    NotInView { label: String },
+    /// `Edit` on a timing fix, which is accepted or rejected, never reworded.
+    TimingFix,
+    /// `Reword` with no text: the edit goes on.
+    EmptyWording,
+    /// `Reword` on an edit none of whose findings is left.
+    EditOutOfDate,
+    /// `Accept`, `Reject` or `Reword`: every finding is `state` already, with that wording.
+    Already { state: State },
+    /// `Clear` on findings none of which is decided.
+    NothingToClear,
+    /// `Undo` with no decision of this session left.
+    NothingToUndo,
+    /// `NextFile` on the last file.
+    LastFile,
+    /// `PreviousFile` on the first file.
+    FirstFile,
+    /// `Play` on a file not on disk, at `path`.
+    FileMissing { path: String },
+    /// `Play` on a timing finding no line of whose track moves.
+    NothingToOpen,
+    /// A new view, apply or a dry run while the scan runs.
+    ScanRunning,
+    /// A new view, or a check again, while apply runs.
+    ApplyRunning,
+    /// `Apply` while apply runs.
+    AlreadyApplying,
+    /// `Apply` with no accepted fix.
+    NoAcceptedFixes,
+    /// `Recheck` on file `label`, which the scan is checking now.
+    BeingChecked { label: String },
+    /// `ShowFileFindings`: the filter shows no finding of file `label`.
+    NoFindingsShown { label: String },
+}
+
+/// What failed, for `Status::Failed` ([`status::Failure`]).
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// Writing the decisions: none was saved.
+    Save,
+    /// Reading another view: the view stays.
+    Switch,
+    /// Reading file `label` back from the store.
+    ReadBack { label: String },
+    /// Checking a file again: finding its run, or starting the scan.
+    Recheck,
+    /// A request mpv refused.
+    Mpv,
+    /// Starting mpv, or reaching it.
+    Player,
+}
+
+/// What the player was asked, for `Status::NotOpen` ([`status::Asked`]).
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    Open,
+    Playback,
+    Close,
 }
 
 /// The open question as data, for a UI to word ([`model::Question`]): what a yes does, with what
@@ -841,8 +978,8 @@ pub struct FileOption {
     pub value: String,
 }
 
-/// What went wrong with a player command ([`player::PlayerError`]), for review to word: the same
-/// words in every UI.
+/// What went wrong with a player command ([`player::PlayerError`]), for review to make its message
+/// of (`Status`), which each UI words.
 #[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
 pub enum PlayerError {
     /// No mpv to ask, or nothing open in it to close.
@@ -995,6 +1132,13 @@ impl From<PlayState> for player::PlayState {
     fn from(state: PlayState) -> player::PlayState {
         let PlayState { paused, at_ms } = state;
         player::PlayState { paused, at_ms }
+    }
+}
+
+impl From<player::PlayState> for PlayState {
+    fn from(state: player::PlayState) -> PlayState {
+        let player::PlayState { paused, at_ms } = state;
+        PlayState { paused, at_ms }
     }
 }
 
@@ -1179,7 +1323,7 @@ impl From<session::Summary> for Summary {
         Summary {
             title,
             selected: selected.map(wide),
-            status,
+            status: status.map(Status::from),
             pending: wide(pending),
             accepted: wide(accepted),
             rejected: wide(rejected),
@@ -1200,6 +1344,128 @@ impl From<session::Editing> for Editing {
         Editing {
             entry: entry.into(),
             wording,
+        }
+    }
+}
+
+impl From<status::Status> for Status {
+    fn from(status: status::Status) -> Status {
+        match status {
+            status::Status::Decided {
+                state,
+                findings,
+                replaced,
+                kept,
+            } => Status::Decided {
+                state: state.into(),
+                findings: wide(findings),
+                replaced: wide(replaced),
+                kept: kept.map(Kept::from),
+            },
+            status::Status::Cleared { findings } => Status::Cleared {
+                findings: wide(findings),
+            },
+            status::Status::Undone { findings, labels } => Status::Undone {
+                findings: wide(findings),
+                labels,
+            },
+            status::Status::Inherited {
+                label,
+                findings,
+                state,
+            } => Status::Inherited {
+                label,
+                findings: wide(findings),
+                state: state.into(),
+            },
+            status::Status::Replaced { label, gone } => Status::Replaced { label, gone },
+            status::Status::EditEnded { label } => Status::EditEnded { label },
+            status::Status::Refused(why) => Status::Refused { why: why.into() },
+            status::Status::QueuedAgain { label } => Status::QueuedAgain { label },
+            status::Status::NoSuchFile { label } => Status::NoSuchFile { label },
+            status::Status::Opening { label, at_ms } => Status::Opening { label, at_ms },
+            status::Status::Opened { paused } => Status::Opened { paused },
+            status::Status::Played(state) => Status::Played {
+                state: state.into(),
+            },
+            status::Status::Closed => Status::Closed,
+            status::Status::NotOpen { asked } => Status::NotOpen {
+                asked: asked.into(),
+            },
+            status::Status::NoFile => Status::NoFile,
+            status::Status::StillOpening => Status::StillOpening,
+            status::Status::CouldNotOpen { label } => Status::CouldNotOpen { label },
+            status::Status::NoAnswer => Status::NoAnswer,
+            status::Status::HungUp => Status::HungUp,
+            status::Status::NoVideo => Status::NoVideo,
+            status::Status::Failed { what, error } => Status::Failed {
+                what: what.into(),
+                error,
+            },
+            status::Status::Warned { first, more } => Status::Warned {
+                first,
+                more: wide(more),
+            },
+        }
+    }
+}
+
+impl From<status::Kept> for Kept {
+    fn from(kept: status::Kept) -> Kept {
+        let status::Kept { findings, state } = kept;
+        Kept {
+            findings: wide(findings),
+            state: state.into(),
+        }
+    }
+}
+
+impl From<status::Refusal> for Refusal {
+    fn from(why: status::Refusal) -> Refusal {
+        match why {
+            status::Refusal::SelectionStays => Refusal::SelectionStays,
+            status::Refusal::NotInView { label } => Refusal::NotInView { label },
+            status::Refusal::TimingFix => Refusal::TimingFix,
+            status::Refusal::EmptyWording => Refusal::EmptyWording,
+            status::Refusal::EditOutOfDate => Refusal::EditOutOfDate,
+            status::Refusal::Already { state } => Refusal::Already {
+                state: state.into(),
+            },
+            status::Refusal::NothingToClear => Refusal::NothingToClear,
+            status::Refusal::NothingToUndo => Refusal::NothingToUndo,
+            status::Refusal::LastFile => Refusal::LastFile,
+            status::Refusal::FirstFile => Refusal::FirstFile,
+            status::Refusal::FileMissing { path } => Refusal::FileMissing { path },
+            status::Refusal::NothingToOpen => Refusal::NothingToOpen,
+            status::Refusal::ScanRunning => Refusal::ScanRunning,
+            status::Refusal::ApplyRunning => Refusal::ApplyRunning,
+            status::Refusal::AlreadyApplying => Refusal::AlreadyApplying,
+            status::Refusal::NoAcceptedFixes => Refusal::NoAcceptedFixes,
+            status::Refusal::BeingChecked { label } => Refusal::BeingChecked { label },
+            status::Refusal::NoFindingsShown { label } => Refusal::NoFindingsShown { label },
+        }
+    }
+}
+
+impl From<status::Failure> for Failure {
+    fn from(what: status::Failure) -> Failure {
+        match what {
+            status::Failure::Save => Failure::Save,
+            status::Failure::Switch => Failure::Switch,
+            status::Failure::ReadBack { label } => Failure::ReadBack { label },
+            status::Failure::Recheck => Failure::Recheck,
+            status::Failure::Mpv => Failure::Mpv,
+            status::Failure::Player => Failure::Player,
+        }
+    }
+}
+
+impl From<status::Asked> for Asked {
+    fn from(asked: status::Asked) -> Asked {
+        match asked {
+            status::Asked::Open => Asked::Open,
+            status::Asked::Playback => Asked::Playback,
+            status::Asked::Close => Asked::Close,
         }
     }
 }
@@ -1963,7 +2229,15 @@ mod tests {
             summary: session::Summary {
                 title: "run r".into(),
                 selected: Some(5),
-                status: Some("opened in mpv".into()),
+                status: Some(status::Status::Decided {
+                    state: store::State::Rejected,
+                    findings: 4,
+                    replaced: 2,
+                    kept: Some(status::Kept {
+                        findings: 3,
+                        state: store::State::Pending,
+                    }),
+                }),
                 pending: 1,
                 accepted: 2,
                 rejected: 3,
@@ -2016,7 +2290,15 @@ mod tests {
             summary: Summary {
                 title: "run r".into(),
                 selected: Some(5),
-                status: Some("opened in mpv".into()),
+                status: Some(Status::Decided {
+                    state: State::Rejected,
+                    findings: 4,
+                    replaced: 2,
+                    kept: Some(Kept {
+                        findings: 3,
+                        state: State::Pending,
+                    }),
+                }),
                 pending: 1,
                 accepted: 2,
                 rejected: 3,
@@ -2974,6 +3256,292 @@ mod tests {
         }
     }
 
+    // Each message, each reason and each failure, with values unlike each other within each.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one pair per variant
+    fn each_message_crosses() {
+        let core = |status: status::Status| Status::from(status);
+        let label = |s: &str| s.to_string();
+        for (from, to) in [
+            (
+                status::Status::Decided {
+                    state: store::State::Accepted,
+                    findings: 9,
+                    replaced: 8,
+                    kept: Some(status::Kept {
+                        findings: 4,
+                        state: store::State::Rejected,
+                    }),
+                },
+                Status::Decided {
+                    state: State::Accepted,
+                    findings: 9,
+                    replaced: 8,
+                    kept: Some(Kept {
+                        findings: 4,
+                        state: State::Rejected,
+                    }),
+                },
+            ),
+            (
+                status::Status::Decided {
+                    state: store::State::Rejected,
+                    findings: 1,
+                    replaced: 0,
+                    kept: None,
+                },
+                Status::Decided {
+                    state: State::Rejected,
+                    findings: 1,
+                    replaced: 0,
+                    kept: None,
+                },
+            ),
+            (
+                status::Status::Cleared { findings: 7 },
+                Status::Cleared { findings: 7 },
+            ),
+            (
+                status::Status::Undone {
+                    findings: 5,
+                    labels: vec![label("E01"), label("E02")],
+                },
+                Status::Undone {
+                    findings: 5,
+                    labels: vec![label("E01"), label("E02")],
+                },
+            ),
+            (
+                status::Status::Inherited {
+                    label: label("E03"),
+                    findings: 2,
+                    state: store::State::Rejected,
+                },
+                Status::Inherited {
+                    label: label("E03"),
+                    findings: 2,
+                    state: State::Rejected,
+                },
+            ),
+            (
+                status::Status::Replaced {
+                    label: label("E04"),
+                    gone: true,
+                },
+                Status::Replaced {
+                    label: label("E04"),
+                    gone: true,
+                },
+            ),
+            (
+                status::Status::Replaced {
+                    label: label("E16"),
+                    gone: false,
+                },
+                Status::Replaced {
+                    label: label("E16"),
+                    gone: false,
+                },
+            ),
+            (
+                status::Status::EditEnded {
+                    label: label("E05"),
+                },
+                Status::EditEnded {
+                    label: label("E05"),
+                },
+            ),
+            (
+                status::Status::QueuedAgain {
+                    label: label("E06"),
+                },
+                Status::QueuedAgain {
+                    label: label("E06"),
+                },
+            ),
+            (
+                status::Status::NoSuchFile {
+                    label: label("E07"),
+                },
+                Status::NoSuchFile {
+                    label: label("E07"),
+                },
+            ),
+            (
+                status::Status::Opening {
+                    label: label("E08"),
+                    at_ms: 165_060,
+                },
+                Status::Opening {
+                    label: label("E08"),
+                    at_ms: 165_060,
+                },
+            ),
+            (
+                status::Status::Opened { paused: true },
+                Status::Opened { paused: true },
+            ),
+            (
+                status::Status::Opened { paused: false },
+                Status::Opened { paused: false },
+            ),
+            (
+                status::Status::Played(player::PlayState {
+                    paused: true,
+                    at_ms: 171_060,
+                }),
+                Status::Played {
+                    state: PlayState {
+                        paused: true,
+                        at_ms: 171_060,
+                    },
+                },
+            ),
+            (
+                status::Status::Played(player::PlayState {
+                    paused: false,
+                    at_ms: 3_723_004,
+                }),
+                Status::Played {
+                    state: PlayState {
+                        paused: false,
+                        at_ms: 3_723_004,
+                    },
+                },
+            ),
+            (status::Status::Closed, Status::Closed),
+            (status::Status::NoFile, Status::NoFile),
+            (status::Status::StillOpening, Status::StillOpening),
+            (
+                status::Status::CouldNotOpen {
+                    label: label("E09"),
+                },
+                Status::CouldNotOpen {
+                    label: label("E09"),
+                },
+            ),
+            (status::Status::NoAnswer, Status::NoAnswer),
+            (status::Status::HungUp, Status::HungUp),
+            (status::Status::NoVideo, Status::NoVideo),
+            (
+                status::Status::Warned {
+                    first: label("warning: /m/locked: skipped"),
+                    more: 6,
+                },
+                Status::Warned {
+                    first: label("warning: /m/locked: skipped"),
+                    more: 6,
+                },
+            ),
+        ] {
+            assert_eq!(core(from), to);
+        }
+        for (from, to) in [
+            (status::Asked::Open, Asked::Open),
+            (status::Asked::Playback, Asked::Playback),
+            (status::Asked::Close, Asked::Close),
+        ] {
+            assert_eq!(
+                core(status::Status::NotOpen { asked: from }),
+                Status::NotOpen { asked: to }
+            );
+        }
+        for (from, to) in [
+            (status::Refusal::SelectionStays, Refusal::SelectionStays),
+            (
+                status::Refusal::NotInView {
+                    label: label("E10"),
+                },
+                Refusal::NotInView {
+                    label: label("E10"),
+                },
+            ),
+            (status::Refusal::TimingFix, Refusal::TimingFix),
+            (status::Refusal::EmptyWording, Refusal::EmptyWording),
+            (status::Refusal::EditOutOfDate, Refusal::EditOutOfDate),
+            (
+                status::Refusal::Already {
+                    state: store::State::Accepted,
+                },
+                Refusal::Already {
+                    state: State::Accepted,
+                },
+            ),
+            (
+                status::Refusal::Already {
+                    state: store::State::Rejected,
+                },
+                Refusal::Already {
+                    state: State::Rejected,
+                },
+            ),
+            (status::Refusal::NothingToClear, Refusal::NothingToClear),
+            (status::Refusal::NothingToUndo, Refusal::NothingToUndo),
+            (status::Refusal::LastFile, Refusal::LastFile),
+            (status::Refusal::FirstFile, Refusal::FirstFile),
+            (
+                status::Refusal::FileMissing {
+                    path: label("/m/s1/E11.mkv"),
+                },
+                Refusal::FileMissing {
+                    path: label("/m/s1/E11.mkv"),
+                },
+            ),
+            (status::Refusal::NothingToOpen, Refusal::NothingToOpen),
+            (status::Refusal::ScanRunning, Refusal::ScanRunning),
+            (status::Refusal::ApplyRunning, Refusal::ApplyRunning),
+            (status::Refusal::AlreadyApplying, Refusal::AlreadyApplying),
+            (status::Refusal::NoAcceptedFixes, Refusal::NoAcceptedFixes),
+            (
+                status::Refusal::BeingChecked {
+                    label: label("E12"),
+                },
+                Refusal::BeingChecked {
+                    label: label("E12"),
+                },
+            ),
+            (
+                status::Refusal::NoFindingsShown {
+                    label: label("E13"),
+                },
+                Refusal::NoFindingsShown {
+                    label: label("E13"),
+                },
+            ),
+        ] {
+            assert_eq!(
+                core(status::Status::Refused(from)),
+                Status::Refused { why: to }
+            );
+        }
+        for (from, to) in [
+            (status::Failure::Save, Failure::Save),
+            (status::Failure::Switch, Failure::Switch),
+            (
+                status::Failure::ReadBack {
+                    label: label("E14"),
+                },
+                Failure::ReadBack {
+                    label: label("E14"),
+                },
+            ),
+            (status::Failure::Recheck, Failure::Recheck),
+            (status::Failure::Mpv, Failure::Mpv),
+            (status::Failure::Player, Failure::Player),
+        ] {
+            assert_eq!(
+                core(status::Status::Failed {
+                    what: from,
+                    error: label("database is locked"),
+                }),
+                Status::Failed {
+                    what: to,
+                    error: label("database is locked"),
+                }
+            );
+        }
+    }
+
     #[test]
     fn each_player_error_is_cores() {
         for (ffi, core) in [
@@ -3335,13 +3903,19 @@ mod tests {
             },
         });
         ui.until(&s, "Played", |ui| {
-            ui.summary().status.as_deref() == Some("⏸ 0:02:51.060")
+            ui.summary().status
+                == Some(Status::Played {
+                    state: PlayState {
+                        paused: true,
+                        at_ms: 171_060,
+                    },
+                })
         });
         s.report(PlayerReport::PlayFailed {
             error: PlayerError::NoFile,
         });
         ui.until(&s, "PlayFailed", |ui| {
-            ui.summary().status.as_deref() == Some("mpv has no file open (o opens one)")
+            ui.summary().status == Some(Status::NoFile)
         });
         s.send(Action::Dismiss);
         ui.until(&s, "Dismiss", |ui| ui.summary().status.is_none());

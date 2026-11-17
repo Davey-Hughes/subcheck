@@ -20,6 +20,7 @@ use super::jobs::panic_text;
 use super::model::{Entry, EntryKey, FileNote, Fix, ListTrack, MarkKind, Pane, Question, Review};
 use super::progress::{ApplyStage, FileProgress, Job, Stage};
 use super::runner::{self, Runner};
+use super::status::Status;
 use super::update::{self, Action, Effect, Input, Task};
 use crate::group;
 use crate::list::Filter;
@@ -83,9 +84,9 @@ pub struct Summary {
     pub title: String,
     /// An index into the rows the UI holds; `None` when it holds none.
     pub selected: Option<usize>,
-    /// Review's message ([`Review::status`]): the question and the job are fields of their own,
-    /// which a UI words.
-    pub status: Option<String>,
+    /// Review's message ([`Review::status`]), which a UI words, as it does the question and the
+    /// job, fields of their own.
+    pub status: Option<Status>,
     /// Findings pending, accepted and rejected ([`Review::counts`]): the whole view's, whatever
     /// the filter shows.
     pub pending: usize,
@@ -788,6 +789,7 @@ mod tests {
     use crate::review::model::tests_support::{self, finding, many, sample, with_timing};
     use crate::review::model::{Mark, Row};
     use crate::review::progress::{ApplyAt, Counts, Scan};
+    use crate::review::status::{Asked, Failure, Refusal};
     use crate::review::update::tests_support::{FIXED, TYPO, decide_as, now, saved, taken};
     use crate::scan;
     use crate::store::{
@@ -796,6 +798,24 @@ mod tests {
 
     fn act(m: &mut Review, action: Action) -> Vec<Effect> {
         update::update(m, Input::Action(action), now())
+    }
+
+    /// The message once `findings` findings are accepted, none of them reworded, none kept.
+    fn accepted(findings: usize) -> Status {
+        Status::Decided {
+            state: State::Accepted,
+            findings,
+            replaced: 0,
+            kept: None,
+        }
+    }
+
+    /// The message as `Play` asks to open E01's first finding.
+    fn opening_e01() -> Status {
+        Status::Opening {
+            label: "E01".into(),
+            at_ms: 165_060,
+        }
     }
 
     /// `sent` up to `m`, what it says of the rows, and the summary; an event must be due.
@@ -1061,7 +1081,7 @@ mod tests {
         assert_eq!((rows.at, rows.removed, rows.inserted.len()), (0, 1, 1));
         assert_eq!(rows.inserted[0].state, Some(State::Accepted));
         assert_eq!(summary.selected, Some(1), "the selection moved on");
-        assert_eq!(summary.status.as_deref(), Some("accepted 3 findings"));
+        assert_eq!(summary.status, Some(accepted(3)));
         assert_eq!((summary.pending, summary.accepted), (1, 3));
     }
 
@@ -1338,8 +1358,8 @@ mod tests {
         assert_eq!(sent.change(&m), None, "nothing since");
     }
 
-    // The status line's words for a job are the terminal's: the summary leaves them out, and
-    // carries the job as data, as it runs and once it has ended.
+    // The job crosses as data, for each UI to word: the summary leaves it out of the message, as it
+    // runs and once it has ended.
     #[test]
     fn the_summary_carries_the_job_and_its_status_is_reviews_message_alone() {
         let mut m = sample();
@@ -1348,7 +1368,7 @@ mod tests {
         changed(&mut sent, &m);
         act(&mut m, Action::Apply { dry_run: true });
         let summary = changed(&mut sent, &m).1;
-        assert_eq!(m.status_text().as_deref(), Some("dry run 0/0"));
+        assert_eq!(m.progress.line().as_deref(), Some("dry run 0/0"));
         assert_eq!(summary.status, None);
         assert_eq!(
             summary.job,
@@ -1561,10 +1581,7 @@ mod tests {
         s.send(Action::Play);
         let (rows, summary) = next_change(&s);
         assert_eq!(rows, None);
-        assert_eq!(
-            summary.status.as_deref(),
-            Some("opening E01 at 0:02:45.060")
-        );
+        assert_eq!(summary.status, Some(opening_e01()));
         assert_eq!(
             next(&s),
             Some(Event::Player(PlayerCommand::Open {
@@ -1580,7 +1597,7 @@ mod tests {
         s.report(PlayerReport::Opened(Ok(player::Opened { paused: true })));
         let (rows, summary) = next_change(&s);
         assert_eq!(rows, None);
-        assert_eq!(summary.status.as_deref(), Some("opened in mpv, paused"));
+        assert_eq!(summary.status, Some(Status::Opened { paused: true }));
         // A task whose result changes the rows: the status line cleared first, on its own, while
         // the write is still to run; then the rows, once the store has said.
         s.send(Action::Accept);
@@ -1590,7 +1607,7 @@ mod tests {
         assert_eq!(summary.accepted, 0);
         let (rows, summary) = next_change(&s);
         assert_eq!(rows.unwrap().inserted[0].state, Some(State::Accepted));
-        assert_eq!(summary.status.as_deref(), Some("accepted 3 findings"));
+        assert_eq!(summary.status, Some(accepted(3)));
         assert_eq!(summary.accepted, 3);
         // The other two commands, and what their reports say.
         s.send(Action::Playback(Playback::Pause));
@@ -1605,13 +1622,24 @@ mod tests {
             at_ms: 1000,
         })));
         let (_, summary) = next_change(&s);
-        assert_eq!(summary.status.as_deref(), Some("⏸ 0:00:01.000"));
+        assert_eq!(
+            summary.status,
+            Some(Status::Played(PlayState {
+                paused: true,
+                at_ms: 1000,
+            }))
+        );
         s.send(Action::ClosePlayer);
         next_change(&s);
         assert_eq!(next(&s), Some(Event::Player(PlayerCommand::Close)));
         s.report(PlayerReport::Closed(Err(PlayerError::NotOpen)));
         let (_, summary) = next_change(&s);
-        assert_eq!(summary.status.as_deref(), Some("mpv is not open"));
+        assert_eq!(
+            summary.status,
+            Some(Status::NotOpen {
+                asked: Asked::Close
+            })
+        );
         // The selection on E02 since the accept, a file that is not on disk: the stat says so,
         // and nothing goes to the player.
         s.send(Action::Play);
@@ -1619,7 +1647,9 @@ mod tests {
         let (_, summary) = next_change(&s);
         assert_eq!(
             summary.status,
-            Some(format!("file missing: {}", tests_support::path(2)))
+            Some(Status::Refused(Refusal::FileMissing {
+                path: tests_support::path(2)
+            }))
         );
     }
 
@@ -1650,8 +1680,11 @@ mod tests {
         let (rows, summary) = next_change(&s);
         assert_eq!(rows, None);
         assert_eq!(
-            summary.status.as_deref(),
-            Some("could not switch views: no run named nope")
+            summary.status,
+            Some(Status::Failed {
+                what: Failure::Switch,
+                error: "no run named nope".into(),
+            })
         );
     }
 
@@ -1675,10 +1708,7 @@ mod tests {
         next(&s);
         let mut held = lock(&s.shared);
         s.send(Action::Play);
-        assert_eq!(
-            next_change(&s).1.status.as_deref(),
-            Some("opening E01 at 0:02:45.060")
-        );
+        assert_eq!(next_change(&s).1.status, Some(opening_e01()));
         assert!(matches!(held.close(), (true, false, _)));
         drop(held);
         let stopped = Arc::clone(&s);
@@ -1809,7 +1839,10 @@ mod tests {
         next_change(&s);
         // Each step makes the record's outro too: review goes on all the same.
         s.send(Action::Undo);
-        assert_eq!(next_change(&s).1.status.as_deref(), Some("nothing to undo"));
+        assert_eq!(
+            next_change(&s).1.status,
+            Some(Status::Refused(Refusal::NothingToUndo))
+        );
         s.send(Action::Dismiss);
         next_change(&s);
         s.send(Action::Quit);
@@ -2269,7 +2302,7 @@ mod tests {
                 // The core thread stuck in a write, on a store another process holds: a message
                 // first, so that the write's step shows by letting it go. The dry run's own steps
                 // change what shows too, and leave the message.
-                let undone = Some("nothing to undo".to_string());
+                let undone = Some(Status::Refused(Refusal::NothingToUndo));
                 s.send(Action::Undo);
                 while next_change(&s).1.status != undone {}
                 let held = hold_the_store(dir);

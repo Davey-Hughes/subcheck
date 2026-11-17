@@ -1,6 +1,7 @@
 #include "session_bridge.h"
 
 #include "overloaded.h"
+#include "status_words.h"
 
 #include <chrono>
 #include <exception>
@@ -97,7 +98,7 @@ QString SessionBridge::statusLine() const {
         return QStringLiteral("opening…");
     }
     if (summary.status) {
-        return QString::fromStdString(*summary.status);
+        return statusWords(*summary.status);
     }
     return QStringLiteral("%1 pending · %2 accepted · %3 rejected")
         .arg(summary.pending)

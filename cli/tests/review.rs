@@ -168,8 +168,8 @@ fn decisions_made_in_review_are_in_the_store() {
     model.filter = Filter::All;
     send(&mut model, &mut screen, key('o'), &mut runner, &mut player);
     assert_eq!(
-        model.status.as_deref(),
-        Some(format!("file missing: {OTHER}").as_str())
+        screen::status(&model),
+        Some(format!("file missing: {OTHER}"))
     );
 
     // A file on disk gets past the stat to the player, which has no mpv to start and says so. A
@@ -192,7 +192,7 @@ fn decisions_made_in_review_are_in_the_store() {
         "{} not found: install mpv to open findings",
         no_mpv.display()
     );
-    assert_eq!(model.status.as_deref(), Some(not_found.as_str()));
+    assert_eq!(screen::status(&model), Some(not_found));
 }
 
 #[test]
@@ -233,7 +233,7 @@ fn a_decision_on_a_finding_checked_again_follows_it_through_the_loop() {
     assert_eq!(ids, [new]);
     assert_eq!(model.run.state_of(new), State::Accepted);
     assert_eq!(
-        model.status.as_deref(),
+        screen::status(&model).as_deref(),
         Some("E01 was checked again; your decision went to its new finding")
     );
 

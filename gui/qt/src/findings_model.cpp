@@ -1,6 +1,7 @@
 #include "findings_model.h"
 
 #include "overloaded.h"
+#include "status_words.h"
 
 #include <QStringList>
 
@@ -134,11 +135,11 @@ Decision decision(const std::optional<State> &state) {
     }
     switch (*state) {
     case State::kPending:
-        return {QStringLiteral("·"), QStringLiteral("pending")};
+        return {QStringLiteral("·"), stateWord(*state)};
     case State::kAccepted:
-        return {QStringLiteral("✓"), QStringLiteral("accepted")};
+        return {QStringLiteral("✓"), stateWord(*state)};
     case State::kRejected:
-        return {QStringLiteral("✗"), QStringLiteral("rejected")};
+        return {QStringLiteral("✗"), stateWord(*state)};
     }
     return {QStringLiteral("?"), QStringLiteral("mixed")};
 }

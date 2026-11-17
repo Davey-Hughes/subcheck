@@ -121,8 +121,9 @@ pub struct Opened {
     pub paused: bool,
 }
 
-/// What went wrong with a player command, as the player says it. Review words it, for both UIs
-/// alike; an error with text keeps the words of whoever made it, mpv's, the OS's or the player's.
+/// What went wrong with a player command, as the player says it. Review makes it its message
+/// ([`Status`](crate::review::status::Status)), which each UI words; an error with text keeps the
+/// words of whoever made it, mpv's, the OS's or the player's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlayerError {
     /// No mpv to ask, or nothing open in it to close.

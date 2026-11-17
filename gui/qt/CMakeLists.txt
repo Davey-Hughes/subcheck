@@ -100,8 +100,8 @@ qt_add_qml_module(subcheck_window
     OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/qml/Subcheck"
     QML_FILES qml/Main.qml
     SOURCES src/findings_model.h src/findings_model.cpp src/session_bridge.h
-            src/session_bridge.cpp src/player_port.h src/player_port.cpp src/mpv_item.h
-            src/mpv_item.cpp src/overloaded.h)
+            src/session_bridge.cpp src/status_words.h src/status_words.cpp src/player_port.h
+            src/player_port.cpp src/mpv_item.h src/mpv_item.cpp src/overloaded.h)
 target_include_directories(subcheck_window PUBLIC src)
 target_link_libraries(subcheck_window PUBLIC subcheck_bindings Qt6::Quick MpvQt::MpvQt)
 subcheck_warnings(subcheck_window)
@@ -166,6 +166,14 @@ target_link_libraries(findings_model_test PRIVATE subcheck_window Qt6::Test)
 subcheck_warnings(findings_model_test)
 add_test(NAME findings_model_test COMMAND findings_model_test)
 set_tests_properties(findings_model_test PROPERTIES
+    ENVIRONMENT QT_QPA_PLATFORM=offscreen TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+
+# The status line's words for each message, with no session.
+qt_add_executable(status_words_test tests/status_words_test.cpp)
+target_link_libraries(status_words_test PRIVATE subcheck_window Qt6::Test)
+subcheck_warnings(status_words_test)
+add_test(NAME status_words_test COMMAND status_words_test)
+set_tests_properties(status_words_test PROPERTIES
     ENVIRONMENT QT_QPA_PLATFORM=offscreen TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 
 # The player, on a fake mpv, with no session.

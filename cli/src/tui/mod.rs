@@ -8,6 +8,7 @@ pub mod files;
 pub mod keymap;
 pub mod layout;
 pub mod screen;
+pub mod status;
 pub mod view;
 
 use std::collections::VecDeque;
@@ -38,6 +39,7 @@ use runner::Runner;
 use screen::{Mouse, Msg, Screen};
 use subcheck_core::group;
 use subcheck_core::player::PlayerCommand;
+use subcheck_core::review::status::Status;
 use subcheck_core::review::{jobs, model, progress, runner, update};
 use subcheck_core::scan;
 use subcheck_core::store::{Run, Store};
@@ -222,13 +224,12 @@ impl<W: Write> Write for Tee<W> {
 }
 
 /// What the status line opens with: the first of what `scan` warned of before the screen covered
-/// it, and how many warnings are more. They are printed above the screen too, so `+n more` points
-/// at what the user can scroll up to. A message as others are, until the next key.
-fn opening_status(warnings: &[String]) -> Option<String> {
+/// it, and how many warnings are more. A message as others are, until the next key.
+fn opening_status(warnings: &[String]) -> Option<Status> {
     let (first, rest) = warnings.split_first()?;
-    Some(match rest.len() {
-        0 => first.clone(),
-        n => format!("{first} · +{n} more"),
+    Some(Status::Warned {
+        first: first.clone(),
+        more: rest.len(),
     })
 }
 
@@ -516,7 +517,7 @@ mod tests {
 
     #[test]
     fn a_scans_screen_opens_with_its_warnings_on_the_status_line() {
-        let status = |m: &Review| m.status_text();
+        let status = screen::status;
         let warnings = vec![
             "warning: /m/locked: skipped: Permission denied (os error 13)".to_string(),
             "warning: /m/lost: skipped: Input/output error (os error 5)".to_string(),
@@ -537,7 +538,8 @@ mod tests {
         );
         assert_eq!(status(&m).as_deref(), Some("scan 0/2 · 0 findings"));
         // One warning alone, or none.
-        assert_eq!(opening_status(&warnings[..1]), Some(warnings[0].clone()));
+        m.status = opening_status(&warnings[..1]);
+        assert_eq!(status(&m), Some(warnings[0].clone()));
         assert_eq!(opening_status(&[]), None);
     }
 

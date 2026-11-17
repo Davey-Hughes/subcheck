@@ -10,12 +10,12 @@ use jiff::Timestamp;
 
 use super::model::{Confirm, Edit, Entry, EntryKey, FileNote, Mark, Pane, Review, UndoStep};
 use super::progress::{Scan, Stage};
+use super::status::{Asked, Failure, Kept, Refusal, Status};
 use crate::apply;
-use crate::list::{self, Filter, label};
+use crate::list::{self, Filter};
 use crate::player::{self, How, Moment, Opened, PlayState, Playback, PlayerCommand, PlayerError};
 use crate::scan;
 use crate::store::{Decided, Decision, Record, Run, State};
-use crate::text::timestamp_ms;
 
 /// What `update` takes: an action, or what a job or an effect has to say.
 #[derive(Debug, Clone, PartialEq)]
@@ -245,23 +245,18 @@ pub fn update(m: &mut Review, input: Input, now: Timestamp) -> Vec<Effect> {
         Input::Stamped { moment, stamp } => stamped(m, moment, stamp),
         Input::Opened(result) => {
             m.status = Some(match result {
-                Ok(Opened { paused: true }) => "opened in mpv, paused".into(),
-                Ok(Opened { paused: false }) => "opened in mpv, playing".into(),
+                Ok(Opened { paused }) => Status::Opened { paused },
                 Err(e) => {
                     m.loaded = None;
-                    player_words(m, Asked::Open, e)
+                    player_status(m, Asked::Open, e)
                 }
             });
             Vec::new()
         }
         Input::Played(result) => {
             m.status = Some(match result {
-                Ok(p) => format!(
-                    "{} {}",
-                    if p.paused { "⏸" } else { "▶" },
-                    timestamp_ms(p.at_ms)
-                ),
-                Err(e) => player_words(m, Asked::Playback, e),
+                Ok(p) => Status::Played(p),
+                Err(e) => player_status(m, Asked::Playback, e),
             });
             Vec::new()
         }
@@ -269,14 +264,14 @@ pub fn update(m: &mut Review, input: Input, now: Timestamp) -> Vec<Effect> {
         Input::Closed(result) => {
             m.loaded = None;
             m.status = Some(match result {
-                Ok(()) => "closed mpv".into(),
-                Err(e) => player_words(m, Asked::Close, e),
+                Ok(()) => Status::Closed,
+                Err(e) => player_status(m, Asked::Close, e),
             });
             Vec::new()
         }
         Input::PlayerFailed(e) => {
             m.loaded = None;
-            m.status = Some(player_words(m, Asked::Open, e));
+            m.status = Some(player_status(m, Asked::Open, e));
             Vec::new()
         }
         Input::Scan(event) => scanned(m, event),
@@ -390,7 +385,7 @@ fn select(m: &mut Review, key: &EntryKey) {
         .and_then(|e| shown(e).or_else(|| shown(Entry::Row(e.row()))))
     {
         Some(at) => m.selected = at,
-        None => m.status = Some("that finding changed; the selection stays".into()),
+        None => m.status = Some(Status::Refused(Refusal::SelectionStays)),
     }
 }
 
@@ -414,7 +409,11 @@ fn move_by(m: &mut Review, by: i32) {
 fn select_file(m: &mut Review, path: &str) {
     match m.progress.files.iter().position(|f| f.path == path) {
         Some(at) => m.file_selected = at,
-        None => m.status = Some(format!("{} is not in this view", m.label(path))),
+        None => {
+            m.status = Some(Status::Refused(Refusal::NotInView {
+                label: m.label(path),
+            }));
+        }
     }
 }
 
@@ -443,7 +442,7 @@ fn open_editor(m: &mut Review) {
     };
     let targets = m.to_decide(entry);
     if targets.iter().any(|&i| m.finding(i).timing.is_some()) {
-        m.status = Some("a timing fix is accepted or rejected, not edited".into());
+        m.status = Some(Status::Refused(Refusal::TimingFix));
         return;
     }
     m.editing = Some(Edit {
@@ -459,7 +458,7 @@ fn reword(m: &mut Review, text: &str, now: Timestamp) -> Vec<Effect> {
         return Vec::new();
     }
     if text.trim().is_empty() {
-        m.status = Some("the wording cannot be empty (Esc cancels)".into());
+        m.status = Some(Status::Refused(Refusal::EmptyWording));
         return Vec::new();
     }
     let target = m.edit_target();
@@ -467,7 +466,7 @@ fn reword(m: &mut Review, text: &str, now: Timestamp) -> Vec<Effect> {
     // `refresh` keeps an edit's findings in step with the rows and ends one left with none, so
     // only a UI that set `editing` itself finds nothing here.
     let Some((entry, findings)) = target else {
-        m.status = Some("the edit is out of date; nothing was decided".into());
+        m.status = Some(Status::Refused(Refusal::EditOutOfDate));
         return Vec::new();
     };
     let edited = (text != m.finding(findings[0]).suggestion).then_some(text);
@@ -515,7 +514,7 @@ fn decide(
 ) -> Vec<Effect> {
     let (before, decisions) = changes(m, findings, state, edited, now);
     if decisions.is_empty() {
-        m.status = Some(format!("already {}", label(state)));
+        m.status = Some(Status::Refused(Refusal::Already { state }));
         return Vec::new();
     }
     vec![Effect::Task(Task::Write {
@@ -533,7 +532,7 @@ fn clear(m: &mut Review, entry: Entry, now: Timestamp) -> Vec<Effect> {
         .collect();
     let (before, decisions) = changes(m, decided, State::Pending, None, now);
     if decisions.is_empty() {
-        m.status = Some("nothing to clear".into());
+        m.status = Some(Status::Refused(Refusal::NothingToClear));
         return Vec::new();
     }
     vec![Effect::Task(Task::Write {
@@ -545,7 +544,7 @@ fn clear(m: &mut Review, entry: Entry, now: Timestamp) -> Vec<Effect> {
 /// Decisions that put back what the last decision of this session changed.
 fn undo(m: &mut Review, now: Timestamp) -> Vec<Effect> {
     let Some(step) = m.undo.last() else {
-        m.status = Some("nothing to undo".into());
+        m.status = Some(Status::Refused(Refusal::NothingToUndo));
         return Vec::new();
     };
     let decisions = step
@@ -576,7 +575,10 @@ fn written(
     let outcomes = match result {
         Ok(outcomes) => outcomes,
         Err(e) => {
-            m.status = Some(format!("not saved: {e}"));
+            m.status = Some(Status::Failed {
+                what: Failure::Save,
+                error: e,
+            });
             return Vec::new();
         }
     };
@@ -590,16 +592,11 @@ fn written(
         }
     }
     let n = decisions.len();
-    let what = if n == 1 {
-        "1 finding".to_string()
-    } else {
-        format!("{n} findings")
-    };
     match purpose {
         WriteFor::Decide { entry, before } => {
             let state = decisions[0].state;
             m.status = Some(if state == State::Pending {
-                format!("cleared {what}")
+                Status::Cleared { findings: n }
             } else {
                 // `Accept` means the suggestion as written, so it replaces a rewording; say so,
                 // since `Undo` can bring it back.
@@ -612,11 +609,6 @@ fn written(
                             && was.as_ref().is_some_and(|d| d.edited.is_some())
                     })
                     .count();
-                let replacing = if replaced > 0 {
-                    format!(", replacing your wording on {replaced} (u undoes)")
-                } else {
-                    String::new()
-                };
                 // The members a row's decision left alone, decided the other way on their own (or,
                 // for an edit, joined the row after it opened).
                 let kept: Vec<State> = m
@@ -625,11 +617,15 @@ fn written(
                     .map(|i| m.state(i))
                     .filter(|&s| s != state)
                     .collect();
-                let kept = match kept.first() {
-                    Some(&other) => format!(", {} kept as {}", kept.len(), label(other)),
-                    None => String::new(),
-                };
-                format!("{} {what}{replacing}{kept}", label(state))
+                Status::Decided {
+                    state,
+                    findings: n,
+                    replaced,
+                    kept: kept.first().map(|&other| Kept {
+                        findings: kept.len(),
+                        state: other,
+                    }),
+                }
             });
             m.undo.push(before);
             advance(m, entry, old, &shown);
@@ -654,22 +650,20 @@ fn written(
                 .find(|f| f.id == first.finding)
                 .map(|f| f.file.clone())
                 .unwrap_or_default();
-            let name = m.label(&file);
-            m.status = Some(if n == 1 {
-                format!(
-                    "{name}: a new finding took its row's decision: {} (u undoes)",
-                    label(first.state)
-                )
-            } else {
-                format!("{name}: {n} new findings took their rows' decisions (u undoes)")
+            m.status = Some(Status::Inherited {
+                label: m.label(&file),
+                findings: n,
+                state: first.state,
             });
         }
         WriteFor::Undo => {
             m.undo.pop();
             // Name the episodes taken back, since the undone step may be a late join in a file
             // the user is not looking at.
-            let names = episodes(m, decisions);
-            m.status = Some(format!("undone: {what} · {names}"));
+            m.status = Some(Status::Undone {
+                findings: n,
+                labels: episodes(m, decisions),
+            });
             // Select the row the undone decision was on, if the filter shows it.
             let first = m
                 .run
@@ -708,12 +702,10 @@ fn replaced(m: &mut Review, decisions: &[Decision], outcomes: &[Decided]) -> Vec
     let Some(first) = files.first() else {
         return Vec::new();
     };
-    let what = if gone {
-        "that finding is gone"
-    } else {
-        "your decision went to its new finding"
-    };
-    m.status = Some(format!("{} was checked again; {what}", m.label(first)));
+    m.status = Some(Status::Replaced {
+        label: m.label(first),
+        gone,
+    });
     files
         .into_iter()
         .map(|p| Effect::Task(Task::ReadBack(p)))
@@ -721,7 +713,7 @@ fn replaced(m: &mut Review, decisions: &[Decision], outcomes: &[Decided]) -> Vec
 }
 
 /// The episode labels of the files the decisions are on, each once, in order of first appearance.
-fn episodes(m: &Review, decisions: &[Decision]) -> String {
+fn episodes(m: &Review, decisions: &[Decision]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for d in decisions {
         let file = m
@@ -736,7 +728,7 @@ fn episodes(m: &Review, decisions: &[Decision]) -> String {
             names.push(name);
         }
     }
-    names.join(", ")
+    names
 }
 
 /// After a decision on `decided`, which was at `old` in `shown` (the list before it): select the
@@ -806,7 +798,7 @@ fn next_file(m: &mut Review) {
     };
     match (m.selected + 1..entries.len()).find(|&i| m.file_of(entries[i]) != Some(current)) {
         Some(i) => m.selected = i,
-        None => m.status = Some("last file".into()),
+        None => m.status = Some(Status::Refused(Refusal::LastFile)),
     }
 }
 
@@ -818,7 +810,7 @@ fn previous_file(m: &mut Review) {
     };
     // The nearest entry of another file, then the first entry of that file's run of entries.
     let Some(mut i) = (0..m.selected).rev().find(|&i| file(i) != Some(current)) else {
-        m.status = Some("first file".into());
+        m.status = Some(Status::Refused(Refusal::FirstFile));
         return;
     };
     let previous = file(i);
@@ -834,7 +826,8 @@ fn open(m: &mut Review) -> Vec<Effect> {
     };
     let f = m.finding(i);
     if m.notes.get(&f.file) == Some(&FileNote::Missing) {
-        m.status = Some(format!("file missing: {}", f.file));
+        let path = f.file.clone();
+        m.status = Some(Status::Refused(Refusal::FileMissing { path }));
         return Vec::new();
     }
     // Whether mpv plays once there is the player's to keep, from mpv's own state, a pause made in
@@ -852,7 +845,7 @@ fn open(m: &mut Review) -> Vec<Effect> {
         };
         (at.at_ms, start_us, at.sid)
     } else if f.timing.is_some() {
-        m.status = Some("nothing to open: no line of this track moves".into());
+        m.status = Some(Status::Refused(Refusal::NothingToOpen));
         return Vec::new();
     } else {
         let (at, sid) = list::line_moment(&m.run, f);
@@ -863,11 +856,10 @@ fn open(m: &mut Review) -> Vec<Effect> {
         start_us: start_us.max(0),
         sid,
     };
-    m.status = Some(format!(
-        "opening {} at {}",
-        m.label(&moment.file),
-        timestamp_ms(at_ms)
-    ));
+    m.status = Some(Status::Opening {
+        label: m.label(&moment.file),
+        at_ms,
+    });
     vec![Effect::Task(Task::Stamp(moment))]
 }
 
@@ -881,7 +873,7 @@ fn open(m: &mut Review) -> Vec<Effect> {
 fn stamped(m: &mut Review, moment: Moment, stamp: Option<(u64, Timestamp)>) -> Vec<Effect> {
     let Some(stamp) = stamp else {
         m.loaded = None;
-        m.status = Some(format!("file missing: {}", moment.file));
+        m.status = Some(Status::Refused(Refusal::FileMissing { path: moment.file }));
         return Vec::new();
     };
     let now = Some((moment.file.clone(), stamp));
@@ -898,29 +890,27 @@ fn stamped(m: &mut Review, moment: Moment, stamp: Option<(u64, Timestamp)>) -> V
     })]
 }
 
-/// What the player was asked, for the words of what went wrong.
-#[derive(Clone, Copy)]
-enum Asked {
-    Open,
-    Playback,
-    Close,
-}
-
-/// The status line's words for what went wrong with a player command, the same in both UIs.
-fn player_words(m: &Review, asked: Asked, e: PlayerError) -> String {
+/// What went wrong with player command `asked`, as review's message: a file by the list's name for
+/// it, an error with text in the words of whoever made it.
+fn player_status(m: &Review, asked: Asked, e: PlayerError) -> Status {
     match e {
-        PlayerError::NotOpen => match asked {
-            Asked::Playback => "mpv is not open (o opens it)".into(),
-            Asked::Open | Asked::Close => "mpv is not open".into(),
+        PlayerError::NotOpen => Status::NotOpen { asked },
+        PlayerError::NoFile => Status::NoFile,
+        PlayerError::StillOpening => Status::StillOpening,
+        PlayerError::CouldNotOpen { file } => Status::CouldNotOpen {
+            label: m.label(&file),
         },
-        PlayerError::NoFile => "mpv has no file open (o opens one)".into(),
-        PlayerError::StillOpening => "mpv is still opening the file".into(),
-        PlayerError::CouldNotOpen { file } => format!("mpv could not open {}", m.label(&file)),
-        PlayerError::NoAnswer => "mpv did not answer".into(),
-        PlayerError::HungUp => "mpv closed the connection without answering".into(),
-        PlayerError::NoVideo => "the video pane could not show video".into(),
-        PlayerError::Mpv(e) => format!("mpv: {e}"),
-        PlayerError::Failed(e) => e,
+        PlayerError::NoAnswer => Status::NoAnswer,
+        PlayerError::HungUp => Status::HungUp,
+        PlayerError::NoVideo => Status::NoVideo,
+        PlayerError::Mpv(error) => Status::Failed {
+            what: Failure::Mpv,
+            error,
+        },
+        PlayerError::Failed(error) => Status::Failed {
+            what: Failure::Player,
+            error,
+        },
     }
 }
 
@@ -939,15 +929,15 @@ fn quit_or_ask(m: &mut Review) {
 /// starts at once.
 fn apply_key(m: &mut Review, dry_run: bool) -> Vec<Effect> {
     if m.progress.running() {
-        m.status = Some("the scan is still running".into());
+        m.status = Some(Status::Refused(Refusal::ScanRunning));
         return Vec::new();
     }
     if m.progress.applying() {
-        m.status = Some("already applying".into());
+        m.status = Some(Status::Refused(Refusal::AlreadyApplying));
         return Vec::new();
     }
     if m.apply_counts().0 == 0 {
-        m.status = Some("no accepted fixes".into());
+        m.status = Some(Status::Refused(Refusal::NoAcceptedFixes));
         return Vec::new();
     }
     if dry_run {
@@ -1038,7 +1028,12 @@ fn switched(
 ) -> Vec<Effect> {
     match result {
         Ok((run, notes)) => m.switch(run, notes),
-        Err(e) => m.status = Some(format!("could not switch views: {e}")),
+        Err(error) => {
+            m.status = Some(Status::Failed {
+                what: Failure::Switch,
+                error,
+            });
+        }
     }
     Vec::new()
 }
@@ -1090,13 +1085,13 @@ fn open_view(m: &mut Review, words: Vec<String>) -> Vec<Effect> {
 /// it started in. The status line says which.
 fn refused_while_a_job_runs(m: &mut Review) -> bool {
     let running = if m.progress.running() {
-        "the scan is still running"
+        Refusal::ScanRunning
     } else if m.progress.applying() {
-        "apply is still running"
+        Refusal::ApplyRunning
     } else {
         return false;
     };
-    m.status = Some(running.into());
+    m.status = Some(Status::Refused(running));
     true
 }
 
@@ -1105,7 +1100,7 @@ fn refused_while_a_job_runs(m: &mut Review) -> bool {
 fn recheck(m: &mut Review) -> Vec<Effect> {
     // A check would read a file apply may be remuxing or swapping.
     if m.progress.applying() {
-        m.status = Some("apply is still running".into());
+        m.status = Some(Status::Refused(Refusal::ApplyRunning));
         return Vec::new();
     }
     let Some(file) = m.progress.files.get(m.file_selected) else {
@@ -1113,15 +1108,13 @@ fn recheck(m: &mut Review) -> Vec<Effect> {
     };
     let path = file.path.clone();
     let queued_again = file.stage == Stage::QueuedAgain;
-    let name = m.label(&path);
+    let label = m.label(&path);
     if m.progress.checking(&path).is_some() {
-        m.status = Some(format!("{name} is being checked now"));
+        m.status = Some(Status::Refused(Refusal::BeingChecked { label }));
         return Vec::new();
     }
     if queued_again {
-        m.status = Some(format!(
-            "{name} will be checked again when the scan is done"
-        ));
+        m.status = Some(Status::QueuedAgain { label });
         return Vec::new();
     }
     let run = (!m.run.of_paths).then(|| m.run.name.clone());
@@ -1136,10 +1129,9 @@ fn again(m: &mut Review, path: String, run: String) -> Vec<Effect> {
             paths: vec![path],
         })];
     }
-    m.status = Some(format!(
-        "{} will be checked again when the scan is done",
-        m.label(&path)
-    ));
+    m.status = Some(Status::QueuedAgain {
+        label: m.label(&path),
+    });
     m.progress.queue_again(&path, &run);
     Vec::new()
 }
@@ -1148,7 +1140,12 @@ fn again(m: &mut Review, path: String, run: String) -> Vec<Effect> {
 fn run_found(m: &mut Review, path: String, found: Result<(String, String), String>) -> Vec<Effect> {
     match found {
         Ok((run, backend)) => m.confirm = Some(Confirm::Recheck { path, run, backend }),
-        Err(e) => m.status = Some(e),
+        Err(error) => {
+            m.status = Some(Status::Failed {
+                what: Failure::Recheck,
+                error,
+            });
+        }
     }
     Vec::new()
 }
@@ -1181,7 +1178,10 @@ fn started(
             for p in paths.iter().filter(|p| !missing.contains(p)) {
                 m.progress.fail(p, &e);
             }
-            m.status = Some(e);
+            m.status = Some(Status::Failed {
+                what: Failure::Recheck,
+                error: e,
+            });
             next_again(m)
         }
     };
@@ -1189,7 +1189,7 @@ fn started(
         m.progress.fail(p, "no such file");
     }
     if let Some(p) = missing.first() {
-        m.status = Some(format!("{}: no such file", m.label(p)));
+        m.status = Some(Status::NoSuchFile { label: m.label(p) });
     }
     settle_quit(m, &effects);
     effects
@@ -1224,7 +1224,11 @@ fn file_findings(m: &mut Review) {
             m.selected = at;
             m.pane = Pane::Findings;
         }
-        None => m.status = Some(format!("no findings of {} shown", m.label(&path))),
+        None => {
+            m.status = Some(Status::Refused(Refusal::NoFindingsShown {
+                label: m.label(&path),
+            }));
+        }
     }
 }
 
@@ -1258,8 +1262,12 @@ fn read_back(m: &mut Review, path: &str, view: Result<Run, String>, now: Timesta
             let new = m.refresh(path, view);
             inherit(m, &new, now)
         }
-        Err(e) => {
-            m.status = Some(format!("could not read {} back: {e}", m.label(path)));
+        Err(error) => {
+            let label = m.label(path);
+            m.status = Some(Status::Failed {
+                what: Failure::ReadBack { label },
+                error,
+            });
             Vec::new()
         }
     }
@@ -1418,6 +1426,24 @@ mod tests {
         update(m, Input::Action(action), now())
     }
 
+    /// The message after `findings` findings were put at `state`.
+    fn was_decided(state: State, findings: usize, replaced: usize, kept: Option<Kept>) -> Status {
+        Status::Decided {
+            state,
+            findings,
+            replaced,
+            kept,
+        }
+    }
+
+    /// The message as `Play` asks to open file `label` at `at_ms`.
+    fn opening(label: &str, at_ms: i64) -> Status {
+        Status::Opening {
+            label: label.into(),
+            at_ms,
+        }
+    }
+
     /// The scan a quit would stop: `done` of `queued` files, and `again` queued after it.
     fn scan_on(done: usize, queued: usize, again: usize) -> Stopping {
         Stopping::Scan {
@@ -1463,8 +1489,12 @@ mod tests {
         written(&mut m, effects);
         assert_eq!(m.run.state_of(5), State::Accepted);
         assert_eq!(
-            m.status.as_deref(),
-            Some("E04: a new finding took its row's decision: accepted (u undoes)")
+            m.status,
+            Some(Status::Inherited {
+                label: "E04".into(),
+                findings: 1,
+                state: State::Accepted,
+            })
         );
         let effects = act(&mut m, Action::Undo);
         assert_eq!(decided(&effects), [(5, State::Pending, None)]);
@@ -1543,7 +1573,13 @@ mod tests {
         assert_eq!(decided(&effects), [(5, State::Pending, None)]);
         written(&mut m, effects);
         assert_eq!(m.run.state_of(5), State::Pending);
-        assert_eq!(m.status.as_deref(), Some("undone: 1 finding · E04"));
+        assert_eq!(
+            m.status,
+            Some(Status::Undone {
+                findings: 1,
+                labels: vec!["E04".into()],
+            })
+        );
         assert_eq!(m.pane, Pane::Files);
     }
 
@@ -1561,7 +1597,13 @@ mod tests {
         m.undo.push(vec![(6, None), (5, None)]);
         let effects = act(&mut m, Action::Undo);
         written(&mut m, effects);
-        assert_eq!(m.status.as_deref(), Some("undone: 2 findings · E05, E04"));
+        assert_eq!(
+            m.status,
+            Some(Status::Undone {
+                findings: 2,
+                labels: vec!["E05".into(), "E04".into()],
+            })
+        );
     }
 
     #[test]
@@ -1645,7 +1687,7 @@ mod tests {
                 act(&mut m, Action::Edit);
                 assert!(m.editing.is_some());
                 m.confirm = Some(confirm);
-                m.status = Some("opened in mpv, paused".into());
+                m.status = Some(Status::Opened { paused: true });
                 m
             })
             .collect()
@@ -1737,7 +1779,6 @@ mod tests {
 
     #[test]
     fn a_quit_question_goes_when_the_scan_ends() {
-        let status = |m: &Review| m.status_text();
         let mut m = scanning();
         act(&mut m, Action::Quit);
         assert!(m.confirm.is_some());
@@ -1749,9 +1790,9 @@ mod tests {
         };
         update(&mut m, Input::ScanEnded(Ok(summary)), now());
         // Nothing left to stop: the line gives the summary, and `Quit` quits at once.
-        assert_eq!(m.confirm, None);
+        assert_eq!((&m.confirm, &m.status), (&None, &None));
         assert_eq!(
-            status(&m).as_deref(),
+            m.progress.line().as_deref(),
             Some(
                 "run r: 2 files, 2 checked, 0 failed, 0 unchanged since an earlier scan; 0 findings"
             )
@@ -1919,7 +1960,7 @@ mod tests {
                 State::Accepted
             ]
         );
-        assert_eq!(m.status.as_deref(), Some("accepted 3 findings"));
+        assert_eq!(m.status, Some(was_decided(State::Accepted, 3, 0, None)));
         // The decided row stays in the list; the selection moved on to the next.
         assert_eq!(m.entries(), [Entry::Row(0), Entry::Row(1)]);
         assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
@@ -1935,7 +1976,12 @@ mod tests {
         // Nothing left to change: no write.
         m.selected = 0;
         assert_eq!(act(&mut m, Action::Reject), []);
-        assert_eq!(m.status.as_deref(), Some("already rejected"));
+        assert_eq!(
+            m.status,
+            Some(Status::Refused(Refusal::Already {
+                state: State::Rejected
+            }))
+        );
     }
 
     #[test]
@@ -2008,10 +2054,7 @@ mod tests {
         m.selected = 1;
         assert_eq!(act(&mut m, Action::Edit), []);
         assert_eq!(m.editing, None);
-        assert_eq!(
-            m.status.as_deref(),
-            Some("a timing fix is accepted or rejected, not edited")
-        );
+        assert_eq!(m.status, Some(Status::Refused(Refusal::TimingFix)));
         // Accepting the row accepts each member's own fix.
         assert_eq!(
             decided(&act(&mut m, Action::Accept)),
@@ -2030,16 +2073,13 @@ mod tests {
         act(&mut m, Action::Edit);
         let effects = act(&mut m, Action::Reword("Snacks every day!".into()));
         written(&mut m, effects);
-        assert_eq!(m.status.as_deref(), Some("accepted 1 finding"));
+        assert_eq!(m.status, Some(was_decided(State::Accepted, 1, 0, None)));
         m.filter = Filter::All;
         m.selected = 1;
         let effects = act(&mut m, Action::Accept);
         assert_eq!(decided(&effects), [(3, State::Accepted, None)]);
         written(&mut m, effects);
-        assert_eq!(
-            m.status.as_deref(),
-            Some("accepted 1 finding, replacing your wording on 1 (u undoes)")
-        );
+        assert_eq!(m.status, Some(was_decided(State::Accepted, 1, 1, None)));
     }
 
     #[test]
@@ -2060,11 +2100,14 @@ mod tests {
         assert_eq!(states(&m), [State::Pending; 4]);
         assert_eq!(m.selected_entry(), Some(Entry::Row(0)));
         assert_eq!(
-            m.status.as_deref(),
-            Some("undone: 3 findings · E01, E02, E03")
+            m.status,
+            Some(Status::Undone {
+                findings: 3,
+                labels: vec!["E01".into(), "E02".into(), "E03".into()],
+            })
         );
         assert_eq!(act(&mut m, Action::Undo), []);
-        assert_eq!(m.status.as_deref(), Some("nothing to undo"));
+        assert_eq!(m.status, Some(Status::Refused(Refusal::NothingToUndo)));
     }
 
     #[test]
@@ -2084,14 +2127,14 @@ mod tests {
         );
         written(&mut m, effects);
         assert_eq!(states(&m), [State::Pending; 4]);
-        assert_eq!(m.status.as_deref(), Some("cleared 3 findings"));
+        assert_eq!(m.status, Some(Status::Cleared { findings: 3 }));
         assert_eq!(
             m.selected_entry(),
             Some(Entry::Row(1)),
             "on to the next pending row, as after a and r"
         );
         assert_eq!(act(&mut m, Action::Clear), []);
-        assert_eq!(m.status.as_deref(), Some("nothing to clear"));
+        assert_eq!(m.status, Some(Status::Refused(Refusal::NothingToClear)));
         let effects = act(&mut m, Action::Undo);
         assert_eq!(
             decided(&effects),
@@ -2187,9 +2230,13 @@ mod tests {
             [(1, State::Accepted, None), (4, State::Accepted, None)]
         );
         written(&mut m, effects);
+        let kept = Kept {
+            findings: 1,
+            state: State::Rejected,
+        };
         assert_eq!(
-            m.status.as_deref(),
-            Some("accepted 2 findings, 1 kept as rejected")
+            m.status,
+            Some(was_decided(State::Accepted, 2, 0, Some(kept)))
         );
         // None pending: the row flips as a whole.
         m.selected = 0;
@@ -2199,7 +2246,7 @@ mod tests {
             [(1, State::Rejected, None), (4, State::Rejected, None)]
         );
         written(&mut m, effects);
-        assert_eq!(m.status.as_deref(), Some("rejected 2 findings"));
+        assert_eq!(m.status, Some(was_decided(State::Rejected, 2, 0, None)));
     }
 
     #[test]
@@ -2250,13 +2297,39 @@ mod tests {
         act(&mut m, Action::Edit);
         assert_eq!(act(&mut m, Action::Reword(String::new())), []);
         assert!(m.editing.is_some());
-        assert_eq!(
-            m.status.as_deref(),
-            Some("the wording cannot be empty (Esc cancels)")
-        );
+        assert_eq!(m.status, Some(Status::Refused(Refusal::EmptyWording)));
         act(&mut m, Action::CancelEdit);
         assert!(m.editing.is_none());
         assert_eq!(states(&m), [State::Pending; 4]);
+    }
+
+    // An edit none of whose findings is left, which only a UI that set it itself can hold:
+    // nothing is decided, and the edit ends.
+    #[test]
+    fn a_reword_with_no_finding_left_decides_nothing_and_says_so() {
+        let mut m = sample();
+        m.editing = Some(Edit {
+            entry: EntryKey::Member(99),
+            findings: vec![99],
+        });
+        assert_eq!(act(&mut m, Action::Reword("Fixed.".into())), []);
+        assert_eq!(m.editing, None);
+        assert_eq!(m.status, Some(Status::Refused(Refusal::EditOutOfDate)));
+    }
+
+    #[test]
+    fn a_files_findings_the_filter_hides_are_not_shown_and_the_status_line_says_so() {
+        let mut m = sample();
+        m.filter = Filter::Only(State::Rejected);
+        m.pane = Pane::Files;
+        assert_eq!(act(&mut m, Action::ShowFileFindings), []);
+        assert_eq!(m.pane, Pane::Files);
+        assert_eq!(
+            m.status,
+            Some(Status::Refused(Refusal::NoFindingsShown {
+                label: "E01".into()
+            }))
+        );
     }
 
     #[test]
@@ -2278,7 +2351,13 @@ mod tests {
         );
         assert_eq!(states(&m), [State::Pending; 4]);
         assert_eq!(m.undo.len(), 0);
-        assert_eq!(m.status.as_deref(), Some("not saved: disk full"));
+        assert_eq!(
+            m.status,
+            Some(Status::Failed {
+                what: Failure::Save,
+                error: "disk full".into(),
+            })
+        );
     }
 
     #[test]
@@ -2325,11 +2404,11 @@ mod tests {
         act(&mut m, Action::NextFile);
         assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
         act(&mut m, Action::NextFile);
-        assert_eq!(m.status.as_deref(), Some("last file"));
+        assert_eq!(m.status, Some(Status::Refused(Refusal::LastFile)));
         act(&mut m, Action::PreviousFile);
         assert_eq!(m.selected_entry(), Some(Entry::Row(0)));
         act(&mut m, Action::PreviousFile);
-        assert_eq!(m.status.as_deref(), Some("first file"));
+        assert_eq!(m.status, Some(Status::Refused(Refusal::FirstFile)));
         // Expanded, the group's members are in their own files.
         act(&mut m, Action::Toggle);
         act(&mut m, Action::NextFile);
@@ -2363,7 +2442,7 @@ mod tests {
         };
         let effects = act(&mut m, Action::Play);
         assert_eq!(effects, [Effect::Task(Task::Stamp(moment.clone()))]);
-        assert_eq!(m.status.as_deref(), Some("opening E01 at 0:02:45.060"));
+        assert_eq!(m.status, Some(opening("E01", 165_060)));
         assert_eq!(
             stat(&mut m, effects, Some(stamp(1))),
             open(moment.clone(), How::Load)
@@ -2410,7 +2489,7 @@ mod tests {
                 sid: Some(1),
             }))]
         );
-        assert_eq!(m.status.as_deref(), Some("opening E01 at 0:12:43.763"));
+        assert_eq!(m.status, Some(opening("E01", 763_763)));
     }
 
     // With no frame that shows its error, it opens on its first moved line as a line opens: on
@@ -2434,7 +2513,7 @@ mod tests {
                 sid: Some(1),
             }))]
         );
-        assert_eq!(m.status.as_deref(), Some("opening E01 at 0:00:01.000"));
+        assert_eq!(m.status, Some(opening("E01", 1_000)));
     }
 
     // mpv counts a time before 0:00 back from the end.
@@ -2482,13 +2561,20 @@ mod tests {
     fn review_forgets_its_load_once_the_player_closes_or_an_open_fails() {
         let gone = PlayerError::CouldNotOpen { file: path(1) };
         for (after, said) in [
-            (Input::Closed(Ok(())), "closed mpv"),
-            (Input::Closed(Err(PlayerError::NotOpen)), "mpv is not open"),
+            (Input::Closed(Ok(())), Status::Closed),
             (
-                Input::Opened(Err(PlayerError::NoAnswer)),
-                "mpv did not answer",
+                Input::Closed(Err(PlayerError::NotOpen)),
+                Status::NotOpen {
+                    asked: Asked::Close,
+                },
             ),
-            (Input::PlayerFailed(gone), "mpv could not open E01"),
+            (Input::Opened(Err(PlayerError::NoAnswer)), Status::NoAnswer),
+            (
+                Input::PlayerFailed(gone),
+                Status::CouldNotOpen {
+                    label: "E01".into(),
+                },
+            ),
         ] {
             let mut m = sample();
             let effects = act(&mut m, Action::Play);
@@ -2500,14 +2586,14 @@ mod tests {
                 [Effect::Player(PlayerCommand::Open { how: How::Seek, .. })]
             ));
             update(&mut m, after, now());
-            assert_eq!(m.status.as_deref(), Some(said));
+            assert_eq!(m.status.as_ref(), Some(&said));
             let effects = act(&mut m, Action::Play);
             assert!(
                 matches!(
                     stat(&mut m, effects, Some(stamp(1)))[..],
                     [Effect::Player(PlayerCommand::Open { how: How::Load, .. })]
                 ),
-                "after {said}"
+                "after {said:?}"
             );
         }
     }
@@ -2521,69 +2607,80 @@ mod tests {
         let effects = act(&mut m, Action::Play);
         assert_eq!(stat(&mut m, effects, None), []);
         assert_eq!(
-            m.status.as_deref(),
-            Some(format!("file missing: {}", path(1)).as_str())
+            m.status,
+            Some(Status::Refused(Refusal::FileMissing { path: path(1) }))
         );
         assert_eq!(m.loaded, None);
     }
 
+    // Each report's message, with what was asked and the file by the list's name; an error with
+    // text keeps its words.
     #[test]
-    fn each_thing_a_player_reports_has_its_words() {
+    fn each_thing_a_player_reports_is_its_message() {
         let error = |e| Input::Opened(Err(e));
+        let failed = |what, error: &str| Status::Failed {
+            what,
+            error: error.into(),
+        };
         for (input, said) in [
             (
                 Input::Opened(Ok(Opened { paused: true })),
-                "opened in mpv, paused",
+                Status::Opened { paused: true },
             ),
             (
                 Input::Opened(Ok(Opened { paused: false })),
-                "opened in mpv, playing",
-            ),
-            (error(PlayerError::NotOpen), "mpv is not open"),
-            (
-                error(PlayerError::NoFile),
-                "mpv has no file open (o opens one)",
+                Status::Opened { paused: false },
             ),
             (
-                error(PlayerError::StillOpening),
-                "mpv is still opening the file",
+                error(PlayerError::NotOpen),
+                Status::NotOpen { asked: Asked::Open },
             ),
+            (error(PlayerError::NoFile), Status::NoFile),
+            (error(PlayerError::StillOpening), Status::StillOpening),
             (
                 error(PlayerError::CouldNotOpen { file: path(2) }),
-                "mpv could not open E02",
+                Status::CouldNotOpen {
+                    label: "E02".into(),
+                },
             ),
-            (error(PlayerError::NoAnswer), "mpv did not answer"),
-            (
-                error(PlayerError::HungUp),
-                "mpv closed the connection without answering",
-            ),
-            (
-                error(PlayerError::NoVideo),
-                "the video pane could not show video",
-            ),
+            (error(PlayerError::NoAnswer), Status::NoAnswer),
+            (error(PlayerError::HungUp), Status::HungUp),
+            (error(PlayerError::NoVideo), Status::NoVideo),
             (
                 error(PlayerError::Mpv("invalid parameter".into())),
-                "mpv: invalid parameter",
+                failed(Failure::Mpv, "invalid parameter"),
             ),
             (
                 error(PlayerError::Failed(
                     "mpv not found: install mpv to open findings".into(),
                 )),
-                "mpv not found: install mpv to open findings",
+                failed(
+                    Failure::Player,
+                    "mpv not found: install mpv to open findings",
+                ),
             ),
             (
                 Input::Played(Err(PlayerError::NotOpen)),
-                "mpv is not open (o opens it)",
+                Status::NotOpen {
+                    asked: Asked::Playback,
+                },
             ),
-            (Input::Closed(Err(PlayerError::NotOpen)), "mpv is not open"),
+            (
+                Input::Closed(Err(PlayerError::NotOpen)),
+                Status::NotOpen {
+                    asked: Asked::Close,
+                },
+            ),
             (
                 Input::PlayerFailed(PlayerError::CouldNotOpen { file: path(1) }),
-                "mpv could not open E01",
+                Status::CouldNotOpen {
+                    label: "E01".into(),
+                },
             ),
         ] {
             let mut m = sample();
             update(&mut m, input, now());
-            assert_eq!(m.status.as_deref(), Some(said));
+            assert_eq!(m.status, Some(said));
         }
     }
 
@@ -2599,10 +2696,7 @@ mod tests {
         }
         m.selected = 1;
         assert_eq!(act(&mut m, Action::Play), []);
-        assert_eq!(
-            m.status.as_deref(),
-            Some("nothing to open: no line of this track moves")
-        );
+        assert_eq!(m.status, Some(Status::Refused(Refusal::NothingToOpen)));
     }
 
     #[test]
@@ -2611,8 +2705,8 @@ mod tests {
         m.notes.insert(path(1), FileNote::Missing);
         assert_eq!(act(&mut m, Action::Play), []);
         assert_eq!(
-            m.status.as_deref(),
-            Some(format!("file missing: {}", path(1)).as_str())
+            m.status,
+            Some(Status::Refused(Refusal::FileMissing { path: path(1) }))
         );
     }
 
@@ -2640,18 +2734,21 @@ mod tests {
             act(&mut m, Action::Playback(Playback::Seek(1))),
             playback(Playback::Seek(1))
         );
-        let at = |paused| {
-            Input::Played(Ok(PlayState {
-                paused,
-                at_ms: 171_060,
-            }))
+        let at = |paused| PlayState {
+            paused,
+            at_ms: 171_060,
         };
-        update(&mut m, at(true), now());
-        assert_eq!(m.status.as_deref(), Some("⏸ 0:02:51.060"));
-        update(&mut m, at(false), now());
-        assert_eq!(m.status.as_deref(), Some("▶ 0:02:51.060"));
+        update(&mut m, Input::Played(Ok(at(true))), now());
+        assert_eq!(m.status, Some(Status::Played(at(true))));
+        update(&mut m, Input::Played(Ok(at(false))), now());
+        assert_eq!(m.status, Some(Status::Played(at(false))));
         update(&mut m, Input::Played(Err(PlayerError::NotOpen)), now());
-        assert_eq!(m.status.as_deref(), Some("mpv is not open (o opens it)"));
+        assert_eq!(
+            m.status,
+            Some(Status::NotOpen {
+                asked: Asked::Playback
+            })
+        );
     }
 
     #[test]
@@ -2662,9 +2759,14 @@ mod tests {
             [Effect::Player(PlayerCommand::Close)]
         );
         update(&mut m, Input::Closed(Ok(())), now());
-        assert_eq!(m.status.as_deref(), Some("closed mpv"));
+        assert_eq!(m.status, Some(Status::Closed));
         update(&mut m, Input::Closed(Err(PlayerError::NotOpen)), now());
-        assert_eq!(m.status.as_deref(), Some("mpv is not open"));
+        assert_eq!(
+            m.status,
+            Some(Status::NotOpen {
+                asked: Asked::Close
+            })
+        );
     }
 
     #[test]
@@ -2679,7 +2781,7 @@ mod tests {
 
     #[test]
     fn an_action_clears_the_status_message_but_an_answer_an_edits_end_and_ctrl_c_leave_it() {
-        let said = || Some("opened in mpv".to_string());
+        let said = || Some(Status::Opened { paused: false });
         for action in [
             Action::Select(EntryKey::Row(vec![3])),
             Action::Toggle,
@@ -2746,15 +2848,15 @@ mod tests {
     fn a_move_at_an_end_or_in_an_empty_list_still_lets_a_message_go() {
         let mut m = sample();
         m.selected = 1;
-        m.status = Some("a message".into());
+        m.status = Some(Status::Closed);
         act(&mut m, Action::Move(1));
-        assert_eq!((m.selected, m.status.as_deref()), (1, None));
+        assert_eq!((m.selected, &m.status), (1, &None));
         // Nothing in the sample is rejected: under that filter the list is empty.
         act(&mut m, Action::SetFilter(Filter::Only(State::Rejected)));
         assert_eq!(m.entries(), []);
-        m.status = Some("a message".into());
+        m.status = Some(Status::Closed);
         act(&mut m, Action::Move(-1));
-        assert_eq!((m.selected, m.status.as_deref()), (0, None));
+        assert_eq!((m.selected, &m.status), (0, &None));
     }
 
     #[test]
@@ -2792,15 +2894,17 @@ mod tests {
         assert_eq!(m.selected_entry(), e03);
         assert_eq!(act(&mut m, Action::Select(snacks)), []);
         assert_eq!(m.selected_entry(), e03);
-        assert_eq!(
-            m.status.as_deref(),
-            Some("that finding changed; the selection stays")
-        );
+        assert_eq!(m.status, Some(Status::Refused(Refusal::SelectionStays)));
         // A file of another view, likewise.
         let elsewhere = "/m/Other/Other - E07.mkv".to_string();
         assert_eq!(act(&mut m, Action::SelectFile(elsewhere)), []);
         assert_eq!(m.file_selected, 1);
-        assert_eq!(m.status.as_deref(), Some("E07 is not in this view"));
+        assert_eq!(
+            m.status,
+            Some(Status::Refused(Refusal::NotInView {
+                label: "E07".into()
+            }))
+        );
     }
 
     #[test]
@@ -2851,8 +2955,11 @@ mod tests {
             [Effect::Task(Task::ReadBack(path(2)))]
         );
         assert_eq!(
-            m.status.as_deref(),
-            Some("E02 was checked again; your decision went to its new finding")
+            m.status,
+            Some(Status::Replaced {
+                label: "E02".into(),
+                gone: false
+            })
         );
         let gone = Input::Written {
             purpose,
@@ -2864,8 +2971,11 @@ mod tests {
             [Effect::Task(Task::ReadBack(path(2)))]
         );
         assert_eq!(
-            m.status.as_deref(),
-            Some("E02 was checked again; that finding is gone")
+            m.status,
+            Some(Status::Replaced {
+                label: "E02".into(),
+                gone: true
+            })
         );
     }
 
@@ -2882,8 +2992,13 @@ mod tests {
         );
         assert_eq!(effects, []);
         assert_eq!(
-            m.status.as_deref(),
-            Some("could not read E02 back: database is locked")
+            m.status,
+            Some(Status::Failed {
+                what: Failure::ReadBack {
+                    label: "E02".into()
+                },
+                error: "database is locked".into(),
+            })
         );
         assert_eq!(m.run.findings.len(), 4);
     }
@@ -2931,6 +3046,20 @@ mod tests {
                 run: None,
             })]
         );
+        // None found: no question, and why, in the runner's words.
+        let none = Input::RunFound {
+            path: path(2),
+            found: Err("E02: no run named it".into()),
+        };
+        update(&mut m, none, now());
+        assert_eq!(m.confirm, None);
+        assert_eq!(
+            m.status,
+            Some(Status::Failed {
+                what: Failure::Recheck,
+                error: "E02: no run named it".into(),
+            })
+        );
     }
 
     #[test]
@@ -2977,8 +3106,10 @@ mod tests {
             assert_eq!(act(&mut m, Action::Answer(true)), []);
         }
         assert_eq!(
-            m.status.as_deref(),
-            Some("E03 will be checked again when the scan is done")
+            m.status,
+            Some(Status::QueuedAgain {
+                label: "E03".into()
+            })
         );
         let labels: Vec<String> = m.progress.files[..3].iter().map(|f| f.label('⠙')).collect();
         assert_eq!(labels, ["queued again"; 3]);
@@ -3004,13 +3135,20 @@ mod tests {
         m.file_selected = 3;
         assert_eq!(m.progress.files[3].path, path(4));
         assert_eq!(act(&mut m, Action::Recheck), []);
-        assert_eq!(m.status.as_deref(), Some("E04 is being checked now"));
+        assert_eq!(
+            m.status,
+            Some(Status::Refused(Refusal::BeingChecked {
+                label: "E04".into()
+            }))
+        );
         m.file_selected = 1;
         m.progress.queue_again(&path(2), "r");
         assert_eq!(act(&mut m, Action::Recheck), []);
         assert_eq!(
-            m.status.as_deref(),
-            Some("E02 will be checked again when the scan is done")
+            m.status,
+            Some(Status::QueuedAgain {
+                label: "E02".into()
+            })
         );
     }
 
@@ -3027,7 +3165,12 @@ mod tests {
             now(),
         );
         assert_eq!(effects, []);
-        assert_eq!(m.status.as_deref(), Some("E02: no such file"));
+        assert_eq!(
+            m.status,
+            Some(Status::NoSuchFile {
+                label: "E02".into()
+            })
+        );
         assert_eq!(m.progress.files[1].label('⠙'), "✗ FAILED: no such file");
         assert!(!m.progress.running());
     }
@@ -3077,7 +3220,13 @@ mod tests {
             !m.progress.outro().iter().any(|l| l.contains("FAILED")),
             "the earlier scan's outro does not list a file its recheck never started"
         );
-        assert_eq!(m.status.as_deref(), Some(why));
+        assert_eq!(
+            m.status,
+            Some(Status::Failed {
+                what: Failure::Recheck,
+                error: why.into(),
+            })
+        );
         act(&mut m, Action::ShowPane(Pane::Files));
         m.file_selected = 0;
         assert!(matches!(
@@ -3144,7 +3293,7 @@ mod tests {
     fn v_while_a_scan_runs_says_so_and_asks_for_nothing() {
         let mut m = scanning();
         assert_eq!(act(&mut m, Action::SwitchView), []);
-        assert_eq!(m.status.as_deref(), Some("the scan is still running"));
+        assert_eq!(m.status, Some(Status::Refused(Refusal::ScanRunning)));
     }
 
     #[test]
@@ -3157,11 +3306,11 @@ mod tests {
         );
         let mut m = scanning();
         assert_eq!(act(&mut m, Action::OpenView(words.clone())), []);
-        assert_eq!(m.status.as_deref(), Some("the scan is still running"));
+        assert_eq!(m.status, Some(Status::Refused(Refusal::ScanRunning)));
         let mut m = accepted();
         act(&mut m, Action::Apply { dry_run: true });
         assert_eq!(act(&mut m, Action::OpenView(words.clone())), []);
-        assert_eq!(m.status.as_deref(), Some("apply is still running"));
+        assert_eq!(m.status, Some(Status::Refused(Refusal::ApplyRunning)));
         // Under a question it only lets the question go, as every action but an answer does.
         let mut m = sample();
         m.confirm = Some(Confirm::Apply);
@@ -3186,8 +3335,11 @@ mod tests {
         update(&mut m, Input::Switched(Err("disk I/O error".into())), now());
         assert_eq!(m.run, before);
         assert_eq!(
-            m.status.as_deref(),
-            Some("could not switch views: disk I/O error")
+            m.status,
+            Some(Status::Failed {
+                what: Failure::Switch,
+                error: "disk I/O error".into(),
+            })
         );
     }
 
@@ -3282,24 +3434,24 @@ mod tests {
     fn a_and_d_wait_for_the_scan_and_for_apply_and_need_an_accepted_fix() {
         let mut m = sample();
         assert_eq!(act(&mut m, Action::Apply { dry_run: false }), []);
-        assert_eq!(m.status.as_deref(), Some("no accepted fixes"));
+        assert_eq!(m.status, Some(Status::Refused(Refusal::NoAcceptedFixes)));
         let mut m = accepted();
         m.progress
             .start("r", "subcheck scan --run r /m".into(), false);
         for dry_run in [false, true] {
             assert_eq!(act(&mut m, Action::Apply { dry_run }), []);
-            assert_eq!(m.status.as_deref(), Some("the scan is still running"));
+            assert_eq!(m.status, Some(Status::Refused(Refusal::ScanRunning)));
         }
         let mut m = accepted();
         act(&mut m, Action::Apply { dry_run: true });
         for dry_run in [false, true] {
             assert_eq!(act(&mut m, Action::Apply { dry_run }), []);
-            assert_eq!(m.status.as_deref(), Some("already applying"));
+            assert_eq!(m.status, Some(Status::Refused(Refusal::AlreadyApplying)));
         }
         // From the files view too.
         act(&mut m, Action::ShowPane(Pane::Files));
         assert_eq!(act(&mut m, Action::Apply { dry_run: false }), []);
-        assert_eq!(m.status.as_deref(), Some("already applying"));
+        assert_eq!(m.status, Some(Status::Refused(Refusal::AlreadyApplying)));
     }
 
     #[test]
@@ -3307,10 +3459,10 @@ mod tests {
         let mut m = accepted();
         act(&mut m, Action::Apply { dry_run: true });
         assert_eq!(act(&mut m, Action::SwitchView), []);
-        assert_eq!(m.status.as_deref(), Some("apply is still running"));
+        assert_eq!(m.status, Some(Status::Refused(Refusal::ApplyRunning)));
         act(&mut m, Action::ShowPane(Pane::Files));
         assert_eq!(act(&mut m, Action::Recheck), []);
-        assert_eq!(m.status.as_deref(), Some("apply is still running"));
+        assert_eq!(m.status, Some(Status::Refused(Refusal::ApplyRunning)));
         act(&mut m, Action::Quit);
         assert_eq!(m.confirm, Some(Confirm::Quit));
         update(
@@ -3557,6 +3709,10 @@ mod tests {
         act(&mut m, Action::Apply { dry_run: true });
         update(&mut m, Input::ApplyStarted(Err("no threads".into())), now());
         assert!(!m.progress.busy());
-        assert_eq!(m.status_text().as_deref(), Some("apply failed: no threads"));
+        assert_eq!(m.status, None);
+        assert_eq!(
+            m.progress.line().as_deref(),
+            Some("apply failed: no threads")
+        );
     }
 }

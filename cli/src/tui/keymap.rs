@@ -155,6 +155,7 @@ mod tests {
     use crate::tui::screen::Editor;
     use subcheck_core::review::model::tests_support::{many, path, sample};
     use subcheck_core::review::model::{Confirm, EntryKey};
+    use subcheck_core::review::status::Status;
     use subcheck_core::review::update::tests_support::now;
     use subcheck_core::review::update::{Input, update};
 
@@ -303,7 +304,7 @@ mod tests {
                     let (mut moved, mut selected) = (list(), list());
                     for m in [&mut moved, &mut selected] {
                         m.selected = at;
-                        m.status = Some("a message".into());
+                        m.status = Some(Status::Closed);
                     }
                     let Press::Act(action) = press(&moved, &Screen::default(), key) else {
                         panic!("{key:?} is not an action");
