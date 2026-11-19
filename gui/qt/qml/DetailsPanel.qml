@@ -1,7 +1,7 @@
 // The details panel: the video, 16:9 at the panel's width, black until a finding is shown in it;
 // then the selected finding as the window words it, with Reject and Accept Fix; its file's
 // particulars under a disclosure; and what the check said of the episode selected, while that is
-// the finding's. Nothing is drawn over the video.
+// the finding's. Over the video, only whether it plays or is paused.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -63,9 +63,19 @@ Item {
             Layout.preferredHeight: width * 9 / 16
 
             MpvItem {
+                id: video
+
                 objectName: "video"
                 anchors.fill: parent
                 player: panel.bridge.player
+            }
+            PlayIndicator {
+                objectName: "playIndicator"
+                anchors.top: parent.top
+                anchors.right: parent.right
+                anchors.margins: 8
+                paused: video.paused
+                visible: video.showing
             }
         }
 

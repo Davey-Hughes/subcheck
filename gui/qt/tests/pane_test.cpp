@@ -300,6 +300,24 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"closed"}, 5000);
         QTRY_COMPARE_WITH_TIMEOUT(bright(), 0, 5000);
     }
+
+    // What the window's indicator draws from: a video showing once one is open, paused or playing
+    // as mpv is, and none once it is closed.
+    void thePaneSaysWhetherAVideoShowsAndWhetherItPlays() {
+        reports.clear();
+        player.run(open(video, 2'500'000, 4));
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened paused"}, 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(pane->showing(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(pane->paused(), 5000);
+        player.run(playback(Playback(Playback::kPause{})));
+        QTRY_VERIFY_WITH_TIMEOUT(!pane->paused(), 5000);
+        player.run(playback(Playback(Playback::kPause{})));
+        QTRY_VERIFY_WITH_TIMEOUT(pane->paused(), 5000);
+        reports.clear();
+        player.run(PlayerCommand(PlayerCommand::kClose{}));
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"closed"}, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!pane->showing(), 5000);
+    }
 };
 
 // An X server of the test's own, before Qt picks its platform; and none of the variables

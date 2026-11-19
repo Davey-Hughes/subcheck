@@ -319,10 +319,15 @@ fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
     }
     // A message stays until the user does something else. An answer, the end of an edit and
     // `Interrupt` leave it, so a message that came while a question or the editor held the line
-    // shows once they are done.
+    // shows once they are done. A playback command leaves it too: its report always follows and
+    // takes its place, so that the line does not go blank between the two.
     if !matches!(
         action,
-        Action::Answer(_) | Action::Interrupt | Action::Reword(_) | Action::CancelEdit
+        Action::Answer(_)
+            | Action::Interrupt
+            | Action::Reword(_)
+            | Action::CancelEdit
+            | Action::Playback(_)
     ) {
         m.status = None;
     }
@@ -2724,6 +2729,27 @@ mod tests {
             m.status,
             Some(Status::Refused(Refusal::FileMissing { path: path(1) }))
         );
+    }
+
+    #[test]
+    fn a_playback_key_leaves_the_message_until_its_report_takes_its_place() {
+        for playback in [
+            Playback::Pause,
+            Playback::Seek(5),
+            Playback::NextFrame,
+            Playback::PreviousFrame,
+        ] {
+            let mut m = sample();
+            m.status = Some(Status::Opened { paused: true });
+            act(&mut m, Action::Playback(playback));
+            assert_eq!(m.status, Some(Status::Opened { paused: true }));
+            let at = PlayState {
+                paused: false,
+                at_ms: 1000,
+            };
+            update(&mut m, Input::Played(Ok(at)), now());
+            assert_eq!(m.status, Some(Status::Played(at)));
+        }
     }
 
     #[test]

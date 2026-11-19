@@ -1087,11 +1087,11 @@ private slots:
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
         w.window->resize(w.window->minimumSize());
-        QTRY_COMPARE(w.window->width(), 772);
+        QTRY_COMPARE(w.window->width(), 762);
         QQuickItem *title = w.item("title");
         QQuickItem *undo = w.item("undoButton");
         QVERIFY(title && undo);
-        auto *toolbar = w.window->property("header").value<QQuickItem *>();
+        QQuickItem *toolbar = w.item("toolbar");
         QVERIFY(toolbar);
         const auto undoEndsInPlace = [toolbar, undo] {
             const qreal end = undo->mapToItem(toolbar, QPointF(undo->width(), 0)).x();
@@ -1337,11 +1337,11 @@ private slots:
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
         w.window->resize(w.window->minimumSize());
-        QTRY_COMPARE(w.window->width(), 772);
+        QTRY_COMPARE(w.window->width(), 762);
         QQuickItem *sidebar = w.item("sidebar");
         QQuickItem *list = w.item("findings");
         QQuickItem *details = w.item("details");
-        QTRY_COMPARE(w.item("columns")->width(), 772);
+        QTRY_COMPARE(w.item("columns")->width(), 762);
         QTRY_VERIFY(sidebar->width() <= 160);
         QVERIFY(list->width() <= 280);
         QVERIFY(list->width() >= 260);
@@ -1370,9 +1370,9 @@ private slots:
             QCOMPARE(w.window->size(), QSize(1280, 800));
             QTRY_COMPARE(qRound(sidebar->width()), 220);
             QCOMPARE(qRound(details->width()), 480);
-            QCOMPARE(qRound(list->width()), 576);
+            QCOMPARE(qRound(list->width()), 578);
             w.window->resize(1100, 700);
-            QTRY_COMPARE(qRound(list->width()), 396);
+            QTRY_COMPARE(qRound(list->width()), 398);
             w.drag(sidebar, list, 30);
             QTRY_COMPARE(qRound(sidebar->width()), 250);
             w.drag(list, details, 40);
@@ -1400,9 +1400,14 @@ private slots:
             QQuickItem *details = w.item("details");
             QVERIFY(sidebar && list && details);
             QTRY_COMPARE(qRound(details->width()), 480);
-            w.window->resize(800, 800);
+            // The list gives way first, then the details panel, then the sidebar: at 800 the
+            // sidebar is squeezed only once the details panel is at its least width, which leaves
+            // no room for the details drag. At 830 the details panel is squeezed but has room to
+            // give.
+            w.window->resize(bySidebar ? 800 : 830, 800);
             QTRY_COMPARE(qRound(list->width()), 260);
-            QTRY_VERIFY(sidebar->width() < 220 && details->width() < 480);
+            QTRY_VERIFY(bySidebar ? sidebar->width() < 220 : qRound(sidebar->width()) == 220);
+            QTRY_VERIFY(details->width() < 480);
             if (bySidebar) {
                 const int dragged = qRound(sidebar->width()) - 10;
                 w.drag(sidebar, list, -10);
@@ -1487,6 +1492,192 @@ private slots:
         w.bridge.setFilter(0);
         QTRY_COMPARE(w.rows(), 2);
         QTRY_VERIFY(!empty->property("visible").toBool());
+    }
+
+    // While a video shows, its corner says whether it plays or is paused, as mpv says; it takes no
+    // click. The pane's first word from mpv is waited for, by a change of mpv's own, so that it
+    // cannot land on what the test says for mpv after it.
+    void theIndicatorSaysWhetherTheVideoPlaysWhileOneShows() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        auto *video = qobject_cast<MpvItem *>(w.item("video"));
+        QQuickItem *indicator = w.item("playIndicator");
+        QVERIFY(video && indicator);
+        QVERIFY(!indicator->isVisible());
+        video->MpvAbstractItem::setProperty(QStringLiteral("pause"), true);
+        QTRY_VERIFY(video->paused());
+
+        video->heard(QStringLiteral("vo-configured"), true);
+        QVERIFY(video->showing());
+        QVERIFY(indicator->isVisible());
+        QCOMPARE(indicator->mapToItem(video, QPointF(indicator->width(), 0)),
+                 QPointF(video->width() - 8, 8));
+        for (const bool paused : {true, false, true}) {
+            video->heard(QStringLiteral("pause"), paused);
+            QCOMPARE(video->paused(), paused);
+            QCOMPARE(Shown::item(indicator, "pausedBars")->isVisible(), paused);
+            QCOMPARE(Shown::item(indicator, "playingTriangle")->isVisible(), !paused);
+            QCOMPARE(indicator->property("said").toString(), paused ? "Paused" : "Playing");
+        }
+        QCOMPARE(indicator->acceptedMouseButtons(), Qt::NoButton);
+        const qsizetype from = w.bridge.sent.size();
+        w.click(indicator);
+        QCOMPARE(w.since(from), QStringList());
+
+        video->heard(QStringLiteral("vo-configured"), false);
+        QVERIFY(!video->showing());
+        QVERIFY(!indicator->isVisible());
+        // As mpv makes its video output again for the next file.
+        video->heard(QStringLiteral("vo-configured"), true);
+        QVERIFY(indicator->isVisible());
+    }
+
+    // A row of another height takes the highlight's height at once, as a move takes its place.
+    void theHighlightTakesARowsSizeAtOnce() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QCOMPARE(w.find("findings")->property("highlightResizeDuration").toInt(), 0);
+        QCOMPARE(w.find("findings")->property("highlightMoveDuration").toInt(), 0);
+    }
+
+    // Each column handle is taken within the columns' margins beside its line, over whatever
+    // lies beside it, with the resize cursor, and a press there drags the column and clicks
+    // nothing under it.
+    void aColumnHandleIsTakenWithinTheMarginsBesideItsLine() {
+        QStyleHints *hints = QGuiApplication::styleHints();
+        const auto restore = qScopeGuard(
+            [hints, was = hints->useHoverEffects()] { hints->setUseHoverEffects(was); });
+        hints->setUseHoverEffects(true);
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.delegate(0));
+        QTRY_VERIFY(w.item("episode0"));
+        QList<QQuickItem *> handles;
+        const QList<QQuickItem *> parts = w.item("columns")->childItems();
+        for (QQuickItem *part : parts) {
+            if (part->objectName() == QLatin1String("columnHandle")) {
+                handles << part;
+            }
+        }
+        QCOMPARE(handles.size(), 2);
+        std::sort(handles.begin(), handles.end(),
+                  [](QQuickItem *a, QQuickItem *b) { return a->x() < b->x(); });
+        const auto lineOf = [](QQuickItem *handle) {
+            return qRound(handle->mapToScene(QPointF(handle->width() / 2, 0)).x());
+        };
+        const int entry = w.middle(w.item("episode0")).y();
+        const int row = w.middle(w.delegate(0)).y();
+        const int video = w.middle(w.item("video")).y();
+        // The grip stays within the columns' 8 px margins, but for 3 px over the sidebar's
+        // scroll bars on the handle beside the sidebar. Offsets are from lineOf, which rounds the
+        // line's centre up to the pixel after the handle's x (L = x + 1): the grip spans
+        // [x - reach, x + 9), so the last pixel in is L + 7 on the right and L - reach - 1 on
+        // the left, and the first pixel out is one past each.
+        struct Place {
+            QQuickItem *handle;
+            int y;
+            int in[2];
+            int out[2];
+        };
+        const std::vector<Place> places{{handles[0], entry, {-4, 7}, {-5, 8}},
+                                        {handles[0], row, {-4, 7}, {-5, 8}},
+                                        {handles[1], row, {-9, 7}, {-10, 8}},
+                                        {handles[1], video, {-9, 7}, {-10, 8}}};
+        for (const Place &p : places) {
+            for (const int off : p.in) {
+                QTest::mouseMove(w.window, QPoint(lineOf(p.handle) + off, p.y));
+                QTRY_VERIFY(p.handle->property("active").toBool());
+                QTRY_COMPARE(w.window->cursor().shape(), Qt::SplitHCursor);
+            }
+            for (const int off : p.out) {
+                QTest::mouseMove(w.window, QPoint(lineOf(p.handle) + off, p.y));
+                QTRY_VERIFY(!p.handle->property("active").toBool());
+            }
+        }
+
+        QQuickItem *sidebar = w.item("sidebar");
+        const qreal before = sidebar->width();
+        const qsizetype from = w.bridge.sent.size();
+        const QPoint at(lineOf(handles[0]) - 2, entry);
+        QTest::mouseMove(w.window, at);
+        QTest::mousePress(w.window, Qt::LeftButton, {}, at);
+        QTest::mouseMove(w.window, at + QPoint(15, 0));
+        QTest::mouseMove(w.window, at + QPoint(45, 0));
+        QTest::mouseRelease(w.window, Qt::LeftButton, {}, at + QPoint(45, 0));
+        QTRY_COMPARE(sidebar->width(), before + 45);
+        QCOMPARE(w.since(from), QStringList());
+
+        // Over the video too, on the handle's other side.
+        QQuickItem *details = w.item("details");
+        const qreal wide = details->width();
+        const QPoint onVideo(lineOf(handles[1]) + 7, video);
+        QTest::mouseMove(w.window, onVideo);
+        QTest::mousePress(w.window, Qt::LeftButton, {}, onVideo);
+        QTest::mouseMove(w.window, onVideo + QPoint(15, 0));
+        QTest::mouseMove(w.window, onVideo + QPoint(45, 0));
+        QTest::mouseRelease(w.window, Qt::LeftButton, {}, onVideo + QPoint(45, 0));
+        QTRY_COMPARE(details->width(), wide - 45);
+        QCOMPARE(w.since(from), QStringList());
+
+        // And over a finding row, on the first handle's right side.
+        const qreal grown = sidebar->width();
+        const QPoint onRow(lineOf(handles[0]) + 7, row);
+        QTest::mouseMove(w.window, onRow);
+        QTest::mousePress(w.window, Qt::LeftButton, {}, onRow);
+        QTest::mouseMove(w.window, onRow + QPoint(15, 0));
+        QTest::mouseMove(w.window, onRow + QPoint(45, 0));
+        QTest::mouseRelease(w.window, Qt::LeftButton, {}, onRow + QPoint(45, 0));
+        QTRY_COMPARE(sidebar->width(), grown + 45);
+        QCOMPARE(w.since(from), QStringList());
+    }
+
+    // The grip leaves the sidebar's scroll bars to them: dragging a list's own bar scrolls it and
+    // does not move the column.
+    void aSidebarScrollBarIsNotTakenByTheColumnHandle() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        w.bridge.folders()->set(manyReviews());
+        QQuickItem *sidebar = w.item("sidebar");
+        QQuickItem *reviews = w.item("reviews");
+        QVERIFY(sidebar && reviews);
+        QTRY_VERIFY(reviews->property("contentHeight").toReal() > reviews->height() + 1);
+        QTRY_VERIFY(qAbs(reviews->height() - sidebar->height() / 3) < 1);
+        const qreal before = sidebar->width();
+        QCOMPARE(reviews->property("contentY").toReal(), 0.0);
+        // The bar's thumb, at the top of the right edge of the list.
+        const qreal thumb =
+            reviews->height() * reviews->height() / reviews->property("contentHeight").toReal();
+        const QPointF top = reviews->mapToScene(QPointF(reviews->width() - 4, thumb / 2));
+        const QPoint at = top.toPoint();
+        QTest::mouseMove(w.window, at);
+        QTest::mousePress(w.window, Qt::LeftButton, {}, at);
+        QTest::mouseMove(w.window, at + QPoint(0, 10));
+        QTest::mouseMove(w.window, at + QPoint(0, 30));
+        QTest::mouseRelease(w.window, Qt::LeftButton, {}, at + QPoint(0, 30));
+        QTRY_VERIFY(reviews->property("contentY").toReal() > 0);
+        QCOMPARE(sidebar->width(), before);
+    }
+
+    // A line across the window, under the menu bar and above the toolbar's words.
+    void aLineSitsBetweenTheMenuBarAndTheToolbar() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QQuickItem *line = w.item("menuLine");
+        auto *bar = w.window->property("menuBar").value<QQuickItem *>();
+        QVERIFY(line && bar);
+        QVERIFY(line->isVisible());
+        QCOMPARE(line->height(), 1.0);
+        QCOMPARE(line->width(), qreal(w.window->width()));
+        QCOMPARE(line->mapToScene(QPointF(0, 0)).y(), bar->height());
+        QVERIFY(w.item("title")->mapToScene(QPointF(0, 0)).y() >= bar->height() + 1);
+        // The line follows the bar: with none drawn there is no line.
+        bar->setVisible(false);
+        QVERIFY(!line->isVisible());
+        bar->setVisible(true);
+        QVERIFY(line->isVisible());
     }
 
     // Esc and OK each close the dialog, which ends the window with 1; a click beside it does not.

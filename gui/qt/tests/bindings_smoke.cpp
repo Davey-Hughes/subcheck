@@ -350,7 +350,7 @@ void a_run_opens_and_each_part_of_a_change_crosses(const std::string &folder) {
     const PlayerCommand::kPlayback *pb = as<PlayerCommand::kPlayback>(ui.played[1]);
     const Playback::kSeek *sk = pb ? as<Playback::kSeek>(pb->v1) : nullptr;
     check(sk && sk->v1 == 5, "a seek of 5 s goes to the player");
-    check(!ui.summary->status, "a seek clears the status line");
+    check(message<Status::kCouldNotOpen>(*ui.summary), "a seek leaves the message to its report");
 
     s->report(PlayerReport(PlayerReport::kPlayed{PlayState{true, 6000}}));
     const Status::kPlayed *played = message<Status::kPlayed>(ui.next("played"));

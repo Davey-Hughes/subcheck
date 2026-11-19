@@ -1878,8 +1878,6 @@ mod tests {
         assert_eq!(summary.accepted, 3);
         // The other two commands, and what their reports say.
         s.send(Action::Playback(Playback::Pause));
-        let (_, summary) = next_change(&s);
-        assert_eq!(summary.status, None);
         assert_eq!(
             next(&s),
             Some(Event::Player(PlayerCommand::Playback(Playback::Pause)))

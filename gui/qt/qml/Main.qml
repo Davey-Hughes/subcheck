@@ -17,13 +17,21 @@ ApplicationWindow {
     required property SessionBridge bridge
     required property WindowSettings settings
 
-    // Each column's least width, and room for the handles between them. As the window narrows,
-    // the list gives way first, then the details panel, then the sidebar, whose widest leaves the
-    // other two their least.
+    // The width of a column handle's line, which the handles' room below and the window's least
+    // width count, so that they follow it.
+    readonly property int handleWidth: 1
+
+    // Each column's least width, and room for the handles between them: two, between three
+    // columns. As the window narrows, the list gives way first, then the details panel, then the
+    // sidebar, whose widest leaves the other two their least.
     readonly property int sidebarLeast: 160
     readonly property int listLeast: 260
     readonly property int detailsLeast: 340
-    readonly property int handles: 12
+    readonly property int handles: 2 * handleWidth
+
+    // The lines between the window's parts. Qt Quick's palette has no separator role, so window
+    // text at 20% alpha stands in for the style's, and follows light and dark with it.
+    readonly property color separator: Qt.alpha(palette.windowText, 0.2)
 
     minimumWidth: sidebarLeast + listLeast + detailsLeast + handles
     minimumHeight: 480
@@ -239,36 +247,53 @@ ApplicationWindow {
         onActivated: window.bridge.quit()
     }
 
-    header: ToolBar {
-        RowLayout {
-            anchors.fill: parent
-            anchors.leftMargin: 8
-            anchors.rightMargin: 8
+    header: ColumnLayout {
+        spacing: 0
 
-            // Takes what Undo leaves, so that a long title is cut rather than push Undo out.
-            ColumnLayout {
-                spacing: 0
+        // Where the window draws the menu bar, a line between it and the toolbar: the two are
+        // otherwise one band. It shows only where the window draws the bar.
+        Rectangle {
+            objectName: "menuLine"
+            visible: bar.visible && bar.height > 0
+            color: window.separator
+            implicitHeight: 1
+            Layout.fillWidth: true
+        }
 
-                Label {
-                    objectName: "title"
-                    text: window.bridge.title
-                    textFormat: Text.PlainText
-                    font.bold: true
-                    elide: Text.ElideRight
-                    Layout.fillWidth: true
+        ToolBar {
+            objectName: "toolbar"
+            Layout.fillWidth: true
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 8
+                anchors.rightMargin: 8
+
+                // Takes what Undo leaves, so that a long title is cut rather than push Undo out.
+                ColumnLayout {
+                    spacing: 0
+
+                    Label {
+                        objectName: "title"
+                        text: window.bridge.title
+                        textFormat: Text.PlainText
+                        font.bold: true
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                    }
+                    Label {
+                        objectName: "counts"
+                        text: window.bridge.counts
+                        textFormat: Text.PlainText
+                        opacity: 0.7
+                    }
                 }
-                Label {
-                    objectName: "counts"
-                    text: window.bridge.counts
-                    textFormat: Text.PlainText
-                    opacity: 0.7
+                ToolButton {
+                    objectName: "undoButton"
+                    text: qsTr("Undo")
+                    focusPolicy: Qt.NoFocus
+                    onClicked: window.bridge.undo()
                 }
-            }
-            ToolButton {
-                objectName: "undoButton"
-                text: qsTr("Undo")
-                focusPolicy: Qt.NoFocus
-                onClicked: window.bridge.undo()
             }
         }
     }
@@ -278,6 +303,39 @@ ApplicationWindow {
 
         objectName: "columns"
         anchors.fill: parent
+        // A thin line with a wide place to take hold of it.
+        handle: Rectangle {
+            id: columnHandle
+
+            readonly property bool active: grip.hovered || SplitHandle.pressed
+
+            // The handle at the sidebar's right edge, where its scroll bars end.
+            readonly property bool besideSidebar: Math.abs(x - (sidebar.x + sidebar.width)) < 1
+
+            objectName: "columnHandle"
+            implicitWidth: window.handleWidth
+            color: active ? window.palette.highlight : window.separator
+            containmentMask: gripArea
+
+            // An item of its own, as hover reaches only what an item's own bounds hold. It stays
+            // within the columns' 8 px margins, so that it covers no content, but for 3 px over
+            // the sidebar's scroll bars, which run to its right edge.
+            Item {
+                id: gripArea
+
+                readonly property int reachLeft: columnHandle.besideSidebar ? 3 : 8
+
+                x: -reachLeft
+                width: reachLeft + columnHandle.width + 8
+                height: columnHandle.height
+
+                HoverHandler {
+                    id: grip
+
+                    cursorShape: Qt.SplitHCursor
+                }
+            }
+        }
         // Kept once a drag ends, rather than at each step of it. Each column's own width, not the
         // one it has now: a narrow window squeezes a column the drag did not touch.
         onResizingChanged: {
@@ -329,6 +387,7 @@ ApplicationWindow {
                 model: window.bridge.findings
                 currentIndex: window.bridge.selected
                 highlightMoveDuration: 0
+                highlightResizeDuration: 0
                 highlight: Rectangle {
                     // A tint, so that the row's own colours still read over it, and an outline
                     // at full strength, so that the selection shows on a pale highlight too.
