@@ -1,12 +1,17 @@
-// The window's own words and colours (words.h), with no session: a decision's look, a badge, a
-// time, a count, and a line with its change marked, escaped and counted in UTF-16 as review's
-// spans are.
+// The window's own words and colours (words.h), with no session: every palette's tones, a
+// decision's look, a badge, a time, a count, and a line with its change marked, escaped and counted
+// in UTF-16 as review's spans are.
 #include "offscreen_main.h"
 #include "words.h"
 
 #include <QGuiApplication>
 #include <QPalette>
+#include <QScopeGuard>
+#include <QStringList>
 #include <QTest>
+
+#include <tuple>
+#include <vector>
 
 using namespace subcheck_ffi;
 
@@ -22,12 +27,95 @@ struct Window {
     ~Window() { QGuiApplication::setPalette(QPalette()); }
 };
 
+// A palette's tones on one background as one line, in Tones' order.
+QString said(const Tones &t) {
+    QStringList each;
+    for (const QColor &c :
+         {t.old, t.added, t.oldTint, t.addedTint, t.pending, t.mixed, t.typoBadge, t.timingBadge}) {
+        each << c.name();
+    }
+    return each.join(QLatin1Char(' '));
+}
+
 } // namespace
 
 class WordsTest : public QObject {
     Q_OBJECT
 
 private slots:
+    // Every tone of every palette, on a light background and a dark, as the design chose them:
+    // Old, New, Old tint, New tint, To review, Mixed, Typo badge, Timing badge.
+    void everyPaletteHasItsEightTonesOnEachBackground() {
+        const std::vector<std::tuple<Colours, QString, QString>> expected = {
+            {Colours::Default, "#c62828 #1a7f37 #f19d9d #4ce678 #1f5fbf #9a6700 #dbe7fb #f1e5c6",
+             "#ff7b72 #56d364 #943841 #1d633a #8ab4f8 #e3b341 #1e3557 #4a3b12"},
+            {Colours::Deuteran, "#c73800 #0073ad #ed9d7e #c9e8f7 #57606a #80680a #dbe7fb #f1e5c6",
+             "#ff9166 #5cc8ff #70301a #0e4d73 #d0d7de #f2d45c #1e3557 #4a3b12"},
+            {Colours::Protan, "#8f6300 #0069d1 #e6b64c #7eb5ed #57606a #d02536 #dbe7fb #f1e5c6",
+             "#ffb000 #6cb6ff #6e4600 #114a80 #d0d7de #e87d88 #1e3557 #4a3b12"},
+            {Colours::Tritan, "#d61100 #00757f #f09b94 #4cd9e6 #57606a #3367cc #dbe7fb #f1c6f1",
+             "#ff6052 #1aecff #a12217 #0b4b50 #d0d7de #648bd8 #1e3557 #8b188b"},
+            {Colours::Monochrome, "#646a73 #111315 #e3e5e7 #b4b9c0 #57606a #6a7079 #e3e5e7 #c9cdd1",
+             "#a9afb7 #ffffff #33373c #6a7079 #c8cdd3 #8f959d #2e3238 #565b63"},
+        };
+        QCOMPARE(expected.size(), everyColours.size());
+        for (size_t i = 0; i < expected.size(); ++i) {
+            const auto &[colours, light, dark] = expected[i];
+            QCOMPARE(everyColours[i], colours);
+            QCOMPARE(said(tones(colours, false)), light);
+            QCOMPARE(said(tones(colours, true)), dark);
+        }
+    }
+
+    // Each palette has a name that is kept, which names it back, and words for the Settings
+    // screen; a name no palette has is the default's.
+    void aPaletteIsKeptByANameThatNamesItBack() {
+        const QStringList keys = {"default", "deuteran", "protan", "tritan", "monochrome"};
+        const QStringList labels = {"Default", "Deuteranomaly/deuteranopia",
+                                    "Protanomaly/protanopia", "Tritanomaly/tritanopia",
+                                    "Little or no colour vision"};
+        for (size_t i = 0; i < everyColours.size(); ++i) {
+            const auto at = static_cast<qsizetype>(i);
+            QCOMPARE(coloursKey(everyColours[i]), keys[at]);
+            QCOMPARE(coloursNamed(keys[at]), everyColours[i]);
+            QCOMPARE(coloursLabel(everyColours[i]), labels[at]);
+        }
+        QCOMPARE(coloursNamed("sepia"), Colours::Default);
+        QCOMPARE(coloursNamed(""), Colours::Default);
+        QCOMPARE(coloursNamed("Protan"), Colours::Default);
+    }
+
+    // Every colour the window draws is the palette's it was last told to use, read as it is asked
+    // for: a decision's, a badge's, and a change's in a row and in the panel.
+    void theColoursAreThePalettesInUse() {
+        const auto restore = qScopeGuard([] { useColours(Colours::Default); });
+        QCOMPARE(colours(), Colours::Default);
+        for (const bool isDark : {false, true}) {
+            const Window window(isDark);
+            for (const Colours each : everyColours) {
+                useColours(each);
+                QCOMPARE(colours(), each);
+                const Tones t = tones(each, isDark);
+                QCOMPARE(stateLook(State::kPending, false).tone, t.pending);
+                QCOMPARE(stateLook(State::kAccepted, false).tone, t.added);
+                QCOMPARE(stateLook(State::kRejected, false).tone, t.old);
+                QCOMPARE(stateLook(std::nullopt, false).tone, t.mixed);
+                QCOMPARE(kindTone(Check::kLlm), t.typoBadge);
+                QCOMPARE(kindTone(Check::kTiming), t.timingBadge);
+                QCOMPARE(marked("ab", Span{1, 2}, true, Marking::InRow),
+                         QStringLiteral("a<s><font color=\"%1\">b</font></s>").arg(t.old.name()));
+                QCOMPARE(marked("ab", Span{1, 2}, false, Marking::InRow),
+                         QStringLiteral("a<font color=\"%1\"><b>b</b></font>").arg(t.added.name()));
+                QCOMPARE(marked("ab", Span{1, 2}, true, Marking::InPanel),
+                         QStringLiteral("a<span style=\"background-color:%1\"><s>b</s></span>")
+                             .arg(t.oldTint.name()));
+                QCOMPARE(marked("ab", Span{1, 2}, false, Marking::InPanel),
+                         QStringLiteral("a<span style=\"background-color:%1\"><b>b</b></span>")
+                             .arg(t.addedTint.name()));
+            }
+        }
+    }
+
     void aDecisionShowsAGlyphAndAWordInItsOwnColour() {
         const Window light(false);
         const auto look = [](std::optional<State> s, bool mixed) {
@@ -52,11 +140,11 @@ private slots:
         QCOMPARE(stateLook(State::kRejected, false).tone.name(), "#ff7b72");
         QCOMPARE(stateLook(std::nullopt, false).tone.name(), "#e3b341");
         QCOMPARE(kindTone(Check::kLlm).name(), "#1e3557");
-        QCOMPARE(kindTone(Check::kTiming).name(), "#3b2752");
+        QCOMPARE(kindTone(Check::kTiming).name(), "#4a3b12");
         QCOMPARE(marked("x<y", Span{1, 2}, true, Marking::InPanel),
-                 "x<span style=\"background-color:#5a1d1d\"><s>&lt;</s></span>y");
+                 "x<span style=\"background-color:#943841\"><s>&lt;</s></span>y");
         QCOMPARE(marked("x<y", Span{1, 2}, false, Marking::InPanel),
-                 "x<span style=\"background-color:#1d4428\"><b>&lt;</b></span>y");
+                 "x<span style=\"background-color:#1d633a\"><b>&lt;</b></span>y");
     }
 
     void aBadgeSaysWhatFoundTheFinding() {
@@ -65,7 +153,7 @@ private slots:
         QCOMPARE(kindWord(Check::kLlm), "Typo");
         QCOMPARE(kindWord(Check::kTiming), "Timing");
         QCOMPARE(kindTone(Check::kLlm).name(), "#dbe7fb");
-        QCOMPARE(kindTone(Check::kTiming).name(), "#efe0fb");
+        QCOMPARE(kindTone(Check::kTiming).name(), "#f1e5c6");
     }
 
     void aTimeIsMinutesAndSecondsAndHoursWhenThereAreAny() {
@@ -90,9 +178,9 @@ private slots:
         QCOMPARE(marked("x<y", Span{1, 2}, true, Marking::InRow),
                  "x<s><font color=\"#c62828\">&lt;</font></s>y");
         QCOMPARE(marked("x<y", Span{1, 2}, true, Marking::InPanel),
-                 "x<span style=\"background-color:#ffd7d5\"><s>&lt;</s></span>y");
+                 "x<span style=\"background-color:#f19d9d\"><s>&lt;</s></span>y");
         QCOMPARE(marked("x<y", Span{1, 2}, false, Marking::InPanel),
-                 "x<span style=\"background-color:#ccffd8\"><b>&lt;</b></span>y");
+                 "x<span style=\"background-color:#4ce678\"><b>&lt;</b></span>y");
     }
 
     // Review counts a span in UTF-16 code units, as QString does: a character past U+FFFF before

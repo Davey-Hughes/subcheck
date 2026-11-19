@@ -1,19 +1,28 @@
 // What the window remembers, on a window of the test's own and a settings file in a directory the
 // test makes and removes: never the user's, and never Qt's test mode, whose files go under the
-// user's home. CTest gives it two screens, a large one first and a small one beside it, so that the
-// default size is the window's and not the offscreen screen's.
+// user's home. The app's own file is looked for under an XDG_CONFIG_HOME the test sets. CTest gives
+// it two screens, a large one first and a small one beside it, so that the default size is the
+// window's and not the offscreen screen's.
 #include "offscreen_main.h"
 #include "window_settings.h"
+#include "words.h"
 
+#include <QFile>
+#include <QFont>
+#include <QFontInfo>
+#include <QFontMetricsF>
 #include <QGuiApplication>
 #include <QQuickWindow>
+#include <QScopeGuard>
 #include <QScreen>
 #include <QSignalBlocker>
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QVariantMap>
 
 #include <chrono>
+#include <cmath>
 #include <memory>
 #include <optional>
 
@@ -482,6 +491,237 @@ private slots:
         window.reset();
         QTRY_VERIFY(in(dir)->contains("window/place"));
         QCOMPARE(in(dir)->value("window/place").toPoint(), place);
+    }
+
+    // The palette is kept by its name and drawn with from the start: the settings use the kept one
+    // as they are made, a choice at once, and a name no palette has as the default.
+    void thePaletteIsKeptByNameAndDrawnWithFromTheStart() {
+        const auto restore = qScopeGuard([] { useColours(Colours::Default); });
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        in(dir)->setValue("look/colours", "protan");
+        WindowSettings settings(in(dir), "offscreen");
+        QCOMPARE(settings.colours(), "protan");
+        QCOMPARE(colours(), Colours::Protan);
+        QSignalSpy changed(&settings, &WindowSettings::coloursChanged);
+        settings.setColours("tritan");
+        QCOMPARE(changed.count(), 1);
+        QCOMPARE(colours(), Colours::Tritan);
+        QCOMPARE(in(dir)->value("look/colours").toString(), "tritan");
+        // The same choice again changes nothing.
+        settings.setColours("tritan");
+        QCOMPARE(changed.count(), 1);
+        settings.setColours("sepia");
+        QCOMPARE(changed.count(), 2);
+        QCOMPARE(settings.colours(), "default");
+        QCOMPARE(colours(), Colours::Default);
+        QCOMPARE(in(dir)->value("look/colours").toString(), "default");
+
+        in(dir)->setValue("look/colours", "sepia");
+        useColours(Colours::Monochrome);
+        WindowSettings unknown(in(dir), "offscreen");
+        QCOMPARE(unknown.colours(), "default");
+        QCOMPARE(colours(), Colours::Default);
+    }
+
+    // The Settings window's radio buttons, one for each palette in its order; the arrows step
+    // through them and stop at either end.
+    void eachPaletteIsAChoiceInOrderAndTheArrowsStopAtTheEnds() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        WindowSettings settings(in(dir), "offscreen");
+        const QVariantList choices = settings.colourChoices();
+        QCOMPARE(choices.size(), qsizetype(everyColours.size()));
+        for (size_t i = 0; i < everyColours.size(); ++i) {
+            const QVariantMap choice = choices[static_cast<qsizetype>(i)].toMap();
+            QCOMPARE(choice.value("key").toString(), coloursKey(everyColours[i]));
+            QCOMPARE(choice.value("label").toString(), coloursLabel(everyColours[i]));
+        }
+        QCOMPARE(WindowSettings::coloursBeside("default", 1), "deuteran");
+        QCOMPARE(WindowSettings::coloursBeside("protan", -1), "deuteran");
+        QCOMPARE(WindowSettings::coloursBeside("protan", 2), "monochrome");
+        QCOMPARE(WindowSettings::coloursBeside("monochrome", 1), "monochrome");
+        QCOMPARE(WindowSettings::coloursBeside("default", -1), "default");
+        QCOMPARE(WindowSettings::coloursBeside("sepia", 1), "deuteran");
+    }
+
+    // Each part's text is the platform's size until it is set, each on its own, kept to the half
+    // point from 6 to 24; set to the platform's, it is kept as no size, and follows the platform
+    // again; and all three go back to the platform's at once.
+    void eachPartsTextSizeIsThePlatformsUntilSetAndEachIsItsOwn() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        WindowSettings settings(in(dir), "offscreen");
+        const qreal platform = std::round(QFontInfo(QGuiApplication::font()).pointSizeF() * 2) / 2;
+        QCOMPARE(settings.windowTextSize(), platform);
+        QCOMPARE(settings.listTextSize(), platform);
+        QCOMPARE(settings.detailsTextSize(), platform);
+        QSignalSpy changed(&settings, &WindowSettings::textSizesChanged);
+
+        settings.setWindowTextSize(14);
+        QCOMPARE(changed.count(), 1);
+        QCOMPARE(settings.windowTextSize(), 14.0);
+        QCOMPARE(settings.listTextSize(), platform);
+        QCOMPARE(settings.detailsTextSize(), platform);
+        QCOMPARE(in(dir)->value("text/window").toReal(), 14.0);
+        settings.setListTextSize(12.3);
+        QCOMPARE(settings.listTextSize(), 12.5);
+        settings.setDetailsTextSize(30);
+        QCOMPARE(settings.detailsTextSize(), 24.0);
+        settings.setDetailsTextSize(2);
+        QCOMPARE(settings.detailsTextSize(), 6.0);
+        QCOMPARE(changed.count(), 4);
+        // The same size again changes nothing.
+        settings.setDetailsTextSize(6);
+        QCOMPARE(changed.count(), 4);
+
+        settings.setWindowTextSize(platform);
+        QCOMPARE(settings.windowTextSize(), platform);
+        QVERIFY(!in(dir)->contains("text/window"));
+        QCOMPARE(changed.count(), 5);
+        settings.useSystemTextSizes();
+        QCOMPARE(changed.count(), 6);
+        QCOMPARE(settings.listTextSize(), platform);
+        QCOMPARE(settings.detailsTextSize(), platform);
+        for (const char *key : {"text/window", "text/list", "text/details"}) {
+            QVERIFY2(!in(dir)->contains(key), key);
+        }
+        settings.useSystemTextSizes();
+        QCOMPARE(changed.count(), 6);
+    }
+
+    // A size kept outside 6 to 24, or that is not a number, was not set by the Settings window:
+    // the part's text is the platform's. One inside is kept to the half point.
+    void aKeptSizeOutsideTheRangeOrNotANumberIsThePlatforms() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        in(dir)->setValue("text/window", "big");
+        in(dir)->setValue("text/list", 3);
+        in(dir)->setValue("text/details", 40);
+        WindowSettings settings(in(dir), "offscreen");
+        const qreal platform = std::round(QFontInfo(QGuiApplication::font()).pointSizeF() * 2) / 2;
+        QCOMPARE(settings.windowTextSize(), platform);
+        QCOMPARE(settings.listTextSize(), platform);
+        QCOMPARE(settings.detailsTextSize(), platform);
+        in(dir)->setValue("text/window", "nan");
+        QCOMPARE(settings.windowTextSize(), platform);
+        in(dir)->setValue("text/details", 13.3);
+        QCOMPARE(settings.detailsTextSize(), 13.5);
+    }
+
+    // An unset size is the platform's as it is now: a change of the desktop's font reaches it, and
+    // a size that was set stays as set.
+    void anUnsetSizeFollowsThePlatformsFontAsItChanges() {
+        const auto restore =
+            qScopeGuard([was = QGuiApplication::font()] { QGuiApplication::setFont(was); });
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        WindowSettings settings(in(dir), "offscreen");
+        settings.setListTextSize(14);
+        QSignalSpy changed(&settings, &WindowSettings::textSizesChanged);
+        QFont larger = QGuiApplication::font();
+        const qreal platform = std::round((larger.pointSizeF() + 3) * 2) / 2;
+        larger.setPointSizeF(larger.pointSizeF() + 3);
+        QGuiApplication::setFont(larger);
+        QCOMPARE(changed.count(), 1);
+        QCOMPARE(settings.windowTextSize(), platform);
+        QCOMPARE(settings.detailsTextSize(), platform);
+        QCOMPARE(settings.listTextSize(), 14.0);
+    }
+
+    // A platform font set in pixels has a size in points all the same, which the parts take.
+    void aPlatformFontSetInPixelsGivesItsSizeInPoints() {
+        const auto restore =
+            qScopeGuard([was = QGuiApplication::font()] { QGuiApplication::setFont(was); });
+        QFont pixels = QGuiApplication::font();
+        pixels.setPixelSize(16);
+        QGuiApplication::setFont(pixels);
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        WindowSettings settings(in(dir), "offscreen");
+        // 16 pixels at the tests' 96 dots an inch.
+        QCOMPARE(settings.windowTextSize(), 12.0);
+    }
+
+    // A size in the Settings window's words, from half points.
+    void aSizeIsSaidInPoints() {
+        QCOMPARE(WindowSettings::sizeWords(20), "10 pt");
+        QCOMPARE(WindowSettings::sizeWords(21), "10.5 pt");
+        QCOMPARE(WindowSettings::sizeWords(48), "24 pt");
+    }
+
+    // The boxes count the sizes from 6 to 24 pt in half points. The size returned is one of those
+    // given whose words are widest: in the same font, at a small size and a large one, no size's
+    // words from the first to the last are wider.
+    void theWidestSizeIsOneOfThoseGivenWithTheWidestWords() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        WindowSettings settings(in(dir), "offscreen");
+        QCOMPARE(settings.leastHalfPoints(), 12);
+        QCOMPARE(settings.mostHalfPoints(), 48);
+        for (const qreal points : {6.0, 24.0}) {
+            QFont font = QGuiApplication::font();
+            font.setPointSizeF(points);
+            const QFontMetricsF metrics(font);
+            const int widest = WindowSettings::widestSize(font, 12, 48);
+            QVERIFY2(widest >= 12 && widest <= 48, qPrintable(QString::number(widest)));
+            const qreal most = metrics.horizontalAdvance(WindowSettings::sizeWords(widest));
+            for (int halfPoints = 12; halfPoints <= 48; ++halfPoints) {
+                const QString words = WindowSettings::sizeWords(halfPoints);
+                QVERIFY2(metrics.horizontalAdvance(words) <= most, qPrintable(words));
+            }
+            QCOMPARE(WindowSettings::widestSize(font, 20, 20), 20);
+            QCOMPARE(WindowSettings::widestSize(font, 20, 21), 21);
+        }
+    }
+
+    // The settings' file is under XDG_CONFIG_HOME when that is absolute, on Linux and macOS alike;
+    // otherwise under the home's .config on Linux, and macOS's own preferences there.
+    void theSettingsFileIsUnderAnAbsoluteXdgConfigHome() {
+        const QString file = QStringLiteral("subcheck/subcheck-qt.conf");
+        for (const bool mac : {false, true}) {
+            QCOMPARE(WindowSettings::fileFor(mac, "/c", "/h"),
+                     std::optional<QString>("/c/" + file));
+            QCOMPARE(WindowSettings::fileFor(mac, "/c/", "/h"),
+                     std::optional<QString>("/c/" + file));
+        }
+        for (const char *unset : {"", "relative", "./c"}) {
+            QCOMPARE(WindowSettings::fileFor(false, unset, "/h"),
+                     std::optional<QString>("/h/.config/" + file));
+            QVERIFY(!WindowSettings::fileFor(true, unset, "/h"));
+        }
+    }
+
+    // The app's settings, under a set XDG_CONFIG_HOME, are written to its file there: on Linux the
+    // one Qt's own settings for the app's names use.
+    void theAppsSettingsAreWrittenUnderASetXdgConfigHome() {
+        const QByteArray was = qgetenv("XDG_CONFIG_HOME");
+        const bool wasSet = qEnvironmentVariableIsSet("XDG_CONFIG_HOME");
+        const auto restore = qScopeGuard([&] {
+            if (wasSet) {
+                qputenv("XDG_CONFIG_HOME", was);
+            } else {
+                qunsetenv("XDG_CONFIG_HOME");
+            }
+        });
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        qputenv("XDG_CONFIG_HOME", dir.path().toUtf8());
+        const QString file = dir.filePath("subcheck/subcheck-qt.conf");
+        {
+            const std::unique_ptr<QSettings> store = WindowSettings::appStore();
+            QCOMPARE(store->fileName(), file);
+            QCOMPARE(store->format(), QSettings::IniFormat);
+            store->setValue("look/colours", "protan");
+        }
+        QVERIFY(QFile::exists(file));
+        QCOMPARE(QSettings(file, QSettings::IniFormat).value("look/colours").toString(), "protan");
+#ifndef Q_OS_MACOS
+        // Qt's own format there is INI, in a .conf file.
+        QCOMPARE(QSettings(QSettings::NativeFormat, QSettings::UserScope, "subcheck", "subcheck-qt")
+                     .fileName(),
+                 file);
+#endif
     }
 };
 

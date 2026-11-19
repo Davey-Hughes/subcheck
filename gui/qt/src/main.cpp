@@ -12,7 +12,6 @@
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQuickWindow>
-#include <QSettings>
 #include <QtQml/QQmlExtensionPlugin>
 
 #include <chrono>
@@ -35,8 +34,8 @@ int run(int argc, char **argv) {
     // first window: Linux's default, but not macOS's, which is Metal.
     QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
     QGuiApplication app(argc, argv);
-    // Where the window's settings stick: $XDG_CONFIG_HOME/subcheck/subcheck-qt.conf on Linux, the
-    // app's preferences on macOS.
+    // The names the platform's own place for the window's settings goes by, which macOS uses when
+    // XDG_CONFIG_HOME is not set (WindowSettings::appStore), and Qt's caches.
     QCoreApplication::setOrganizationName(QStringLiteral("subcheck"));
     QCoreApplication::setApplicationName(QStringLiteral("subcheck-qt"));
     // Through QString, as the session takes UTF-8 and toStdString always gives it.
@@ -61,7 +60,7 @@ int run(int argc, char **argv) {
     SessionBridge bridge(std::move(selector), player, std::cout, std::cerr, 10s);
     QObject::connect(&bridge, &SessionBridge::finished, &app,
                      [](int status) { QCoreApplication::exit(status); });
-    WindowSettings settings(std::make_unique<QSettings>(), QGuiApplication::platformName());
+    WindowSettings settings(WindowSettings::appStore(), QGuiApplication::platformName());
     QQmlApplicationEngine engine;
     engine.setInitialProperties({{QStringLiteral("bridge"), QVariant::fromValue(&bridge)},
                                  {QStringLiteral("settings"), QVariant::fromValue(&settings)}});

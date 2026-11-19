@@ -125,6 +125,10 @@ QColor DetailView::stateTone() const {
     return detail ? stateLook(detail->state, false).tone : QColor();
 }
 
+QColor DetailView::oldTone() const { return tones(colours(), dark()).old; }
+
+QColor DetailView::newTone() const { return tones(colours(), dark()).added; }
+
 bool DetailView::edited() const { return detail && detail->edited; }
 
 QString DetailView::now() const {

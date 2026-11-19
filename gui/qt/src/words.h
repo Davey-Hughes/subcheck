@@ -1,5 +1,6 @@
 // The window's own words and colours for what review sends, shared by the list, the details panel
-// and the status bar, so that one thing is called and coloured one way everywhere.
+// and the status bar, so that one thing is called and coloured one way everywhere. The colours are
+// the palette's the window draws with, which the Settings window chooses.
 // None of them is the terminal's: they name review's actions, never a key.
 #pragma once
 
@@ -8,9 +9,42 @@
 #include <QColor>
 #include <QString>
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
+
+// The palettes the window can draw with, one for each kind of colour vision the Settings window
+// names, in its order.
+enum class Colours { Default, Deuteran, Protan, Tritan, Monochrome };
+inline constexpr std::array<Colours, 5> everyColours{
+    Colours::Default, Colours::Deuteran, Colours::Protan, Colours::Tritan, Colours::Monochrome};
+
+// A palette's tones on one background: the words a change takes out and puts in, the tints behind
+// them in the details panel, a finding to review, a row whose decisions differ, and each badge.
+struct Tones {
+    QColor old;
+    QColor added;
+    QColor oldTint;
+    QColor addedTint;
+    QColor pending;
+    QColor mixed;
+    QColor typoBadge;
+    QColor timingBadge;
+};
+Tones tones(Colours colours, bool dark);
+
+// The palette the window draws with: Default until the settings choose another. Every colour below
+// is read from it as it is asked for, so a row or a panel drawn again after a change draws in the
+// new one.
+Colours colours();
+void useColours(Colours colours);
+
+// A palette's name as the settings keep it, which never changes; the palette a kept name names,
+// Default for a name no palette has; and the words the Settings window gives it.
+QString coloursKey(Colours colours);
+Colours coloursNamed(const QString &key);
+QString coloursLabel(Colours colours);
 
 // Text as review sends it, in UTF-8, as the window holds it.
 QString text(const std::string &s);
@@ -19,8 +53,8 @@ QString text(const std::string &s);
 QString stateName(subcheck_ffi::State state);
 
 // How a row or a finding shows its decision, never by colour alone: a glyph and a word, and the
-// colour of both. `state` none is a row whose decided members differ; `mixed` a row whose shown
-// members' decisions differ, which its glyph says even while some are still to review.
+// colour of both, the palette's. `state` none is a row whose decided members differ; `mixed` a row
+// whose shown members' decisions differ, which its glyph says even while some are still to review.
 struct StateLook {
     QString glyph;
     QString word;

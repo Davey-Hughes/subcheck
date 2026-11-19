@@ -116,6 +116,15 @@ bool FindingsModel::apply(const Splice &change) {
     return splice(*this, rows, change.at, change.removed, change.inserted);
 }
 
+void FindingsModel::recolour() {
+    if (rows.empty()) {
+        return;
+    }
+    emit dataChanged(
+        index(0), index(rowCount() - 1),
+        {KindToneRole, StateToneRole, LineRole, CutLineRole, LineReachRole, Qt::DisplayRole});
+}
+
 std::optional<EntryKey> FindingsModel::keyAt(int row) const {
     if (row < 0 || row >= rowCount()) {
         return std::nullopt;

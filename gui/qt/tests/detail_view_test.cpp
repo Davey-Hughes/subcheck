@@ -4,6 +4,7 @@
 #include "offscreen_main.h"
 #include "words.h"
 
+#include <QScopeGuard>
 #include <QSignalSpy>
 #include <QTest>
 
@@ -209,6 +210,22 @@ private slots:
         d.edited = true;
         view.show(d);
         QVERIFY(view.edited());
+    }
+
+    // The tones the panel's blocks are drawn in are the palette's for taken out and put in, the
+    // one in use, with a finding or none.
+    void theBlocksTonesAreThePalettesInUse() {
+        const auto restore = qScopeGuard([] { useColours(Colours::Default); });
+        DetailView view;
+        for (const Colours each : everyColours) {
+            useColours(each);
+            QCOMPARE(view.oldTone(), tones(each, dark()).old);
+            QCOMPARE(view.newTone(), tones(each, dark()).added);
+            view.show(line());
+            QCOMPARE(view.oldTone(), tones(each, dark()).old);
+            QCOMPARE(view.newTone(), tones(each, dark()).added);
+            view.show(std::nullopt);
+        }
     }
 };
 

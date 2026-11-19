@@ -25,6 +25,10 @@ class DetailView : public QObject {
     Q_PROPERTY(QString glyph READ glyph NOTIFY changed)
     Q_PROPERTY(QString stateWord READ stateWord NOTIFY changed)
     Q_PROPERTY(QColor stateTone READ stateTone NOTIFY changed)
+    // The palette's tones for the words a change takes out and puts in, which the panel's blocks
+    // draw their bars and labels in.
+    Q_PROPERTY(QColor oldTone READ oldTone NOTIFY changed)
+    Q_PROPERTY(QColor newTone READ newTone NOTIFY changed)
     // The wording is the person's own, not the suggestion.
     Q_PROPERTY(bool edited READ edited NOTIFY changed)
     // The line as the subtitles have it now, and with the fix, each with its change marked.
@@ -65,6 +69,8 @@ public:
     QString glyph() const;
     QString stateWord() const;
     QColor stateTone() const;
+    QColor oldTone() const;
+    QColor newTone() const;
     bool edited() const;
     QString now() const;
     QString fixed() const;
@@ -78,6 +84,7 @@ public:
     QStringList technical() const;
 
 signals:
+    // What it shows changed: another detail, or the same in another palette.
     void changed();
 
 private:

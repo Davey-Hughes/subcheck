@@ -34,6 +34,9 @@ class SessionBridge : public QObject {
     Q_PROPERTY(FiltersModel *filters READ filters CONSTANT)
     Q_PROPERTY(EpisodesModel *episodes READ episodes CONSTANT)
     Q_PROPERTY(DetailView *detail READ detail CONSTANT)
+    // A finding made up for the Settings window, which draws it as the details panel does, so that
+    // a palette is seen on a change before it is chosen.
+    Q_PROPERTY(DetailView *sample READ sample CONSTANT)
     // The view's name; its counts; the list's heading (the filter's name and count); the words
     // of the View menu's item that switches between a check and its folders; the status bar
     // (that the window is quitting, else review's message, else nothing); the selected row (-1
@@ -73,6 +76,7 @@ public:
     FiltersModel *filters();
     EpisodesModel *episodes();
     DetailView *detail();
+    DetailView *sample();
     PlayerPort *player();
     QString title() const;
     QString counts() const;
@@ -127,6 +131,9 @@ public:
     Q_INVOKABLE void quit();
     // The fatal end's dialog has closed.
     Q_INVOKABLE void dismiss();
+    // Everything drawn in the palette's colours, drawn again in the one now chosen: the rows, the
+    // details and the sample. Nothing else changes, so the selection and every scroll stay.
+    Q_INVOKABLE void recolour();
 
 signals:
     // An event the pump read, for the GUI thread.
@@ -174,6 +181,7 @@ private:
     FiltersModel shows;
     EpisodesModel files;
     DetailView details;
+    DetailView example;
     std::optional<subcheck_ffi::FileLogs> logs;
     std::shared_ptr<subcheck_ffi::Session> session;
     std::shared_ptr<Relay> relay;

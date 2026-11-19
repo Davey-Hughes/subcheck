@@ -30,6 +30,30 @@ bool sameEntry(const std::optional<EntryKey> &a, const std::optional<EntryKey> &
            std::get<EntryKey::kMember>(b->get_variant()).v1;
 }
 
+// The Settings window's sample: a word taken out and a longer one put in, as a typo's fix is.
+Detail sampleFinding() {
+    return Detail{
+        .file = {},
+        .label = {},
+        .group = std::nullopt,
+        .at_ms = std::nullopt,
+        .track = std::nullopt,
+        .more = 0,
+        .note = std::nullopt,
+        .checking = std::nullopt,
+        .truncated = std::nullopt,
+        .state = State::kPending,
+        .edited = false,
+        .mark = std::nullopt,
+        .original = "We should of left before it got dark.",
+        .wording = "We should have left before it got dark.",
+        .original_changed = Span{10, 12},
+        .wording_changed = Span{10, 14},
+        .reason = {},
+        .kind = Kind(Kind::kLine{{}, {}}),
+    };
+}
+
 } // namespace
 
 SessionBridge::SessionBridge(std::vector<std::string> selector, PlayerPort &player,
@@ -44,6 +68,7 @@ SessionBridge::SessionBridge(std::vector<std::string> selector, PlayerPort &play
     quitWait.setSingleShot(true);
     quitWait.setInterval(wait);
     connect(&quitWait, &QTimer::timeout, this, &SessionBridge::giveUp);
+    example.show(sampleFinding());
 }
 
 SessionBridge::~SessionBridge() {
@@ -104,6 +129,8 @@ FiltersModel *SessionBridge::filters() { return &shows; }
 EpisodesModel *SessionBridge::episodes() { return &files; }
 
 DetailView *SessionBridge::detail() { return &details; }
+
+DetailView *SessionBridge::sample() { return &example; }
 
 PlayerPort *SessionBridge::player() { return &port; }
 
@@ -275,6 +302,12 @@ void SessionBridge::dismiss() {
     if (!fatalText.isEmpty()) {
         finish(1);
     }
+}
+
+void SessionBridge::recolour() {
+    list.recolour();
+    emit details.changed();
+    emit example.changed();
 }
 
 void SessionBridge::apply(const Event &event) {

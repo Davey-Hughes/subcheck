@@ -50,6 +50,9 @@ public:
     // The key of the entry at `row`, for `Select`; none outside the list.
     std::optional<subcheck_ffi::EntryKey> keyAt(int row) const;
 
+    // Every row drawn again in the palette now chosen: its badge, its state and its line.
+    void recolour();
+
 private:
     template <typename M, typename I>
     friend bool splice(M &, std::vector<I> &, uint64_t, uint64_t, const std::vector<I> &);

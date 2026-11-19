@@ -6,9 +6,11 @@
 
 #include <QAbstractItemModelTester>
 #include <QColor>
+#include <QScopeGuard>
 #include <QSignalSpy>
 #include <QTest>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -385,6 +387,32 @@ private slots:
             QCOMPARE(role(*model, 0, FindingsModel::LineRole).toString(), line.whole);
             QCOMPARE(role(*model, 0, FindingsModel::CutLineRole).toString(), line.cut);
         }
+    }
+
+    // Another palette redraws every row's coloured parts at once, in place: its badge, its state
+    // and its line in each form, now in the palette's tones; an empty list has nothing to redraw.
+    void anotherPaletteRedrawsEveryRowsColouredParts() {
+        const auto restore = qScopeGuard([] { useColours(Colours::Default); });
+        QSignalSpy changed(model.get(), &QAbstractItemModel::dataChanged);
+        model->recolour();
+        QCOMPARE(changed.count(), 0);
+        QVERIFY(model->apply(splice(0, 0, {row(1), row(3, State::kRejected), row(5)})));
+        useColours(Colours::Tritan);
+        model->recolour();
+        QCOMPARE(changed.count(), 1);
+        QCOMPARE(changed[0][0].toModelIndex().row(), 0);
+        QCOMPARE(changed[0][1].toModelIndex().row(), 2);
+        QList<int> roles = changed[0][2].value<QList<int>>();
+        std::sort(roles.begin(), roles.end());
+        QList<int> expected = {
+            Qt::DisplayRole,         FindingsModel::KindToneRole, FindingsModel::StateToneRole,
+            FindingsModel::LineRole, FindingsModel::CutLineRole,  FindingsModel::LineReachRole};
+        std::sort(expected.begin(), expected.end());
+        QCOMPARE(roles, expected);
+        const Tones tritan = tones(Colours::Tritan, dark());
+        QCOMPARE(role(*model, 1, FindingsModel::StateToneRole).value<QColor>(), tritan.old);
+        QCOMPARE(role(*model, 0, FindingsModel::KindToneRole).value<QColor>(), tritan.typoBadge);
+        QVERIFY(role(*model, 0, FindingsModel::LineRole).toString().contains(tritan.added.name()));
     }
 };
 

@@ -1,7 +1,8 @@
 // The details panel: the video, 16:9 at the panel's width, black until a finding is shown in it;
-// then the selected finding as the window words it, with Reject and Accept Fix; its file's
-// particulars under a disclosure; and what the check said of the episode selected, while that is
-// the finding's. Over the video, only whether it plays or is paused.
+// then the selected finding as the window words it, its line as it is now above its line with the
+// fix, each a block of its own, with Reject and Accept Fix; its file's particulars under a
+// disclosure; and what the check said of the episode selected, while that is the finding's. Over
+// the video, only whether it plays or is paused.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -9,7 +10,9 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import Subcheck
 
-Item {
+// A Control, so that the labels in it take the size of text the window gives the panel. Its hover
+// stays on, as a Control's is by default, so that its buttons still follow the pointer.
+Control {
     id: panel
 
     required property SessionBridge bridge
@@ -143,26 +146,22 @@ Item {
                     Layout.fillWidth: true
                 }
 
-                Heading {
-                    objectName: "nowHeading"
-                    text: qsTr("In the subtitles now")
-                }
-                Label {
-                    objectName: "now"
-                    text: panel.detail.now
-                    textFormat: Text.RichText
-                    wrapMode: Text.Wrap
+                ChangeBlock {
+                    objectName: "nowBlock"
+                    label: qsTr("− In the subtitles now")
+                    line: panel.detail.now
+                    tone: panel.detail.oldTone
+                    Layout.topMargin: 8
                     Layout.fillWidth: true
                 }
-                Heading {
-                    objectName: "fixedHeading"
-                    text: panel.detail.edited ? qsTr("With your wording") : qsTr("With the fix")
-                }
-                Label {
-                    objectName: "fixed"
-                    text: panel.detail.fixed
-                    textFormat: Text.RichText
-                    wrapMode: Text.Wrap
+                ChangeBlock {
+                    objectName: "fixedBlock"
+                    label: panel.detail.edited ? qsTr("+ With your wording")
+                                               : qsTr("+ With the fix")
+                    line: panel.detail.fixed
+                    tone: panel.detail.newTone
+                    Layout.topMargin: 8
+                    Layout.bottomMargin: 4
                     Layout.fillWidth: true
                 }
 

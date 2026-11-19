@@ -107,7 +107,7 @@ qt_add_qml_module(subcheck_window
     VERSION 1.0
     OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/qml/Subcheck"
     QML_FILES qml/Main.qml qml/Sidebar.qml qml/FindingRow.qml qml/DetailsPanel.qml
-            qml/PlayIndicator.qml
+            qml/PlayIndicator.qml qml/ChangeBlock.qml qml/SettingsWindow.qml
     SOURCES src/findings_model.h src/findings_model.cpp src/session_bridge.h
             src/session_bridge.cpp src/status_words.h src/status_words.cpp src/player_port.h
             src/player_port.cpp src/mpv_item.h src/mpv_item.cpp src/overloaded.h src/spliced.h

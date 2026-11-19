@@ -5,6 +5,7 @@
 #include "offscreen_main.h"
 #include "session_bridge.h"
 #include "told.h"
+#include "words.h"
 
 #include <QElapsedTimer>
 #include <QFileInfo>
@@ -742,6 +743,40 @@ private slots:
         QTRY_COMPARE(fatal.count(), 1);
         QCOMPARE(o.bridge.fatal(), "the list is out of step with review");
         QCOMPARE(o.bridge.findings()->rowCount(), 2);
+    }
+
+    // The Settings window's sample is there before any session: a word taken out and a longer one
+    // put in, each marked as the details panel marks a change.
+    void theSampleIsAChangeOfOneWordForAnother() {
+        Opened o({media()});
+        DetailView *sample = o.bridge.sample();
+        QVERIFY(sample->shown());
+        QVERIFY(sample != o.bridge.detail());
+        QCOMPARE(sample->now(), marked("We should of left before it got dark.", Span{10, 12}, true,
+                                       Marking::InPanel));
+        QCOMPARE(sample->fixed(), marked("We should have left before it got dark.", Span{10, 14},
+                                         false, Marking::InPanel));
+        QVERIFY(sample->now().contains("<s>of</s>"));
+        QVERIFY(sample->fixed().contains("<b>have</b>"));
+    }
+
+    // A recolour redraws, in place, everything drawn in the palette's colours: the list's rows, the
+    // details and the sample; and moves nothing, so the selection stays.
+    void aRecolourRedrawsTheListTheDetailsAndTheSampleInPlace() {
+        Opened o({media()});
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        QSignalSpy rows(o.bridge.findings(), &QAbstractItemModel::dataChanged);
+        QSignalSpy detail(o.bridge.detail(), &DetailView::changed);
+        QSignalSpy sample(o.bridge.sample(), &DetailView::changed);
+        QSignalSpy moved(&o.bridge, &SessionBridge::selectionMoved);
+        o.bridge.recolour();
+        QCOMPARE(rows.count(), 1);
+        QCOMPARE(detail.count(), 1);
+        QCOMPARE(sample.count(), 1);
+        QCOMPARE(moved.count(), 0);
+        QCOMPARE(o.bridge.selected(), 0);
+        QCOMPARE(o.bridge.sent, QStringList());
     }
 };
 

@@ -1,9 +1,10 @@
 // The window: its menus; a toolbar with the view's name and counts; three columns, the sidebar,
-// the findings and the details panel; the status bar; and the fatal end's dialog. Layout,
-// bindings and one-line handlers only: what each asks of review is the bridge's
+// the findings and the details panel; the status bar; the Settings window; and the fatal end's
+// dialog. Layout, bindings and one-line handlers only: what each asks of review is the bridge's
 // (session_bridge.cpp), and what the window remembers the settings' (window_settings.cpp). Its
 // keys are the window's whatever has focus, but for a text field's, which takes the keys it types,
-// and an open menu's, which takes them all (menu_keys.h).
+// an open menu's, which takes them all (menu_keys.h), and the Settings window's, which holds all of
+// review's back.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -33,6 +34,17 @@ ApplicationWindow {
     // text at 20% alpha stands in for the style's, and follows light and dark with it.
     readonly property color separator: Qt.alpha(palette.windowText, 0.2)
 
+    // Whether the window's keys reach review: not while Settings is open. Qt counts this window
+    // active while Settings, which is transient for it, has the keys, so that a key typed into
+    // Settings matches this window's shortcuts and menu items too; and a menu bar outside the
+    // window, where one still offers its items, could run them by key or click. Disabled, an item
+    // or a shortcut runs on neither.
+    readonly property bool keysToReview: !settingsWindow.visible
+
+    // The window's own size of text, which its menus and dialogs take too; the list and the details
+    // panel each have their own below.
+    font.pointSize: settings.windowTextSize
+
     minimumWidth: sidebarLeast + listLeast + detailsLeast + handles
     minimumHeight: 480
     title: bridge.title
@@ -56,16 +68,39 @@ ApplicationWindow {
         id: shownFilter
     }
 
+    // A palette chosen in Settings shows at once, everywhere it is drawn.
+    Connections {
+        target: window.settings
+
+        function onColoursChanged() {
+            window.bridge.recolour();
+        }
+    }
+
     menuBar: MenuBar {
         id: bar
 
         Menu {
             title: qsTr("&File")
 
+            // Not StandardKey.Preferences, which some platforms leave with no key. Enabled while
+            // Settings is open, so that where a menu bar still offers it, it brings Settings to
+            // the front rather than do nothing; but not once review has ended in an error, when
+            // Settings, application-modal, would open over the error's dialog and hold back its
+            // OK and Escape.
+            Action {
+                objectName: "settings"
+                enabled: window.bridge.fatal === ""
+                text: qsTr("&Settings…")
+                shortcut: "Ctrl+,"
+                onTriggered: settingsWindow.open()
+            }
+            MenuSeparator {}
             // Not StandardKey.Close, which on Linux has a second key, Ctrl+F4, that KDE's styles
             // warn of as they draw the item. Qt reads Ctrl as Command on macOS, here and below.
             Action {
                 objectName: "close"
+                enabled: window.keysToReview
                 text: qsTr("&Close")
                 shortcut: "Ctrl+W"
                 onTriggered: window.bridge.quit()
@@ -74,6 +109,7 @@ ApplicationWindow {
             // among them.
             Action {
                 objectName: "quit"
+                enabled: window.keysToReview
                 text: qsTr("&Quit")
                 shortcut: "Ctrl+Q"
                 onTriggered: window.bridge.quit()
@@ -86,6 +122,7 @@ ApplicationWindow {
             // warn of as they draw the item.
             Action {
                 objectName: "undo"
+                enabled: window.keysToReview
                 text: qsTr("&Undo")
                 shortcut: "Ctrl+Z"
                 onTriggered: window.bridge.undo()
@@ -107,6 +144,7 @@ ApplicationWindow {
                         required property bool current
 
                         objectName: "show" + index
+                        enabled: window.keysToReview
                         text: name
                         checkable: true
                         checked: current
@@ -119,6 +157,7 @@ ApplicationWindow {
             }
             Action {
                 objectName: "switchView"
+                enabled: window.keysToReview
                 text: window.bridge.switchLabel
                 shortcut: "V"
                 onTriggered: window.bridge.switchView()
@@ -129,18 +168,21 @@ ApplicationWindow {
 
             Action {
                 objectName: "accept"
+                enabled: window.keysToReview
                 text: qsTr("&Accept Fix")
                 shortcut: "A"
                 onTriggered: window.bridge.accept()
             }
             Action {
                 objectName: "reject"
+                enabled: window.keysToReview
                 text: qsTr("&Reject Fix")
                 shortcut: "R"
                 onTriggered: window.bridge.reject()
             }
             Action {
                 objectName: "clear"
+                enabled: window.keysToReview
                 text: qsTr("&Back to Undecided")
                 shortcut: "X"
                 onTriggered: window.bridge.clear()
@@ -148,6 +190,7 @@ ApplicationWindow {
             MenuSeparator {}
             Action {
                 objectName: "play"
+                enabled: window.keysToReview
                 text: qsTr("Show in &Video")
                 shortcut: "O"
                 onTriggered: window.bridge.play()
@@ -155,12 +198,14 @@ ApplicationWindow {
             MenuSeparator {}
             Action {
                 objectName: "nextEpisode"
+                enabled: window.keysToReview
                 text: qsTr("&Next Episode")
                 shortcut: "N"
                 onTriggered: window.bridge.nextEpisode()
             }
             Action {
                 objectName: "previousEpisode"
+                enabled: window.keysToReview
                 text: qsTr("&Previous Episode")
                 shortcut: "P"
                 onTriggered: window.bridge.previousEpisode()
@@ -171,42 +216,49 @@ ApplicationWindow {
 
             Action {
                 objectName: "pause"
+                enabled: window.keysToReview
                 text: qsTr("&Play/Pause")
                 shortcut: "Space"
                 onTriggered: window.bridge.pause()
             }
             Action {
                 objectName: "back5"
+                enabled: window.keysToReview
                 text: qsTr("&Back 5 s")
                 shortcut: "Left"
                 onTriggered: window.bridge.seek(-5)
             }
             Action {
                 objectName: "forward5"
+                enabled: window.keysToReview
                 text: qsTr("&Forward 5 s")
                 shortcut: "Right"
                 onTriggered: window.bridge.seek(5)
             }
             Action {
                 objectName: "back1"
+                enabled: window.keysToReview
                 text: qsTr("Back 1 s")
                 shortcut: ","
                 onTriggered: window.bridge.seek(-1)
             }
             Action {
                 objectName: "forward1"
+                enabled: window.keysToReview
                 text: qsTr("Forward 1 s")
                 shortcut: "."
                 onTriggered: window.bridge.seek(1)
             }
             Action {
                 objectName: "previousFrame"
+                enabled: window.keysToReview
                 text: qsTr("Pre&vious Frame")
                 shortcut: "["
                 onTriggered: window.bridge.previousFrame()
             }
             Action {
                 objectName: "nextFrame"
+                enabled: window.keysToReview
                 text: qsTr("Ne&xt Frame")
                 shortcut: "]"
                 onTriggered: window.bridge.nextFrame()
@@ -214,6 +266,7 @@ ApplicationWindow {
             MenuSeparator {}
             Action {
                 objectName: "closeVideo"
+                enabled: window.keysToReview
                 text: qsTr("&Close Video")
                 shortcut: "Shift+O"
                 onTriggered: window.bridge.closePlayer()
@@ -223,26 +276,32 @@ ApplicationWindow {
 
     // The terminal's keys that no menu item has.
     Shortcut {
+        enabled: window.keysToReview
         sequences: ["J", "Down"]
         onActivated: window.bridge.move(1)
     }
     Shortcut {
+        enabled: window.keysToReview
         sequences: ["K", "Up"]
         onActivated: window.bridge.move(-1)
     }
     Shortcut {
+        enabled: window.keysToReview
         sequences: ["Return", "Enter"]
         onActivated: window.bridge.toggle()
     }
     Shortcut {
+        enabled: window.keysToReview
         sequence: "F"
         onActivated: window.bridge.cycleFilter()
     }
     Shortcut {
+        enabled: window.keysToReview
         sequence: "U"
         onActivated: window.bridge.undo()
     }
     Shortcut {
+        enabled: window.keysToReview
         sequence: "Q"
         onActivated: window.bridge.quit()
     }
@@ -356,10 +415,13 @@ ApplicationWindow {
                                     - window.handles
         }
 
-        // The list takes what the other two leave, so that it gives way first.
-        Item {
+        // The list takes what the other two leave, so that it gives way first. A Control, so that
+        // the labels in it take the list's size of text; its hover stays on, as a Control's is by
+        // default, so that what is in it still follows the pointer.
+        Control {
             SplitView.fillWidth: true
             SplitView.minimumWidth: window.listLeast
+            font.pointSize: window.settings.listTextSize
 
             Label {
                 id: heading
@@ -415,6 +477,7 @@ ApplicationWindow {
 
             objectName: "details"
             bridge: window.bridge
+            font.pointSize: window.settings.detailsTextSize
             SplitView.preferredWidth: window.settings.detailsWidth
             SplitView.minimumWidth: window.detailsLeast
         }
@@ -429,6 +492,14 @@ ApplicationWindow {
         textFormat: Text.PlainText
     }
 
+    SettingsWindow {
+        id: settingsWindow
+
+        settings: window.settings
+        bridge: window.bridge
+        separator: window.separator
+    }
+
     Dialog {
         objectName: "fatal"
         anchors.centerIn: parent
@@ -440,6 +511,9 @@ ApplicationWindow {
         title: qsTr("subcheck")
         standardButtons: Dialog.Ok
         visible: window.bridge.fatal !== ""
+        // Settings, modal, would hold the keys from the window this dialog is in, and with them
+        // the keys that close it.
+        onAboutToShow: settingsWindow.close()
         onClosed: window.bridge.dismiss()
 
         Label {
