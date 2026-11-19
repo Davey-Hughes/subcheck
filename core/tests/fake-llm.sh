@@ -2,13 +2,14 @@
 # A stand-in LLM for the scan tests: reads a subcheck prompt on stdin and "corrects" the typos the
 # fixtures plant ("befor", "trough") in subcheck's reply format. Offline and deterministic.
 #
-# Run through a link named `claude` or `codex`, it prints the reply as that preset reads it:
-# claude's JSON, or codex's events, with made-up usage.
+# Run through a link named `claude`, `codex` or `openai`, it prints the reply in that output's
+# format, as subcheck reads it: claude's JSON, codex's events, or an OpenAI chat completion, with
+# made-up usage.
 #
 #   FAKE_LLM_LOG=<file>    append "<n> lines" per call, to count calls and lines sent
 #   FAKE_LLM_FAIL=1        exit 3 without replying
 #   FAKE_LLM_REPLY=<text>  reply with exactly this instead
-#   FAKE_LLM_PLAIN=1       reply in plain text even as claude or codex
+#   FAKE_LLM_PLAIN=1       reply in plain text even as claude, codex or openai
 set -euo pipefail
 
 prompt=$(cat)
@@ -70,6 +71,10 @@ case "$name" in
     printf '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"%s"}}\n' \
       "$(json "$reply")"
     printf '{"type":"turn.completed","usage":{"input_tokens":1500,"cached_input_tokens":1000,"output_tokens":40}}\n'
+    ;;
+  openai)
+    printf '{"object":"chat.completion","model":"fake","choices":[{"index":0,"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1500,"completion_tokens":40,"total_tokens":1540,"prompt_tokens_details":{"cached_tokens":1000}}}\n' \
+      "$(json "$reply")"
     ;;
   *)
     printf '%s\n' "$reply"

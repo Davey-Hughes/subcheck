@@ -6,12 +6,13 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
   subtitle packets (through the file's Cues) instead of the whole file.
 - `subcheck scan` sends the English lines to an LLM and records each suggested fix in its database
   ([Where findings are kept](#where-findings-are-kept)), with each track `timing` finds shifted,
-  and what each LLM call used ([LLM costs](#llm-costs)). A file unchanged since any earlier scan
-  checked it the same way is skipped; `--force` checks it again. `--run <run>` adds the files to
-  that run, making only the checks they need. On a terminal it opens review's screen as it
-  starts, and each file's findings join the list when the file is done ([Review](#review));
-  `--no-tui` prints its log instead. `--karaoke` makes the screen's apply re-space per-letter
-  karaoke as `apply --karaoke` does.
+  and what each LLM call used ([LLM costs](#llm-costs)). `--llm` picks the LLM: `claude` (the
+  default), `gpt`, `ollama:<model>`, or an entry in the [settings file](#llm-settings). A file
+  unchanged since any earlier scan checked it the same way is skipped; `--force` checks it again.
+  `--run <run>` adds the files to that run, making only the checks they need. On a terminal it opens
+  review's screen as it starts, and each file's findings join the list when the file is done
+  ([Review](#review)); `--no-tui` prints its log instead. `--karaoke` makes the screen's apply
+  re-space per-letter karaoke as `apply --karaoke` does.
 - `subcheck review` steps through a run's fixes, or those of the files under some paths, to
   accept, reject or reword each one. With no argument it opens the folders that hold the newest
   run's files.
@@ -46,7 +47,7 @@ Building needs a C compiler (SQLite is compiled in). At run time:
 
 | Needs | For |
 |---|---|
-| `claude`, `codex` or `ollama` (or any command, with `--llm-cmd`) | `scan` |
+| `claude`, `codex` or `ollama`, or any command (`--llm-cmd`, or an entry in the [settings file](#llm-settings)) | `scan` |
 | `mpv` | `o` in review |
 | mkvtoolnix | `apply` |
 | ffmpeg | `audio` |
@@ -252,6 +253,46 @@ and `pause`, as mpv is to end up, which `reset-on-next-file=pause` would otherwi
 file that is not there (whose size and time cannot be read) says `file missing`, and asks nothing
 of mpv.
 
+## LLM settings
+
+The settings file defines LLMs of your own for `--llm` to pick by name. It is
+`~/.config/subcheck/config.toml` (under `$XDG_CONFIG_HOME` when that is set to an absolute path,
+`~/Library/Application Support/subcheck/` on macOS), or the absolute path in `SUBCHECK_CONFIG`. No
+file is the same as an empty one.
+
+```toml
+default = "mine"
+
+[llm.mine]
+command = "my-llm --fast"
+output = "openai"
+jobs = 4
+chunk_lines = 200
+```
+
+- `command` is run through `sh -c`, as `--llm-cmd`'s is: it reads the prompt on stdin and prints
+  the reply on stdout.
+- `output` is what the command prints: `"text"` (the default) is the reply alone, and reports no
+  usage; `"openai"` is an OpenAI chat completion, and reports its tokens; `"claude"` is
+  `claude -p --output-format json`, and reports tokens and a price; `"codex"` is
+  `codex exec --json`, and reports tokens.
+- `jobs` is the calls in flight to this LLM at once (2 when left out).
+- `chunk_lines` is the lines sent in each call (400 when left out).
+- `default` is the LLM `--llm` means when it is left out. It takes anything `--llm` takes, a
+  preset as well as an entry.
+
+`subcheck scan --llm mine` runs the entry. `-j` and `--chunk-lines` beat the entry's `jobs` and
+`chunk_lines`. A recheck from the screen (`c`) uses the entry as the file has it then, not as it
+was when the run began.
+
+An entry's name is letters, digits, `-` and `_`, and `claude` and `gpt` are taken. A run records
+the entry's name, not its command: after changing what a command runs, rename the entry or scan
+with `--force`, or files checked by the old command are skipped as already checked.
+
+A mistake in the file stops `scan` and review's rechecks, with a one-line message naming the file,
+then the entry or the line the mistake is in. `list` and `apply` do not read it, and `review` reads
+it only to recheck, so all else works with it broken.
+
 ## LLM costs
 
 A scan records what each LLM call used, retries and failed calls too, and after its summary says
@@ -268,8 +309,10 @@ LLM: 98 calls, 1.23M in / 31.2k out tokens, $3.21 at API prices
   rates, not what a Claude subscription bills.
 - `gpt` (Codex) reports tokens only, so no price is shown: subcheck keeps no price list of its own
   to go stale.
-- `ollama:<model>` and `--llm-cmd` report nothing, and nothing is shown; nor for a run made before
-  calls were recorded.
+- `ollama:<model>`, `--llm-cmd` and entries that print text report nothing, and nothing is shown;
+  nor for a run made before calls were recorded.
+- An entry with `output = "openai"`, `"claude"` or `"codex"` reports what its JSON says: tokens,
+  and for `"claude"` a price too.
 
 The tokens in are all of each call's input, read from the prompt cache or not.
 

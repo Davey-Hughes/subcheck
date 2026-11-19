@@ -16,7 +16,8 @@ use super::progress;
 use super::update::{Input, Job, Switch, Task};
 use crate::llm::Backend;
 use crate::scan::{self, file_stamp};
-use crate::store::{Run, Selector, ShowFolder, Store};
+use crate::settings::Settings;
+use crate::store::{Run, ScanRow, Selector, ShowFolder, Store};
 
 /// Runs `update`'s tasks for a UI: through `store`, the connection review writes through; with
 /// `state`, the state directory, where apply writes the fixed tracks; and with `tx`, a sender on
@@ -27,11 +28,30 @@ pub struct Runner<T> {
     store: Store,
     state: PathBuf,
     tx: Sender<T>,
+    /// The settings file a recheck reads; `None` for this process's ([`Settings::load`]).
+    settings: Option<PathBuf>,
 }
 
 impl<T: From<Input> + Send + 'static> Runner<T> {
     pub fn new(store: Store, state: PathBuf, tx: Sender<T>) -> Runner<T> {
-        Runner { store, state, tx }
+        Runner {
+            store,
+            state,
+            tx,
+            settings: None,
+        }
+    }
+
+    /// This runner, its rechecks reading the settings file at `path` rather than this process's.
+    /// For tests, which run on threads of one process: `SUBCHECK_CONFIG` set in it would reach
+    /// every test beside this one, and left unset lets the developer's own file in.
+    #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_settings_at(self, path: PathBuf) -> Runner<T> {
+        Runner {
+            settings: Some(path),
+            ..self
+        }
     }
 
     /// The store's show folders ([`Store::show_folders`]), read through the connection review's
@@ -43,7 +63,12 @@ impl<T: From<Input> + Send + 'static> Runner<T> {
     /// Run `task` and say how it went. A job it starts (`Recheck`, `StartApply`) runs on a
     /// thread of its own, which sends the rest to the channel.
     pub fn run(&mut self, task: Task) -> Input {
-        let Runner { store, state, tx } = self;
+        let Runner {
+            store,
+            state,
+            tx,
+            settings,
+        } = self;
         match task {
             Task::Write { purpose, decisions } => {
                 let result = store.decide(&decisions).map_err(|e| e.to_string());
@@ -79,7 +104,7 @@ impl<T: From<Input> + Send + 'static> Runner<T> {
                     Err("nothing to check".into())
                 } else {
                     let files: Vec<PathBuf> = here.iter().map(PathBuf::from).collect();
-                    recheck(store, tx, &run, &files)
+                    recheck(store, tx, settings.as_deref(), &run, &files)
                 };
                 Input::Started {
                     job,
@@ -156,30 +181,49 @@ fn other_view(store: &Store, to: &Switch) -> anyhow::Result<Run> {
     }
 }
 
-/// Check `files` again into run `run`, as `subcheck scan --run <run> --force <files>` does: with
-/// the run's backend and languages, on a thread of its own that sends to `tx`.
-fn recheck<T: From<Input> + Send + 'static>(
-    store: &mut Store,
-    tx: &Sender<T>,
+/// The options to check run `run`'s files again with: its backend and languages, and that
+/// backend's jobs and chunk size as `settings` have them now.
+fn recheck_options(
+    scan: &ScanRow,
     run: &str,
-    files: &[PathBuf],
-) -> Result<Job, String> {
-    let scan = store
-        .scan_named(run)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("no run named {run}"))?;
-    // One this subcheck no longer knows would fail every file at the LLM: refused here instead.
-    Backend::from_label(&scan.header.backend).map_err(|e| format!("run {run}: {e}"))?;
-    let (backend, langs) = scan::resume(&scan, None, None, &[])?;
-    let opts = scan::Options {
+    settings: &Settings,
+) -> Result<scan::Options, String> {
+    // A backend this subcheck does not know, or an entry the settings file does not name, would
+    // fail every file at the LLM: refused here instead.
+    Backend::from_label(&scan.header.backend, settings)
+        .map_err(|e| format!("run {run} was scanned with {e}"))?;
+    let (backend, langs) = scan::resume(scan, None, None, &[], settings)?;
+    Ok(scan::Options {
         chunk_lines: backend.chunk_lines,
+        jobs: backend.jobs,
         backend,
-        jobs: scan::DEFAULT_JOBS,
         langs,
         force: true,
         verbose: false,
         into: Some(run.to_string()),
+    })
+}
+
+/// Check `files` again into run `run`, as `subcheck scan --run <run> --force <files>` does: with
+/// the run's backend and languages, on a thread of its own that sends to `tx`. An entry is as the
+/// settings file at `settings` has it now, or this process's file when that is `None`.
+fn recheck<T: From<Input> + Send + 'static>(
+    store: &mut Store,
+    tx: &Sender<T>,
+    settings: Option<&Path>,
+    run: &str,
+    files: &[PathBuf],
+) -> Result<Job, String> {
+    // Read each time, so an edit to the file reaches the next recheck.
+    let settings = match settings {
+        Some(path) => Settings::read(path)?,
+        None => Settings::load()?,
     };
+    let scan = store
+        .scan_named(run)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no run named {run}"))?;
+    let opts = recheck_options(&scan, run, &settings)?;
     let planned = scan::plan(files, &opts, store, &mut io::sink()).map_err(|e| format!("{e:#}"))?;
     let scan::Planned::Scan(plan) = planned else {
         return Err("nothing to check".into());
@@ -206,6 +250,85 @@ mod tests {
     use std::time::Duration;
 
     use crate::apply;
+    use crate::llm;
+    use crate::test_support::{copied, fake_llm, scan_row};
+
+    #[test]
+    fn a_recheck_takes_the_entrys_jobs_and_chunk_lines_as_the_settings_have_them_now() {
+        let s = Settings::parse(
+            Path::new("/c/config.toml"),
+            "[llm.mine]\ncommand = \"x\"\njobs = 4\nchunk_lines = 150\n",
+        )
+        .unwrap();
+        let opts = recheck_options(&scan_row("mine", &["eng"]), "r", &s).unwrap();
+        assert_eq!(
+            (
+                opts.backend.label.as_str(),
+                opts.jobs,
+                opts.chunk_lines,
+                opts.force,
+                opts.into.as_deref()
+            ),
+            ("mine", 4, 150, true, Some("r"))
+        );
+        let opts = recheck_options(&scan_row("cmd:my-llm", &["eng"]), "r", &s).unwrap();
+        assert_eq!((opts.jobs, opts.chunk_lines), (llm::JOBS, llm::CHUNK_LINES));
+        let none = Settings::parse(Path::new("/c/config.toml"), "").unwrap();
+        assert_eq!(
+            recheck_options(&scan_row("mine", &["eng"]), "r", &none).err(),
+            Some("run r was scanned with mine, which this subcheck does not know and /c/config.toml does not name".into())
+        );
+    }
+
+    // The settings file the runner was given, not this process's: one without the run's entry
+    // refuses the recheck, naming that file, and one with it runs the entry's command.
+    #[test]
+    fn a_recheck_reads_the_settings_file_the_runner_was_given() {
+        let (dir, file) = copied("typos.mkv");
+        let mut store = Store::open_at(&dir.path().join("subcheck.db")).unwrap();
+        let header = scan_row("mine", &["eng"]).header;
+        let run = store
+            .begin_scan(&header, std::slice::from_ref(&file))
+            .unwrap()
+            .name;
+        let config = dir.path().join("config.toml");
+        let entry = format!("[llm.mine]\ncommand = \"'{}'\"\n", fake_llm().display());
+        std::fs::write(&config, entry).unwrap();
+        let (tx, rx) = mpsc::channel::<Input>();
+        let rechecked = |at: &Path| {
+            let mut runner = Runner::new(
+                store.reopen().unwrap(),
+                dir.path().join("state"),
+                tx.clone(),
+            )
+            .with_settings_at(at.to_path_buf());
+            let paths = vec![file.to_string_lossy().into_owned()];
+            match runner.run(Task::Recheck {
+                run: run.clone(),
+                paths,
+            }) {
+                Input::Started { job, .. } => job.map(|j| j.run),
+                other => panic!("{other:?}"),
+            }
+        };
+        let none = dir.path().join("none.toml");
+        assert_eq!(
+            rechecked(&none),
+            Err(format!(
+                "run {run} was scanned with mine, which this subcheck does not know and {} does \
+                 not name",
+                none.display()
+            ))
+        );
+        assert_eq!(rechecked(&config), Ok(run.clone()));
+        let ended = loop {
+            if let Input::ScanEnded(ended) = rx.recv_timeout(Duration::from_mins(1)).unwrap() {
+                break ended.unwrap();
+            }
+        };
+        // The fake LLM, the entry's command, finds the fixture's two typos.
+        assert_eq!((ended.checked, ended.failed, ended.findings), (1, 0, 2));
+    }
 
     #[test]
     fn files_that_changed_or_went_missing_are_noted() {

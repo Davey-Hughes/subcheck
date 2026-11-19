@@ -5,6 +5,8 @@
 # more are named as a show's episodes, whose like findings group into rows of a member per copy;
 # one copy keeps the fixture's name. CLEAN adds a second run to the store: a copy of typos.mkv in
 # DIR/clean that the fake LLM finds nothing in, so that its folder is a view with no findings.
+# Each scan reads DIR/config.toml as its settings file, which nothing writes, so that the user's is
+# never read: a mistake in theirs would stop the scan.
 # SUBCHECK, REPO_ROOT and DIR must be set: with DIR empty, what follows would work at the
 # filesystem's root.
 foreach(var SUBCHECK REPO_ROOT DIR)
@@ -39,6 +41,7 @@ else()
 endif()
 execute_process(
     COMMAND "${CMAKE_COMMAND}" -E env "SUBCHECK_DB=${DIR}/subcheck.db" "XDG_STATE_HOME=${DIR}/state"
+            "SUBCHECK_CONFIG=${DIR}/config.toml"
             "${SUBCHECK}" scan --no-tui --llm-cmd "'${REPO_ROOT}/core/tests/fake-llm.sh'"
             "${DIR}/media"
     COMMAND_ERROR_IS_FATAL ANY)
@@ -46,7 +49,8 @@ if(CLEAN)
     file(COPY "${REPO_ROOT}/core/tests/fixtures/typos.mkv" DESTINATION "${DIR}/clean")
     execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env "SUBCHECK_DB=${DIR}/subcheck.db"
-                "XDG_STATE_HOME=${DIR}/state" FAKE_LLM_REPLY=NONE
+                "XDG_STATE_HOME=${DIR}/state" "SUBCHECK_CONFIG=${DIR}/config.toml"
+                FAKE_LLM_REPLY=NONE
                 "${SUBCHECK}" scan --no-tui --llm-cmd "'${REPO_ROOT}/core/tests/fake-llm.sh'"
                 "${DIR}/clean"
         COMMAND_ERROR_IS_FATAL ANY)

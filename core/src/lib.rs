@@ -17,6 +17,7 @@ pub mod mkv;
 pub mod player;
 pub mod review;
 pub mod scan;
+pub mod settings;
 pub mod store;
 pub mod subs;
 #[cfg(any(test, feature = "test-support"))]

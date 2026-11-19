@@ -2922,6 +2922,8 @@ mod tests {
             .args(["--exact", CHILD, "--ignored", "--nocapture"])
             .env("SUBCHECK_TEST_HOW", how)
             .env("SUBCHECK_TEST_DIR", dir)
+            // A recheck reads the settings file; the developer's must not reach a test.
+            .env("SUBCHECK_CONFIG", dir.join("config.toml"))
             .stdout(Stdio::from(out.try_clone().unwrap()))
             .stderr(Stdio::from(out));
         set(&mut command);

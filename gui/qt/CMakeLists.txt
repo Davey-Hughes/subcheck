@@ -139,14 +139,17 @@ endif()
 
 # A run made by the real `subcheck scan` with core's fake LLM over a copy of a fixture, in a store
 # of the build directory's own: a session given neither variable finds the user's. A test that
-# decides findings needs a run of its own: CTest seeds a fixture once per run of the tests.
+# decides findings needs a run of its own: CTest seeds a fixture once per run of the tests. A
+# recheck reads the settings file, as the seed's scans do, so every test with a store of its own
+# names one beside it too, which nothing writes (SUBCHECK_CONFIG): none reads the user's.
 set(SEEDED "${CMAKE_BINARY_DIR}/seeded")
 add_test(NAME seed_a_run
     COMMAND "${CMAKE_COMMAND}" -D "SUBCHECK=$<TARGET_FILE:subcheck>" -D "REPO_ROOT=${REPO_ROOT}"
             -D "DIR=${SEEDED}" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/seed.cmake")
 set_tests_properties(seed_a_run PROPERTIES
     FIXTURES_SETUP seeded_run TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
-set(SEEDED_ENV "SUBCHECK_DB=${SEEDED}/subcheck.db" "XDG_STATE_HOME=${SEEDED}/state")
+set(SEEDED_ENV "SUBCHECK_DB=${SEEDED}/subcheck.db" "XDG_STATE_HOME=${SEEDED}/state"
+    "SUBCHECK_CONFIG=${SEEDED}/config.toml")
 
 # The smoke decides findings and checks a file again, so its run is seeded at each of its starts,
 # in a directory of its own (tests/seeded.cmake): two copies of typos.mkv, so that a row has two
@@ -159,9 +162,10 @@ add_test(NAME bindings_smoke
     COMMAND "${CMAKE_COMMAND}" -D "SUBCHECK=$<TARGET_FILE:subcheck>" -D "REPO_ROOT=${REPO_ROOT}"
             -D "DIR=${dir}" -D COPIES=2 -D "TEST=$<TARGET_FILE:bindings_smoke>"
             -D "ARGS=${dir}/media" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/seeded.cmake")
+set(env "SUBCHECK_DB=${dir}/subcheck.db" "XDG_STATE_HOME=${dir}/state"
+    "SUBCHECK_CONFIG=${dir}/config.toml")
 set_tests_properties(bindings_smoke PROPERTIES
-    ENVIRONMENT "SUBCHECK_DB=${dir}/subcheck.db;XDG_STATE_HOME=${dir}/state"
-    TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+    ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 
 # The list's model, on the splices it is given, with no session. Offscreen, as every Qt test here
 # is, so that none opens a window on the desktop of whoever runs them.
@@ -245,8 +249,8 @@ function(subcheck_window_test name)
     subcheck_warnings(${name})
     add_test(NAME ${name} COMMAND ${name})
     set(env "SUBCHECK_DB=${dir}/subcheck.db" "XDG_STATE_HOME=${dir}/state"
-        "SUBCHECK_TEST_MEDIA=${dir}/media" "SUBCHECK_TEST_CLEAN=${dir}/clean"
-        ${TEST_MPV_ENV} QT_QPA_PLATFORM=offscreen)
+        "SUBCHECK_CONFIG=${dir}/config.toml" "SUBCHECK_TEST_MEDIA=${dir}/media"
+        "SUBCHECK_TEST_CLEAN=${dir}/clean" ${TEST_MPV_ENV} QT_QPA_PLATFORM=offscreen)
     set_tests_properties(${name} PROPERTIES
         FIXTURES_REQUIRED ${name}_run ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 endfunction()
@@ -276,7 +280,8 @@ foreach(function IN ITEMS quittingDuringADryRunStopsItAndSaysHowToFinishIt
                 -D "DIR=${dir}" -D "TEST=$<TARGET_FILE:session_bridge_job_test>"
                 -D "ARGS=${function}" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/seeded.cmake")
     set(env "SUBCHECK_DB=${dir}/subcheck.db" "XDG_STATE_HOME=${dir}/state"
-        "SUBCHECK_TEST_MEDIA=${dir}/media" QT_QPA_PLATFORM=offscreen)
+        "SUBCHECK_CONFIG=${dir}/config.toml" "SUBCHECK_TEST_MEDIA=${dir}/media"
+        QT_QPA_PLATFORM=offscreen)
     set_tests_properties(session_bridge_job_test.${function} PROPERTIES
         ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 endforeach()
@@ -307,10 +312,10 @@ add_test(NAME app_starts_with_nothing_to_open
     COMMAND "${CMAKE_COMMAND}" -D "APP=$<TARGET_FILE:subcheck-qt>" -D "DIR=${dir}"
             -D "SAYS=subcheck-qt: no runs yet"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/app_starts.cmake")
+set(env "SUBCHECK_DB=${dir}/subcheck.db" "XDG_STATE_HOME=${dir}/state"
+    "SUBCHECK_CONFIG=${dir}/config.toml" ${TEST_MPV_ENV} QT_QPA_PLATFORM=offscreen)
 set_tests_properties(app_starts_with_nothing_to_open PROPERTIES
-    ENVIRONMENT
-        "SUBCHECK_DB=${dir}/subcheck.db;XDG_STATE_HOME=${dir}/state;${TEST_MPV_ENV};QT_QPA_PLATFORM=offscreen"
-    TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+    ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 
 # The tests on real mpv, each on an X display of its own: the pane as the player's mpv
 # (tests/pane_test.cpp), on timing.mkv and ties.mkv, two fixtures with video; and the app end to
@@ -346,7 +351,8 @@ if(NOT APPLE)
     subcheck_warnings(end_to_end_test)
     add_test(NAME end_to_end_test COMMAND end_to_end_test)
     set(env "SUBCHECK_DB=${dir}/subcheck.db" "XDG_STATE_HOME=${dir}/state"
-        "SUBCHECK_TEST_MEDIA=${dir}/media" "SUBCHECK_TEST_DIR=${dir}"
+        "SUBCHECK_CONFIG=${dir}/config.toml" "SUBCHECK_TEST_MEDIA=${dir}/media"
+        "SUBCHECK_TEST_DIR=${dir}"
         "SUBCHECK_QT=$<TARGET_FILE:subcheck-qt>" "SUBCHECK_XVFB=${XVFB}"
         "SUBCHECK_XDOTOOL=${XDOTOOL}" "SUBCHECK_CMAKE=${CMAKE_COMMAND}"
         "SUBCHECK_SEED=${CMAKE_CURRENT_SOURCE_DIR}/tests/seed.cmake"

@@ -1,6 +1,7 @@
 //! The LLM step: a backend is any command that reads the prompt on stdin and prints the reply on
-//! stdout. Presets cover claude, codex (gpt) and ollama; `--llm-cmd` covers anything else. claude
-//! and codex print their reply as JSON, with what the call used.
+//! stdout. Presets cover claude, codex (gpt) and ollama; an entry in the settings file or
+//! `--llm-cmd` covers anything else. claude, codex and a command that prints an OpenAI chat
+//! completion give their reply as JSON, with what the call used.
 
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::group;
+use crate::settings::{Entry, Settings};
 use crate::text::{Line, timestamp};
 
 /// Stored with every scan and every LLM check, so findings can be traced to the prompt that
@@ -27,19 +29,25 @@ pub const TIMEOUT: Duration = Duration::from_mins(10);
 pub const CHUNK_LINES: usize = 400;
 pub const CHUNK_LINES_OLLAMA: usize = 150;
 
+/// LLM calls a scan runs at once, unless `-j` or the LLM's entry in the settings file says.
+pub const JOBS: usize = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Backend {
-    /// What a run records: `claude`, `gpt`, `ollama:<model>` or `cmd:<command>`.
+    /// What a run records: `claude`, `gpt`, `ollama:<model>`, an entry's name or
+    /// `cmd:<command>`.
     pub label: String,
     pub argv: Vec<String>,
     pub chunk_lines: usize,
+    pub jobs: usize,
     pub output: Output,
 }
 
 /// How a backend prints its reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Output {
-    /// The reply alone: ollama, and any `--llm-cmd`.
+    /// The reply alone: ollama, any `--llm-cmd`, and a settings entry with `output = "text"` or
+    /// no `output`.
     Text,
     /// `claude -p --output-format json`: one object, the reply in `result`, with the call's tokens
     /// and its price.
@@ -47,6 +55,9 @@ pub enum Output {
     /// `codex exec --json`: an event a line, the reply in the last agent message, the call's
     /// tokens in `turn.completed`. No price.
     Codex,
+    /// An OpenAI chat completion (`/v1/chat/completions`): the reply in the first choice, the
+    /// call's tokens in `usage`. No price.
+    OpenAi,
 }
 
 /// The system prompt for presets that take one; the instructions themselves go on stdin.
@@ -108,6 +119,7 @@ impl Backend {
                     label: name.to_string(),
                     argv: argv.iter().map(ToString::to_string).collect(),
                     chunk_lines: CHUNK_LINES_OLLAMA,
+                    jobs: JOBS,
                     output: Output::Text,
                 });
             }
@@ -116,6 +128,7 @@ impl Backend {
             label: name.to_string(),
             argv: argv.iter().map(ToString::to_string).collect(),
             chunk_lines: CHUNK_LINES,
+            jobs: JOBS,
             output,
         })
     }
@@ -126,15 +139,48 @@ impl Backend {
             label: format!("cmd:{command}"),
             argv: vec!["sh".into(), "-c".into(), command.into()],
             chunk_lines: CHUNK_LINES,
+            jobs: JOBS,
             output: Output::Text,
         }
     }
 
-    /// The backend a run records, by its label.
-    pub fn from_label(label: &str) -> Result<Backend, String> {
+    /// The settings file's entry `name`: its command run as `--llm-cmd`'s is, recorded by the name.
+    pub fn command(name: &str, entry: &Entry) -> Backend {
+        Backend {
+            label: name.to_string(),
+            chunk_lines: entry.chunk_lines.unwrap_or(CHUNK_LINES),
+            jobs: entry.jobs.unwrap_or(JOBS),
+            output: entry.output,
+            ..Backend::shell(&entry.command)
+        }
+    }
+
+    /// What `--llm` names: a preset, else an entry in `settings`. The file refuses the presets'
+    /// names, and an entry's name has no `:`, so neither can hide the other.
+    pub fn named(name: &str, settings: &Settings) -> Result<Backend, String> {
+        if let Ok(preset) = Backend::preset(name) {
+            return Ok(preset);
+        }
+        match settings.entries.get(name) {
+            Some(entry) => Ok(Backend::command(name, entry)),
+            None => Err(format!(
+                "unknown --llm {name:?}: use claude, gpt, ollama:<model>, an entry in {}, or \
+                 --llm-cmd",
+                settings.path.display()
+            )),
+        }
+    }
+
+    /// The backend a run records, by its label; an entry as `settings` has it now.
+    pub fn from_label(label: &str, settings: &Settings) -> Result<Backend, String> {
         match label.strip_prefix("cmd:") {
             Some(command) => Ok(Backend::shell(command)),
-            None => Backend::preset(label),
+            None => Backend::named(label, settings).map_err(|_| {
+                format!(
+                    "{label}, which this subcheck does not know and {} does not name",
+                    settings.path.display()
+                )
+            }),
         }
     }
 
@@ -194,8 +240,8 @@ pub enum Used {
     /// It started, and its backend said nothing of what it used: killed at the timeout, printing
     /// nothing or something other than its JSON, or JSON with no usage in it. It may have cost.
     Unreported,
-    /// Nothing to count: a backend that never reports (ollama, `--llm-cmd`), or a call that never
-    /// started.
+    /// Nothing to count: a backend whose output is [`Output::Text`], which never reports, or a
+    /// call that never started.
     Untracked,
 }
 
@@ -309,6 +355,7 @@ impl Output {
             }
             Output::Claude => "claude's JSON",
             Output::Codex => "codex's events",
+            Output::OpenAi => "an OpenAI chat completion",
         };
         self.read_json(stdout).map_or_else(
             || {
@@ -328,7 +375,7 @@ impl Output {
     /// The backend, as an error names it.
     fn name(self) -> &'static str {
         match self {
-            Output::Text => "the command",
+            Output::Text | Output::OpenAi => "the command",
             Output::Claude => "claude",
             Output::Codex => "codex",
         }
@@ -341,8 +388,45 @@ impl Output {
             Output::Text => None,
             Output::Claude => read_claude(stdout),
             Output::Codex => read_codex(stdout),
+            Output::OpenAi => read_openai(stdout),
         }
     }
+}
+
+#[derive(Deserialize)]
+struct OpenAiReply {
+    #[serde(default)]
+    choices: Vec<OpenAiChoice>,
+    usage: Option<OpenAiUsage>,
+    error: Option<OpenAiError>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiChoice {
+    message: Option<OpenAiMessage>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiMessage {
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    prompt_tokens_details: Option<OpenAiPromptDetails>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiPromptDetails {
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiError {
+    message: Option<String>,
 }
 
 /// Whether `cost` can be a price: finite, and not below 0. In claude's reply one that is not is
@@ -383,6 +467,52 @@ fn read_claude(stdout: &str) -> Option<Said> {
         let reply = r.result.map(|result| format!("{result}\n"));
         (
             reply.ok_or_else(|| "claude's reply has no result".into()),
+            None,
+        )
+    };
+    Some(Said {
+        reply,
+        reason,
+        usage,
+    })
+}
+
+/// `None` when `stdout` is not a JSON object.
+fn read_openai(stdout: &str) -> Option<Said> {
+    let r: OpenAiReply = serde_json::from_str(stdout).ok()?;
+    let usage = r.usage.map(|u| Usage {
+        input_tokens: u.prompt_tokens.unwrap_or(0),
+        output_tokens: u.completion_tokens.unwrap_or(0),
+        cache_read_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+        cache_write_tokens: None,
+        cost_usd: None,
+    });
+    let said = r
+        .error
+        .and_then(|e| e.message)
+        .filter(|m| !m.trim().is_empty());
+    let choice = r.choices.into_iter().next();
+    let stopped = choice.as_ref().and_then(|c| c.finish_reason.clone());
+    let (reply, reason) = if let Some(why) = said {
+        (Err(format!("the reply is an error: {why:.200}")), Some(why))
+    } else if stopped.as_deref() == Some("length") {
+        (
+            Err("the reply was cut off at the server's length limit".into()),
+            None,
+        )
+    } else if let Some(early) = stopped.filter(|s| s == "content_filter") {
+        // A reply the server cut short is no whole reply: taken as one, its chunk would be
+        // recorded as checked with nothing found in lines it never reached. Servers word a normal
+        // end many ways (`eos_token`, `stop_sequence`, `STOP`, an empty string), so only the
+        // reasons known to cut a reply fail.
+        (Err(format!("the reply stopped early: {early:.200}")), None)
+    } else {
+        // As claude's reader ends its reply.
+        let content = choice.and_then(|c| c.message).and_then(|m| m.content);
+        (
+            content
+                .map(|c| format!("{c}\n"))
+                .ok_or_else(|| "the reply has no content".into()),
             None,
         )
     };
@@ -851,6 +981,8 @@ fn run(argv: &[String], input: &str, timeout: Duration) -> Result<String, Failed
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::text::Occurrence;
 
@@ -974,6 +1106,8 @@ mod tests {
     const CLAUDE: &str = include_str!("../tests/fixtures/llm/claude.json");
     /// A real reply of `codex exec --json` (0.163.0), whole.
     const CODEX: &str = include_str!("../tests/fixtures/llm/codex.jsonl");
+    /// An OpenAI chat completion, as the API documents it.
+    const OPENAI: &str = include_str!("../tests/fixtures/llm/openai.json");
     /// A real failed call of `codex exec --json` (0.163.0), whole: a model the account cannot use.
     const CODEX_ERROR: &str = include_str!("../tests/fixtures/llm/codex-error.jsonl");
 
@@ -1072,6 +1206,108 @@ mod tests {
         assert_eq!(a.reply, Err("codex: stream disconnected".into()));
         let a = Output::Codex.read("");
         assert_eq!(a.reply, Err("reply is not codex's events: (empty)".into()));
+    }
+
+    #[test]
+    fn an_openai_reply_gives_its_content_and_what_the_call_used() {
+        let a = Output::OpenAi.read(OPENAI);
+        assert_eq!(a.reply.as_deref(), Ok("NONE\n"));
+        assert_eq!(
+            a.used,
+            Used::Reported(Usage {
+                input_tokens: 624,
+                output_tokens: 5,
+                cache_read_tokens: Some(512),
+                cache_write_tokens: None,
+                cost_usd: None,
+            })
+        );
+        let a = Backend {
+            output: Output::OpenAi,
+            ..Backend::shell("cat")
+        }
+        .call(OPENAI, TIMEOUT);
+        assert_eq!(a.reply.as_deref(), Ok("NONE\n"));
+    }
+
+    #[test]
+    fn an_openai_reply_cut_off_at_its_length_limit_fails_and_keeps_its_usage() {
+        let cut = OPENAI.replace(r#""finish_reason":"stop""#, r#""finish_reason":"length""#);
+        let a = Output::OpenAi.read(&cut);
+        assert_eq!(
+            a.reply,
+            Err("the reply was cut off at the server's length limit".into())
+        );
+        assert_eq!(reported(&a.used).map(|u| u.output_tokens), Some(5));
+    }
+
+    #[test]
+    fn an_openai_reply_stopped_by_the_content_filter_fails_and_keeps_its_usage() {
+        let stopped = OPENAI.replace(
+            r#""finish_reason":"stop""#,
+            r#""finish_reason":"content_filter""#,
+        );
+        let a = Output::OpenAi.read(&stopped);
+        assert_eq!(
+            a.reply,
+            Err("the reply stopped early: content_filter".into())
+        );
+        assert_eq!(reported(&a.used).map(|u| u.output_tokens), Some(5));
+        // Any other word a server ends a whole reply with is read as one.
+        for end in ["eos_token", "stop_sequence", "STOP", ""] {
+            let ended = OPENAI.replace(
+                r#""finish_reason":"stop""#,
+                &format!(r#""finish_reason":"{end}""#),
+            );
+            assert_eq!(
+                Output::OpenAi.read(&ended).reply.as_deref(),
+                Ok("NONE\n"),
+                "{end}"
+            );
+        }
+        // A null reason, or none, as some servers send: a whole reply.
+        let null = OPENAI.replace(r#""finish_reason":"stop""#, r#""finish_reason":null"#);
+        let absent = OPENAI.replace(r#","finish_reason":"stop""#, "");
+        assert!(null.contains("null") && !absent.contains("finish_reason"));
+        for whole in [&null, &absent] {
+            assert_eq!(
+                Output::OpenAi.read(whole).reply.as_deref(),
+                Ok("NONE\n"),
+                "{whole}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_openai_reply_without_content_usage_or_json_says_so() {
+        let empty = OPENAI.replace(r#""content":"NONE""#, r#""content":null"#);
+        assert_eq!(
+            Output::OpenAi.read(&empty).reply,
+            Err("the reply has no content".into())
+        );
+        let bare = r#"{"choices":[{"message":{"content":"NONE"},"finish_reason":"stop"}]}"#;
+        assert_eq!(Output::OpenAi.read(bare).used, Used::Unreported);
+        let a = Output::OpenAi.read("hello\n");
+        assert_eq!(
+            a.reply,
+            Err("reply is not an OpenAI chat completion: hello".into())
+        );
+        assert_eq!(a.used, Used::Unreported);
+    }
+
+    #[test]
+    fn an_openai_error_object_is_the_reason_whether_the_command_failed_or_not() {
+        let said = r#"{"error":{"message":"model not found"}}"#;
+        assert_eq!(
+            Output::OpenAi.read(said).reply,
+            Err("the reply is an error: model not found".into())
+        );
+        let a = failing(Output::OpenAi, said, "");
+        assert_eq!(
+            a.reply,
+            Err("sh exited with exit status: 1; the command said: model not found".into())
+        );
+        assert_eq!(a.used, Used::Unreported);
     }
 
     /// A JSON backend that prints `stdout`, says `stderr` (when there is any), and exits 1.
@@ -1395,14 +1631,70 @@ mod tests {
             "ollama:gemma4:12b-it-qat",
             "cmd:my-llm --x",
         ] {
-            let b = Backend::from_label(label).unwrap();
+            let b = Backend::from_label(label, &settings("")).unwrap();
             assert_eq!(b.label, label);
         }
         assert_eq!(
-            Backend::from_label("cmd:my-llm --x").unwrap().argv,
+            Backend::from_label("cmd:my-llm --x", &settings(""))
+                .unwrap()
+                .argv,
             Backend::shell("my-llm --x").argv
         );
-        assert!(Backend::from_label("gemini").is_err());
+        assert!(Backend::from_label("gemini", &settings("")).is_err());
+    }
+
+    fn settings(text: &str) -> Settings {
+        Settings::parse(Path::new("/c/config.toml"), text).unwrap()
+    }
+
+    #[test]
+    fn an_entry_is_a_backend_by_its_name() {
+        let s = settings(
+            "[llm.mine]\ncommand = \"my-llm --fast\"\noutput = \"claude\"\njobs = 4\nchunk_lines = 200\n[llm.plain]\ncommand = \"x\"\n",
+        );
+        assert_eq!(
+            Backend::named("mine", &s),
+            Ok(Backend {
+                label: "mine".into(),
+                argv: vec!["sh".into(), "-c".into(), "my-llm --fast".into()],
+                chunk_lines: 200,
+                jobs: 4,
+                output: Output::Claude,
+            })
+        );
+        let p = Backend::named("plain", &s).unwrap();
+        assert_eq!(
+            (p.chunk_lines, p.jobs, p.output),
+            (CHUNK_LINES, JOBS, Output::Text)
+        );
+        for preset in ["claude", "gpt", "ollama:gemma4"] {
+            assert_eq!(
+                Backend::named(preset, &s),
+                Backend::preset(preset),
+                "{preset}"
+            );
+        }
+        assert_eq!(Backend::preset("claude").unwrap().jobs, JOBS);
+        assert_eq!(Backend::shell("x").jobs, JOBS);
+        assert_eq!(
+            Backend::named("nope", &s),
+            Err("unknown --llm \"nope\": use claude, gpt, ollama:<model>, an entry in /c/config.toml, or --llm-cmd".into())
+        );
+    }
+
+    #[test]
+    fn a_recorded_label_finds_its_backend_again() {
+        let s = settings("[llm.mine]\ncommand = \"x\"\n");
+        assert_eq!(Backend::from_label("mine", &s), Backend::named("mine", &s));
+        assert_eq!(
+            Backend::from_label("cmd:my-llm", &s),
+            Ok(Backend::shell("my-llm"))
+        );
+        assert_eq!(Backend::from_label("gpt", &s), Backend::preset("gpt"));
+        assert_eq!(
+            Backend::from_label("gone", &s),
+            Err("gone, which this subcheck does not know and /c/config.toml does not name".into())
+        );
     }
 
     #[test]

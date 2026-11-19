@@ -18,6 +18,7 @@ use crate::blocks::{self, ReadPath};
 use crate::list::shell_quote;
 use crate::llm::{self, Answer, Backend, Spent, Suggestion, Usage, Used};
 use crate::mkv::{self, Layout, TRACK_TYPE_SUBTITLE, Track, Truncated};
+use crate::settings::Settings;
 use crate::store::{
     self, Attempt, Check, CheckedWith, FileRecord, Finding, LlmCall, Made, Record, RunHeader,
     Saved, ScanRow, Store, TrackRecord,
@@ -28,9 +29,6 @@ use crate::timing::{self, record, shared};
 
 /// The subtitle languages a scan checks unless told otherwise.
 pub const DEFAULT_LANG: &str = "eng";
-
-/// LLM calls a scan runs at once, unless `--jobs` says.
-pub const DEFAULT_JOBS: usize = 2;
 
 pub struct Options {
     pub backend: Backend,
@@ -613,17 +611,18 @@ fn read(
 
 /// The backend and languages for adding to the run `scan` (`scan --run`): the run's own, which
 /// `llm`, `llm_cmd` and `langs`, when given, must match. A run has one backend and one set of
-/// languages.
+/// languages. An entry's backend is as `settings` has it now.
 pub fn resume(
     scan: &ScanRow,
     llm: Option<&str>,
     llm_cmd: Option<&str>,
     langs: &[String],
+    settings: &Settings,
 ) -> Result<(Backend, Vec<String>), String> {
     let header = &scan.header;
     let given = match (llm_cmd, llm) {
         (Some(cmd), _) => Some(Backend::shell(cmd)),
-        (None, Some(name)) => Some(Backend::preset(name)?),
+        (None, Some(name)) => Some(Backend::named(name, settings)?),
         (None, None) => None,
     };
     let backend = match given {
@@ -634,12 +633,13 @@ pub fn resume(
             ));
         }
         Some(b) => b,
-        // One this subcheck no longer knows is refused when a file needs the LLM: the command the
-        // run recorded may not work as it did.
-        None => Backend::from_label(&header.backend).unwrap_or_else(|_| Backend {
+        // A backend this subcheck does not know, or an entry the settings file does not name, is
+        // refused when a file needs the LLM: the command the run recorded may not work as it did.
+        None => Backend::from_label(&header.backend, settings).unwrap_or_else(|_| Backend {
             label: header.backend.clone(),
             argv: Vec::new(),
             chunk_lines: llm::CHUNK_LINES,
+            jobs: llm::JOBS,
             output: llm::Output::Text,
         }),
     };
@@ -714,8 +714,8 @@ fn start_adding(
         }
         if opts.backend.argv.is_empty() {
             anyhow::bail!(
-                "run {} was scanned with {}, which this subcheck does not know: scan the files \
-                 it lacks into a new run",
+                "run {} was scanned with {}, which this subcheck does not know and the settings \
+                 file does not name: scan the files it lacks into a new run",
                 scan.name,
                 opts.backend.label
             );
@@ -1191,6 +1191,7 @@ fn findings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::scan_row;
     use crate::text::Occurrence;
 
     fn line(text: &str) -> Line {
@@ -1205,30 +1206,17 @@ mod tests {
         }
     }
 
-    fn run_with(backend: &str, langs: &[&str]) -> ScanRow {
-        ScanRow {
-            id: 1,
-            name: "r".into(),
-            header: RunHeader {
-                started: Timestamp::UNIX_EPOCH,
-                backend: backend.into(),
-                command: Vec::new(),
-                prompt_version: llm::PROMPT_VERSION,
-                version: String::new(),
-                langs: langs.iter().map(|l| (*l).to_string()).collect(),
-            },
-        }
-    }
-
     fn langs(l: &[&str]) -> Vec<String> {
         l.iter().map(|l| (*l).to_string()).collect()
     }
 
     #[test]
     fn adding_to_a_run_takes_its_backend_and_languages_unless_they_are_given_alike() {
-        let resume =
-            |run: &ScanRow, llm, llm_cmd, langs: &[String]| super::resume(run, llm, llm_cmd, langs);
-        let run = run_with("claude", &["eng", "und"]);
+        let none = Settings::parse(Path::new("/c/config.toml"), "").unwrap();
+        let resume = |run: &ScanRow, llm, llm_cmd, langs: &[String]| {
+            super::resume(run, llm, llm_cmd, langs, &none)
+        };
+        let run = scan_row("claude", &["eng", "und"]);
         let (b, l) = resume(&run, None, None, &[]).unwrap();
         assert_eq!((b.label.as_str(), l), ("claude", langs(&["eng", "und"])));
         // The same, given again (in another order).
@@ -1243,15 +1231,38 @@ mod tests {
             "run r checked --lang eng --lang und; leave out --lang to use it"
         );
         // A command LLM comes back from its label.
-        let cmd = run_with("cmd:my-llm --x", &["eng"]);
+        let cmd = scan_row("cmd:my-llm --x", &["eng"]);
         let (b, _) = resume(&cmd, None, None, &[]).unwrap();
         assert_eq!(b.argv, ["sh", "-c", "my-llm --x"]);
         // A backend this subcheck does not know: no command, refused later if a file needs it,
         // whatever command the run recorded.
-        let mut gone = run_with("gemini", &["eng"]);
+        let mut gone = scan_row("gemini", &["eng"]);
         gone.header.command = vec!["gemini".into(), "-p".into()];
         let (b, _) = resume(&gone, None, None, &[]).unwrap();
         assert_eq!((b.label.as_str(), b.argv.len()), ("gemini", 0));
+    }
+
+    #[test]
+    fn a_run_scanned_with_an_entry_resumes_with_it_while_the_file_has_it() {
+        let s = Settings::parse(
+            Path::new("/c/config.toml"),
+            "[llm.mine]\ncommand = \"x\"\njobs = 3\n",
+        )
+        .unwrap();
+        let run = scan_row("mine", &["eng"]);
+        let (b, _) = resume(&run, None, None, &[], &s).unwrap();
+        assert_eq!((b.label.as_str(), b.jobs), ("mine", 3));
+        assert_eq!(
+            resume(&run, Some("mine"), None, &[], &s).unwrap().0.label,
+            "mine"
+        );
+        assert_eq!(
+            resume(&run, Some("claude"), None, &[], &s).unwrap_err(),
+            "run r was scanned with mine; leave out --llm and --llm-cmd to use it"
+        );
+        let none = Settings::parse(Path::new("/c/config.toml"), "").unwrap();
+        let (b, _) = resume(&run, None, None, &[], &none).unwrap();
+        assert_eq!((b.label.as_str(), b.argv.len()), ("mine", 0));
     }
 
     /// A file as `finish` gets it when only the timing check is made of it and found nothing.
@@ -1282,7 +1293,7 @@ mod tests {
             .set_busy_timeout(std::time::Duration::from_millis(50))
             .unwrap();
         let files = [PathBuf::from("/m/a.mkv"), PathBuf::from("/m/b.mkv")];
-        let header = run_with("claude", &["eng"]).header;
+        let header = scan_row("claude", &["eng"]).header;
         let scan = store.begin_scan(&header, &files).unwrap();
         let opts = Options {
             backend: Backend::shell("true"),

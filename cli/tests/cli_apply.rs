@@ -196,7 +196,8 @@ impl Setup {
         s
     }
 
-    /// `subcheck scan` of the file, with core/tests/fake-llm.sh as its LLM.
+    /// `subcheck scan` of the file, with core/tests/fake-llm.sh as its LLM and a settings file
+    /// that is never written, so the developer's own is not read.
     fn scan(&self) -> Output {
         let fake = common::fake_llm();
         Command::new(env!("CARGO_BIN_EXE_subcheck"))
@@ -206,6 +207,7 @@ impl Setup {
             .arg(format!("'{}'", fake.display()))
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env("SUBCHECK_DB", self.db())
+            .env("SUBCHECK_CONFIG", self.root.join("config.toml"))
             .env("FAKE_LLM_LOG", self.root.join("llm-calls.log"))
             .output()
             .unwrap()

@@ -1,0 +1,1 @@
+{"id":"chatcmpl-1","object":"chat.completion","created":1763540000,"model":"gemma4","choices":[{"index":0,"message":{"role":"assistant","content":"NONE"},"finish_reason":"stop"}],"usage":{"prompt_tokens":624,"completion_tokens":5,"total_tokens":629,"prompt_tokens_details":{"cached_tokens":512}}}

@@ -5,6 +5,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::llm;
+use crate::store::{RunHeader, ScanRow};
+
 /// A file under core/tests/fixtures/, built by dev/make-fixtures.sh.
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -127,4 +130,20 @@ pub fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         .unwrap();
     assert!(sh.wait().unwrap().success(), "writing {}", path.display());
     path
+}
+
+/// A scan named `r` that used `backend` and checked `langs`.
+pub fn scan_row(backend: &str, langs: &[&str]) -> ScanRow {
+    ScanRow {
+        id: 1,
+        name: "r".into(),
+        header: RunHeader {
+            started: jiff::Timestamp::UNIX_EPOCH,
+            backend: backend.into(),
+            command: Vec::new(),
+            prompt_version: llm::PROMPT_VERSION,
+            version: String::new(),
+            langs: langs.iter().map(|l| (*l).to_string()).collect(),
+        },
+    }
 }

@@ -17,6 +17,7 @@ use subcheck_core::llm::Backend;
 use subcheck_core::mkv::{self, Track};
 use subcheck_core::review;
 use subcheck_core::scan::{self, Planned};
+use subcheck_core::settings::Settings;
 use subcheck_core::store::{self, Selector, State, Store};
 use subcheck_core::subs::{self, Kind};
 use subcheck_core::text;
@@ -68,7 +69,8 @@ enum Command {
         /// checks they need are made, under it, so running it again adds nothing.
         #[arg(long, conflicts_with = "dry_run")]
         run: Option<String>,
-        /// claude, gpt (Codex) or ollama:<model>. Default: claude, or with --run the run's.
+        /// claude, gpt (Codex), ollama:<model>, or an entry in the settings file. Default: the
+        /// settings file's `default`, else claude; with --run, the run's.
         #[arg(long)]
         llm: Option<String>,
         /// Any other LLM: a shell command that reads the prompt on stdin and prints the reply.
@@ -78,10 +80,11 @@ enum Command {
         /// Default: eng, or with --run the run's.
         #[arg(long = "lang")]
         langs: Vec<String>,
-        /// LLM calls to run at once.
-        #[arg(short, long, default_value_t = scan::DEFAULT_JOBS)]
-        jobs: usize,
-        /// Lines per LLM call. Default 400, or 150 for ollama (its default context is 4k tokens).
+        /// LLM calls to run at once. Default: the entry's `jobs`, else 2.
+        #[arg(short, long)]
+        jobs: Option<usize>,
+        /// Lines per LLM call. Default: the entry's `chunk_lines`, else 400, or 150 for ollama (its
+        /// default context is 4k tokens).
         #[arg(long)]
         chunk_lines: Option<usize>,
         /// Check files even if they are unchanged since an earlier scan.
@@ -257,19 +260,30 @@ fn run(cli: Cli) -> Result<ExitCode> {
             no_tui,
             karaoke,
         } => {
+            let settings = Settings::load().map_err(anyhow::Error::msg)?;
             let state = store::state_dir()?;
             let mut db = Store::open()?;
             let (backend, langs) = if let Some(name) = &run {
                 let scan = db
                     .scan_named(name)?
                     .with_context(|| format!("no run named {name}"))?;
-                scan::resume(&scan, llm.as_deref(), llm_cmd.as_deref(), &langs)
+                scan::resume(&scan, llm.as_deref(), llm_cmd.as_deref(), &langs, &settings)
                     .map_err(anyhow::Error::msg)?
             } else {
-                let backend = match llm_cmd {
-                    Some(cmd) => Backend::shell(&cmd),
-                    None => Backend::preset(llm.as_deref().unwrap_or("claude"))
-                        .map_err(anyhow::Error::msg)?,
+                let backend = match (llm_cmd, llm, &settings.default) {
+                    (Some(cmd), _, _) => Backend::shell(&cmd),
+                    (None, Some(name), _) => {
+                        Backend::named(&name, &settings).map_err(anyhow::Error::msg)?
+                    }
+                    // The file's mistake, not a flag's: no --llm was given to blame.
+                    (None, None, Some(name)) => Backend::named(name, &settings).map_err(|_| {
+                        anyhow::anyhow!(
+                            "{}: default {name:?} names no LLM: use claude, gpt, ollama:<model>, \
+                             or an entry in the file",
+                            settings.path.display()
+                        )
+                    })?,
+                    (None, None, None) => Backend::preset("claude").map_err(anyhow::Error::msg)?,
                 };
                 let langs = if langs.is_empty() {
                     vec![scan::DEFAULT_LANG.to_string()]
@@ -280,8 +294,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             };
             let opts = scan::Options {
                 chunk_lines: chunk_lines.unwrap_or(backend.chunk_lines),
+                jobs: jobs.unwrap_or(backend.jobs),
                 backend,
-                jobs,
                 langs,
                 force,
                 verbose,

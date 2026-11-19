@@ -25,6 +25,8 @@ thiserror = "2"
 jiff = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The settings file (`settings`). Already built for uniffi's macros; read only, so no `display`.
+toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"] }
 # The review screen.
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29.0"

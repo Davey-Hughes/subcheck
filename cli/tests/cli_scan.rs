@@ -1,8 +1,10 @@
 //! `subcheck scan` and `subcheck list` end to end, with core/tests/fake-llm.sh as the LLM, a
-//! temporary directory as XDG_STATE_HOME, and a database in it as SUBCHECK_DB.
+//! temporary directory as XDG_STATE_HOME, a database in it as SUBCHECK_DB, and a settings file in
+//! it, absent until a test writes one, as SUBCHECK_CONFIG.
 
 use subcheck_core::test_support as common;
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -14,61 +16,76 @@ use subcheck_core::store::{self, Check, LlmCall, Selector, State, Store};
 struct Env {
     state: tempfile::TempDir,
     log: PathBuf,
+    /// The copies [`Env::typos`] has made.
+    copies: Cell<usize>,
 }
 
 impl Env {
     fn new() -> Env {
         let state = tempfile::tempdir().unwrap();
         let log = state.path().join("llm-calls.log");
-        Env { state, log }
+        Env {
+            state,
+            log,
+            copies: Cell::new(0),
+        }
     }
 
-    fn subcheck(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-        let fake = common::fake_llm();
+    /// The binary with `args`, this test's state directory, database, call log and settings file,
+    /// then `extra_env`, which can change any of them.
+    fn run(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_subcheck"));
         cmd.args(args)
             .env("XDG_STATE_HOME", self.state.path())
             .env("SUBCHECK_DB", self.db())
-            .env("FAKE_LLM_LOG", &self.log);
-        if args.first() == Some(&"scan") {
-            cmd.arg("--llm-cmd").arg(format!("'{}'", fake.display()));
-        }
+            .env("FAKE_LLM_LOG", &self.log)
+            .env("SUBCHECK_CONFIG", self.config());
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
         cmd.output().unwrap()
     }
 
-    /// `subcheck scan` with the preset `llm`, whose program (`claude`, `codex`) is the fake LLM by
-    /// that name, first on the PATH.
+    /// `subcheck`, with the fake LLM as `scan`'s `--llm-cmd`.
+    fn subcheck(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+        let fake = format!("'{}'", fake_llm());
+        let mut args = args.to_vec();
+        if args.first() == Some(&"scan") {
+            args.extend(["--llm-cmd", &fake]);
+        }
+        self.run(&args, extra_env)
+    }
+
+    /// `subcheck scan --llm <llm>`, as [`Env::scan_plain`] runs it.
     fn scan_preset(&self, llm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-        let bin = self.fake_bin();
+        let mut args = args.to_vec();
+        args.extend(["--llm", llm]);
+        self.scan_plain(&args, extra_env)
+    }
+
+    /// `subcheck scan` with neither `--llm` nor `--llm-cmd`, and the fake LLM first on the PATH
+    /// by the names the presets run ([`Env::fake_bin`]), so a scan that falls back to claude never
+    /// runs the real one.
+    fn scan_plain(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
         let path = format!(
             "{}:{}",
-            bin.display(),
+            self.fake_bin().display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_subcheck"));
-        cmd.arg("scan")
-            .args(args)
-            .args(["--llm", llm])
-            .env("XDG_STATE_HOME", self.state.path())
-            .env("SUBCHECK_DB", self.db())
-            .env("FAKE_LLM_LOG", &self.log)
-            .env("PATH", path);
-        for (k, v) in extra_env {
-            cmd.env(k, v);
-        }
-        cmd.output().unwrap()
+        let mut all = vec!["scan"];
+        all.extend_from_slice(args);
+        let mut env = vec![("PATH", path.as_str())];
+        env.extend_from_slice(extra_env);
+        self.run(&all, &env)
     }
 
-    /// A directory of links to the fake LLM named `claude` and `codex`.
+    /// A directory of links to the fake LLM named `claude`, `codex` and `openai`.
     fn fake_bin(&self) -> PathBuf {
         let fake = common::fake_llm();
         let bin = self.state.path().join("bin");
         if !bin.exists() {
             std::fs::create_dir(&bin).unwrap();
-            for name in ["claude", "codex"] {
+            for name in ["claude", "codex", "openai"] {
                 std::os::unix::fs::symlink(&fake, bin.join(name)).unwrap();
             }
         }
@@ -87,6 +104,28 @@ impl Env {
     /// to miss it.
     fn db(&self) -> PathBuf {
         self.state.path().join("subcheck.db")
+    }
+
+    /// SUBCHECK_CONFIG, written only by [`Env::settings`]: no test reads the developer's own file.
+    fn config(&self) -> PathBuf {
+        self.state.path().join("config.toml")
+    }
+
+    /// Write `text` as the settings file.
+    fn settings(&self, text: &str) {
+        std::fs::write(self.config(), text).unwrap();
+    }
+
+    /// A copy of typos.mkv, `<state>/show/E<n>.mkv`, by a name no earlier call gave: a file no
+    /// scan has checked yet.
+    fn typos(&self) -> String {
+        let n = self.copies.get() + 1;
+        self.copies.set(n);
+        let show = self.state.path().join("show");
+        std::fs::create_dir_all(&show).unwrap();
+        let to = show.join(format!("E{n}.mkv"));
+        std::fs::copy(fixture("typos.mkv"), &to).unwrap();
+        to.to_string_lossy().into_owned()
     }
 
     fn store(&self) -> Store {
@@ -547,14 +586,7 @@ fn scan_run_refuses_another_llm_or_languages_and_checks_a_changed_file_again() {
     let out = env.subcheck(&["scan", &file, "--run", &name, "--dry-run"], &[]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
 
-    // The test harness passes --llm-cmd with the fake LLM's path, so this --llm conflicts with
-    // it; call the binary with --llm alone.
-    let out = Command::new(env!("CARGO_BIN_EXE_subcheck"))
-        .args(["scan", &file, "--run", &name, "--llm", "gpt"])
-        .env("XDG_STATE_HOME", env.state.path())
-        .env("SUBCHECK_DB", env.db())
-        .output()
-        .unwrap();
+    let out = env.scan_preset("gpt", &[&file, "--run", &name], &[]);
     assert!(
         stderr(&out).contains(&format!("run {name} was scanned with cmd:")),
         "{}",
@@ -592,12 +624,7 @@ fn scan_run_refuses_another_llm_or_languages_and_checks_a_changed_file_again() {
     env.sql(&format!(
         "UPDATE scans SET backend = 'gemini', command = '[]' WHERE name = '{name}'"
     ));
-    let out = Command::new(env!("CARGO_BIN_EXE_subcheck"))
-        .args(["scan", &file, &path("typos.mkv"), "--run", &name])
-        .env("XDG_STATE_HOME", env.state.path())
-        .env("SUBCHECK_DB", env.db())
-        .output()
-        .unwrap();
+    let out = env.scan_plain(&[&file, &path("typos.mkv"), "--run", &name], &[]);
     assert!(
         stderr(&out).contains(&format!(
             "run {name} was scanned with gemini, which this subcheck does not know"
@@ -1153,4 +1180,165 @@ fn a_bare_list_shows_the_newest_runs_folders() {
     // The heading is the folder, quoted, then its counts.
     let heading = text.lines().next().unwrap_or_default();
     assert!(heading.starts_with(&shell_quote(&folder)), "{text}");
+}
+
+#[test]
+fn an_entry_in_the_settings_file_is_an_llm_by_its_name() {
+    let env = Env::new();
+    env.settings(&format!(
+        "[llm.mine]\ncommand = \"'{}'\"\nchunk_lines = 1\n",
+        fake_llm()
+    ));
+    let out = env.scan_preset("mine", &[&env.typos()], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let calls = env.calls();
+    assert!(
+        calls.len() > 1 && calls.iter().all(|c| c == "1 lines"),
+        "{calls:?}"
+    );
+    assert_eq!(
+        env.newest_run().header.expect("the run's header").backend,
+        "mine"
+    );
+}
+
+#[test]
+fn chunk_lines_on_the_command_line_beats_the_entrys() {
+    let env = Env::new();
+    env.settings(&format!(
+        "[llm.mine]\ncommand = \"'{}'\"\nchunk_lines = 1\n",
+        fake_llm()
+    ));
+    let out = env.scan_preset("mine", &["--chunk-lines", "400", &env.typos()], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(env.calls().len(), 1, "{:?}", env.calls());
+}
+
+#[test]
+fn the_settings_files_default_is_the_llm_when_none_is_named() {
+    let env = Env::new();
+    env.settings(&format!(
+        "default = \"mine\"\n[llm.mine]\ncommand = \"'{}'\"\n",
+        fake_llm()
+    ));
+    let out = env.scan_plain(&[&env.typos()], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        env.newest_run().header.expect("the run's header").backend,
+        "mine"
+    );
+    // A default that names nothing is the file's mistake: no --llm was given.
+    env.settings("default = \"nope\"\n");
+    let out = env.scan_plain(&[&env.typos()], &[]);
+    assert!(!out.status.success());
+    let said = stderr(&out);
+    assert!(
+        said.contains(&format!(
+            "{}: default \"nope\" names no LLM: use claude, gpt, ollama:<model>, or an entry in the \
+             file",
+            env.config().display()
+        )) && !said.contains("--llm"),
+        "{said}"
+    );
+    // --llm beats the default, and a name it does not know is its own mistake.
+    let out = env.scan_preset("mien", &[&env.typos()], &[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("unknown --llm \"mien\""),
+        "{}",
+        stderr(&out)
+    );
+    // A preset is a default too.
+    env.settings("default = \"claude\"\n");
+    let out = env.scan_plain(
+        &[&env.typos()],
+        &[(
+            "PATH",
+            &format!(
+                "{}:{}",
+                env.fake_bin().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        env.newest_run().header.expect("the run's header").backend,
+        "claude"
+    );
+}
+
+#[test]
+fn an_entry_printing_openai_json_records_what_its_calls_used() {
+    let env = Env::new();
+    let openai = env.fake_bin().join("openai");
+    env.settings(&format!(
+        "[llm.oa]\ncommand = \"'{}'\"\noutput = \"openai\"\n",
+        openai.display()
+    ));
+    assert!(env.scan_preset("oa", &[&env.typos()], &[]).status.success());
+    let out = env.subcheck(&["list"], &[]);
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        listed.contains("out tokens") && !listed.contains('$'),
+        "{listed}"
+    );
+}
+
+#[test]
+fn scanning_again_with_the_same_entry_checks_nothing_and_a_command_by_hand_checks_again() {
+    let env = Env::new();
+    let file = env.typos();
+    env.settings(&format!("[llm.mine]\ncommand = \"'{}'\"\n", fake_llm()));
+    assert!(env.scan_preset("mine", &[&file], &[]).status.success());
+    let first = env.calls().len();
+    assert!(env.scan_preset("mine", &[&file], &[]).status.success());
+    assert_eq!(env.calls().len(), first);
+    // `subcheck` adds --llm-cmd with the same command: another label, so checked again.
+    assert!(env.subcheck(&["scan", &file], &[]).status.success());
+    assert!(env.calls().len() > first);
+}
+
+#[test]
+fn a_broken_settings_file_stops_a_scan_and_leaves_list_alone() {
+    let env = Env::new();
+    let file = env.typos();
+    assert!(env.subcheck(&["scan", &file], &[]).status.success());
+    env.settings("[llm.mine]\ncomand = \"x\"\n");
+    let out = env.subcheck(&["scan", "--force", &file], &[]);
+    assert!(!out.status.success());
+    let said = stderr(&out);
+    assert!(
+        said.contains(&env.config().display().to_string()) && said.contains("comand"),
+        "{said}"
+    );
+    assert!(env.subcheck(&["list"], &[]).status.success());
+}
+
+#[test]
+fn the_settings_file_is_where_subcheck_config_says_else_under_xdg_config_home() {
+    let env = Env::new();
+    let out = env.subcheck(
+        &["scan", &env.typos()],
+        &[("SUBCHECK_CONFIG", "config.toml")],
+    );
+    assert!(
+        stderr(&out).contains("SUBCHECK_CONFIG must be an absolute path"),
+        "{}",
+        stderr(&out)
+    );
+    let xdg = env.state.path().join("xdg");
+    std::fs::create_dir_all(xdg.join("subcheck")).unwrap();
+    std::fs::write(
+        xdg.join("subcheck/config.toml"),
+        format!("[llm.mine]\ncommand = \"'{}'\"\n", fake_llm()),
+    )
+    .unwrap();
+    let xdg = xdg.display().to_string();
+    let out = env.scan_preset(
+        "mine",
+        &[&env.typos()],
+        &[("SUBCHECK_CONFIG", ""), ("XDG_CONFIG_HOME", &xdg)],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
 }

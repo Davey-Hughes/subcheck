@@ -38,8 +38,11 @@ fn send(m: &mut Review, s: &mut Screen, msg: Msg, runner: &mut Runner<Msg>, play
 /// A runner writing through a connection of its own to `store`'s database, which each test reads
 /// back through `store`, its jobs sending to `tx`.
 fn runner_on(store: &Store, tx: &mpsc::Sender<Msg>) -> Runner<Msg> {
-    // Where apply would write its tracks: no test here starts apply, so nothing goes there.
+    // Where apply would write its tracks: no test here starts apply, so nothing goes there. And
+    // the settings file a recheck reads: none is there, which reads as one with no entries, so the
+    // developer's own is never read.
     Runner::new(store.reopen().unwrap(), "/no-state".into(), tx.clone())
+        .with_settings_at("/no-settings/config.toml".into())
 }
 
 /// A database of its own, in a directory that goes with it.
@@ -262,7 +265,8 @@ fn a_skipped_files_findings_are_on_the_screen_from_the_start() {
 }
 
 /// `subcheck scan` as a process, stdout and stderr pipes, with core/tests/fake-llm.sh as its LLM,
-/// `state` as XDG_STATE_HOME and `state/subcheck.db` as SUBCHECK_DB.
+/// `state` as XDG_STATE_HOME, `state/subcheck.db` as SUBCHECK_DB and `state/config.toml`, never
+/// written, as SUBCHECK_CONFIG, so the developer's own settings file is not read.
 fn scan_cli(state: &Path, args: &[&str]) -> Output {
     let fake = common::fake_llm();
     Command::new(env!("CARGO_BIN_EXE_subcheck"))
@@ -272,6 +276,7 @@ fn scan_cli(state: &Path, args: &[&str]) -> Output {
         .arg(format!("'{}'", fake.display()))
         .env("XDG_STATE_HOME", state)
         .env("SUBCHECK_DB", state.join("subcheck.db"))
+        .env("SUBCHECK_CONFIG", state.join("config.toml"))
         .output()
         .unwrap()
 }
