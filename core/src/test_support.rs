@@ -8,6 +8,25 @@ use std::process::{Command, Stdio};
 use crate::llm;
 use crate::store::{RunHeader, ScanRow};
 
+mod server;
+pub use server::*;
+
+/// The pid of a child `start` starts, and the session it is in; the child is killed after.
+pub fn a_childs_session(
+    start: fn(&mut Command) -> std::io::Result<(std::process::Child, crate::group::Registered)>,
+) -> (
+    rustix::process::Pid,
+    rustix::io::Result<rustix::process::Pid>,
+) {
+    let mut sleep = Command::new("sleep");
+    let (mut child, _running) = start(sleep.arg("5")).unwrap();
+    let pid = rustix::process::Pid::from_child(&child);
+    let session = rustix::process::getsid(Some(pid));
+    crate::group::kill(&child);
+    let _ = child.wait();
+    (pid, session)
+}
+
 /// A file under core/tests/fixtures/, built by dev/make-fixtures.sh.
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

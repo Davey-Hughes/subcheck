@@ -84,7 +84,8 @@ enum Command {
         #[arg(short, long)]
         jobs: Option<usize>,
         /// Lines per LLM call. Default: the entry's `chunk_lines`, else 400, or 150 for ollama (its
-        /// default context is 4k tokens).
+        /// default context is 4k tokens). For a server, fit it to the server's context, about 150
+        /// for 4k: a server may cut an over-long prompt without saying so.
         #[arg(long)]
         chunk_lines: Option<usize>,
         /// Check files even if they are unchanged since an earlier scan.
@@ -263,6 +264,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let settings = Settings::load().map_err(anyhow::Error::msg)?;
             let state = store::state_dir()?;
             let mut db = Store::open()?;
+            // What readying the LLM and planning warn of goes to stderr as it comes, and is kept
+            // for the screen, which covers it once it opens.
+            let mut log = tui::Tee::new(std::io::stderr());
             let (backend, langs) = if let Some(name) = &run {
                 let scan = db
                     .scan_named(name)?
@@ -290,9 +294,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 } else {
                     langs
                 };
-                (backend, langs)
+                // A new scan: readied before the dry run and before planning, since a server's
+                // label, which the run records and which says whether a file was checked already,
+                // waits on the model the server serves.
+                (ready(backend, &mut log)?, langs)
             };
-            let opts = scan::Options {
+            let mut opts = scan::Options {
                 chunk_lines: chunk_lines.unwrap_or(backend.chunk_lines),
                 jobs: jobs.unwrap_or(backend.jobs),
                 backend,
@@ -314,10 +321,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let adding = opts.into.is_some();
             let screen =
                 !no_tui && std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
-            // What planning warns of goes to stderr as it comes, and is kept for the screen, which
-            // covers it once it opens.
-            let mut log = tui::Tee::new(std::io::stderr());
-            let s = match scan::plan(&paths, &opts, &mut db, &mut log)? {
+            let planned = scan::plan(&paths, &opts, &mut db, &mut log)?;
+            // Adding to a run (--run): readied after planning, and only when a file needs the LLM,
+            // so adding nothing, or only the timing check, needs no server up. Planning asks the
+            // server nothing: the label is the one the run recorded.
+            if adding && matches!(&planned, Planned::Scan(plan) if plan.needs_llm()) {
+                opts.backend = ready(opts.backend, &mut log)?;
+            }
+            let s = match planned {
                 Planned::Nothing(s) if screen => {
                     match review::nothing_to_check(&db, &s, opts.into.as_deref())? {
                         Some(shown) => {
@@ -385,6 +396,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// `backend` made ready for calls ([`Backend::ready`]), each of its warnings written to `log`.
+fn ready(backend: Backend, log: &mut dyn Write) -> Result<Backend> {
+    let (backend, warnings) = backend.ready().map_err(anyhow::Error::msg)?;
+    for w in &warnings {
+        writeln!(log, "warning: {w}")?;
+    }
+    Ok(backend)
 }
 
 /// `subcheck apply`: exit status 1 when a file failed (or, with --check, differs or is missing).

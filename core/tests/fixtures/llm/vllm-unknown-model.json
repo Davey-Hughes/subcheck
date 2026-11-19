@@ -1,0 +1,1 @@
+{"error":{"message":"The model `no-such-model` does not exist. Valid aliases: google/gemma-4-12B-it-qat-w4a16-ct.","type":"NotFoundError","param":"model","code":404}}

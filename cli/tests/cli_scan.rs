@@ -168,6 +168,11 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// The newest run, as the store has it.
+fn newest(env: &Env) -> store::ScanRow {
+    env.store().newest_scan().unwrap().unwrap()
+}
+
 #[test]
 fn scan_records_the_planted_typos() {
     let env = Env::new();
@@ -1341,4 +1346,175 @@ fn the_settings_file_is_where_subcheck_config_says_else_under_xdg_config_home() 
         &[("SUBCHECK_CONFIG", ""), ("XDG_CONFIG_HOME", &xdg)],
     );
     assert!(out.status.success(), "{}", stderr(&out));
+}
+
+fn server_entry(env: &Env, url: &str, extra: &str) {
+    env.settings(&format!("[llm.srv]\nurl = \"{url}\"\n{extra}"));
+}
+
+#[test]
+fn a_server_entry_scans_through_the_server_and_says_its_tokens() {
+    let env = Env::new();
+    let fake = common::FakeServer::llm(&["fake-model"]);
+    server_entry(&env, &fake.url, "");
+    let out = env.scan_preset("srv", &[&env.typos()], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("LLM: 1 call, 1.50k in / 40 out tokens"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(newest(&env).header.backend, "srv@fake-model");
+    assert_eq!(
+        newest(&env).header.command,
+        [format!("{}/chat/completions", fake.url)]
+    );
+    assert_eq!(env.newest_run().findings.len(), 2);
+    let asked: Vec<String> = fake
+        .requests()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    assert_eq!(asked, ["GET /v1/models", "POST /v1/chat/completions"]);
+}
+
+#[test]
+fn nothing_answering_stops_a_scan_before_any_file_is_read() {
+    let env = Env::new();
+    let closed = common::closed_port_url();
+    server_entry(&env, &closed, "");
+    let out = env.scan_preset("srv", &[&env.typos()], &[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains(&format!(
+            "srv: nothing answering at {closed}: is the server running?"
+        )),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.runs(), 0);
+}
+
+#[test]
+fn a_dry_run_asks_the_server_for_its_models_and_nothing_else() {
+    let env = Env::new();
+    let fake = common::FakeServer::llm(&["fake-model"]);
+    server_entry(&env, &fake.url, "");
+    let out = env.scan_preset("srv", &["--dry-run", &env.typos()], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("(chunk 0, "));
+    assert!(!fake.requests().is_empty() && fake.requests().iter().all(|r| r.method == "GET"));
+}
+
+#[test]
+fn an_api_key_reaches_the_server_and_nowhere_else() {
+    let key = "sk-test-7c1e";
+    let env = Env::new();
+    let fake = common::FakeServer::llm(&["m"]);
+    server_entry(&env, &fake.url, "api_key_env = \"SUBCHECK_TEST_KEY\"\n");
+    let out = env.scan_preset("srv", &[&env.typos()], &[("SUBCHECK_TEST_KEY", key)]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let bearer = format!("Bearer {key}");
+    assert!(
+        fake.requests()
+            .iter()
+            .all(|r| r.header("authorization") == Some(bearer.as_str()))
+    );
+    let refusing = common::FakeServer::start(move |r| match r.path.as_str() {
+        "/v1/models" => common::models_reply(&["m"]),
+        _ => common::Reply::status(
+            401,
+            format!("{{\"error\":{{\"message\":\"bad key {key}\"}}}}"),
+        ),
+    });
+    server_entry(&env, &refusing.url, "api_key_env = \"SUBCHECK_TEST_KEY\"\n");
+    let out = env.scan_preset(
+        "srv",
+        &["--force", &env.typos()],
+        &[("SUBCHECK_TEST_KEY", key)],
+    );
+    assert!(
+        stderr(&out).contains("HTTP 401: bad key <key>; check the entry's key"),
+        "{}",
+        stderr(&out)
+    );
+    let mut stored = std::fs::read(env.db()).unwrap();
+    stored.extend(std::fs::read(env.db().with_extension("db-wal")).unwrap_or_default());
+    for (what, text) in [
+        ("stderr", stderr(&out).into_bytes()),
+        ("store", stored),
+        ("label", newest(&env).header.backend.into_bytes()),
+    ] {
+        assert!(
+            !text.windows(key.len()).any(|w| w == key.as_bytes()),
+            "the key is in the {what}"
+        );
+    }
+}
+
+#[test]
+fn a_run_resumes_only_while_the_server_serves_its_model() {
+    let env = Env::new();
+    let file = env.typos();
+    let first = common::FakeServer::llm(&["a"]);
+    server_entry(&env, &first.url, "");
+    assert!(env.scan_preset("srv", &[&file], &[]).status.success());
+    let run = newest(&env).name;
+    // Nothing for the LLM to do: the server is not asked, so it need not be up.
+    server_entry(&env, &common::closed_port_url(), "");
+    let out = env.scan_plain(&["--run", &run, &file], &[]);
+    assert!(
+        out.status.success() && stderr(&out).contains(&format!("Nothing to add to run {run}")),
+        "{}",
+        stderr(&out)
+    );
+    let second = common::FakeServer::llm(&["b"]);
+    server_entry(&env, &second.url, "");
+    for llm in [&[][..], &["--llm", "srv"][..]] {
+        let mut args = vec!["--run", run.as_str(), "--force", file.as_str()];
+        args.extend_from_slice(llm);
+        let out = env.scan_plain(&args, &[]);
+        assert!(!out.status.success());
+        let said = format!(
+            "srv@a: {} does not serve \"a\"; it serves \"b\"",
+            second.url
+        );
+        assert!(stderr(&out).contains(&said), "{}", stderr(&out));
+    }
+    assert!(second.completions().is_empty());
+    server_entry(&env, &first.url, "chunk_lines = 1\n");
+    let out = env.scan_plain(&["--run", &run, "--force", &file], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        first.completions().len() > 2,
+        "the entry's chunk_lines as the file has it now"
+    );
+}
+
+#[test]
+fn a_server_on_this_machine_is_never_called_through_a_proxy() {
+    let env = Env::new();
+    let fake = common::FakeServer::llm(&["m"]);
+    server_entry(&env, &fake.url, "");
+    // Nothing listens on the proxy's port, so a call sent through it fails. NO_PROXY is set empty,
+    // naming no host: one in the tests' own environment cannot steer the calls around the proxy.
+    let proxy = "http://127.0.0.1:1";
+    let mut vars = [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ]
+    .map(|name| (name, proxy))
+    .to_vec();
+    vars.extend([("NO_PROXY", ""), ("no_proxy", "")]);
+    let out = env.scan_preset("srv", &[&env.typos()], &vars);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let asked: Vec<String> = fake
+        .requests()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    assert_eq!(asked, ["GET /v1/models", "POST /v1/chat/completions"]);
 }

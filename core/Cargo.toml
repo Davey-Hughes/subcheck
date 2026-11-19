@@ -25,6 +25,7 @@ rustfft.workspace = true
 signal-hook.workspace = true
 rustix.workspace = true
 rusqlite.workspace = true
+ureq.workspace = true
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]

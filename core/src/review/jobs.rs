@@ -1,9 +1,9 @@
-//! Review's jobs: the scan and apply, each on a thread of its own, sending what happens to the
-//! channel `update`'s inputs come in on (the terminal's loop's, or a session's), as an `Input` or
-//! a message of that loop's own that one becomes. The runner starts them for `update`'s tasks, and
-//! a UI that opens on a scan starts that one itself. Each runs to its end or the process's:
-//! quitting with a job running ends its LLM calls or mkvmerge through `group::end`, and its
-//! threads with the process.
+//! Review's jobs: the scan, the recheck and apply, each on a thread of its own, sending what
+//! happens to the channel `update`'s inputs come in on (the terminal's loop's, or a session's), as
+//! an `Input` or a message of that loop's own that one becomes. The runner starts them for
+//! `update`'s tasks, and a UI that opens on a scan starts that one itself. Each runs to its end or
+//! the process's: quitting with a job running ends its LLM calls or mkvmerge through `group::end`,
+//! and its threads with the process.
 
 use std::any::Any;
 use std::ffi::OsStr;
@@ -23,20 +23,49 @@ use crate::store::{Run, Store};
 pub fn scan<T: From<Input> + Send + 'static>(
     plan: Plan,
     opts: Options,
-    mut store: Store,
+    store: Store,
     tx: Sender<T>,
 ) -> io::Result<()> {
+    check(plan, opts, store, tx, false)
+}
+
+/// Run `plan` as [`scan()`] does, on a thread named `recheck`, readying `opts.backend` there first
+/// ([`Backend::ready`](crate::llm::Backend::ready)): a server's key fetched and the server asked
+/// what it serves. Its error ends the job as `Input::ScanEnded(Err(..))` with nothing checked. Its
+/// warnings are dropped, as no input carries one, so a warning the run's own scan did not say (its
+/// entry has changed since) goes unseen.
+pub fn recheck<T: From<Input> + Send + 'static>(
+    plan: Plan,
+    opts: Options,
+    store: Store,
+    tx: Sender<T>,
+) -> io::Result<()> {
+    check(plan, opts, store, tx, true)
+}
+
+/// [`scan()`], or with `ready_first` [`recheck()`].
+fn check<T: From<Input> + Send + 'static>(
+    plan: Plan,
+    mut opts: Options,
+    mut store: Store,
+    tx: Sender<T>,
+    ready_first: bool,
+) -> io::Result<()> {
     std::thread::Builder::new()
-        .name("scan".into())
+        .name(if ready_first { "recheck" } else { "scan" }.into())
         .spawn(move || {
             let report = |event: scan::Event| {
                 let _ = tx.send(Input::Scan(event).into());
             };
             let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+                if ready_first {
+                    opts.backend = opts.backend.ready()?.0;
+                }
                 scan::execute(plan, &opts, &mut store, &mut io::sink(), &report)
+                    .map_err(|e| format!("{e:#}"))
             }));
             let last = match ran {
-                Ok(ended) => Input::ScanEnded(ended.map_err(|e| format!("{e:#}"))),
+                Ok(ended) => Input::ScanEnded(ended),
                 Err(panic) => {
                     Input::Fatal(format!("the scan panicked: {}", panic_text(panic.as_ref())))
                 }

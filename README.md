@@ -261,7 +261,22 @@ The settings file defines LLMs of your own for `--llm` to pick by name. It is
 file is the same as an empty one.
 
 ```toml
-default = "mine"
+default = "local"
+
+[llm.local]
+url = "http://127.0.0.1:8000/v1"
+jobs = 4
+
+[llm.local.request]
+temperature = 1.0
+top_k = 64
+top_p = 0.95
+
+[llm.openrouter]
+url = "https://openrouter.ai/api/v1"
+model = "google/gemma-4-12b-it"
+api_key_cmd = "pass show openrouter | head -n 1"
+thinking = "server"
 
 [llm.mine]
 command = "my-llm --fast"
@@ -270,6 +285,18 @@ jobs = 4
 chunk_lines = 200
 ```
 
+An entry has a `url` (a server that speaks the OpenAI chat API) or a `command`.
+
+- `url` is the server's address up to and including `/v1`.
+- `model` is the model to ask for. Left out, it is the one model the server lists. Either way the
+  server must list it.
+- `api_key_env` names an environment variable that holds the key, and `api_key_cmd` is a command
+  that prints it; see [Keys](#keys).
+- `thinking` is `"off"` (the default), which sends `reasoning_effort: "none"` and
+  `chat_template_kwargs.enable_thinking: false`, or `"server"`, which sends neither, for an API that
+  refuses them.
+- `request` is a table merged over every request body, last, each key replacing subcheck's. It
+  cannot set `model`, `messages` or `stream`.
 - `command` is run through `sh -c`, as `--llm-cmd`'s is: it reads the prompt on stdin and prints
   the reply on stdout.
 - `output` is what the command prints: `"text"` (the default) is the reply alone, and reports no
@@ -277,7 +304,10 @@ chunk_lines = 200
   `claude -p --output-format json`, and reports tokens and a price; `"codex"` is
   `codex exec --json`, and reports tokens.
 - `jobs` is the calls in flight to this LLM at once (2 when left out).
-- `chunk_lines` is the lines sent in each call (400 when left out).
+- `chunk_lines` is the lines sent in each call (400 when left out). For a server, set it to fit
+  the server's context, about 150 lines for a 4k context, because a server may cut an over-long
+  prompt without saying so: Ollama does at its default 4k context on cards under 24 GB, unless
+  `OLLAMA_CONTEXT_LENGTH` is set.
 - `default` is the LLM `--llm` means when it is left out. It takes anything `--llm` takes, a
   preset as well as an entry.
 
@@ -286,12 +316,35 @@ chunk_lines = 200
 was when the run began.
 
 An entry's name is letters, digits, `-` and `_`, and `claude` and `gpt` are taken. A run records
-the entry's name, not its command: after changing what a command runs, rename the entry or scan
-with `--force`, or files checked by the old command are skipped as already checked.
+a command entry's name, not its command: after changing what a command runs, rename the entry or
+scan with `--force`, or files checked by the old command are skipped as already checked.
+
+subcheck asks `<url>/models` before a scan, so a server that is down stops it before any file is
+checked. llama-server lists the path given to `-m` unless it was started with `--alias <name>`.
+
+A run records `<entry>@<model>` for a server, so moving a server to another port checks nothing
+again, and serving another model checks every file again. `scan --run` and a recheck refuse a
+run whose model the server no longer serves.
 
 A mistake in the file stops `scan` and review's rechecks, with a one-line message naming the file,
 then the entry or the line the mistake is in. `list` and `apply` do not read it, and `review` reads
 it only to recheck, so all else works with it broken.
+
+### Keys
+
+A key is never in the file: `api_key` is refused. `api_key_env` names a variable. `api_key_cmd`
+runs through `sh -c` with no terminal, within 2 minutes, and prints the key alone on one line. The
+key is kept for the process, so a passphrase is asked at most once a session; after a 401 or 403
+the next scan or recheck runs the command again.
+
+A prompt in the terminal is not supported. The command's stdin is empty and it runs in a session
+of its own, so a script that opens `/dev/tty` to ask fails at once. `GPG_TTY` is unset, but
+gpg-agent can still show `pinentry-curses` on the terminal the agent started from, which can be
+the review screen's. A graphical pinentry, KWallet, GNOME Keyring, the 1Password app, the macOS
+Keychain or an unlocked agent works.
+
+A key sent over plain `http://` to another machine warns. A server on this machine is never
+called through a proxy.
 
 ## LLM costs
 
@@ -311,6 +364,7 @@ LLM: 98 calls, 1.23M in / 31.2k out tokens, $3.21 at API prices
   to go stale.
 - `ollama:<model>`, `--llm-cmd` and entries that print text report nothing, and nothing is shown;
   nor for a run made before calls were recorded.
+- An entry with a `url` reports tokens, and no price.
 - An entry with `output = "openai"`, `"claude"` or `"codex"` reports what its JSON says: tokens,
   and for `"claude"` a price too.
 
@@ -327,7 +381,9 @@ LLM: 200 calls (none reported usage)
 ```
 
 A failed call's error is the exit status and stderr, then what the backend's JSON says of it:
-`claude exited with exit status: 1; claude said: You've hit your session limit`.
+`claude exited with exit status: 1; claude said: You've hit your session limit`. A server's is
+`HTTP 401: Incorrect API key provided; check the entry's key`. A call that failed on a refused or
+unresolvable connection is not counted.
 
 ## Where findings are kept
 

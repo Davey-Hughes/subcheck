@@ -78,6 +78,14 @@ add_custom_command(
 add_library(subcheck_bindings STATIC ${GENERATED})
 target_include_directories(subcheck_bindings PUBLIC "${BINDINGS_DIR}")
 target_link_libraries(subcheck_bindings PUBLIC subcheck_ffi-static Threads::Threads)
+# A staticlib carries no link line of its own, and Corrosion adds only what Rust's std needs. On
+# macOS the verifier that core checks a server's certificate with (rustls-platform-verifier) calls
+# into these two frameworks, which this lists when run on a Mac:
+# `cargo rustc -p subcheck-ffi --lib --crate-type staticlib -- --print native-static-libs`
+if(APPLE)
+    target_link_libraries(subcheck_ffi-static INTERFACE
+        "-framework Security" "-framework CoreFoundation")
+endif()
 
 # Our own code is held to these, and a warning in it fails the build. So is the C++ Qt generates
 # for a target given them: moc's, and the QML module's type registrations, resources and compiled

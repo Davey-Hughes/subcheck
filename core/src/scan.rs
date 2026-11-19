@@ -16,7 +16,7 @@ use jiff::Timestamp;
 
 use crate::blocks::{self, ReadPath};
 use crate::list::shell_quote;
-use crate::llm::{self, Answer, Backend, Spent, Suggestion, Usage, Used};
+use crate::llm::{self, Answer, Backend, Spent, Suggestion, Usage, Used, Via};
 use crate::mkv::{self, Layout, TRACK_TYPE_SUBTITLE, Track, Truncated};
 use crate::settings::Settings;
 use crate::store::{
@@ -110,6 +110,11 @@ impl Plan {
     /// The files the scan checks, in the order it reads them, each with the checks it makes.
     pub fn todo(&self) -> &[(PathBuf, Vec<Check>)] {
         &self.start.todo
+    }
+
+    /// Whether some file the scan checks needs the LLM's check.
+    pub fn needs_llm(&self) -> bool {
+        needs_llm(&self.start.todo)
     }
 }
 
@@ -410,6 +415,11 @@ pub fn files(n: usize) -> String {
 /// A file to read, and the checks it needs.
 type Todo = (PathBuf, Vec<Check>);
 
+/// Whether some file in `todo` needs the LLM's check.
+fn needs_llm(todo: &[Todo]) -> bool {
+    todo.iter().any(|(_, checks)| checks.contains(&Check::Llm))
+}
+
 /// Each file with the checks it needs, and how many files need none: each file's current check
 /// of each kind is fresh ([`Store::is_fresh`]), the LLM's made with the same backend, languages
 /// and prompt, the timing check's with the same languages and rules. `--force` needs them all.
@@ -611,7 +621,7 @@ fn read(
 
 /// The backend and languages for adding to the run `scan` (`scan --run`): the run's own, which
 /// `llm`, `llm_cmd` and `langs`, when given, must match. A run has one backend and one set of
-/// languages. An entry's backend is as `settings` has it now.
+/// languages. An entry's backend is as `settings` has it now, with the model the run recorded.
 pub fn resume(
     scan: &ScanRow,
     llm: Option<&str>,
@@ -625,24 +635,27 @@ pub fn resume(
         (None, Some(name)) => Some(Backend::named(name, settings)?),
         (None, None) => None,
     };
-    let backend = match given {
-        Some(b) if b.label != header.backend => {
-            return Err(format!(
-                "run {} was scanned with {}; leave out --llm and --llm-cmd to use it",
-                scan.name, header.backend
-            ));
-        }
-        Some(b) => b,
-        // A backend this subcheck does not know, or an entry the settings file does not name, is
-        // refused when a file needs the LLM: the command the run recorded may not work as it did.
-        None => Backend::from_label(&header.backend, settings).unwrap_or_else(|_| Backend {
-            label: header.backend.clone(),
-            argv: Vec::new(),
-            chunk_lines: llm::CHUNK_LINES,
-            jobs: llm::JOBS,
-            output: llm::Output::Text,
-        }),
+    // A server whose entry names no model has only the entry's name for a label until the server
+    // says its model, so it matches a run through that entry with any model.
+    let same_llm = |b: &Backend| {
+        b.label == header.backend
+            || matches!(&b.via, Via::Server(s) if s.model.is_none()
+                && header.backend.split_once('@').is_some_and(|(name, _)| name == s.name))
     };
+    if given.is_some_and(|b| !same_llm(&b)) {
+        return Err(format!(
+            "run {} was scanned with {}; leave out --llm and --llm-cmd to use it",
+            scan.name, header.backend
+        ));
+    }
+    // An LLM that cannot be built again is refused when a file needs it: the command the run
+    // recorded may not work as it did, and an entry changed since is not what the run called.
+    let backend = Backend::from_label(&header.backend, settings).unwrap_or_else(|why| Backend {
+        label: header.backend.clone(),
+        via: Via::Unknown(why),
+        chunk_lines: llm::CHUNK_LINES,
+        jobs: llm::JOBS,
+    });
     let set = |l: &[String]| CheckedWith::new("", l, 0).langs;
     if !langs.is_empty() && set(langs) != set(&header.langs) {
         return Err(format!(
@@ -678,7 +691,7 @@ fn start_new(
     let header = RunHeader {
         started: Timestamp::now(),
         backend: opts.backend.label.clone(),
-        command: opts.backend.argv.clone(),
+        command: opts.backend.command_line(),
         prompt_version: llm::PROMPT_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         langs: opts.langs.clone(),
@@ -702,7 +715,7 @@ fn start_adding(
     summary.run.clone_from(&scan.name);
     let (todo, cached) = to_check(all, opts, store)?;
     summary.cached = cached;
-    if todo.iter().any(|(_, c)| c.contains(&Check::Llm)) {
+    if needs_llm(&todo) {
         let prompt = scan.header.prompt_version;
         if prompt != llm::PROMPT_VERSION {
             anyhow::bail!(
@@ -712,12 +725,10 @@ fn start_adding(
                 llm::PROMPT_VERSION
             );
         }
-        if opts.backend.argv.is_empty() {
+        if let Via::Unknown(why) = &opts.backend.via {
             anyhow::bail!(
-                "run {} was scanned with {}, which this subcheck does not know and the settings \
-                 file does not name: scan the files it lacks into a new run",
-                scan.name,
-                opts.backend.label
+                "run {} was scanned with {why}: scan the files it lacks into a new run",
+                scan.name
             );
         }
     }
@@ -1233,13 +1244,16 @@ mod tests {
         // A command LLM comes back from its label.
         let cmd = scan_row("cmd:my-llm --x", &["eng"]);
         let (b, _) = resume(&cmd, None, None, &[]).unwrap();
-        assert_eq!(b.argv, ["sh", "-c", "my-llm --x"]);
-        // A backend this subcheck does not know: no command, refused later if a file needs it,
+        assert_eq!(b.command_line(), ["sh", "-c", "my-llm --x"]);
+        // A backend this subcheck does not know: unknown, refused later if a file needs it,
         // whatever command the run recorded.
         let mut gone = scan_row("gemini", &["eng"]);
         gone.header.command = vec!["gemini".into(), "-p".into()];
         let (b, _) = resume(&gone, None, None, &[]).unwrap();
-        assert_eq!((b.label.as_str(), b.argv.len()), ("gemini", 0));
+        assert_eq!(
+            (b.label.as_str(), matches!(b.via, Via::Unknown(_))),
+            ("gemini", true)
+        );
     }
 
     #[test]
@@ -1262,7 +1276,51 @@ mod tests {
         );
         let none = Settings::parse(Path::new("/c/config.toml"), "").unwrap();
         let (b, _) = resume(&run, None, None, &[], &none).unwrap();
-        assert_eq!((b.label.as_str(), b.argv.len()), ("mine", 0));
+        assert_eq!(
+            (b.label.as_str(), matches!(b.via, Via::Unknown(_))),
+            ("mine", true)
+        );
+    }
+
+    #[test]
+    fn a_run_through_a_server_resumes_by_the_entrys_name_with_the_runs_model() {
+        let s = Settings::parse(
+            Path::new("/c/config.toml"),
+            "[llm.srv]\nurl = \"http://127.0.0.1:1/v1\"\n",
+        )
+        .unwrap();
+        let run = scan_row("srv@a", &["eng"]);
+        for llm in [None, Some("srv")] {
+            let (b, _) = resume(&run, llm, None, &[], &s).unwrap();
+            assert_eq!(b.label, "srv@a", "{llm:?}");
+        }
+        let pinned = Settings::parse(
+            Path::new("/c/config.toml"),
+            "[llm.srv]\nurl = \"http://127.0.0.1:1/v1\"\nmodel = \"b\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resume(&run, Some("srv"), None, &[], &pinned).unwrap_err(),
+            "run r was scanned with srv@a; leave out --llm and --llm-cmd to use it"
+        );
+        let (b, _) = resume(&run, None, None, &[], &pinned).unwrap();
+        assert_eq!(
+            b.via,
+            Via::Unknown("srv@a, but /c/config.toml now has srv ask for \"b\"".into())
+        );
+    }
+
+    #[test]
+    fn a_plan_needs_the_llm_only_when_a_file_needs_its_check() {
+        let plan = |checks: Vec<Check>| Plan {
+            start: Start {
+                todo: vec![(PathBuf::from("/m/a.mkv"), checks)],
+                scan: scan_row("claude", &["eng"]),
+            },
+            summary: Summary::default(),
+        };
+        assert!(!plan(vec![Check::Timing]).needs_llm());
+        assert!(plan(vec![Check::Llm, Check::Timing]).needs_llm());
     }
 
     /// A file as `finish` gets it when only the timing check is made of it and found nothing.

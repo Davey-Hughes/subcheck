@@ -10,6 +10,7 @@
 #   FAKE_LLM_FAIL=1        exit 3 without replying
 #   FAKE_LLM_REPLY=<text>  reply with exactly this instead
 #   FAKE_LLM_PLAIN=1       reply in plain text even as claude, codex or openai
+#   FAKE_LLM_AS=<name>     reply as if run through a link of that name (claude, codex, openai)
 set -euo pipefail
 
 prompt=$(cat)
@@ -59,7 +60,7 @@ json() {
   done
 }
 
-name=$(basename "$0")
+name=${FAKE_LLM_AS:-$(basename "$0")}
 [ "${FAKE_LLM_PLAIN:-}" = 1 ] && name=plain
 case "$name" in
   claude)

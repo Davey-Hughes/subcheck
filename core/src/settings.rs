@@ -1,7 +1,7 @@
 //! The settings file: the LLMs a user defines for `--llm` to pick by name, each a command run as
-//! `--llm-cmd`'s is, and which LLM `--llm` means when it is left out. It is `config.toml` in
-//! subcheck's config directory, unless `SUBCHECK_CONFIG` names another file ([`config_path`]).
-//! No file is the same as an empty one.
+//! `--llm-cmd`'s is or a server subcheck calls itself, and which LLM `--llm` means when it is left
+//! out. It is `config.toml` in subcheck's config directory, unless `SUBCHECK_CONFIG` names another
+//! file ([`config_path`]). No file is the same as an empty one.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -65,17 +65,58 @@ pub struct Settings {
 }
 
 /// An `[llm.<name>]` table: a command that reads the prompt on stdin and prints the reply on
-/// stdout.
+/// stdout, or a server subcheck calls over HTTP.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    pub command: String,
-    /// `Text` when the file does not say.
-    pub output: Output,
+    pub kind: EntryKind,
     /// Calls in flight to this LLM at once; `None`, when the file does not say, leaves the default
     /// to the caller.
     pub jobs: Option<usize>,
     /// Lines per call; `None` as for `jobs`.
     pub chunk_lines: Option<usize>,
+}
+
+/// What an entry runs: it has a `command` or a `url`, never both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryKind {
+    Command {
+        command: String,
+        /// `Text` when the file does not say.
+        output: Output,
+    },
+    Server(ServerEntry),
+}
+
+/// An entry with a `url`: an OpenAI-style chat completions server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerEntry {
+    /// The server's `/v1` root, never ending in `/`, so a path joins to it with one.
+    pub url: String,
+    /// `None` when the file does not say: the server's only model, when it has one.
+    pub model: Option<String>,
+    pub key: KeySource,
+    /// `Off` when the file does not say.
+    pub thinking: Thinking,
+    /// Fields added to every request body: sampling settings and the like.
+    pub request: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Where a server's API key comes from. The key itself is never in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeySource {
+    None,
+    /// An environment variable's name.
+    Env(String),
+    /// A command that prints the key.
+    Command(String),
+}
+
+/// Whether the model reasons before it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Thinking {
+    Off,
+    /// Left to the server's own default.
+    Server,
 }
 
 /// The file as written. Unknown keys are refused here and in [`EntryShape`], so a misspelt key is
@@ -94,15 +135,30 @@ struct FileShape {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EntryShape {
-    command: String,
-    #[serde(default)]
-    output: OutputShape,
+    command: Option<String>,
+    output: Option<OutputShape>,
+    url: Option<String>,
+    model: Option<String>,
+    api_key_env: Option<String>,
+    api_key_cmd: Option<String>,
+    /// Read only to be refused, so a key written here is never echoed back.
+    api_key: Option<toml::Value>,
+    thinking: Option<ThinkingShape>,
+    request: Option<toml::Table>,
     jobs: Option<usize>,
     chunk_lines: Option<usize>,
 }
 
+/// `thinking`'s values, as the file spells them.
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum ThinkingShape {
+    Off,
+    Server,
+}
+
 /// `output`'s values, as the file spells them.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 enum OutputShape {
     #[default]
@@ -180,6 +236,7 @@ impl Settings {
                 )));
             }
             let shape: EntryShape = value.try_into().map_err(|e| at(&one_line(e)))?;
+            let kind = entry_kind(&shape).map_err(|e| at(&e))?;
             if shape.jobs == Some(0) {
                 return Err(at("jobs must be at least 1"));
             }
@@ -187,8 +244,7 @@ impl Settings {
                 return Err(at("chunk_lines must be at least 1"));
             }
             let entry = Entry {
-                command: shape.command,
-                output: shape.output.into(),
+                kind,
                 jobs: shape.jobs,
                 chunk_lines: shape.chunk_lines,
             };
@@ -200,6 +256,103 @@ impl Settings {
             entries,
         })
     }
+}
+
+/// What `shape` runs, or why it cannot: keys that belong to the other kind are refused rather than
+/// ignored, as a misspelt key is, so no setting silently does nothing.
+fn entry_kind(shape: &EntryShape) -> Result<EntryKind, String> {
+    if shape.api_key.is_some() {
+        return Err(
+            "api_key does not go in this file: name a variable with api_key_env, or a \
+                    command that prints the key with api_key_cmd"
+                .into(),
+        );
+    }
+    match (&shape.url, &shape.command) {
+        (Some(_), Some(_)) => Err("an entry has a url or a command, not both".into()),
+        (None, None) => Err("an entry needs a url (a server) or a command".into()),
+        (None, Some(command)) => {
+            let only_for_url = [
+                ("model", shape.model.is_some()),
+                ("api_key_env", shape.api_key_env.is_some()),
+                ("api_key_cmd", shape.api_key_cmd.is_some()),
+                ("thinking", shape.thinking.is_some()),
+                ("request", shape.request.is_some()),
+            ];
+            if let Some((key, _)) = only_for_url.iter().find(|(_, present)| *present) {
+                return Err(format!("{key} is for an entry with a url"));
+            }
+            Ok(EntryKind::Command {
+                command: command.clone(),
+                output: shape.output.map_or(Output::Text, Into::into),
+            })
+        }
+        (Some(url), None) => server_entry(shape, url).map(EntryKind::Server),
+    }
+}
+
+fn server_entry(shape: &EntryShape, url: &str) -> Result<ServerEntry, String> {
+    if shape.output.is_some() {
+        return Err("output is for an entry with a command".into());
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("url must start with http:// or https://".into());
+    }
+    if shape.api_key_env.is_some() && shape.api_key_cmd.is_some() {
+        return Err("api_key_env and api_key_cmd both name a key: keep one".into());
+    }
+    for (key, value) in [
+        ("model", &shape.model),
+        ("api_key_env", &shape.api_key_env),
+        ("api_key_cmd", &shape.api_key_cmd),
+    ] {
+        if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+            return Err(format!("{key} is empty"));
+        }
+    }
+    // Each message about the key names its variable, so a key written in the variable's place
+    // would be shown. A name any shell can set has only these characters, and the refusal does not
+    // echo the value.
+    let var_name = |v: &str| {
+        v.starts_with(|c: char| !c.is_ascii_digit())
+            && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    if shape.api_key_env.as_deref().is_some_and(|v| !var_name(v)) {
+        return Err(
+            "api_key_env must name an environment variable (letters, digits and _), not \
+             hold the key"
+                .into(),
+        );
+    }
+    let request = match &shape.request {
+        Some(table) => match serde_json::to_value(table).map_err(|e| e.to_string())? {
+            serde_json::Value::Object(map) => map,
+            _ => unreachable!("a toml table is a json object"),
+        },
+        None => serde_json::Map::new(),
+    };
+    // subcheck sends these itself; a request field of the same name would fight it.
+    for key in ["model", "messages", "stream"] {
+        if request.contains_key(key) {
+            return Err(format!("request cannot set {key}: subcheck sends it"));
+        }
+    }
+    let key = match (&shape.api_key_env, &shape.api_key_cmd) {
+        (Some(env), _) => KeySource::Env(env.clone()),
+        (None, Some(cmd)) => KeySource::Command(cmd.clone()),
+        (None, None) => KeySource::None,
+    };
+    let thinking = match shape.thinking {
+        Some(ThinkingShape::Server) => Thinking::Server,
+        Some(ThinkingShape::Off) | None => Thinking::Off,
+    };
+    Ok(ServerEntry {
+        url: url.trim_end_matches('/').to_string(),
+        model: shape.model.clone(),
+        key,
+        thinking,
+        request,
+    })
 }
 
 /// toml's error as one line. Given the input, toml writes the line the mistake is on and a diagram
@@ -282,8 +435,10 @@ mod tests {
         assert_eq!(
             s.entries["mine"],
             Entry {
-                command: "my-llm --fast".into(),
-                output: Output::OpenAi,
+                kind: EntryKind::Command {
+                    command: "my-llm --fast".into(),
+                    output: Output::OpenAi
+                },
                 jobs: Some(4),
                 chunk_lines: Some(200)
             }
@@ -291,8 +446,10 @@ mod tests {
         assert_eq!(
             at("[llm.e]\ncommand = \"x\"\n").unwrap().entries["e"],
             Entry {
-                command: "x".into(),
-                output: Output::Text,
+                kind: EntryKind::Command {
+                    command: "x".into(),
+                    output: Output::Text
+                },
                 jobs: None,
                 chunk_lines: None
             }
@@ -304,10 +461,134 @@ mod tests {
             ("codex", Output::Codex),
         ] {
             let s = at(&format!("[llm.e]\ncommand = \"x\"\noutput = \"{name}\"\n")).unwrap();
-            assert_eq!(s.entries["e"].output, output, "{name}");
+            let EntryKind::Command { output: got, .. } = s.entries["e"].kind else {
+                panic!("{name}: not a command")
+            };
+            assert_eq!(got, output, "{name}");
         }
         // Names: letters, digits, - and _; `ollama` alone is an entry, `ollama:<model>` the preset.
         assert!(at("[llm.My_llm-2]\ncommand = \"x\"\n[llm.ollama]\ncommand = \"x\"\n").is_ok());
+    }
+
+    #[test]
+    fn a_server_entry_reads_every_key_and_defaults_the_rest() {
+        let s = at("[llm.vllm]\nurl = \"http://127.0.0.1:8000/v1/\"\nmodel = \"gemma4\"\napi_key_cmd = \"pass show x\"\nthinking = \"server\"\njobs = 4\nchunk_lines = 150\n[llm.vllm.request]\ntemperature = 1.0\ntop_k = 64\n").unwrap();
+        let request = serde_json::json!({"temperature": 1.0, "top_k": 64});
+        assert_eq!(
+            s.entries["vllm"],
+            Entry {
+                kind: EntryKind::Server(ServerEntry {
+                    url: "http://127.0.0.1:8000/v1".into(),
+                    model: Some("gemma4".into()),
+                    key: KeySource::Command("pass show x".into()),
+                    thinking: Thinking::Server,
+                    request: request.as_object().unwrap().clone(),
+                }),
+                jobs: Some(4),
+                chunk_lines: Some(150),
+            }
+        );
+        let s = at("[llm.or]\nurl = \"https://openrouter.ai/api/v1\"\napi_key_env = \"OPENROUTER_KEY\"\n[llm.bare]\nurl = \"http://h/v1\"\n").unwrap();
+        let server = |url: &str, key| {
+            EntryKind::Server(ServerEntry {
+                url: url.into(),
+                model: None,
+                key,
+                thinking: Thinking::Off,
+                request: serde_json::Map::new(),
+            })
+        };
+        assert_eq!(
+            s.entries["or"].kind,
+            server(
+                "https://openrouter.ai/api/v1",
+                KeySource::Env("OPENROUTER_KEY".into())
+            )
+        );
+        assert_eq!(
+            s.entries["bare"].kind,
+            server("http://h/v1", KeySource::None)
+        );
+        assert_eq!(
+            (s.entries["bare"].jobs, s.entries["bare"].chunk_lines),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn a_server_entry_refuses_what_it_cannot_use() {
+        let p = "/c/config.toml: [llm.s]: ";
+        for (body, said) in [
+            (
+                "url = \"http://h/v1\"\napi_key = \"sk-1\"\n",
+                "api_key does not go in this file: name a variable with api_key_env, or a command that prints the key with api_key_cmd",
+            ),
+            (
+                "url = \"http://h/v1\"\ncommand = \"x\"\n",
+                "an entry has a url or a command, not both",
+            ),
+            ("jobs = 2\n", "an entry needs a url (a server) or a command"),
+            (
+                "command = \"x\"\nmodel = \"m\"\n",
+                "model is for an entry with a url",
+            ),
+            (
+                "command = \"x\"\napi_key_env = \"K\"\n",
+                "api_key_env is for an entry with a url",
+            ),
+            (
+                "command = \"x\"\nrequest = { top_k = 1 }\n",
+                "request is for an entry with a url",
+            ),
+            (
+                "url = \"http://h/v1\"\noutput = \"text\"\n",
+                "output is for an entry with a command",
+            ),
+            (
+                "url = \"ftp://h/v1\"\n",
+                "url must start with http:// or https://",
+            ),
+            (
+                "url = \"http://h/v1\"\napi_key_env = \"K\"\napi_key_cmd = \"x\"\n",
+                "api_key_env and api_key_cmd both name a key: keep one",
+            ),
+            ("url = \"http://h/v1\"\nmodel = \"\"\n", "model is empty"),
+            (
+                "url = \"http://h/v1\"\napi_key_cmd = \" \"\n",
+                "api_key_cmd is empty",
+            ),
+            (
+                "url = \"http://h/v1\"\napi_key_env = \"sk-or-v1-0a1b\"\n",
+                "api_key_env must name an environment variable (letters, digits and _), not hold the key",
+            ),
+            (
+                "url = \"http://h/v1\"\napi_key_env = \"1KEY\"\n",
+                "api_key_env must name an environment variable (letters, digits and _), not hold the key",
+            ),
+            (
+                "url = \"http://h/v1\"\nrequest = { model = \"m\" }\n",
+                "request cannot set model: subcheck sends it",
+            ),
+            (
+                "url = \"http://h/v1\"\nrequest = { messages = [] }\n",
+                "request cannot set messages: subcheck sends it",
+            ),
+            (
+                "url = \"http://h/v1\"\nrequest = { stream = true }\n",
+                "request cannot set stream: subcheck sends it",
+            ),
+        ] {
+            assert_eq!(
+                at(&format!("[llm.s]\n{body}")).unwrap_err(),
+                format!("{p}{said}"),
+                "{body:?}"
+            );
+        }
+        let e = at("[llm.s]\nurl = \"http://h/v1\"\nthinking = \"on\"\n").unwrap_err();
+        assert!(
+            e.starts_with(p) && e.contains("on") && !e.contains('\n'),
+            "{e}"
+        );
     }
 
     #[test]

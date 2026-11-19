@@ -14,7 +14,7 @@ use super::jobs;
 use super::model::{self, FileNote};
 use super::progress;
 use super::update::{Input, Job, Switch, Task};
-use crate::llm::Backend;
+use crate::llm::Via;
 use crate::scan::{self, file_stamp};
 use crate::settings::Settings;
 use crate::store::{Run, ScanRow, Selector, ShowFolder, Store};
@@ -188,11 +188,11 @@ fn recheck_options(
     run: &str,
     settings: &Settings,
 ) -> Result<scan::Options, String> {
-    // A backend this subcheck does not know, or an entry the settings file does not name, would
-    // fail every file at the LLM: refused here instead.
-    Backend::from_label(&scan.header.backend, settings)
-        .map_err(|e| format!("run {run} was scanned with {e}"))?;
     let (backend, langs) = scan::resume(scan, None, None, &[], settings)?;
+    // An LLM that cannot be built again would fail every file at the LLM: refused here instead.
+    if let Via::Unknown(why) = &backend.via {
+        return Err(format!("run {run} was scanned with {why}"));
+    }
     Ok(scan::Options {
         chunk_lines: backend.chunk_lines,
         jobs: backend.jobs,
@@ -206,7 +206,10 @@ fn recheck_options(
 
 /// Check `files` again into run `run`, as `subcheck scan --run <run> --force <files>` does: with
 /// the run's backend and languages, on a thread of its own that sends to `tx`. An entry is as the
-/// settings file at `settings` has it now, or this process's file when that is `None`.
+/// settings file at `settings` has it now, or this process's file when that is `None`. The server
+/// and the key command are asked on the job's thread ([`jobs::recheck`]), never here: this runs on
+/// the screen's loop or the window's core thread, and one that hangs would freeze the screen or the
+/// window.
 fn recheck<T: From<Input> + Send + 'static>(
     store: &mut Store,
     tx: &Sender<T>,
@@ -229,7 +232,7 @@ fn recheck<T: From<Input> + Send + 'static>(
         return Err("nothing to check".into());
     };
     let scans = store.reopen().map_err(|e| e.to_string())?;
-    jobs::scan(plan, opts, scans, tx.clone()).map_err(|e| e.to_string())?;
+    jobs::recheck(plan, opts, scans, tx.clone()).map_err(|e| e.to_string())?;
     Ok(Job {
         run: run.to_string(),
         resume: progress::again_command(run, files),
@@ -247,11 +250,11 @@ pub fn opening(store: &Store, plan: &scan::Plan) -> rusqlite::Result<Run> {
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::apply;
     use crate::llm;
-    use crate::test_support::{copied, fake_llm, scan_row};
+    use crate::test_support::{FakeServer, closed_port_url, copied, fake_llm, scan_row};
 
     #[test]
     fn a_recheck_takes_the_entrys_jobs_and_chunk_lines_as_the_settings_have_them_now() {
@@ -280,47 +283,61 @@ mod tests {
         );
     }
 
-    // The settings file the runner was given, not this process's: one without the run's entry
-    // refuses the recheck, naming that file, and one with it runs the entry's command.
-    #[test]
-    fn a_recheck_reads_the_settings_file_the_runner_was_given() {
+    /// A store in a temp dir holding a run labelled `label`, begun on a copy of typos.mkv, and
+    /// `settings` in config.toml beside it; a runner whose rechecks read that file, the channel its
+    /// jobs send to, and the task that checks the copy again into the run.
+    fn rechecking(
+        label: &str,
+        settings: &str,
+    ) -> (
+        tempfile::TempDir,
+        Runner<Input>,
+        mpsc::Receiver<Input>,
+        Task,
+    ) {
         let (dir, file) = copied("typos.mkv");
         let mut store = Store::open_at(&dir.path().join("subcheck.db")).unwrap();
-        let header = scan_row("mine", &["eng"]).header;
+        let header = scan_row(label, &["eng"]).header;
         let run = store
             .begin_scan(&header, std::slice::from_ref(&file))
             .unwrap()
             .name;
         let config = dir.path().join("config.toml");
-        let entry = format!("[llm.mine]\ncommand = \"'{}'\"\n", fake_llm().display());
-        std::fs::write(&config, entry).unwrap();
+        std::fs::write(&config, settings).unwrap();
         let (tx, rx) = mpsc::channel::<Input>();
-        let rechecked = |at: &Path| {
-            let mut runner = Runner::new(
-                store.reopen().unwrap(),
-                dir.path().join("state"),
-                tx.clone(),
-            )
-            .with_settings_at(at.to_path_buf());
-            let paths = vec![file.to_string_lossy().into_owned()];
-            match runner.run(Task::Recheck {
-                run: run.clone(),
-                paths,
-            }) {
-                Input::Started { job, .. } => job.map(|j| j.run),
-                other => panic!("{other:?}"),
-            }
+        let runner = Runner::new(store, dir.path().join("state"), tx).with_settings_at(config);
+        let task = Task::Recheck {
+            run,
+            paths: vec![file.to_string_lossy().into_owned()],
+        };
+        (dir, runner, rx, task)
+    }
+
+    // The settings file the runner was given, not this process's: one without the run's entry
+    // refuses the recheck, naming that file, and one with it runs the entry's command.
+    #[test]
+    fn a_recheck_reads_the_settings_file_the_runner_was_given() {
+        let entry = format!("[llm.mine]\ncommand = \"'{}'\"\n", fake_llm().display());
+        let (dir, runner, rx, task) = rechecking("mine", &entry);
+        let Task::Recheck { run, .. } = task.clone() else {
+            unreachable!()
+        };
+        let started = |input: Input| match input {
+            Input::Started { job, .. } => job.map(|j| j.run),
+            other => panic!("{other:?}"),
         };
         let none = dir.path().join("none.toml");
+        let mut runner = runner.with_settings_at(none.clone());
         assert_eq!(
-            rechecked(&none),
+            started(runner.run(task.clone())),
             Err(format!(
                 "run {run} was scanned with mine, which this subcheck does not know and {} does \
                  not name",
                 none.display()
             ))
         );
-        assert_eq!(rechecked(&config), Ok(run.clone()));
+        let mut runner = runner.with_settings_at(dir.path().join("config.toml"));
+        assert_eq!(started(runner.run(task)), Ok(run));
         let ended = loop {
             if let Input::ScanEnded(ended) = rx.recv_timeout(Duration::from_mins(1)).unwrap() {
                 break ended.unwrap();
@@ -328,6 +345,70 @@ mod tests {
         };
         // The fake LLM, the entry's command, finds the fixture's two typos.
         assert_eq!((ended.checked, ended.failed, ended.findings), (1, 0, 2));
+    }
+
+    #[test]
+    fn a_recheck_takes_a_server_entrys_jobs_and_chunk_lines_and_the_runs_model() {
+        let s = Settings::parse(
+            Path::new("/c/config.toml"),
+            "[llm.srv]\nurl = \"http://127.0.0.1:1/v1\"\njobs = 5\nchunk_lines = 120\n",
+        )
+        .unwrap();
+        let opts = recheck_options(&scan_row("srv@m", &["eng"]), "r", &s).unwrap();
+        assert_eq!(
+            (opts.backend.label.as_str(), opts.jobs, opts.chunk_lines),
+            ("srv@m", 5, 120)
+        );
+    }
+
+    // The runner is the screen's loop or the window's core thread: it answers at once, however long
+    // the server takes to say what it serves.
+    #[test]
+    fn a_recheck_asks_the_server_on_its_own_thread() {
+        let server = FakeServer::llm_slow(&["m"], Duration::from_secs(3));
+        let settings = format!("[llm.srv]\nurl = \"{}\"\nchunk_lines = 1\n", server.url);
+        let (_dir, mut runner, rx, recheck_task) = rechecking("srv@m", &settings);
+        let started = Instant::now();
+        let Input::Started { job, .. } = runner.run(recheck_task) else {
+            panic!()
+        };
+        assert!(
+            job.is_ok() && started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        let summary = loop {
+            if let Input::ScanEnded(ended) = rx.recv_timeout(Duration::from_secs(60)).unwrap() {
+                break ended.unwrap();
+            }
+        };
+        assert_eq!(summary.findings, 2);
+        assert!(
+            server.requests().iter().any(|r| r.path == "/v1/models"),
+            "the start-up check ran"
+        );
+        assert!(
+            server.completions().len() > 2,
+            "chunk_lines = 1: a call a line"
+        );
+    }
+
+    #[test]
+    fn a_recheck_that_finds_no_server_ends_as_a_failed_scan() {
+        let closed = closed_port_url();
+        let settings = format!("[llm.srv]\nurl = \"{closed}\"\n");
+        let (_dir, mut runner, rx, recheck_task) = rechecking("srv@m", &settings);
+        let Input::Started { job, .. } = runner.run(recheck_task) else {
+            panic!()
+        };
+        assert!(job.is_ok());
+        // The first input is the end: nothing was queued or checked before the check failed.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+            Input::ScanEnded(Err(format!(
+                "srv@m: nothing answering at {closed}: is the server running?"
+            )))
+        );
     }
 
     #[test]

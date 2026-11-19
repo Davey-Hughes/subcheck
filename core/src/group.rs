@@ -51,8 +51,9 @@ impl<T> List<T> {
 
 static GROUPS: Mutex<List<Pid>> = Mutex::new(List::new());
 static FILES: Mutex<List<PathBuf>> = Mutex::new(List::new());
-/// Read by each [`spawn`] from before its child starts until the child is registered, side by
-/// side; written by the signal thread, which so waits for the spawns under way and stops new ones.
+/// Read by each spawn ([`spawn`], [`spawn_without_terminal`]) from before its child starts until
+/// the child is registered, side by side; written by the signal thread, which so waits for the
+/// spawns under way and stops new ones.
 static STARTING: RwLock<()> = RwLock::new(());
 static INSTALL: Once = Once::new();
 /// Set by the signal thread before it kills anything: from then on, a thread that comes back
@@ -95,10 +96,28 @@ impl Drop for Registered {
 /// Start `cmd` in a process group of its own, registered so that a signal that ends subcheck ends
 /// it too.
 pub fn spawn(cmd: &mut Command) -> io::Result<(Child, Registered)> {
+    start_registered(cmd.process_group(0))
+}
+
+/// As [`spawn`], in a session of its own too, so that it has no terminal: opening one fails at
+/// once, where in subcheck's session a read of it would stop the command, out of the terminal's
+/// foreground group, until it is killed.
+pub fn spawn_without_terminal(cmd: &mut Command) -> io::Result<(Child, Registered)> {
+    // A new session's leader leads a new process group too, whose id is its pid, as [`spawn`]'s
+    // child does; `process_group` is not set, since setsid fails in a group's leader.
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| rustix::process::setsid().map(drop).map_err(io::Error::from));
+    }
+    start_registered(cmd)
+}
+
+/// Start `cmd`, registered as the process group it leads.
+fn start_registered(cmd: &mut Command) -> io::Result<(Child, Registered)> {
     INSTALL.call_once(install);
     wait_if_ending();
     let _starting = STARTING.read().unwrap_or_else(PoisonError::into_inner);
-    let child = cmd.process_group(0).spawn()?;
+    let child = cmd.spawn()?;
     let id = lock(&GROUPS).add(Pid::from_child(&child));
     Ok((child, Registered(id)))
 }
@@ -306,6 +325,14 @@ mod tests {
 
     const CHILD: &str = "group::tests::child_that_registers_a_file_and_waits";
     const STARTER: &str = "group::tests::child_that_starts_a_group_slowly";
+
+    #[test]
+    fn a_group_started_without_a_terminal_leads_a_session_of_its_own() {
+        let (pid, session) = crate::test_support::a_childs_session(spawn_without_terminal);
+        assert_eq!(session, Ok(pid));
+        let (_, session) = crate::test_support::a_childs_session(spawn);
+        assert_eq!(session, rustix::process::getsid(None));
+    }
 
     /// Start `true` from another thread, its start stuck in exec for `secs` (its program on a
     /// stalled mount, say).

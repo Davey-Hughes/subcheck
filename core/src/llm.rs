@@ -1,11 +1,12 @@
-//! The LLM step: a backend is any command that reads the prompt on stdin and prints the reply on
-//! stdout. Presets cover claude, codex (gpt) and ollama; an entry in the settings file or
-//! `--llm-cmd` covers anything else. claude, codex and a command that prints an OpenAI chat
-//! completion give their reply as JSON, with what the call used.
+//! The LLM step: a backend is a command that reads the prompt on stdin and prints the reply on
+//! stdout, or an OpenAI-API server subcheck calls itself ([`Server`]). Presets cover claude, codex
+//! (gpt) and ollama; an entry in the settings file or `--llm-cmd` covers anything else. claude,
+//! codex and a command that prints an OpenAI chat completion give their reply as JSON, with what
+//! the call used.
 
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,8 +14,12 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::group;
-use crate::settings::{Entry, Settings};
+use crate::settings::{Entry, EntryKind, Settings};
 use crate::text::{Line, timestamp};
+
+mod key;
+mod server;
+pub use server::Server;
 
 /// Stored with every scan and every LLM check, so findings can be traced to the prompt that
 /// produced them.
@@ -34,13 +39,27 @@ pub const JOBS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Backend {
-    /// What a run records: `claude`, `gpt`, `ollama:<model>`, an entry's name or
-    /// `cmd:<command>`.
+    /// What a run records: `claude`, `gpt`, `ollama:<model>`, an entry's name, `<entry>@<model>`
+    /// for a server (the entry's name alone while its model is not known), or `cmd:<command>`.
+    /// An entry's name has no `@`, so the first `@` always ends it; a model may hold `@`, `/`
+    /// or `:`.
     pub label: String,
-    pub argv: Vec<String>,
+    pub via: Via,
     pub chunk_lines: usize,
     pub jobs: usize,
-    pub output: Output,
+}
+
+/// What a backend's calls go through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Via {
+    /// A command that reads the prompt on stdin and prints the reply as `output` says.
+    Command { argv: Vec<String>, output: Output },
+    /// An OpenAI-API server subcheck calls itself.
+    Server(Server),
+    /// A run's LLM that cannot be built again: why, as [`Backend::from_label`] says it. A call
+    /// answers that, so a file that needs the LLM fails saying why rather than calling something
+    /// the run did not use.
+    Unknown(String),
 }
 
 /// How a backend prints its reply.
@@ -117,19 +136,23 @@ impl Backend {
                 let argv = ["ollama", "run", "--think=false", "--nowordwrap", model];
                 return Ok(Backend {
                     label: name.to_string(),
-                    argv: argv.iter().map(ToString::to_string).collect(),
+                    via: Via::Command {
+                        argv: argv.iter().map(ToString::to_string).collect(),
+                        output: Output::Text,
+                    },
                     chunk_lines: CHUNK_LINES_OLLAMA,
                     jobs: JOBS,
-                    output: Output::Text,
                 });
             }
         };
         Ok(Backend {
             label: name.to_string(),
-            argv: argv.iter().map(ToString::to_string).collect(),
+            via: Via::Command {
+                argv: argv.iter().map(ToString::to_string).collect(),
+                output,
+            },
             chunk_lines: CHUNK_LINES,
             jobs: JOBS,
-            output,
         })
     }
 
@@ -137,21 +160,39 @@ impl Backend {
     pub fn shell(command: &str) -> Backend {
         Backend {
             label: format!("cmd:{command}"),
-            argv: vec!["sh".into(), "-c".into(), command.into()],
+            via: Via::Command {
+                argv: vec!["sh".into(), "-c".into(), command.into()],
+                output: Output::Text,
+            },
             chunk_lines: CHUNK_LINES,
             jobs: JOBS,
-            output: Output::Text,
         }
     }
 
-    /// The settings file's entry `name`: its command run as `--llm-cmd`'s is, recorded by the name.
-    pub fn command(name: &str, entry: &Entry) -> Backend {
+    /// The settings file's entry `name`: its command run as `--llm-cmd`'s is, or its server.
+    /// Recorded by the name, and a server's with the model when the entry names one.
+    pub fn entry(name: &str, entry: &Entry) -> Backend {
+        let (label, via) = match &entry.kind {
+            EntryKind::Command { command, output } => {
+                let argv = Backend::shell(command).command_line();
+                (
+                    name.to_string(),
+                    Via::Command {
+                        argv,
+                        output: *output,
+                    },
+                )
+            }
+            EntryKind::Server(server) => {
+                let server = Server::new(name, server, server.model.as_deref());
+                (server.label(), Via::Server(server))
+            }
+        };
         Backend {
-            label: name.to_string(),
+            label,
+            via,
             chunk_lines: entry.chunk_lines.unwrap_or(CHUNK_LINES),
             jobs: entry.jobs.unwrap_or(JOBS),
-            output: entry.output,
-            ..Backend::shell(&entry.command)
         }
     }
 
@@ -162,7 +203,7 @@ impl Backend {
             return Ok(preset);
         }
         match settings.entries.get(name) {
-            Some(entry) => Ok(Backend::command(name, entry)),
+            Some(entry) => Ok(Backend::entry(name, entry)),
             None => Err(format!(
                 "unknown --llm {name:?}: use claude, gpt, ollama:<model>, an entry in {}, or \
                  --llm-cmd",
@@ -171,47 +212,126 @@ impl Backend {
         }
     }
 
-    /// The backend a run records, by its label; an entry as `settings` has it now.
+    /// The backend a run records, by its label; an entry as `settings` has it now. An entry that
+    /// is gone, or is no longer what the run called, is refused, saying which.
     pub fn from_label(label: &str, settings: &Settings) -> Result<Backend, String> {
-        match label.strip_prefix("cmd:") {
-            Some(command) => Ok(Backend::shell(command)),
-            None => Backend::named(label, settings).map_err(|_| {
-                format!(
-                    "{label}, which this subcheck does not know and {} does not name",
-                    settings.path.display()
-                )
-            }),
+        if let Some(command) = label.strip_prefix("cmd:") {
+            return Ok(Backend::shell(command));
+        }
+        // Before the split at `@`: an ollama model may hold one.
+        if let Ok(preset) = Backend::preset(label) {
+            return Ok(preset);
+        }
+        let path = settings.path.display();
+        let (name, model) = match label.split_once('@') {
+            Some((name, model)) => (name, Some(model)),
+            None => (label, None),
+        };
+        // The settings file refuses an empty model, so a run never records one.
+        if model == Some("") {
+            return Err(format!("{label}, which names no model"));
+        }
+        let Some(entry) = settings.entries.get(name) else {
+            return Err(format!(
+                "{label}, which this subcheck does not know and {path} does not name"
+            ));
+        };
+        match (&entry.kind, model) {
+            (EntryKind::Command { .. }, None) => Ok(Backend::entry(name, entry)),
+            (EntryKind::Command { .. }, Some(_)) => {
+                Err(format!("{label}, which {path} now has as a command"))
+            }
+            // A run through a server records its model, so a bare name was a command's.
+            (EntryKind::Server(_), None) => {
+                Err(format!("{label}, which {path} now has as a server"))
+            }
+            (EntryKind::Server(server), Some(model)) => match &server.model {
+                Some(asked) if asked != model => Err(format!(
+                    "{label}, but {path} now has {name} ask for {asked:?}"
+                )),
+                _ => Ok(Backend {
+                    label: label.to_string(),
+                    via: Via::Server(Server::new(name, server, Some(model))),
+                    ..Backend::entry(name, entry)
+                }),
+            },
         }
     }
 
-    /// One call: the prompt in, the reply out, read as the backend prints it.
-    pub fn call(&self, prompt: &str, timeout: Duration) -> Answer {
-        let failed = match run(&self.argv, prompt, timeout) {
-            Ok(stdout) => return self.output.read(&stdout),
-            Err(failed) => failed,
-        };
-        let said = self.output.read_json(&failed.stdout);
-        // The exit status and stderr, then the backend's reason when its JSON gives one: claude
-        // out of its session says why there alone, with nothing on stderr.
-        let reply = match said.as_ref().and_then(|s| s.reason.as_deref()) {
-            Some(why) => format!(
-                "{}; {} said: {why:.200}",
-                failed.message,
-                self.output.name()
-            ),
-            None => failed.message,
-        };
-        // Every call that started counts, with what its JSON says it used, if anything.
-        let used = match (self.output, said.and_then(|s| s.usage)) {
-            (Output::Text, _) => Used::Untracked,
-            _ if !failed.started => Used::Untracked,
-            (_, Some(usage)) => Used::Reported(usage),
-            (_, None) => Used::Unreported,
-        };
-        Answer {
-            reply: Err(reply),
-            used,
+    /// The backend made ready for calls: for a server, its key fetched, `GET <url>/models` asked,
+    /// the model settled (the one the entry or the run names, which the server must serve, else
+    /// the only one it serves) and the label with it, `<name>@<model>`, as the run records it; with
+    /// the warnings to show. A command, or an LLM that cannot be built again, comes back as it is,
+    /// asking nothing. Every error starts with the label as it was.
+    ///
+    /// A new scan runs it before it reads any file, since the label it records waits on the
+    /// model; a resumed run only once a file needs the LLM, so a resume with nothing for the LLM
+    /// to do needs no server up; a recheck on its job's thread, so a server or a key command that
+    /// hangs freezes neither the screen nor the window. It sends only `GET`s, so it never makes a
+    /// server load a model.
+    pub fn ready(self) -> Result<(Backend, Vec<String>), String> {
+        match self.via {
+            Via::Server(server) => {
+                let (server, warnings) = server
+                    .ready()
+                    .map_err(|why| format!("{}: {why}", self.label))?;
+                let ready = Backend {
+                    label: server.label(),
+                    via: Via::Server(server),
+                    ..self
+                };
+                Ok((ready, warnings))
+            }
+            via => Ok((Backend { via, ..self }, Vec::new())),
         }
+    }
+
+    /// What a run's header records as the backend's command: its argv, or the URL a server's calls
+    /// go to; nothing for an LLM that cannot be built again.
+    pub fn command_line(&self) -> Vec<String> {
+        match &self.via {
+            Via::Command { argv, .. } => argv.clone(),
+            Via::Server(server) => vec![format!("{}/chat/completions", server.entry.url)],
+            Via::Unknown(_) => Vec::new(),
+        }
+    }
+
+    /// One call: the prompt in, the reply out, read as the backend gives it.
+    pub fn call(&self, prompt: &str, timeout: Duration) -> Answer {
+        match &self.via {
+            Via::Command { argv, output } => call_command(argv, *output, prompt, timeout),
+            Via::Server(server) => server.call(prompt, timeout),
+            Via::Unknown(why) => Answer {
+                reply: Err(why.clone()),
+                used: Used::Untracked,
+            },
+        }
+    }
+}
+
+/// One call of `argv`, its reply read as `output` says.
+fn call_command(argv: &[String], output: Output, prompt: &str, timeout: Duration) -> Answer {
+    let failed = match run(argv, prompt, timeout, group::spawn) {
+        Ok(stdout) => return output.read(&stdout),
+        Err(failed) => failed,
+    };
+    let said = output.read_json(&failed.stdout);
+    // The exit status and stderr, then the backend's reason when its JSON gives one: claude out of
+    // its session says why there alone, with nothing on stderr.
+    let reply = match said.as_ref().and_then(|s| s.reason.as_deref()) {
+        Some(why) => format!("{}; {} said: {why:.200}", failed.message, output.name()),
+        None => failed.message,
+    };
+    // Every call that started counts, with what its JSON says it used, if anything.
+    let used = match (output, said.and_then(|s| s.usage)) {
+        (Output::Text, _) => Used::Untracked,
+        _ if !failed.started => Used::Untracked,
+        (_, Some(usage)) => Used::Reported(usage),
+        (_, None) => Used::Unreported,
+    };
+    Answer {
+        reply: Err(reply),
+        used,
     }
 }
 
@@ -424,9 +544,24 @@ struct OpenAiPromptDetails {
     cached_tokens: Option<u64>,
 }
 
+/// `error` as servers send it: an object with a message, as OpenAI's does, or a message alone.
 #[derive(Deserialize)]
-struct OpenAiError {
-    message: Option<String>,
+#[serde(untagged)]
+enum OpenAiError {
+    Said(String),
+    Object { message: Option<String> },
+}
+
+impl OpenAiError {
+    fn message(self) -> Option<String> {
+        match self {
+            OpenAiError::Said(message)
+            | OpenAiError::Object {
+                message: Some(message),
+            } => Some(message),
+            OpenAiError::Object { message: None } => None,
+        }
+    }
 }
 
 /// Whether `cost` can be a price: finite, and not below 0. In claude's reply one that is not is
@@ -489,7 +624,7 @@ fn read_openai(stdout: &str) -> Option<Said> {
     });
     let said = r
         .error
-        .and_then(|e| e.message)
+        .and_then(OpenAiError::message)
         .filter(|m| !m.trim().is_empty());
     let choice = r.choices.into_iter().next();
     let stopped = choice.as_ref().and_then(|c| c.finish_reason.clone());
@@ -854,6 +989,8 @@ struct Failed {
     stdout: String,
     /// It started, so it may have cost.
     started: bool,
+    /// The code it exited with, when it ran to an exit.
+    code: Option<i32>,
 }
 
 impl Failed {
@@ -863,6 +1000,7 @@ impl Failed {
             message,
             stdout: String::new(),
             started,
+            code: None,
         }
     }
 }
@@ -870,15 +1008,22 @@ impl Failed {
 /// Run `argv` with `input` on stdin, returning stdout; an error names the exit status or the
 /// timeout, plus the last line of stderr, and keeps what the command printed on stdout.
 ///
-/// The command runs in its own process group, so a timeout kills everything it started (a wrapper
-/// script's children, or what dash forks for `sh -c`), not just the direct child. That takes it out
-/// of the terminal's foreground group, where Ctrl-C would reach it, so when SIGINT, SIGTERM or
-/// SIGHUP ends subcheck, [`group`] kills every group still running.
-fn run(argv: &[String], input: &str, timeout: Duration) -> Result<String, Failed> {
+/// `spawn` starts the command in its own process group ([`group::spawn`], or
+/// [`group::spawn_without_terminal`] for one that must not reach the terminal), so a timeout kills
+/// everything it started (a wrapper script's children, or what dash forks for `sh -c`), not just
+/// the direct child. That takes it out of the terminal's foreground group, where Ctrl-C would
+/// reach it, so when SIGINT, SIGTERM or SIGHUP ends subcheck, [`group`] kills every group still
+/// running.
+fn run(
+    argv: &[String],
+    input: &str,
+    timeout: Duration,
+    spawn: fn(&mut Command) -> io::Result<(Child, group::Registered)>,
+) -> Result<String, Failed> {
     let Some((program, rest)) = argv.split_first() else {
         return Err(Failed::with_nothing("empty command".into(), false));
     };
-    let (mut child, _running) = group::spawn(
+    let (mut child, _running) = spawn(
         Command::new(program)
             .args(rest)
             .stdin(Stdio::piped())
@@ -975,6 +1120,7 @@ fn run(argv: &[String], input: &str, timeout: Duration) -> Result<String, Failed
             message: format!("{program} exited with {status}{}", said(&err)),
             stdout: out,
             started: true,
+            code: status.code(),
         })
     }
 }
@@ -1068,21 +1214,42 @@ mod tests {
         assert!(parse("Nonetheless, all fine.", &[&a]).is_err());
     }
 
+    /// A command backend's argv and how it prints its reply.
+    fn command(b: &Backend) -> (&[String], Output) {
+        match &b.via {
+            Via::Command { argv, output } => (argv, *output),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `command` run through `sh -c`, its reply read as `output` says.
+    fn shell_as(output: Output, command: &str) -> Backend {
+        Backend {
+            via: Via::Command {
+                argv: Backend::shell(command).command_line(),
+                output,
+            },
+            ..Backend::shell(command)
+        }
+    }
+
     #[test]
     fn presets() {
-        let c = Backend::preset("claude").unwrap();
-        assert_eq!(&c.argv[..4], ["claude", "-p", "--model", "sonnet"]);
-        assert!(c.argv.contains(&"--setting-sources".to_string()));
-        assert!(c.argv.windows(2).any(|w| w == ["--output-format", "json"]));
-        assert_eq!(c.output, Output::Claude);
-        let g = Backend::preset("gpt").unwrap();
-        assert_eq!(&g.argv[..4], ["codex", "exec", "--disable", "hooks"]);
-        assert_eq!(&g.argv[g.argv.len() - 2..], ["--json", "-"]);
-        assert_eq!(g.output, Output::Codex);
+        let claude = Backend::preset("claude").unwrap();
+        let (c, output) = command(&claude);
+        assert_eq!(&c[..4], ["claude", "-p", "--model", "sonnet"]);
+        assert!(c.contains(&"--setting-sources".to_string()));
+        assert!(c.windows(2).any(|w| w == ["--output-format", "json"]));
+        assert_eq!(output, Output::Claude);
+        let gpt = Backend::preset("gpt").unwrap();
+        let (g, output) = command(&gpt);
+        assert_eq!(&g[..4], ["codex", "exec", "--disable", "hooks"]);
+        assert_eq!(&g[g.len() - 2..], ["--json", "-"]);
+        assert_eq!(output, Output::Codex);
         let o = Backend::preset("ollama:gemma4:12b-it-qat").unwrap();
-        assert_eq!(o.output, Output::Text);
+        assert_eq!(command(&o).1, Output::Text);
         assert_eq!(
-            o.argv,
+            command(&o).0,
             [
                 "ollama",
                 "run",
@@ -1095,10 +1262,10 @@ mod tests {
         assert!(Backend::preset("ollama:").is_err());
         assert!(Backend::preset("gemini").is_err());
         assert_eq!(
-            Backend::shell("my-llm --x").argv,
+            Backend::shell("my-llm --x").command_line(),
             ["sh", "-c", "my-llm --x"]
         );
-        assert_eq!(Backend::shell("my-llm --x").output, Output::Text);
+        assert_eq!(command(&Backend::shell("my-llm --x")).1, Output::Text);
     }
 
     /// A real reply of `claude -p --output-format json` (2.1.304), with fields it does not read
@@ -1222,11 +1389,7 @@ mod tests {
                 cost_usd: None,
             })
         );
-        let a = Backend {
-            output: Output::OpenAi,
-            ..Backend::shell("cat")
-        }
-        .call(OPENAI, TIMEOUT);
+        let a = shell_as(Output::OpenAi, "cat").call(OPENAI, TIMEOUT);
         assert_eq!(a.reply.as_deref(), Ok("NONE\n"));
     }
 
@@ -1310,6 +1473,14 @@ mod tests {
         assert_eq!(a.used, Used::Unreported);
     }
 
+    #[test]
+    fn an_openai_error_that_is_a_string_is_the_reason_too() {
+        assert_eq!(
+            Output::OpenAi.read(r#"{"error":"model not found"}"#).reply,
+            Err("the reply is an error: model not found".into())
+        );
+    }
+
     /// A JSON backend that prints `stdout`, says `stderr` (when there is any), and exits 1.
     fn failing(output: Output, stdout: &str, stderr: &str) -> Answer {
         let dir = tempfile::tempdir().unwrap();
@@ -1321,11 +1492,7 @@ mod tests {
             format!("echo '{stderr}' >&2; ")
         };
         let cmd = format!("cat '{}'; {say}exit 1", out.display());
-        Backend {
-            output,
-            ..Backend::shell(&cmd)
-        }
-        .call("", TIMEOUT)
+        shell_as(output, &cmd).call("", TIMEOUT)
     }
 
     #[test]
@@ -1442,11 +1609,7 @@ mod tests {
 
     #[test]
     fn a_call_reads_its_reply_as_the_backend_prints_it() {
-        let claude = Backend {
-            output: Output::Claude,
-            ..Backend::shell("cat")
-        };
-        let a = claude.call(CLAUDE, TIMEOUT);
+        let a = shell_as(Output::Claude, "cat").call(CLAUDE, TIMEOUT);
         assert_eq!(a.reply.as_deref(), Ok("NONE\n"));
         assert!(reported(&a.used).is_some());
         let a = Backend::shell("exit 3").call("", TIMEOUT);
@@ -1456,10 +1619,7 @@ mod tests {
 
     #[test]
     fn every_call_a_json_backend_started_is_counted_with_numbers_or_without() {
-        let claude = |cmd: &str| Backend {
-            output: Output::Claude,
-            ..Backend::shell(cmd)
-        };
+        let claude = |cmd: &str| shell_as(Output::Claude, cmd);
         // Killed at the timeout.
         let a = claude("sleep 5; echo late").call("", Duration::from_millis(200));
         assert!(a.reply.unwrap_err().contains("timed out"));
@@ -1477,14 +1637,17 @@ mod tests {
                 "{cmd}"
             );
         }
-        let codex = Backend {
-            output: Output::Codex,
-            ..Backend::shell(r#"echo '{"type":"thread.started","thread_id":"t"}'; exit 1"#)
-        };
+        let codex = shell_as(
+            Output::Codex,
+            r#"echo '{"type":"thread.started","thread_id":"t"}'; exit 1"#,
+        );
         assert_eq!(codex.call("", TIMEOUT).used, Used::Unreported);
         // It never started: nothing to count.
         let gone = Backend {
-            argv: vec!["/nonexistent/claude".into()],
+            via: Via::Command {
+                argv: vec!["/nonexistent/claude".into()],
+                output: Output::Claude,
+            },
             ..claude("")
         };
         let a = gone.call("", TIMEOUT);
@@ -1637,8 +1800,8 @@ mod tests {
         assert_eq!(
             Backend::from_label("cmd:my-llm --x", &settings(""))
                 .unwrap()
-                .argv,
-            Backend::shell("my-llm --x").argv
+                .command_line(),
+            Backend::shell("my-llm --x").command_line()
         );
         assert!(Backend::from_label("gemini", &settings("")).is_err());
     }
@@ -1656,15 +1819,17 @@ mod tests {
             Backend::named("mine", &s),
             Ok(Backend {
                 label: "mine".into(),
-                argv: vec!["sh".into(), "-c".into(), "my-llm --fast".into()],
+                via: Via::Command {
+                    argv: vec!["sh".into(), "-c".into(), "my-llm --fast".into()],
+                    output: Output::Claude,
+                },
                 chunk_lines: 200,
                 jobs: 4,
-                output: Output::Claude,
             })
         );
         let p = Backend::named("plain", &s).unwrap();
         assert_eq!(
-            (p.chunk_lines, p.jobs, p.output),
+            (p.chunk_lines, p.jobs, command(&p).1),
             (CHUNK_LINES, JOBS, Output::Text)
         );
         for preset in ["claude", "gpt", "ollama:gemma4"] {
@@ -1698,15 +1863,98 @@ mod tests {
     }
 
     #[test]
+    fn a_label_with_nothing_after_the_at_names_no_model() {
+        let s = settings("[llm.srv]\nurl = \"http://127.0.0.1:1/v1\"\n");
+        assert_eq!(
+            Backend::from_label("srv@", &s),
+            Err("srv@, which names no model".into())
+        );
+        assert_eq!(
+            Backend::from_label("ollama:m@x", &s),
+            Backend::preset("ollama:m@x")
+        );
+    }
+
+    #[test]
+    fn a_server_entry_is_a_backend_labelled_by_its_name_and_model() {
+        let s = settings(
+            "[llm.srv]\nurl = \"http://127.0.0.1:1/v1\"\nmodel = \"gemma4\"\njobs = 3\n[llm.any]\nurl = \"http://127.0.0.1:1/v1\"\n",
+        );
+        let b = Backend::named("srv", &s).unwrap();
+        assert_eq!(
+            (b.label.as_str(), b.jobs, b.chunk_lines),
+            ("srv@gemma4", 3, CHUNK_LINES)
+        );
+        assert!(
+            matches!(&b.via, Via::Server(s) if s.name == "srv" && s.model.as_deref() == Some("gemma4"))
+        );
+        assert_eq!(b.command_line(), ["http://127.0.0.1:1/v1/chat/completions"]);
+        let any = Backend::named("any", &s).unwrap();
+        assert_eq!(any.label, "any");
+        assert!(matches!(&any.via, Via::Server(s) if s.model.is_none()));
+        assert_eq!(Backend::shell("x y").command_line(), ["sh", "-c", "x y"]);
+    }
+
+    #[test]
+    fn a_recorded_server_label_finds_its_entry_and_keeps_its_model() {
+        let s = settings(
+            "[llm.srv]\nurl = \"http://127.0.0.1:1/v1\"\n[llm.pinned]\nurl = \"http://127.0.0.1:1/v1\"\nmodel = \"b\"\n[llm.cmd]\ncommand = \"x\"\n",
+        );
+        let b = Backend::from_label("srv@org/model:q4@x", &s).unwrap();
+        assert_eq!(b.label, "srv@org/model:q4@x");
+        assert!(matches!(&b.via, Via::Server(s) if s.model.as_deref() == Some("org/model:q4@x")));
+        assert_eq!(
+            Backend::from_label("pinned@b", &s).map(|b| b.label),
+            Ok("pinned@b".into())
+        );
+        for (label, said) in [
+            (
+                "pinned@a",
+                "pinned@a, but /c/config.toml now has pinned ask for \"b\"",
+            ),
+            ("cmd@a", "cmd@a, which /c/config.toml now has as a command"),
+            ("srv", "srv, which /c/config.toml now has as a server"),
+            (
+                "gone@a",
+                "gone@a, which this subcheck does not know and /c/config.toml does not name",
+            ),
+        ] {
+            assert_eq!(
+                Backend::from_label(label, &s),
+                Err(said.to_string()),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_llm_answers_why_and_counts_nothing() {
+        let b = Backend {
+            via: Via::Unknown("gone, which …".into()),
+            ..Backend::shell("x")
+        };
+        assert_eq!(
+            b.call("P", TIMEOUT),
+            Answer {
+                reply: Err("gone, which …".into()),
+                used: Used::Untracked
+            }
+        );
+    }
+
+    #[test]
     fn run_passes_stdin_through() {
-        let argv = Backend::shell("tr a-z A-Z").argv;
-        assert_eq!(run(&argv, "hello\n", TIMEOUT).unwrap(), "HELLO\n");
+        let argv = Backend::shell("tr a-z A-Z").command_line();
+        assert_eq!(
+            run(&argv, "hello\n", TIMEOUT, group::spawn).unwrap(),
+            "HELLO\n"
+        );
     }
 
     #[test]
     fn run_reports_exit_status_and_stderr() {
-        let argv = Backend::shell("echo boom >&2; exit 3").argv;
-        let err = run(&argv, "", TIMEOUT).unwrap_err().message;
+        let argv = Backend::shell("echo boom >&2; exit 3").command_line();
+        let err = run(&argv, "", TIMEOUT, group::spawn).unwrap_err().message;
         assert!(
             err.contains("exit status: 3") && err.contains("boom"),
             "{err}"
@@ -1717,25 +1965,27 @@ mod tests {
     fn run_kills_a_command_that_overruns() {
         // Two commands, so every shell forks `sleep` instead of exec'ing it: the grandchild
         // outlives the killed shell and keeps stdout open. dash forks even a lone `sleep 5`.
-        let argv = Backend::shell("sleep 5; echo late").argv;
+        let argv = Backend::shell("sleep 5; echo late").command_line();
         let started = Instant::now();
-        let err = run(&argv, "", Duration::from_millis(200))
+        let err = run(&argv, "", Duration::from_millis(200), group::spawn)
             .unwrap_err()
             .message;
         assert!(err.contains("timed out"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(3));
         // With what it said on stderr before.
-        let argv = Backend::shell("echo 'rate limited' >&2; sleep 5").argv;
-        let err = run(&argv, "", Duration::from_secs(1)).unwrap_err().message;
+        let argv = Backend::shell("echo 'rate limited' >&2; sleep 5").command_line();
+        let err = run(&argv, "", Duration::from_secs(1), group::spawn)
+            .unwrap_err()
+            .message;
         assert!(err.ends_with("timed out after 1s: rate limited"), "{err}");
     }
 
     #[test]
     fn run_does_not_wait_for_a_background_process_holding_stdout() {
         // The shell exits at once, but `sleep` inherited stdout and keeps it open.
-        let argv = Backend::shell("sleep 30 & echo done").argv;
+        let argv = Backend::shell("sleep 30 & echo done").command_line();
         let started = Instant::now();
-        assert_eq!(run(&argv, "", TIMEOUT).unwrap(), "done\n");
+        assert_eq!(run(&argv, "", TIMEOUT, group::spawn).unwrap(), "done\n");
         let took = started.elapsed();
         assert!(took < Duration::from_secs(10), "{took:?}");
     }
@@ -1745,9 +1995,9 @@ mod tests {
     fn run_does_not_wait_for_a_process_out_of_its_group_holding_stdout() {
         // `setsid` puts `sleep` in a session of its own, out of reach of the group's kill, and it
         // keeps the stdout it inherited open until it ends.
-        let argv = Backend::shell("setsid sleep 6 & echo done").argv;
+        let argv = Backend::shell("setsid sleep 6 & echo done").command_line();
         let started = Instant::now();
-        assert_eq!(run(&argv, "", TIMEOUT).unwrap(), "done\n");
+        assert_eq!(run(&argv, "", TIMEOUT, group::spawn).unwrap(), "done\n");
         let took = started.elapsed();
         assert!(took < Duration::from_secs(5), "{took:?}");
     }
@@ -1758,9 +2008,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("pid");
         let cmd = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
-        let err = run(&Backend::shell(&cmd).argv, "", Duration::from_millis(300))
-            .unwrap_err()
-            .message;
+        let err = run(
+            &Backend::shell(&cmd).command_line(),
+            "",
+            Duration::from_millis(300),
+            group::spawn,
+        )
+        .unwrap_err()
+        .message;
         assert!(err.contains("timed out"), "{err}");
         let pid = std::fs::read_to_string(&pidfile).unwrap();
         thread::sleep(Duration::from_millis(200));
@@ -1783,8 +2038,8 @@ mod tests {
     #[test]
     fn run_survives_a_command_that_ignores_its_input() {
         // 1 MB on stdin to a command that never reads it must not deadlock.
-        let argv = Backend::shell("echo done").argv;
+        let argv = Backend::shell("echo done").command_line();
         let big = "x".repeat(1 << 20);
-        assert_eq!(run(&argv, &big, TIMEOUT).unwrap(), "done\n");
+        assert_eq!(run(&argv, &big, TIMEOUT, group::spawn).unwrap(), "done\n");
     }
 }
