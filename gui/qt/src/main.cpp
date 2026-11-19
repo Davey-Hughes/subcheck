@@ -6,16 +6,19 @@
 // and 0 otherwise.
 #include "player_port.h"
 #include "session_bridge.h"
+#include "window_settings.h"
 
 #include <QCoreApplication>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQuickWindow>
+#include <QSettings>
 #include <QtQml/QQmlExtensionPlugin>
 
 #include <chrono>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -32,6 +35,10 @@ int run(int argc, char **argv) {
     // first window: Linux's default, but not macOS's, which is Metal.
     QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
     QGuiApplication app(argc, argv);
+    // Where the window's settings stick: $XDG_CONFIG_HOME/subcheck/subcheck-qt.conf on Linux, the
+    // app's preferences on macOS.
+    QCoreApplication::setOrganizationName(QStringLiteral("subcheck"));
+    QCoreApplication::setApplicationName(QStringLiteral("subcheck-qt"));
     // Through QString, as the session takes UTF-8 and toStdString always gives it.
     std::vector<std::string> selector;
     const QStringList arguments = QCoreApplication::arguments();
@@ -40,9 +47,9 @@ int run(int argc, char **argv) {
     }
     // A load or a seek has a second to land before the player goes on as if it had; mpv has two to
     // answer a request, as the terminal's socket gives it; and an Open waits ten for the pane to
-    // show video, long past a first frame on a display that can draw, so that `o` on one that
-    // cannot says so. Made before the bridge, which stops it as it goes: the player must outlive
-    // the bridge, or the bridge's last release runs on a player already destroyed.
+    // show video, long past a first frame on a display that can draw, so that Show in Video on one
+    // that cannot says so. Made before the bridge, which stops it as it goes: the player must
+    // outlive the bridge, or the bridge's last release runs on a player already destroyed.
     PlayerPort player(1s, 2s, 10s);
     // Before the engine, so that it outlives the window that shows it. The wait after a quit is
     // longer than the store waits for another process's write lock (core's BUSY_TIMEOUT), so that
@@ -54,12 +61,16 @@ int run(int argc, char **argv) {
     SessionBridge bridge(std::move(selector), player, std::cout, std::cerr, 10s);
     QObject::connect(&bridge, &SessionBridge::finished, &app,
                      [](int status) { QCoreApplication::exit(status); });
+    WindowSettings settings(std::make_unique<QSettings>(), QGuiApplication::platformName());
     QQmlApplicationEngine engine;
-    engine.setInitialProperties({{QStringLiteral("bridge"), QVariant::fromValue(&bridge)}});
+    engine.setInitialProperties({{QStringLiteral("bridge"), QVariant::fromValue(&bridge)},
+                                 {QStringLiteral("settings"), QVariant::fromValue(&settings)}});
     engine.loadFromModule("Subcheck", "Main");
-    if (engine.rootObjects().isEmpty()) {
+    auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().value(0));
+    if (!window) {
         return 1;
     }
+    settings.show(window);
     bridge.start();
     return QGuiApplication::exec();
 }

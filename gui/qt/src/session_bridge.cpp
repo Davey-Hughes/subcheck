@@ -16,6 +16,20 @@ namespace {
 // one way out of a failed review, shows only with text, and quit and dismiss look for it.
 const char *const noReason = "review ended on an error that gave no reason";
 
+// Whether two keys name one entry of the list: the same row, or the same member of a row.
+bool sameEntry(const std::optional<EntryKey> &a, const std::optional<EntryKey> &b) {
+    if (!a || !b) {
+        return !a && !b;
+    }
+    const auto *rowA = std::get_if<EntryKey::kRow>(&a->get_variant());
+    const auto *rowB = std::get_if<EntryKey::kRow>(&b->get_variant());
+    if (rowA || rowB) {
+        return rowA && rowB && rowA->v1 == rowB->v1;
+    }
+    return std::get<EntryKey::kMember>(a->get_variant()).v1 ==
+           std::get<EntryKey::kMember>(b->get_variant()).v1;
+}
+
 } // namespace
 
 SessionBridge::SessionBridge(std::vector<std::string> selector, PlayerPort &player,
@@ -83,75 +97,91 @@ void SessionBridge::start() {
 
 FindingsModel *SessionBridge::findings() { return &list; }
 
+FoldersModel *SessionBridge::folders() { return &reviews; }
+
+FiltersModel *SessionBridge::filters() { return &shows; }
+
+EpisodesModel *SessionBridge::episodes() { return &files; }
+
+DetailView *SessionBridge::detail() { return &details; }
+
 PlayerPort *SessionBridge::player() { return &port; }
 
 QString SessionBridge::title() const {
     return opened ? QString::fromStdString(summary.title) : QStringLiteral("subcheck");
 }
 
-QString SessionBridge::statusLine() const {
-    // Until the end comes, which can take the whole wait, so that the window says why it stays.
-    if (quitting) {
-        return QStringLiteral("quitting: waiting for review to end");
-    }
+QString SessionBridge::counts() const {
     if (!opened) {
-        return QStringLiteral("opening…");
+        return {};
     }
-    if (summary.status) {
-        return statusWords(*summary.status);
-    }
-    return QStringLiteral("%1 pending · %2 accepted · %3 rejected")
+    return QStringLiteral("%1 to review · %2 accepted · %3 rejected")
         .arg(summary.pending)
         .arg(summary.accepted)
         .arg(summary.rejected);
+}
+
+QString SessionBridge::heading() const { return opened ? shows.heading() : QString(); }
+
+QString SessionBridge::switchLabel() const {
+    return summary.of_paths ? QStringLiteral("Show Newest Check") : QStringLiteral("Show Folders");
+}
+
+QString SessionBridge::statusLine() const {
+    // Until the end comes, which can take the whole wait, so that the window says why it stays.
+    if (quitting) {
+        return QStringLiteral("Quitting: waiting for review to end");
+    }
+    if (!opened) {
+        return QStringLiteral("Opening…");
+    }
+    return summary.status ? statusWords(*summary.status) : QString();
 }
 
 int SessionBridge::selected() const {
     return summary.selected ? static_cast<int>(*summary.selected) : -1;
 }
 
-bool SessionBridge::empty() const { return opened && list.rowCount() == 0; }
+QString SessionBridge::emptyWords() const {
+    if (!opened || list.rowCount() > 0) {
+        return {};
+    }
+    // Review's counts are the whole view's, whatever the filter shows.
+    return summary.pending + summary.accepted + summary.rejected == 0
+               ? QStringLiteral("No findings in this run")
+               : QStringLiteral("No findings under this filter");
+}
+
+QString SessionBridge::episodeName() const {
+    // Review sends the logs of the file selected, which stays where a click on an episode left it
+    // while the finding selected moves on: beside a finding of another episode, they are not
+    // its. A row of several is each of its episodes', and its members name them as the list does.
+    if (!logs || !summary.file_selected) {
+        return {};
+    }
+    const std::optional<std::string> label =
+        files.labelAt(static_cast<int>(*summary.file_selected));
+    return label && details.isOf(*label) ? QString::fromStdString(*label) : QString();
+}
+
+QStringList SessionBridge::episodeLog() const {
+    if (episodeName().isEmpty()) {
+        return {};
+    }
+    QStringList said;
+    for (const std::string &line : logs->log) {
+        said << QString::fromStdString(line);
+    }
+    if (!logs->apply_log.empty()) {
+        said << QString();
+        for (const std::string &line : logs->apply_log) {
+            said << QString::fromStdString(line);
+        }
+    }
+    return said;
+}
 
 QString SessionBridge::fatal() const { return fatalText; }
-
-bool SessionBridge::key(int key, const QString &text) {
-    if (key == Qt::Key_Down || text == u"j") {
-        move(1);
-    } else if (key == Qt::Key_Up || text == u"k") {
-        move(-1);
-    } else if (key == Qt::Key_Return || key == Qt::Key_Enter) {
-        toggle();
-    } else if (text == u"a") {
-        accept();
-    } else if (text == u"r") {
-        reject();
-    } else if (text == u"u") {
-        undo();
-    } else if (text == u"o") {
-        play();
-    } else if (text == u"O") {
-        closePlayer();
-    } else if (key == Qt::Key_Space) {
-        playback(Playback(Playback::kPause{}));
-    } else if (key == Qt::Key_Left) {
-        playback(Playback(Playback::kSeek{-5}));
-    } else if (key == Qt::Key_Right) {
-        playback(Playback(Playback::kSeek{5}));
-    } else if (text == u",") {
-        playback(Playback(Playback::kSeek{-1}));
-    } else if (text == u".") {
-        playback(Playback(Playback::kSeek{1}));
-    } else if (text == u"[") {
-        playback(Playback(Playback::kPreviousFrame{}));
-    } else if (text == u"]") {
-        playback(Playback(Playback::kNextFrame{}));
-    } else if (text == u"q") {
-        quit();
-    } else {
-        return false;
-    }
-    return true;
-}
 
 void SessionBridge::select(int row) {
     // The core owns the selection: the list's moves wait for the summary that follows.
@@ -161,7 +191,7 @@ void SessionBridge::select(int row) {
 }
 
 void SessionBridge::move(int by) {
-    // Review works out where a move lands, from its own selection: a key pressed before it has
+    // Review works out where a move lands, from its own selection: a move asked for before it has
     // answered the one before still moves on from where that one landed.
     send(Action(Action::kMove{by}));
 }
@@ -172,11 +202,48 @@ void SessionBridge::accept() { send(Action(Action::kAccept{})); }
 
 void SessionBridge::reject() { send(Action(Action::kReject{})); }
 
+void SessionBridge::clear() { send(Action(Action::kClear{})); }
+
 void SessionBridge::undo() { send(Action(Action::kUndo{})); }
 
 void SessionBridge::play() { send(Action(Action::kPlay{})); }
 
 void SessionBridge::closePlayer() { send(Action(Action::kClosePlayer{})); }
+
+void SessionBridge::pause() { playback(Playback(Playback::kPause{})); }
+
+void SessionBridge::seek(int seconds) { playback(Playback(Playback::kSeek{seconds})); }
+
+void SessionBridge::nextFrame() { playback(Playback(Playback::kNextFrame{})); }
+
+void SessionBridge::previousFrame() { playback(Playback(Playback::kPreviousFrame{})); }
+
+void SessionBridge::setFilter(int row) {
+    if (std::optional<Filter> filter = shows.filterAt(row)) {
+        send(Action(Action::kSetFilter{*filter}));
+    }
+}
+
+void SessionBridge::cycleFilter() { send(Action(Action::kSetFilter{shows.next()})); }
+
+void SessionBridge::nextEpisode() { send(Action(Action::kNextFile{})); }
+
+void SessionBridge::previousEpisode() { send(Action(Action::kPreviousFile{})); }
+
+void SessionBridge::switchView() { send(Action(Action::kSwitchView{})); }
+
+void SessionBridge::openFolder(int row) {
+    if (std::optional<std::string> path = reviews.pathAt(row)) {
+        send(Action(Action::kOpenFolder{*path}));
+    }
+}
+
+void SessionBridge::openEpisode(int row) {
+    if (std::optional<std::string> path = files.pathAt(row)) {
+        send(Action(Action::kSelectFile{*path}));
+        send(Action(Action::kShowFileFindings{}));
+    }
+}
 
 void SessionBridge::playback(Playback playback) {
     send(Action(Action::kPlayback{std::move(playback)}));
@@ -228,9 +295,38 @@ void SessionBridge::changed(const Event::kChanged &change) {
         fail("the list is out of step with review");
         return;
     }
+    if (change.files && !files.apply(*change.files)) {
+        fail("the episodes are out of step with review");
+        return;
+    }
+    if (change.folders) {
+        reviews.set(*change.folders);
+    }
+    if (change.detail) {
+        details.show(change.detail->detail);
+    }
+    if (change.logs) {
+        logs = change.logs->logs;
+    }
     summary = change.summary;
+    shows.show(summary);
     opened = true;
+    // The episode marked is the one last clicked while it is the selected finding's or one of its
+    // row's, so that a click on an episode whose first finding is in a row of several marks it;
+    // else the selected finding's own. Either is the episode the details panel shows.
+    const std::optional<std::string> clicked =
+        episodeName().isEmpty() || !summary.file_selected
+            ? std::nullopt
+            : files.pathAt(static_cast<int>(*summary.file_selected));
+    files.follow(clicked ? *clicked : details.file());
+    const std::optional<EntryKey> entry =
+        summary.selected ? list.keyAt(static_cast<int>(*summary.selected)) : std::nullopt;
+    const bool moved = !sameEntry(selectedEntry, entry);
+    selectedEntry = entry;
     emit summaryChanged();
+    if (moved) {
+        emit selectionMoved();
+    }
 }
 
 void SessionBridge::ended(const Event::kEnded &end) {

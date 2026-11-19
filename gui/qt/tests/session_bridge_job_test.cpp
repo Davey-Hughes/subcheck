@@ -3,6 +3,7 @@
 // process's groups, after which no session opens in it, so CMake runs each test in a process of
 // its own, on a run seeded afresh at its start (tests/seeded.cmake): typos.mkv, two rows of one
 // finding each.
+#include "offscreen_main.h"
 #include "session_bridge.h"
 
 #include <QFile>
@@ -64,7 +65,7 @@ struct Opened {
         bridge->send(Action(Action::kAccept{}));
         FindingsModel *list = bridge->findings();
         if (!QTest::qWaitFor([&] {
-                return list->data(list->index(0), FindingsModel::StateRole) == "accepted";
+                return list->data(list->index(0), FindingsModel::StateWordRole) == "Accepted";
             })) {
             return "the first finding was never accepted";
         }
@@ -189,5 +190,5 @@ private slots:
     }
 };
 
-QTEST_GUILESS_MAIN(SessionBridgeJobTest)
+SUBCHECK_OFFSCREEN_TEST_MAIN(SessionBridgeJobTest)
 #include "session_bridge_job_test.moc"

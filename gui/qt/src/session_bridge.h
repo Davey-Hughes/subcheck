@@ -2,12 +2,15 @@
 // and asks of it. Every event is applied on the GUI thread, in the order the session sent it.
 #pragma once
 
+#include "detail_view.h"
 #include "findings_model.h"
 #include "player_port.h"
+#include "sidebar_models.h"
 #include "subcheck_ffi.hpp"
 
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QThread>
 #include <QTimer>
 #include <QtQml/qqmlregistration.h>
@@ -24,14 +27,29 @@ class SessionBridge : public QObject {
     Q_OBJECT
     QML_ELEMENT
     QML_UNCREATABLE("main.cpp makes the one bridge, for the run it was given")
-    // What QML shows: the view's name, the status line (that the window is quitting, else review's
-    // message, else the counts), the selected row (-1 for none), whether the run opened with no
-    // findings, and a fatal end's text.
+    // The lists QML shows: the findings, the sidebar's reviews, filters and episodes; and the
+    // selected finding's details.
     Q_PROPERTY(FindingsModel *findings READ findings CONSTANT)
+    Q_PROPERTY(FoldersModel *folders READ folders CONSTANT)
+    Q_PROPERTY(FiltersModel *filters READ filters CONSTANT)
+    Q_PROPERTY(EpisodesModel *episodes READ episodes CONSTANT)
+    Q_PROPERTY(DetailView *detail READ detail CONSTANT)
+    // The view's name; its counts; the list's heading (the filter's name and count); the words
+    // of the View menu's item that switches between a check and its folders; the status bar
+    // (that the window is quitting, else review's message, else nothing); the selected row (-1
+    // for none); and what the list says when it shows no row, that the run has no findings or
+    // that the filter hides them all, empty while it shows any.
     Q_PROPERTY(QString title READ title NOTIFY summaryChanged)
+    Q_PROPERTY(QString counts READ counts NOTIFY summaryChanged)
+    Q_PROPERTY(QString heading READ heading NOTIFY summaryChanged)
+    Q_PROPERTY(QString switchLabel READ switchLabel NOTIFY summaryChanged)
     Q_PROPERTY(QString statusLine READ statusLine NOTIFY summaryChanged)
     Q_PROPERTY(int selected READ selected NOTIFY summaryChanged)
-    Q_PROPERTY(bool empty READ empty NOTIFY summaryChanged)
+    Q_PROPERTY(QString emptyWords READ emptyWords NOTIFY summaryChanged)
+    // The episode selected (the first as a view opens, then the one last clicked) and what the
+    // check and apply said of it; empty but while it is the selected finding's or its row's.
+    Q_PROPERTY(QString episodeName READ episodeName NOTIFY summaryChanged)
+    Q_PROPERTY(QStringList episodeLog READ episodeLog NOTIFY summaryChanged)
     Q_PROPERTY(QString fatal READ fatal NOTIFY fatalChanged)
     // The player, which the video pane is the mpv of.
     Q_PROPERTY(PlayerPort *player READ player CONSTANT)
@@ -51,33 +69,59 @@ public:
     void start();
 
     FindingsModel *findings();
+    FoldersModel *folders();
+    FiltersModel *filters();
+    EpisodesModel *episodes();
+    DetailView *detail();
     PlayerPort *player();
     QString title() const;
+    QString counts() const;
+    QString heading() const;
+    QString switchLabel() const;
     QString statusLine() const;
     int selected() const;
-    bool empty() const;
+    QString emptyWords() const;
+    QString episodeName() const;
+    QStringList episodeLog() const;
     QString fatal() const;
 
-    // A key pressed in the list: the terminal's keys for what this window does. False for any
-    // other key, which is left to Qt.
-    Q_INVOKABLE bool key(int key, const QString &text);
-    // The entry at `row`, as a click selects it.
+    // What the window's menus, keys, buttons and clicks ask of review, each one action but where
+    // it says otherwise. The entry at `row`, as a click selects it.
     Q_INVOKABLE void select(int row);
     // The entry `by` places on from the selected one, as review holds it, or the list's first or
     // last: at an end, the entry already selected, which lets a message go.
-    void move(int by);
-    void toggle();
-    void accept();
-    void reject();
-    void undo();
-    // The selected entry's moment in the video pane; closing it; and the playback keys'.
-    void play();
-    void closePlayer();
+    Q_INVOKABLE void move(int by);
+    Q_INVOKABLE void toggle();
+    Q_INVOKABLE void accept();
+    Q_INVOKABLE void reject();
+    Q_INVOKABLE void clear();
+    Q_INVOKABLE void undo();
+    // The selected entry's moment in the video pane; closing it; and the video's own.
+    Q_INVOKABLE void play();
+    Q_INVOKABLE void closePlayer();
+    Q_INVOKABLE void pause();
+    Q_INVOKABLE void seek(int seconds);
+    Q_INVOKABLE void nextFrame();
+    Q_INVOKABLE void previousFrame();
+    // The filter at `row` of the sidebar's list; the one after the filter shown, the first after
+    // the last, so that one key steps through them in the sidebar's order.
+    Q_INVOKABLE void setFilter(int row);
+    Q_INVOKABLE void cycleFilter();
+    Q_INVOKABLE void nextEpisode();
+    Q_INVOKABLE void previousEpisode();
+    // Between a check's view and its folders'.
+    Q_INVOKABLE void switchView();
+    // The sidebar's review at `row`.
+    Q_INVOKABLE void openFolder(int row);
+    // The sidebar's episode at `row`: the file selected, which review gives the logs of, then its
+    // first finding. Nothing is sent as the selection later moves into another episode: a
+    // `SelectFile` then would let review's message, or an open question, go.
+    Q_INVOKABLE void openEpisode(int row);
     void playback(subcheck_ffi::Playback playback);
-    // Any of review's actions, as the window's keys send theirs. After the session is let go of,
-    // it goes nowhere.
-    void send(subcheck_ffi::Action action);
-    // Asks review to end, stopping a job under way, and says so on the status line until it has.
+    // Any of review's actions; after the session is let go of, it goes nowhere. Virtual, so that
+    // a test can see each action the window sends.
+    virtual void send(subcheck_ffi::Action action);
+    // Asks review to end, stopping a job under way, and says so on the status bar until it has.
     // If it has not within the bridge's wait, the session is closed and the window ends anyway,
     // with status 1: what the last decisions came to is unknown.
     Q_INVOKABLE void quit();
@@ -88,6 +132,8 @@ signals:
     // An event the pump read, for the GUI thread.
     void eventArrived(const subcheck_ffi::Event &event);
     void summaryChanged();
+    // Another entry of the list is selected, rather than the selected one refreshed in place.
+    void selectionMoved();
     void fatalChanged();
     // The window is done, and the process exits with `status`.
     void finished(int status);
@@ -124,11 +170,17 @@ private:
     std::ostream &out;
     std::ostream &err;
     FindingsModel list;
+    FoldersModel reviews;
+    FiltersModel shows;
+    EpisodesModel files;
+    DetailView details;
+    std::optional<subcheck_ffi::FileLogs> logs;
     std::shared_ptr<subcheck_ffi::Session> session;
     std::shared_ptr<Relay> relay;
     std::unique_ptr<QThread> pump;
     QTimer quitWait;
     subcheck_ffi::Summary summary{};
+    std::optional<subcheck_ffi::EntryKey> selectedEntry;
     bool opened = false;
     bool quitting = false;
     bool done = false;

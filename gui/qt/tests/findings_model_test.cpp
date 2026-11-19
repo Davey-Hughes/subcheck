@@ -1,8 +1,11 @@
 // The list's model on splices of every shape a session sends, each under Qt's own checker of a
-// model's signals and indexes; and each entry as one line.
+// model's signals and indexes; and each entry as a Two Lines row draws it.
 #include "findings_model.h"
+#include "offscreen_main.h"
+#include "words.h"
 
 #include <QAbstractItemModelTester>
+#include <QColor>
 #include <QSignalSpy>
 #include <QTest>
 
@@ -77,8 +80,8 @@ std::vector<uint64_t> ids(const FindingsModel &model, int row) {
     return {std::get<EntryKey::kMember>(key->get_variant()).v1};
 }
 
-QString line(const FindingsModel &model, int row) {
-    return model.data(model.index(row), FindingsModel::LineRole).toString();
+QVariant role(const FindingsModel &model, int row, FindingsModel::Role role) {
+    return model.data(model.index(row), role);
 }
 
 } // namespace
@@ -128,7 +131,7 @@ private slots:
         QCOMPARE(changed[0][0].toModelIndex().row(), 1);
         QCOMPARE(changed[0][1].toModelIndex().row(), 1);
         QCOMPARE(inserted.count() + removed.count(), 0);
-        QCOMPARE(model->data(model->index(1), FindingsModel::StateRole).toString(), "accepted");
+        QCOMPARE(role(*model, 1, FindingsModel::StateWordRole).toString(), "Accepted");
     }
 
     void expandingChangesTheRowAndInsertsItsMembers() {
@@ -177,8 +180,8 @@ private slots:
         QCOMPARE(changed[0][0].toModelIndex().row(), 0);
         QCOMPARE(changed[0][1].toModelIndex().row(), 2);
         QCOMPARE(inserted.count() + removed.count(), 0);
-        QCOMPARE(model->data(model->index(2), FindingsModel::StateRole).toString(), "accepted");
-        QCOMPARE(model->data(model->index(3), FindingsModel::StateRole).toString(), "pending");
+        QCOMPARE(role(*model, 2, FindingsModel::StateWordRole).toString(), "Accepted");
+        QCOMPARE(role(*model, 3, FindingsModel::StateWordRole).toString(), "To review");
     }
 
     void collapsingChangesTheRowAndRemovesItsMembers() {
@@ -241,90 +244,149 @@ private slots:
         QVERIFY(!model->keyAt(2));
     }
 
-    void anEntryIsOneLine() {
+    // Each role passes on its own part of the entry: values unlike each other, so that a role
+    // that read another's field shows.
+    void eachRoleIsItsOwnPartOfTheRow() {
+        EntryView entry = group(false);
+        entry.total = 3;
+        entry.shown = 3;
+        entry.label = "E07";
+        entry.at_ms = 754'999;
+        entry.state = State::kRejected;
+        entry.original = "𝄞 We should leave befor it <rains>.";
+        entry.wording = "𝄞 We should leave before it <rains>.";
+        entry.original_changed = Span{19, 24};
+        entry.wording_changed = Span{19, 25};
+        QVERIFY(model->apply(splice(0, 0, {entry})));
+        QCOMPARE(role(*model, 0, FindingsModel::KindRole).toString(), "Typo");
+        QCOMPARE(role(*model, 0, FindingsModel::KindToneRole).value<QColor>(),
+                 kindTone(Check::kLlm));
+        QCOMPARE(role(*model, 0, FindingsModel::SeveralRole).toString(), "In 3 places");
+        QCOMPARE(role(*model, 0, FindingsModel::PlaceRole).toString(), "E07 · 12:34");
+        QCOMPARE(role(*model, 0, FindingsModel::GlyphRole).toString(), "✕");
+        QCOMPARE(role(*model, 0, FindingsModel::StateWordRole).toString(), "Rejected");
+        QCOMPARE(role(*model, 0, FindingsModel::StateToneRole).value<QColor>(),
+                 stateLook(State::kRejected, false).tone);
+        QCOMPARE(role(*model, 0, FindingsModel::LineRole).toString(),
+                 rowLine(QString::fromStdString(entry.original), entry.original_changed,
+                         QString::fromStdString(entry.wording), entry.wording_changed)
+                     .whole);
+        QVERIFY(role(*model, 0, FindingsModel::LineRole).toString().contains("&lt;rains&gt;"));
+        QVERIFY(role(*model, 0, FindingsModel::LineRole).toString().contains(">befor<"));
+        QCOMPARE(role(*model, 0, FindingsModel::MemberRole).toBool(), false);
+        QCOMPARE(model->data(model->index(0), Qt::DisplayRole),
+                 role(*model, 0, FindingsModel::LineRole));
+        QVERIFY(!model->data(model->index(0), Qt::DecorationRole).isValid());
+        QCOMPARE(model->roleNames().value(FindingsModel::LineRole), "line");
+        QCOMPARE(model->roleNames().value(FindingsModel::CutLineRole), "cutLine");
+        QCOMPARE(model->roleNames().value(FindingsModel::LineReachRole), "lineReach");
+        QCOMPARE(model->roleNames().size(), 11);
+
+        // A change far into its line: the three forms of it differ, and each role is its own.
+        EntryView far = group(false);
+        far.original = "One two three four five six seven eight nine befor it.";
+        far.wording = "One two three four five six seven eight nine before it.";
+        far.original_changed = Span{45, 50};
+        far.wording_changed = Span{45, 51};
+        QVERIFY(model->apply(splice(1, 0, {far})));
+        const RowLine line = rowLine(QString::fromStdString(far.original), far.original_changed,
+                                     QString::fromStdString(far.wording), far.wording_changed);
+        QVERIFY(line.whole != line.cut && line.cut != line.reach && line.whole != line.reach);
+        QCOMPARE(role(*model, 1, FindingsModel::LineRole).toString(), line.whole);
+        QCOMPARE(role(*model, 1, FindingsModel::CutLineRole).toString(), line.cut);
+        QCOMPARE(role(*model, 1, FindingsModel::LineReachRole).toString(), line.reach);
+    }
+
+    // A timing finding is placed by its track, which its fix moves whole, by its number too when
+    // another track of its file has its name; a row of several says how many places the filter
+    // shows when not all; a member says neither; a row whose decided members differ is mixed.
+    void aRowIsPlacedAndCountedAsWhatItIs() {
         EntryView timing = row(7, std::nullopt);
+        timing.check = Check::kTiming;
         timing.total = 3;
         timing.shown = 2;
         timing.track = ListTrack{4, "Signs", "jpn", true};
-        timing.fixes = {FixCount{Fix(Fix::kShift{-3}), 2}};
-        timing.marks = {MarkCount{MarkKind::kWouldApply, 2}};
-        EntryView late = member(9);
-        late.at_ms = -40;
-        late.state = State::kRejected;
-        EntryView fixed = member(8);
-        fixed.fixes = {FixCount{Fix(Fix::kPartial{}), 1}};
-        EntryView hours = member(10);
-        hours.at_ms = 3723456;
-        QVERIFY(model->apply(splice(
-            0, 0, {row(1), group(true), timing, late, fixed, row(11, State::kAccepted), hours})));
-        QCOMPARE(line(*model, 0),
-                 "· E01 0:00:01.00 We should leave befor it rains. → We should leave before it "
-                 "rains.");
-        QCOMPARE(line(*model, 1),
-                 "· ×2 0:00:01.00 We should leave befor it rains. → We should leave before it "
-                 "rains.");
-        QCOMPARE(line(*model, 2), "± ×2/3 Signs  +3 frames  would apply");
-        QCOMPARE(line(*model, 3), "    ✗ E02 0:00:00.00");
-        QCOMPARE(line(*model, 4), "    · E02 partial");
-        QVERIFY(line(*model, 5).startsWith("✓ E01 0:00:01.00 "));
-        QCOMPARE(line(*model, 6), "    · E02 1:02:03.45");
-        QCOMPARE(model->data(model->index(0), Qt::DisplayRole).toString(), line(*model, 0));
-        QCOMPARE(model->data(model->index(2), FindingsModel::StateRole).toString(), "mixed");
-        QCOMPARE(model->data(model->index(3), FindingsModel::StateRole).toString(), "rejected");
-        QCOMPARE(model->data(model->index(0), FindingsModel::StateRole).toString(), "pending");
-        QCOMPARE(model->data(model->index(3), FindingsModel::MemberRole).toBool(), true);
-        QCOMPARE(model->data(model->index(0), FindingsModel::MemberRole).toBool(), false);
-        QVERIFY(!model->data(model->index(0), Qt::DecorationRole).isValid());
-        QCOMPARE(model->roleNames().value(FindingsModel::LineRole), "line");
+        EntryView unnamed = row(8);
+        unnamed.track = ListTrack{5, std::nullopt, "ja", false};
+        EntryView bare = row(9);
+        bare.track = ListTrack{6, std::nullopt, std::nullopt, false};
+        EntryView alike = row(12);
+        alike.track = ListTrack{7, "Signs", "jpn", false};
+        EntryView one = member(10);
+        one.total = 2;
+        one.mixed = true;
+        QVERIFY(model->apply(splice(0, 0, {timing, unnamed, bare, one, alike})));
+        QCOMPARE(role(*model, 0, FindingsModel::KindRole).toString(), "Timing");
+        QCOMPARE(role(*model, 0, FindingsModel::PlaceRole).toString(), "E01 · Signs");
+        QCOMPARE(role(*model, 0, FindingsModel::SeveralRole).toString(), "In 3 places, 2 shown");
+        QCOMPARE(role(*model, 0, FindingsModel::StateWordRole).toString(), "Mixed");
+        QCOMPARE(role(*model, 1, FindingsModel::PlaceRole).toString(), "E01 · Track 5 (ja)");
+        QCOMPARE(role(*model, 2, FindingsModel::PlaceRole).toString(), "E01 · Track 6");
+        QCOMPARE(role(*model, 2, FindingsModel::SeveralRole).toString(), "");
+        QCOMPARE(role(*model, 3, FindingsModel::SeveralRole).toString(), "");
+        QCOMPARE(role(*model, 3, FindingsModel::MemberRole).toBool(), true);
+        QCOMPARE(role(*model, 3, FindingsModel::PlaceRole).toString(), "E02 · 0:01");
+        QCOMPARE(role(*model, 3, FindingsModel::GlyphRole).toString(), "◐");
+        QCOMPARE(role(*model, 3, FindingsModel::StateWordRole).toString(), "To review");
+        // Another track of its file has its name: its number tells it apart.
+        QCOMPARE(role(*model, 4, FindingsModel::PlaceRole).toString(), "E01 · Track 7: Signs");
     }
 
-    // An entry's marks, fixes and track, from the data the session sends, in the terminal's list's
-    // words: a mark alone when every finding the entry shows has it, else each with its count; a
-    // fix alone when all agree, else each with its count; a track by its own name, with its ID
-    // when that is not its own, or by its ID alone.
-    void itsMarksFixesAndTrackAreTheTerminalsWords() {
-        EntryView entry = group(false);
-        const auto said = [&entry](std::vector<MarkCount> marks) {
-            entry.marks = std::move(marks);
-            return FindingsModel::line(entry).section(QStringLiteral("rains.  "), 1);
+    // A timing row's line says the fixes its shown members differ by, each counted in the order
+    // review sends them, the same in each form of the line, with nothing marked as changed.
+    void aRowWhoseFixesDifferSaysThem() {
+        struct Case {
+            uint64_t shown;
+            std::vector<FixCount> fixes;
+            QString said;
+            QString several;
         };
-        QCOMPARE(said({{MarkKind::kByHand, 2}}), "by hand");
-        QCOMPARE(said({{MarkKind::kByHand, 1}}), "by hand 1");
-        QCOMPARE(said({{MarkKind::kApplied, 3}, {MarkKind::kNotFound, 1}}),
-                 "applied 3 · not found 1");
-        QCOMPARE(said({}), "");
-        const std::vector<std::pair<MarkKind, QString>> words = {
-            {MarkKind::kByHand, "by hand"},
-            {MarkKind::kNotFound, "not found"},
-            {MarkKind::kWouldApply, "would apply"},
-            {MarkKind::kAlreadyApplied, "already applied"},
-            {MarkKind::kWouldBeByHand, "would be by hand"},
-            {MarkKind::kWouldNotBeFound, "would not be found"},
-            {MarkKind::kFailed, "failed"},
-            {MarkKind::kWouldFail, "would fail"},
-            {MarkKind::kApplied, "applied"},
+        const std::vector<Case> cases = {
+            {12,
+             {{Fix(Fix::kShift{2}), 8}, {Fix(Fix::kShift{1}), 4}},
+             "2 frames late × 8 · 1 frame late × 4",
+             "In 12 places"},
+            {12,
+             {{Fix(Fix::kShift{-3}), 7}, {Fix(Fix::kPartial{}), 4}, {Fix(Fix::kShift{1}), 1}},
+             "3 frames early × 7 · partly off × 4 · 1 frame late × 1",
+             "In 12 places"},
+            // A filter showing some of the members: review counts only those.
+            {3,
+             {{Fix(Fix::kShift{2}), 2}, {Fix(Fix::kPartial{}), 1}},
+             "2 frames late × 2 · partly off × 1",
+             "In 12 places, 3 shown"},
         };
-        for (const auto &[kind, word] : words) {
-            QCOMPARE(said({{kind, 2}}), word);
+        for (const Case &c : cases) {
+            EntryView timing = group(false);
+            timing.check = Check::kTiming;
+            timing.total = 12;
+            timing.shown = c.shown;
+            timing.fixes = c.fixes;
+            QVERIFY(model->apply(splice(0, model->rowCount(), {timing})));
+            QCOMPARE(role(*model, 0, FindingsModel::LineRole).toString(), c.said);
+            QCOMPARE(role(*model, 0, FindingsModel::CutLineRole).toString(), c.said);
+            QCOMPARE(role(*model, 0, FindingsModel::LineReachRole).toString(), "");
+            QCOMPARE(role(*model, 0, FindingsModel::SeveralRole).toString(), c.several);
         }
+    }
 
-        EntryView timing = row(7);
-        timing.total = 9;
-        timing.shown = 9;
-        timing.track = ListTrack{4, "Signs", "jpn", true};
-        timing.fixes = {{Fix(Fix::kShift{1}), 9}};
-        QCOMPARE(FindingsModel::line(timing), "· ×9 Signs  −1 frame");
-        timing.fixes = {{Fix(Fix::kShift{-2}), 5}, {Fix(Fix::kPartial{}), 4}};
-        QCOMPARE(FindingsModel::line(timing), "· ×9 Signs  +2 frames ×5 · partial ×4");
-        timing.fixes = {{Fix(Fix::kShift{0}), 9}};
-        timing.track = ListTrack{4, "Signs", "jpn", false};
-        QCOMPARE(FindingsModel::line(timing), "· ×9 track 4 Signs  +0 frames");
-        timing.track = ListTrack{4, std::nullopt, "ja", false};
-        QCOMPARE(FindingsModel::line(timing), "· ×9 track 4 (ja)  +0 frames");
-        timing.track = ListTrack{4, std::nullopt, std::nullopt, false};
-        QCOMPARE(FindingsModel::line(timing), "· ×9 track 4  +0 frames");
+    // One fix, of all the members or of the only ones a filter shows, is the row's own line.
+    void aRowOfOneFixKeepsItsLine() {
+        for (const uint64_t shown : {uint64_t{12}, uint64_t{5}}) {
+            EntryView timing = group(false);
+            timing.check = Check::kTiming;
+            timing.total = 12;
+            timing.shown = shown;
+            timing.fixes = {FixCount{Fix(Fix::kShift{2}), shown}};
+            QVERIFY(model->apply(splice(0, model->rowCount(), {timing})));
+            const RowLine line =
+                rowLine(QString::fromStdString(timing.original), timing.original_changed,
+                        QString::fromStdString(timing.wording), timing.wording_changed);
+            QCOMPARE(role(*model, 0, FindingsModel::LineRole).toString(), line.whole);
+            QCOMPARE(role(*model, 0, FindingsModel::CutLineRole).toString(), line.cut);
+        }
     }
 };
 
-QTEST_GUILESS_MAIN(FindingsModelTest)
+SUBCHECK_OFFSCREEN_TEST_MAIN(FindingsModelTest)
 #include "findings_model_test.moc"

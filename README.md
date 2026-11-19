@@ -76,13 +76,23 @@ pane's and the app's end to end, so the script needs Xvfb and xdotool there too,
 mpv needs to draw the subtitle the pane's test looks for; those displays are the tests' alone, and
 nothing they play makes a sound.
 
-The app is `subcheck-qt [run | paths…]`, which takes the run or paths `subcheck review` takes. It
-lists the findings on the left and plays them on the right: `j` and `k` (or the up and down
-arrows) move, Enter expands a row into its members, `a`, `r` and `u` accept, reject and undo, `o`
-opens the selected finding in the video pane as the terminal's `o` does in mpv, playing on if the
-pane plays and paused if not, and `O` stops playback, leaving the pane black and review open; Space
-plays and pauses, ← and → seek 5 s, `,` and `.` 1 s, and `[` and `]` step a frame; `q` quits. At the
-end it prints the counts as the terminal does, but names a view of paths as its window's title does:
+The app is `subcheck-qt [run | paths…]`, which takes the run or paths `subcheck review` takes, and
+with none opens the newest check's folders, as bare `subcheck review` does. Its window has three
+columns: a sidebar with the reviews (one per show folder the store holds, which a click opens), what
+the list shows (each filter with its count) and the view's episodes (a click selects one and its
+first finding); the findings, two lines a row (what found it, its episode and time, its decision,
+and its line with the change marked, or for a timing row whose members the filter shows differ in
+their fixes, those fixes, counted); and the details panel, the video at its top, then the
+selected finding with Reject and Accept Fix. The menus hold the rest, and the terminal's keys work
+too: `j` and `k` (or the up and down arrows) move, Enter expands a row into its members, `a`, `r`,
+`x` and `u` accept, reject, put back to undecided and undo, `f` steps through the filters, `n` and
+`p` go to the next and previous episode, `v` switches between a check and its folders, `o` opens
+the selected finding in the video pane as the terminal's `o` does in mpv, playing on if the pane
+plays and paused if not, and `O` stops playback, leaving the pane black and review open; Space plays
+and pauses, ← and → seek 5 s, `,` and `.` 1 s, and `[` and `]` step a frame; `q` quits. The window
+keeps its size, its place on X11 and macOS (Wayland lets no window place itself) and its columns'
+widths for the next run, on Linux in `$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf`. At the end it
+prints the counts as the terminal does, but names a view of paths as its window's title does:
 by the first path's last part, and `+N` for the others. It exits with 1 after an error, or when
 review has not ended 10 s after quitting, and with 0 otherwise. The 10 s gives one decision's write
 time to wait out another process's lock on the store, which the store waits up to 5 s for. It is not

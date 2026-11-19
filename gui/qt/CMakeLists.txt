@@ -98,10 +98,13 @@ qt_add_qml_module(subcheck_window
     URI Subcheck
     VERSION 1.0
     OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/qml/Subcheck"
-    QML_FILES qml/Main.qml
+    QML_FILES qml/Main.qml qml/Sidebar.qml qml/FindingRow.qml qml/DetailsPanel.qml
     SOURCES src/findings_model.h src/findings_model.cpp src/session_bridge.h
             src/session_bridge.cpp src/status_words.h src/status_words.cpp src/player_port.h
-            src/player_port.cpp src/mpv_item.h src/mpv_item.cpp src/overloaded.h)
+            src/player_port.cpp src/mpv_item.h src/mpv_item.cpp src/overloaded.h src/spliced.h
+            src/words.h src/words.cpp src/sidebar_models.h src/sidebar_models.cpp
+            src/detail_view.h src/detail_view.cpp src/window_settings.h src/window_settings.cpp
+            src/menu_keys.h src/menu_keys.cpp)
 target_include_directories(subcheck_window PUBLIC src)
 target_link_libraries(subcheck_window PUBLIC subcheck_bindings Qt6::Quick MpvQt::MpvQt)
 subcheck_warnings(subcheck_window)
@@ -168,12 +171,53 @@ add_test(NAME findings_model_test COMMAND findings_model_test)
 set_tests_properties(findings_model_test PROPERTIES
     ENVIRONMENT QT_QPA_PLATFORM=offscreen TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 
-# The status line's words for each message, with no session.
-qt_add_executable(status_words_test tests/status_words_test.cpp)
-target_link_libraries(status_words_test PRIVATE subcheck_window Qt6::Test)
-subcheck_warnings(status_words_test)
-add_test(NAME status_words_test COMMAND status_words_test)
-set_tests_properties(status_words_test PROPERTIES
+# The window's code that needs no session, each test on its own: the status bar's words for each
+# message, the window's other words and colours, the sidebar's lists, the details panel's words,
+# and what the window remembers.
+foreach(name IN ITEMS status_words_test words_test sidebar_models_test detail_view_test
+                      window_settings_test)
+    qt_add_executable(${name} tests/${name}.cpp)
+    target_link_libraries(${name} PRIVATE subcheck_window Qt6::Test)
+    subcheck_warnings(${name})
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES
+        ENVIRONMENT QT_QPA_PLATFORM=offscreen TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+endforeach()
+
+# Two screens for the tests of the window's size, a large one and a small one beside it: the
+# offscreen platform's own is 800 by 800, smaller than the window's default.
+set(TEST_SCREENS "${CMAKE_BINARY_DIR}/test-screens.json")
+file(WRITE "${TEST_SCREENS}"
+    "{\"screens\": [{\"name\": \"large\", \"x\": 0, \"y\": 0, \"width\": 1920, \"height\": 1080, "
+    "\"logicalDpi\": 96, \"logicalBaseDpi\": 96, \"dpr\": 1}, {\"name\": \"small\", \"x\": 1920, "
+    "\"y\": 0, \"width\": 1024, \"height\": 600, \"logicalDpi\": 96, \"logicalBaseDpi\": 96, "
+    "\"dpr\": 1}]}\n")
+set_tests_properties(window_settings_test PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=${TEST_SCREENS}")
+
+# The same two screens with the small one primary, for a window that comes back to a larger screen
+# than the one it starts on. The offscreen platform orders screens by name and the first is the
+# primary, so the names say which that is.
+set(small_primary_screens "${CMAKE_BINARY_DIR}/test-screens-small-primary.json")
+file(WRITE "${small_primary_screens}"
+    "{\"screens\": [{\"name\": \"a-small\", \"x\": 0, \"y\": 0, \"width\": 1024, \"height\": 600, "
+    "\"logicalDpi\": 96, \"logicalBaseDpi\": 96, \"dpr\": 1}, {\"name\": \"b-large\", \"x\": 1024, "
+    "\"y\": 0, \"width\": 1920, \"height\": 1080, \"logicalDpi\": 96, \"logicalBaseDpi\": 96, "
+    "\"dpr\": 1}]}\n")
+qt_add_executable(window_settings_small_primary_test tests/window_settings_small_primary_test.cpp)
+target_link_libraries(window_settings_small_primary_test PRIVATE subcheck_window Qt6::Test)
+subcheck_warnings(window_settings_small_primary_test)
+add_test(NAME window_settings_small_primary_test COMMAND window_settings_small_primary_test)
+set_tests_properties(window_settings_small_primary_test PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=${small_primary_screens}"
+    TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+
+# A test that makes a GUI application refuses to start anywhere Qt could draw on a desktop
+# (tests/offscreen_main.h): on a platform that is not offscreen, and with a display to open.
+add_test(NAME words_test_refuses_a_desktop
+    COMMAND "${CMAKE_COMMAND}" -D "TEST=$<TARGET_FILE:words_test>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/refuses.cmake")
+set_tests_properties(words_test_refuses_a_desktop PROPERTIES
     ENVIRONMENT QT_QPA_PLATFORM=offscreen TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
 
 # The player, on a fake mpv, with no session.
@@ -208,6 +252,9 @@ endfunction()
 
 subcheck_window_test(session_bridge_test)
 subcheck_window_test(window_test)
+# window_test checks the window's default size and its columns, which the large screen holds.
+set_property(TEST window_test APPEND PROPERTY ENVIRONMENT_MODIFICATION
+             "QT_QPA_PLATFORM=set:offscreen:configfile=${TEST_SCREENS}")
 
 # The bridge during a job, where review's end ends the process's groups, after which no session
 # opens in the process: each test function in a process of its own, on a run seeded at its start
@@ -321,7 +368,11 @@ set(DESKTOP_SESSION_NAMES DISPLAY WAYLAND_DISPLAY PULSE_SERVER PIPEWIRE_REMOTE
     SESSION_MANAGER DESKTOP_SESSION GNOME_DESKTOP_SESSION_ID ICEAUTHORITY XAUTHORITY XDG_SEAT
     XDG_VTNR KDE_FULL_SESSION KDE_SESSION_VERSION XDG_SESSION_TYPE)
 list(TRANSFORM DESKTOP_SESSION_NAMES APPEND "=unset:" OUTPUT_VARIABLE unset_desktop_session)
+# And every test draws the window in Fusion, whatever style the desktop would pick, so that the
+# window's sizes are the same on every machine, gui-macos's among them; a person's run sees the
+# platform's own.
 get_property(tests DIRECTORY PROPERTY TESTS)
 foreach(test IN LISTS tests)
-    set_property(TEST ${test} APPEND PROPERTY ENVIRONMENT_MODIFICATION ${unset_desktop_session})
+    set_property(TEST ${test} APPEND PROPERTY ENVIRONMENT_MODIFICATION ${unset_desktop_session}
+                 QT_QUICK_CONTROLS_STYLE=set:Fusion)
 endforeach()
