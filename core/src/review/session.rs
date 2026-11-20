@@ -48,6 +48,9 @@ pub enum Event {
         /// The store's show folders, whole: a short list, sent again when any of it changes.
         folders: Option<Vec<FolderView>>,
     },
+    /// Review took one of the UI's actions, and nothing the UI shows changed: the count of actions
+    /// taken alone ([`Summary::answered`]), the rest of the summary as last sent.
+    Answered { answered: u64 },
     /// For the UI's player, which runs it and says how it went ([`Session::report`]).
     Player(PlayerCommand),
     /// The last event: why review could not go on, if it could not, and what is left to say of the
@@ -116,6 +119,11 @@ pub struct Summary {
     /// ([`Run::of_paths`]): what `SwitchView` opens from it, the newest run that named the
     /// selected file where a run's view opens the run's folders.
     pub of_paths: bool,
+    /// How many of the UI's actions review has taken ([`Session::send`]). Each one adds to it, so
+    /// every action is answered, the first event to carry its count: a change, or
+    /// [`Event::Answered`] when nothing else a UI shows changed. A UI that counts what it sends
+    /// knows which event answers which action.
+    pub answered: u64,
 }
 
 /// An edit under way, for a UI's editor ([`Review::editing`]).
@@ -306,8 +314,9 @@ fn file_logs(m: &Review) -> Option<FileLogs> {
     })
 }
 
-/// What `m` shows beside a list of `rows` rows and `files` files.
-fn summary(m: &Review, rows: usize, files: usize) -> Summary {
+/// What `m` shows beside a list of `rows` rows and `files` files, once review has taken `answered`
+/// of the UI's actions.
+fn summary(m: &Review, rows: usize, files: usize, answered: u64) -> Summary {
     let (pending, accepted, rejected) = m.counts();
     Summary {
         title: m.run.shown_name(),
@@ -330,6 +339,7 @@ fn summary(m: &Review, rows: usize, files: usize) -> Summary {
         file_selected: (m.file_selected < files).then_some(m.file_selected),
         spent: m.run.spent.clone(),
         of_paths: m.run.of_paths,
+        answered,
     }
 }
 
@@ -365,16 +375,19 @@ struct Sent {
     logs: Option<FileLogs>,
     folders: Vec<FolderView>,
     shelf: Vec<ShowFolder>,
+    /// The UI's actions taken so far, which each summary says.
+    answered: u64,
 }
 
 impl Sent {
-    /// The event that brings the UI up to `m`; `None` when nothing it shows changed. The first
-    /// always comes, with a splice of each list even for none, and the detail, the logs and the
-    /// folders even when there are none: it tells the UI the run has opened, and what it starts at.
+    /// The event that brings the UI up to `m`: a change, or an answer alone when only the count
+    /// of actions taken changed; `None` when nothing did. The first always comes, with a splice of
+    /// each list even for none, and the detail, the logs and the folders even when there are none:
+    /// it tells the UI the run has opened, and what it starts at.
     fn change(&mut self, m: &Review) -> Option<Event> {
         let rows = entry_views(m);
         let files = file_views(m);
-        let summary = summary(m, rows.len(), files.len());
+        let summary = summary(m, rows.len(), files.len(), self.answered);
         let detail = m.detail();
         let logs = file_logs(m);
         let folders: Vec<FolderView> = self
@@ -388,14 +401,22 @@ impl Sent {
         let detail_now = (first || detail != self.detail).then(|| detail.clone());
         let logs_now = (first || logs != self.logs).then(|| logs.clone());
         let folders_now = (first || folders != self.folders).then(|| folders.clone());
+        // Nothing else to send, and the summary as last sent once its count is set aside: either an
+        // action's count alone changed, said as an answer alone, or nothing did. The count is kept
+        // as sent either way.
         if row_splice.is_none()
             && file_splice.is_none()
             && detail_now.is_none()
             && logs_now.is_none()
             && folders_now.is_none()
-            && self.summary.as_ref() == Some(&summary)
+            && let Some(last) = &mut self.summary
         {
-            return None;
+            let told = std::mem::replace(&mut last.answered, summary.answered);
+            if *last == summary {
+                return (told != summary.answered).then_some(Event::Answered {
+                    answered: summary.answered,
+                });
+            }
         }
         self.rows = rows;
         self.files = files;
@@ -836,6 +857,11 @@ fn step(
     emit: &mut dyn FnMut(Event),
     shared: &Mutex<Shared>,
 ) {
+    // Counted before the event this step publishes, which then always comes and says it: the UI's
+    // answer to the action, alone when nothing else it shows changed.
+    if matches!(input, Input::Action(_)) {
+        sent.answered += 1;
+    }
     let moved = moves_folders(&input);
     let mut effects: VecDeque<Effect> = update::update(review, input, Timestamp::now()).into();
     if moved {
@@ -951,6 +977,7 @@ mod tests {
                 file_selected: Some(0),
                 spent: Spent::default(),
                 of_paths: false,
+                answered: 0,
             }
         );
     }
@@ -1816,6 +1843,9 @@ mod tests {
         let (first, summary) = next_change(&s);
         assert_eq!(first.unwrap().inserted.len(), 2);
         assert_eq!(summary.accepted, 0, "the first shows the run as it opened");
+        assert_eq!(summary.answered, 0);
+        // The accept's answer, then its write's.
+        assert_eq!(next(&s), Some(Event::Answered { answered: 1 }));
         let (rows, summary) = next_change(&s);
         assert_eq!(rows.unwrap().at, 0);
         assert_eq!(summary.accepted, 3);
@@ -1876,8 +1906,10 @@ mod tests {
         assert_eq!(rows.unwrap().inserted[0].state, Some(State::Accepted));
         assert_eq!(summary.status, Some(accepted(3)));
         assert_eq!(summary.accepted, 3);
-        // The other two commands, and what their reports say.
+        // The other two commands, and what their reports say. Each action's answer comes before its
+        // command, alone when nothing else it shows changed.
         s.send(Action::Playback(Playback::Pause));
+        assert_eq!(next(&s), Some(Event::Answered { answered: 3 }));
         assert_eq!(
             next(&s),
             Some(Event::Player(PlayerCommand::Playback(Playback::Pause)))
@@ -1937,11 +1969,15 @@ mod tests {
         let s = Arc::new(Session::start(move || opened(store, state, &[a], false)));
         assert_eq!(next_change(&s).0.unwrap().inserted.len(), 2);
         s.send(Action::OpenView(vec![b.name.clone()]));
+        // Its answer, before the view is read.
+        assert_eq!(next(&s), Some(Event::Answered { answered: 1 }));
         let (rows, summary) = next_change(&s);
         let rows = rows.unwrap();
         assert_eq!((rows.at, rows.removed, rows.inserted.len()), (0, 2, 1));
         assert_eq!(summary.title, format!("run {}", b.name));
         s.send(Action::OpenView(vec!["nope".into()]));
+        // Its answer, then the failed read's.
+        assert_eq!(next(&s), Some(Event::Answered { answered: 2 }));
         let (rows, summary) = next_change(&s);
         assert_eq!(rows, None);
         assert_eq!(
@@ -1975,6 +2011,8 @@ mod tests {
         };
         assert_eq!(changed(&s).1, Some(vec![k_on(4, false)]));
         s.send(Action::Accept);
+        // Its answer, before the write, which the store's count is read after.
+        assert_eq!(next(&s), Some(Event::Answered { answered: 1 }));
         let (summary, folders) = changed(&s);
         assert_eq!(summary.accepted, 3);
         assert_eq!(folders, Some(vec![k_on(1, false)]));
@@ -2041,20 +2079,78 @@ mod tests {
         assert_eq!(after, []);
     }
 
+    // An action that changes nothing a UI shows is answered alone, with the count of actions taken,
+    // so that a UI that counts what it sends knows which event answers which action. One that
+    // changes something is answered with the change, whose summary carries the count.
     #[test]
-    fn an_input_that_changes_nothing_is_silent_and_a_clean_quit_ends_with_nothing_to_say() {
+    fn an_action_that_changes_nothing_else_is_answered_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session(dir.path(), |_| {});
+        let (rows, summary) = next_change(&s);
+        assert_eq!(summary.answered, 0);
+        let last = rows.unwrap().inserted.pop().unwrap().key;
+        s.send(Action::Move(1));
+        let (_, summary) = next_change(&s);
+        assert_eq!((summary.selected, summary.answered), (Some(1), 1));
+        // At the last row a move goes nowhere, and a select of the row selected selects it again.
+        s.send(Action::Move(1));
+        assert_eq!(next(&s), Some(Event::Answered { answered: 2 }));
+        s.send(Action::Select(last));
+        assert_eq!(next(&s), Some(Event::Answered { answered: 3 }));
+        // The change after them has the count as it now is.
+        s.send(Action::Move(-1));
+        let (_, summary) = next_change(&s);
+        assert_eq!((summary.selected, summary.answered), (Some(0), 4));
+    }
+
+    // A task's result and the player's report are review's inputs, not the UI's actions: the
+    // changes they lead to carry the count as it was, and one that changes nothing is silent.
+    #[test]
+    fn inputs_that_are_not_actions_do_not_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session(dir.path(), |_| {});
+        next(&s);
+        // The accept's answer, then its write's result.
+        s.send(Action::Accept);
+        assert_eq!(next(&s), Some(Event::Answered { answered: 1 }));
+        let (rows, summary) = next_change(&s);
+        assert!(rows.is_some());
+        assert_eq!((summary.accepted, summary.answered), (3, 1));
+        let not_open = || PlayerReport::Closed(Err(PlayerError::NotOpen));
+        s.report(not_open());
+        let (_, summary) = next_change(&s);
+        assert_eq!(
+            summary.status,
+            Some(Status::NotOpen {
+                asked: Asked::Close
+            })
+        );
+        assert_eq!(summary.answered, 1);
+        // Said again, it changes nothing: the next change is the dismiss's answer.
+        s.report(not_open());
+        s.send(Action::Dismiss);
+        let (_, summary) = next_change(&s);
+        assert_eq!((summary.status, summary.answered), (None, 2));
+    }
+
+    #[test]
+    fn a_clean_quit_ends_with_nothing_to_say() {
         let dir = tempfile::tempdir().unwrap();
         let s = session(dir.path(), |_| {});
         next(&s);
         s.send(Action::Dismiss);
         s.send(Action::Quit);
+        let events = to_the_end(&s);
         assert_eq!(
-            next(&s),
-            Some(Event::Ended {
-                fatal: None,
-                outro: vec![],
-            })
+            events[..2],
+            [
+                Event::Answered { answered: 1 },
+                Event::Answered { answered: 2 }
+            ],
+            "the two answers, then the end: {events:?}"
         );
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(end_of(&events), (None, &[][..]));
     }
 
     #[test]
@@ -2123,7 +2219,12 @@ mod tests {
         assert_eq!(rows.unwrap().inserted.len(), 2);
         s.send(Action::Undo);
         let events = to_the_end(&s);
-        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            events.len(),
+            2,
+            "the undo's answer, then the end: {events:?}"
+        );
+        assert_eq!(events[0], Event::Answered { answered: 1 });
         assert_eq!(panicked_end(&events), Vec::<String>::new());
         assert_eq!(next(&s), None);
     }
@@ -2157,7 +2258,12 @@ mod tests {
         next_change(&s);
         s.send(Action::Quit);
         let events = to_the_end(&s);
-        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            events.len(),
+            2,
+            "the quit's answer, then the end: {events:?}"
+        );
+        assert_eq!(events[0], Event::Answered { answered: 3 });
         let (fatal, outro) = end_of(&events);
         let fatal = fatal.unwrap();
         assert!(
@@ -2174,7 +2280,7 @@ mod tests {
         let s = session(dir.path(), |_| {});
         next(&s);
         s.send(Action::Quit);
-        assert!(matches!(next(&s), Some(Event::Ended { .. })));
+        to_the_end(&s);
         for _ in 0..3 {
             assert_eq!(next(&s), None);
         }
@@ -2869,7 +2975,7 @@ mod tests {
                 let s = session(dir, |_| {});
                 next(&s);
                 s.send(Action::Quit);
-                assert!(matches!(next(&s), Some(Event::Ended { .. })));
+                to_the_end(&s);
                 // After `group::end`, this would wait forever.
                 within(|| group::output(&mut Command::new("true")).unwrap());
             }

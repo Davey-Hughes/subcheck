@@ -18,6 +18,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -51,10 +53,10 @@ QString decision(SessionBridge &bridge, int row) {
 
 // Which episodes the sidebar marks as the selected finding's.
 QStringList current(SessionBridge &bridge) {
-    EpisodesModel *files = bridge.episodes();
+    EpisodeOrder *files = bridge.episodes();
     QStringList marked;
     for (int row = 0; row < files->rowCount(); ++row) {
-        const QModelIndex at = files->index(row);
+        const QModelIndex at = files->index(row, 0);
         if (files->data(at, EpisodesModel::CurrentRole).toBool()) {
             marked << files->data(at, EpisodesModel::LabelRole).toString();
         }
@@ -89,6 +91,90 @@ protected:
     void closeSession(Session &session) override {
         unclosed = &session;
         throw std::runtime_error("close panicked");
+    }
+};
+
+// A bridge that, once `holding`, keeps each action from review as it tells it, counted as sent: a
+// test then stands in for review's answers, each at the moment it chooses, with the count review
+// would give it.
+class Holding : public Telling {
+public:
+    using Telling::Telling;
+
+    bool holding = false;
+
+    void send(Action action) override {
+        if (holding) {
+            sent << told(action);
+            ++asked;
+            return;
+        }
+        Telling::send(std::move(action));
+    }
+};
+
+// A bridge on the run with no findings and the seeded one, whose review a test stands in for once
+// it has gone quiet: each change stood in for is review's last with the count, the file and the
+// selection the test gives it.
+struct StandIn {
+    // Review's first change, and its last before it was held, with the count of any answer alone
+    // after it. Declared before the bridge, which writes them, so that they outlive it.
+    std::optional<Event::kChanged> first;
+    std::optional<Event::kChanged> last;
+    std::ostringstream out;
+    std::ostringstream err;
+    PlayerPort player{std::chrono::milliseconds(100)};
+    Holding bridge;
+
+    StandIn() : bridge({clean(), media()}, player, out, err, std::chrono::seconds(1)) {
+        QObject::connect(&bridge, &SessionBridge::eventArrived, &bridge, [this](const Event &e) {
+            if (bridge.holding) {
+                return;
+            }
+            if (const auto *answer = std::get_if<Event::kAnswered>(&e.get_variant());
+                answer && last) {
+                last->summary.answered = answer->answered;
+            }
+            const auto *change = std::get_if<Event::kChanged>(&e.get_variant());
+            if (change) {
+                if (!first) {
+                    first = *change;
+                }
+                last = *change;
+            }
+        });
+    }
+
+    // Holds review from now on, once it has gone quiet, with no event of its for a while, so that
+    // none lands among the changes stood in for.
+    void holdOnceQuiet() {
+        QSignalSpy arrived(&bridge, &SessionBridge::eventArrived);
+        for (qsizetype before = -1; before != arrived.count();) {
+            before = arrived.count();
+            QTest::qWait(300);
+        }
+        bridge.holding = true;
+    }
+
+    // Review's change that answers the action counted `answered`, with the file and the entry
+    // selected at those rows of the lists the bridge holds, and with `files`, `logs` and `detail`.
+    void answer(uint64_t answered, uint64_t file, uint64_t selected,
+                std::optional<FilesSplice> files = std::nullopt,
+                std::optional<LogsNow> logs = std::nullopt,
+                std::optional<DetailNow> detail = std::nullopt) {
+        Summary summary = last->summary;
+        summary.answered = answered;
+        summary.file_selected = file;
+        summary.selected = selected;
+        emit bridge.eventArrived(
+            Event(Event::kChanged{std::nullopt, summary, std::move(detail), std::move(files),
+                                  std::move(logs), std::nullopt}));
+    }
+
+    // Review's answer alone to the action counted `answered`, as it says one that changed nothing
+    // the window shows.
+    void answerAlone(uint64_t answered) {
+        emit bridge.eventArrived(Event(Event::kAnswered{answered}));
     }
 };
 
@@ -624,6 +710,621 @@ private slots:
                  (QStringList{"Toggle", "Move 3",
                               "SelectFile " + QString::fromStdString(media()) + "/typos - E02.mkv",
                               "ShowFileFindings", "Move 1", "Move 1"}));
+    }
+
+    // As a view opens, review's file is its first episode's. A click on that episode when the check
+    // found nothing in it names that file again, which changes nothing of review's but its count:
+    // what the check said of it shows with review's answer, the episode marked, and is scrolled to
+    // again with a second click's. It goes once another finding is selected.
+    void aClickOnTheSelectedEpisodeWithNoFindingsShowsItsLogWithReviewsAnswer() {
+        Opened o({clean(), media()});
+        QSignalSpy shown(&o.bridge, &SessionBridge::episodeShown);
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        EpisodeOrder *files = o.bridge.episodes();
+        const QString label = files->data(files->index(0, 0), EpisodesModel::LabelRole).toString();
+        QVERIFY(files->data(files->index(0, 0), EpisodesModel::NoFindingsRole).toBool());
+        QCOMPARE(o.bridge.episodeName(), QString());
+        QCOMPARE(current(o.bridge), QStringList{"E01"});
+
+        o.bridge.openEpisode(0);
+        const QString file = QString::fromStdString(clean()) + "/typos.mkv";
+        QCOMPARE(o.bridge.sent, QStringList{"SelectFile " + file});
+        QCOMPARE(o.bridge.episodeName(), QString());
+        QTRY_COMPARE(o.bridge.episodeName(), label);
+        QVERIFY(!o.bridge.episodeLog().isEmpty());
+        QCOMPARE(current(o.bridge), QStringList{label});
+        QCOMPARE(shown.count(), 1);
+        o.bridge.openEpisode(0);
+        QTRY_COMPARE(shown.count(), 2);
+        QCOMPARE(o.bridge.episodeName(), label);
+
+        o.bridge.move(1);
+        QTRY_COMPARE(o.bridge.selected(), 1);
+        QCOMPARE(o.bridge.episodeName(), QString());
+        QCOMPARE(o.bridge.episodeLog(), QStringList());
+        QCOMPARE(current(o.bridge), QStringList{"E01"});
+        QCOMPARE(shown.count(), 2);
+        QCOMPARE(o.bridge.sent,
+                 (QStringList{"SelectFile " + file, "SelectFile " + file, "Move 1"}));
+    }
+
+    // A click on an episode the check found nothing in, here from another episode's file, shows its
+    // view with review's answer to the click; a move ends it with its own.
+    void showingEpisodeFollowsAClickOnAGreyedEpisode() {
+        Opened o({clean(), media()});
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        QVERIFY(!o.bridge.showingEpisode());
+        o.bridge.openEpisode(1);
+        QTRY_COMPARE(o.bridge.episodeName(), "E01");
+        QVERIFY(!o.bridge.showingEpisode());
+        o.bridge.openEpisode(0);
+        QVERIFY(!o.bridge.showingEpisode());
+        QTRY_VERIFY(o.bridge.showingEpisode());
+        QVERIFY(o.bridge.property("showingEpisode").toBool());
+        o.bridge.move(1);
+        QTRY_COMPARE(o.bridge.selected(), 1);
+        QVERIFY(!o.bridge.showingEpisode());
+    }
+
+    // A click on another row while a greyed episode's view shows ends the view with review's
+    // answer to its select, the change that carries the select's count, and nothing is said before
+    // it: the panel goes from the log straight to the finding clicked, with no moment of the
+    // finding review still had selected.
+    void theViewEndsAtTheAnswerToTheActionThatEndsIt() {
+        // Declared before the bridge, which the handler below writes it from, so that it outlives
+        // it.
+        QList<std::tuple<uint64_t, bool, int, qsizetype>> seen;
+        Opened o({clean(), media()});
+        QSignalSpy changed(&o.bridge, &SessionBridge::summaryChanged);
+        // Each change once applied: its count, what the bridge then shows, and how often the bridge
+        // has said so.
+        connect(&o.bridge, &SessionBridge::eventArrived, &o.bridge, [&](const Event &e) {
+            if (const auto *change = std::get_if<Event::kChanged>(&e.get_variant())) {
+                seen << std::tuple{change->summary.answered, o.bridge.showingEpisode(),
+                                   o.bridge.selected(), changed.count()};
+            }
+        });
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        o.bridge.openEpisode(0);
+        QTRY_VERIFY(o.bridge.showingEpisode());
+        QCOMPARE(o.bridge.selected(), 0);
+
+        seen.clear();
+        changed.clear();
+        o.bridge.select(1);
+        QVERIFY2(o.bridge.sent.last().startsWith("Select row "), qPrintable(o.bridge.sent.last()));
+        // Each action the bridge sent counts, the select last.
+        const auto select = static_cast<uint64_t>(o.bridge.sent.size());
+        QVERIFY(o.bridge.showingEpisode());
+        QCOMPARE(changed.count(), 0);
+        QTRY_VERIFY(!seen.isEmpty());
+        QCOMPARE(seen.first(), (std::tuple<uint64_t, bool, int, qsizetype>{select, false, 1, 1}));
+        QCOMPARE(o.bridge.episodeName(), QString());
+        QCOMPARE(current(o.bridge), QStringList{"E01"});
+    }
+
+    // A move on at the last finding moves nothing in review, and still ends the view, with review's
+    // answer, which comes alone as nothing else changed: the finding is back, and its episode
+    // marked again.
+    void aNoOpActionStillEndsTheView() {
+        Opened o({clean(), media()});
+        QList<uint64_t> alone;
+        connect(&o.bridge, &SessionBridge::eventArrived, &o.bridge, [&alone](const Event &e) {
+            if (const auto *answer = std::get_if<Event::kAnswered>(&e.get_variant())) {
+                alone << answer->answered;
+            }
+        });
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        o.bridge.move(1);
+        QTRY_COMPARE(o.bridge.selected(), 1);
+        o.bridge.openEpisode(0);
+        QTRY_VERIFY(o.bridge.showingEpisode());
+        alone.clear();
+        o.bridge.move(1);
+        QVERIFY(o.bridge.showingEpisode());
+        QTRY_VERIFY(!o.bridge.showingEpisode());
+        QCOMPARE(alone, QList<uint64_t>{static_cast<uint64_t>(o.bridge.sent.size())});
+        QCOMPARE(o.bridge.selected(), 1);
+        QCOMPARE(o.bridge.episodeName(), QString());
+        QCOMPARE(current(o.bridge), QStringList{"E01"});
+    }
+
+    // A select of the entry already selected moves nothing in review, and still ends the view, with
+    // review's answer, which changes nothing else: the finding's episode is marked again, and no
+    // log shows, as the file review has selected is still the one clicked.
+    void selectingTheRowAlreadySelectedEndsTheEpisodesView() {
+        Opened o({clean(), media()});
+        QSignalSpy changed(&o.bridge, &SessionBridge::summaryChanged);
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        o.bridge.openEpisode(1);
+        QTRY_COMPARE(o.bridge.episodeName(), "E01");
+        o.bridge.openEpisode(0);
+        QTRY_VERIFY(o.bridge.showingEpisode());
+        const QString label = o.bridge.episodeName();
+        QCOMPARE(current(o.bridge), QStringList{label});
+
+        const qsizetype from = o.bridge.sent.size();
+        changed.clear();
+        o.bridge.select(o.bridge.selected());
+        const QStringList sent = o.bridge.sent.mid(from);
+        QVERIFY2(sent.size() == 1 && sent.first().startsWith("Select row "),
+                 qPrintable(sent.join(" | ")));
+        QCOMPARE(changed.count(), 0);
+        QVERIFY(o.bridge.showingEpisode());
+        QTRY_COMPARE(changed.count(), 1);
+        QVERIFY(!o.bridge.showingEpisode());
+        QCOMPARE(o.bridge.episodeName(), QString());
+        QCOMPARE(o.bridge.episodeLog(), QStringList());
+        QCOMPARE(current(o.bridge), QStringList{"E01"});
+        QCOMPARE(o.bridge.selected(), 0);
+    }
+
+    // An undo can leave the selection where it is, and with no decision to take back review only
+    // says so: the view ends with that answer.
+    void undoEndsTheEpisodesView() {
+        Opened o({clean(), media()});
+        QSignalSpy changed(&o.bridge, &SessionBridge::summaryChanged);
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        o.bridge.openEpisode(1);
+        QTRY_COMPARE(o.bridge.episodeName(), "E01");
+        o.bridge.openEpisode(0);
+        QTRY_VERIFY(o.bridge.showingEpisode());
+
+        const qsizetype from = o.bridge.sent.size();
+        changed.clear();
+        o.bridge.undo();
+        QCOMPARE(o.bridge.sent.mid(from), QStringList{"Undo"});
+        QCOMPARE(changed.count(), 0);
+        QVERIFY(o.bridge.showingEpisode());
+        QTRY_COMPARE(o.bridge.statusLine(), "Nothing to undo");
+        QVERIFY(!o.bridge.showingEpisode());
+        QCOMPARE(o.bridge.episodeName(), QString());
+        QCOMPARE(current(o.bridge), QStringList{"E01"});
+        QCOMPARE(o.bridge.selected(), 0);
+    }
+
+    // A move, or a step to another episode, that review cannot make changes nothing there but its
+    // count, and still ends a greyed episode's view, with review's answer: the move on at the last
+    // finding; the step to the next episode, which goes nowhere either; and here the step back,
+    // which finds no other episode before it. Review answers the last two with a refusal.
+    void everyMoveEndsTheEpisodesView() {
+        Opened o({clean(), media()});
+        QSignalSpy changed(&o.bridge, &SessionBridge::summaryChanged);
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        o.bridge.move(1);
+        QTRY_COMPARE(o.bridge.selected(), 1);
+        const std::vector<std::tuple<QString, std::function<void()>, QString>> moves = {
+            {"Move 1", [&o] { o.bridge.move(1); }, QString()},
+            {"NextFile", [&o] { o.bridge.nextEpisode(); }, "This is the last episode"},
+            {"PreviousFile", [&o] { o.bridge.previousEpisode(); }, "This is the first episode"},
+        };
+        for (const auto &[action, call, said] : moves) {
+            // Review's file is still the one with no findings: the view shows with the click's
+            // answer, which lets the last refusal go.
+            o.bridge.openEpisode(0);
+            QTRY_VERIFY2(o.bridge.showingEpisode(), qPrintable(action));
+            QCOMPARE(o.bridge.statusLine(), QString());
+            const qsizetype from = o.bridge.sent.size();
+            changed.clear();
+            call();
+            QCOMPARE(o.bridge.sent.mid(from), QStringList{action});
+            QCOMPARE(changed.count(), 0);
+            QVERIFY2(o.bridge.showingEpisode(), qPrintable(action));
+            QTRY_VERIFY2(!o.bridge.showingEpisode(), qPrintable(action));
+            QCOMPARE(changed.count(), 1);
+            QCOMPARE(o.bridge.statusLine(), said);
+            QCOMPARE(o.bridge.episodeName(), QString());
+            QCOMPARE(current(o.bridge), QStringList{"E01"});
+            QCOMPARE(o.bridge.selected(), 1);
+        }
+    }
+
+    // A click on a greyed episode while review has yet to answer an ask that ends the view takes
+    // that end's place: the view stays through the ask's answer, though it selects another
+    // finding, and shows again with the click's, scrolled to.
+    void aGreyedClickCancelsAPendingEnd() {
+        // Declared before the bridge, which the handler below writes it from, so that it outlives
+        // it.
+        QList<bool> seen;
+        Opened o({clean(), media()});
+        QSignalSpy shown(&o.bridge, &SessionBridge::episodeShown);
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        o.bridge.openEpisode(0);
+        QTRY_COMPARE(shown.count(), 1);
+        QVERIFY(o.bridge.showingEpisode());
+        connect(&o.bridge, &SessionBridge::summaryChanged, &o.bridge,
+                [&] { seen << o.bridge.showingEpisode(); });
+
+        o.bridge.move(1);
+        o.bridge.openEpisode(0);
+        QVERIFY(o.bridge.showingEpisode());
+        QTRY_COMPARE(shown.count(), 2);
+        QCOMPARE(o.bridge.selected(), 1);
+        QCOMPARE(seen, (QList<bool>{true, true}));
+        QVERIFY(o.bridge.showingEpisode());
+    }
+
+    // A click on a greyed episode that review has yet to take: a change answering an action sent
+    // before it, which selects another finding, leaves it be, and its episode shows once review
+    // answers the click's `SelectFile`. Review is held back, and its changes stood in for, once
+    // E01's file is selected, so that the click changes review's file.
+    void aStaleChangeDoesNotEndANewerClicksView() {
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.bridge.openEpisode(1);
+        QTRY_COMPARE(s.bridge.episodeName(), "E01");
+        s.holdOnceQuiet();
+        const auto count = static_cast<uint64_t>(s.bridge.sent.size());
+        QVERIFY(s.last && s.last->summary.answered == count);
+        EpisodeOrder *files = s.bridge.episodes();
+        const QString label = files->data(files->index(0, 0), EpisodesModel::LabelRole).toString();
+
+        s.bridge.cycleFilter();
+        s.bridge.openEpisode(0);
+        QCOMPARE(s.bridge.sent.size(), qsizetype(count + 2));
+        // The filter's answer, which selects the second row.
+        s.answer(count + 1, 1, 1);
+        QTRY_COMPARE(s.bridge.selected(), 1);
+        QVERIFY(!s.bridge.showingEpisode());
+        // The click's.
+        s.answer(count + 2, 0, 1, std::nullopt, LogsNow{FileLogs{{"Its log"}, {}}});
+        QTRY_VERIFY(s.bridge.showingEpisode());
+        QCOMPARE(s.bridge.episodeName(), label);
+        QCOMPARE(s.bridge.episodeLog(), QStringList{"Its log"});
+        QCOMPARE(current(s.bridge), QStringList{label});
+        QCOMPARE(s.bridge.selected(), 1);
+    }
+
+    // A click's answer that leaves another file selected shows no log, then or with a later change
+    // of review's that has the clicked file selected after all: the view shows what review's answer
+    // to the click has. That answer comes alone, as nothing else changed, so nothing is said for
+    // it: the later change, said once, is taken after it.
+    void aClickAnsweredWithAnotherFileShowsNothing() {
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.bridge.openEpisode(1);
+        QTRY_COMPARE(s.bridge.episodeName(), "E01");
+        s.holdOnceQuiet();
+        const auto count = static_cast<uint64_t>(s.bridge.sent.size());
+        QSignalSpy changed(&s.bridge, &SessionBridge::summaryChanged);
+        QSignalSpy shown(&s.bridge, &SessionBridge::episodeShown);
+
+        s.bridge.openEpisode(0);
+        s.answerAlone(count + 1);
+        s.answer(count + 1, 0, 0, std::nullopt, LogsNow{FileLogs{{"Its log"}, {}}});
+        QTRY_COMPARE(changed.count(), 1);
+        QVERIFY(!s.bridge.showingEpisode());
+        QCOMPARE(s.bridge.episodeLog(), QStringList());
+        QCOMPARE(shown.count(), 0);
+    }
+
+    // A click on an episode with findings while a greyed episode's view shows sends two actions,
+    // its file and then its first finding. The view holds through review's answer to the first,
+    // which has the new file selected and the finding selected before, and ends with the answer to
+    // the second, on that episode's first finding. Review is held back, and its changes stood in
+    // for, so that the first answer comes alone.
+    void aClickOnAnEpisodeWithFindingsEndsTheViewAtItsLastAnswer() {
+        // Declared before the stand-in, whose bridge the handler below writes it from, so that it
+        // outlives it.
+        QList<std::pair<bool, QString>> seen;
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.bridge.move(1);
+        QTRY_COMPARE(s.bridge.selected(), 1);
+        s.holdOnceQuiet();
+        QVERIFY(s.first && s.first->detail && s.first->files);
+        QCOMPARE(s.first->files->inserted.size(), std::size_t(3));
+        const QString label = QString::fromStdString(s.first->files->inserted[0].label);
+        const QString e02 = QString::fromStdString(s.first->files->inserted[2].path);
+        const auto count = static_cast<uint64_t>(s.bridge.sent.size());
+        s.bridge.openEpisode(0);
+        s.answer(count + 1, 0, 1);
+        QTRY_VERIFY(s.bridge.showingEpisode());
+        const QStringList log = s.bridge.episodeLog();
+        QVERIFY(!log.isEmpty());
+        connect(&s.bridge, &SessionBridge::summaryChanged, &s.bridge,
+                [&] { seen << std::pair{s.bridge.showingEpisode(), s.bridge.episodeName()}; });
+
+        s.bridge.openEpisode(2);
+        QCOMPARE(s.bridge.sent.mid(s.bridge.sent.size() - 2),
+                 (QStringList{"SelectFile " + e02, "ShowFileFindings"}));
+        // `SelectFile`'s answer: E02's file and log, and the finding selected before.
+        s.answer(count + 2, 2, 1, std::nullopt, LogsNow{FileLogs{{"E02's log"}, {}}});
+        QTRY_COMPARE(seen.size(), 1);
+        QCOMPARE(seen.last(), (std::pair<bool, QString>{true, label}));
+        QCOMPARE(s.bridge.episodeLog(), log);
+        QCOMPARE(current(s.bridge), QStringList{label});
+        // `ShowFileFindings`': the first row, E01's and E02's, with its detail.
+        s.answer(count + 3, 2, 0, std::nullopt, std::nullopt, s.first->detail);
+        QTRY_COMPARE(seen.size(), 2);
+        QCOMPARE(seen.last(), (std::pair<bool, QString>{false, "E02"}));
+        QCOMPARE(s.bridge.selected(), 0);
+        QCOMPARE(s.bridge.detail()->place(), "E01 · 0:01");
+        QCOMPARE(s.bridge.episodeLog(), QStringList{"E02's log"});
+        QCOMPARE(current(s.bridge), QStringList{"E02"});
+    }
+
+    // A change of review's own after a greyed click's answer, as a job's is, carries the click's
+    // count: one that selects another finding ends the view.
+    void aJobsMoveAfterTheClicksAnswerEndsTheView() {
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.holdOnceQuiet();
+        const auto count = static_cast<uint64_t>(s.bridge.sent.size());
+        s.bridge.openEpisode(0);
+        s.answer(count + 1, 0, 0);
+        QTRY_VERIFY(s.bridge.showingEpisode());
+        // No action of the window's since the click, and another finding selected.
+        s.answer(count + 1, 0, 1);
+        QTRY_COMPARE(s.bridge.selected(), 1);
+        QTRY_VERIFY(!s.bridge.showingEpisode());
+        QCOMPARE(s.bridge.episodeName(), QString());
+    }
+
+    // Review's answer to a later ask, here Switch View's, that has another file selected and the
+    // same finding ends a greyed episode's view: the log shown is no longer review's file's.
+    void anotherFileSelectedEndsTheView() {
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.holdOnceQuiet();
+        const auto count = static_cast<uint64_t>(s.bridge.sent.size());
+        s.bridge.openEpisode(0);
+        s.answer(count + 1, 0, 0);
+        QTRY_VERIFY(s.bridge.showingEpisode());
+        s.bridge.switchView();
+        s.answer(count + 2, 1, 0);
+        QTRY_VERIFY(!s.bridge.showingEpisode());
+        QCOMPARE(s.bridge.selected(), 0);
+        QCOMPARE(current(s.bridge), QStringList{"E01"});
+    }
+
+    // A greyed click the bridge sends while it still holds a question review has let go, at a key
+    // whose answer has yet to come: review takes the click as any other, and its answer, with the
+    // file clicked selected, shows the episode.
+    void aGreyedClickAfterAQuestionWasLetGoShowsAtItsAnswer() {
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.bridge.openEpisode(1);
+        QTRY_COMPARE(s.bridge.episodeName(), "E01");
+        // Recheck asks first. The window has no way to ask it yet, so the test sends it.
+        s.bridge.send(Action(Action::kRecheck{}));
+        QTRY_VERIFY(s.last && s.last->summary.question);
+        s.holdOnceQuiet();
+        const auto count = static_cast<uint64_t>(s.bridge.sent.size());
+        s.bridge.cycleFilter();
+        s.bridge.openEpisode(0);
+        s.last->summary.question.reset();
+        // The filter key's answer, which let the question go; then the click's.
+        s.answer(count + 1, 1, 0);
+        s.answer(count + 2, 0, 0, std::nullopt, LogsNow{FileLogs{{"Its log"}, {}}});
+        QTRY_VERIFY(s.bridge.showingEpisode());
+        QCOMPARE(s.bridge.episodeLog(), QStringList{"Its log"});
+    }
+
+    // A greyed click review takes while it asks only lets the question go, and shows nothing, even
+    // with the file clicked already review's, as it is as the view opens.
+    void aGreyedClickReviewTakesWhileAskingShowsNothing() {
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.bridge.send(Action(Action::kRecheck{}));
+        QTRY_VERIFY(s.last && s.last->summary.question);
+        s.holdOnceQuiet();
+        const auto count = static_cast<uint64_t>(s.bridge.sent.size());
+        QSignalSpy changed(&s.bridge, &SessionBridge::summaryChanged);
+        s.bridge.openEpisode(0);
+        s.last->summary.question.reset();
+        s.answer(count + 1, 0, 0);
+        QTRY_COMPARE(changed.count(), 1);
+        QVERIFY(!s.bridge.showingEpisode());
+        QCOMPARE(s.bridge.episodeName(), QString());
+    }
+
+    // A greyed click review takes while it asks only lets the question go, and the view stays as it
+    // was before the click: a job's change meanwhile, which answers an action sent after the shown
+    // view's click and selects another finding, ends that view once the click's answer says review
+    // was asking. Review is held back, and its changes stood in for, once it asks; the second
+    // greyed episode is made up.
+    void aClickReviewTakesWhileAskingLeavesAJobsMoveToEndTheView() {
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        // Review's file as the view opens is the greyed episode's: its view shows with the answer.
+        s.bridge.openEpisode(0);
+        QTRY_VERIFY(s.bridge.showingEpisode());
+        // Recheck asks. The window has no way to ask it yet, so the test sends it.
+        s.bridge.send(Action(Action::kRecheck{}));
+        QTRY_VERIFY(s.last && s.last->summary.question);
+        s.holdOnceQuiet();
+        QVERIFY(s.bridge.showingEpisode());
+        QVERIFY(s.first && s.first->files && !s.first->files->inserted.empty());
+        FileView other = s.first->files->inserted[0];
+        other.path = clean() + "/other.mkv";
+        other.label = "Other";
+        const auto count = static_cast<uint64_t>(s.bridge.sent.size());
+        s.answer(count, 0, 0, FilesSplice{1, 0, {other}});
+        QTRY_COMPARE(s.bridge.episodes()->rowCount(), 4);
+
+        s.bridge.openEpisode(1);
+        // A job's change: no action since the question, another finding selected. The view holds
+        // while the click's answer is awaited.
+        s.answer(count, 0, 1);
+        QTRY_COMPARE(s.bridge.selected(), 1);
+        QVERIFY(s.bridge.showingEpisode());
+        // The click's answer: review only let the question go, its file still the first's.
+        s.last->summary.question.reset();
+        s.answer(count + 1, 0, 1);
+        QTRY_VERIFY(!s.bridge.showingEpisode());
+        QCOMPARE(s.bridge.episodeName(), QString());
+    }
+
+    // Two greyed clicks, the second taken while review asks: review answered the first before the
+    // question came, so once the second's answer says review was asking, the first's view, put
+    // back, shows. Review is held back, and its changes stood in for; the second greyed episode is
+    // made up.
+    void aClickReviewTakesWhileAskingPutsBackTheClickBefore() {
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.holdOnceQuiet();
+        QVERIFY(s.first && s.first->files && !s.first->files->inserted.empty());
+        FileView other = s.first->files->inserted[0];
+        other.path = clean() + "/other.mkv";
+        other.label = "Other";
+        const auto count = static_cast<uint64_t>(s.bridge.sent.size());
+        s.answer(count, 0, 0, FilesSplice{1, 0, {other}});
+        QTRY_COMPARE(s.bridge.episodes()->rowCount(), 4);
+        QSignalSpy shown(&s.bridge, &SessionBridge::episodeShown);
+
+        s.bridge.openEpisode(1);
+        s.bridge.openEpisode(0);
+        // The first click's answer, with its file and log; then a job's change that asks.
+        s.answer(count + 1, 1, 0, std::nullopt, LogsNow{FileLogs{{"Other's log"}, {}}});
+        s.last->summary.question = Question(Question::kRecheck{"Other", "claude"});
+        s.answer(count + 1, 1, 0);
+        // The second click's answer: review only let the question go.
+        s.last->summary.question.reset();
+        s.answer(count + 2, 1, 0);
+        QTRY_VERIFY(s.bridge.showingEpisode());
+        QCOMPARE(s.bridge.episodeName(), "Other");
+        QCOMPARE(s.bridge.episodeLog(), QStringList{"Other's log"});
+        QCOMPARE(shown.count(), 1);
+    }
+
+    // A playback key's answer changes nothing the window shows, and comes alone: nothing is said
+    // for it and nothing drawn again. The move after it is said, once, after the answer was taken.
+    void aPlaybackKeysAnswerAloneSaysNothing() {
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.holdOnceQuiet();
+        const auto count = static_cast<uint64_t>(s.bridge.sent.size());
+        QSignalSpy changed(&s.bridge, &SessionBridge::summaryChanged);
+        QSignalSpy filters(s.bridge.filters(), &QAbstractItemModel::dataChanged);
+        s.bridge.pause();
+        s.answerAlone(count + 1);
+        s.bridge.move(1);
+        s.answer(count + 2, 0, 1);
+        QTRY_COMPARE(changed.count(), 1);
+        QCOMPARE(s.bridge.selected(), 1);
+        QCOMPARE(filters.count(), 1);
+        QCOMPARE(s.bridge.sent.mid(s.bridge.sent.size() - 2),
+                 (QStringList{"Playback Pause", "Move 1"}));
+    }
+
+    // A click on a second episode with no findings, while the first's view shows, keeps the first
+    // shown until review answers it: a change answering an earlier action, which still has the
+    // first's file selected, changes nothing shown; the second's log shows with the click's
+    // answer, and is scrolled to. Review is held back, and its changes stood in for, as the seeded
+    // run has one episode with no findings: the second is made up.
+    void aSecondGreyedClickKeepsTheFirstShownUntilItsAnswer() {
+        // Declared before the stand-in, whose bridge the handler below writes it from, so that it
+        // outlives it.
+        QList<std::pair<bool, QString>> seen;
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.holdOnceQuiet();
+        QVERIFY(s.first && s.first->files && !s.first->files->inserted.empty());
+        QVERIFY(s.last->summary.file_selected == std::optional<uint64_t>(0));
+        const QString label = QString::fromStdString(s.first->files->inserted[0].label);
+        const QString path = QString::fromStdString(s.first->files->inserted[0].path);
+        FileView other = s.first->files->inserted[0];
+        other.path = clean() + "/other.mkv";
+        other.label = "Other";
+        const auto count = static_cast<uint64_t>(s.bridge.sent.size());
+        // The made-up episode, after the first, in a change that answers no action of its own.
+        s.answer(count, 0, 0, FilesSplice{1, 0, {other}});
+        QTRY_COMPARE(s.bridge.episodes()->rowCount(), 4);
+        QVERIFY(s.bridge.episodes()
+                    ->data(s.bridge.episodes()->index(1, 0), EpisodesModel::NoFindingsRole)
+                    .toBool());
+        QSignalSpy shown(&s.bridge, &SessionBridge::episodeShown);
+        connect(&s.bridge, &SessionBridge::summaryChanged, &s.bridge,
+                [&] { seen << std::pair{s.bridge.showingEpisode(), s.bridge.episodeName()}; });
+
+        s.bridge.openEpisode(0);
+        QCOMPARE(seen.size(), 0);
+        s.answer(count + 1, 0, 0);
+        QTRY_COMPARE(seen.size(), 1);
+        QCOMPARE(seen.last(), (std::pair<bool, QString>{true, label}));
+        QCOMPARE(shown.count(), 1);
+        QCOMPARE(current(s.bridge), QStringList{label});
+
+        s.bridge.openEpisode(1);
+        QCOMPARE(s.bridge.sent.mid(s.bridge.sent.size() - 2),
+                 (QStringList{"SelectFile " + path,
+                              "SelectFile " + QString::fromStdString(other.path)}));
+        QCOMPARE(seen.size(), 1);
+        // A change answering the first click, as a job's after it would, here one that adds to the
+        // first's log: the first stays shown, its log as review now has it.
+        s.answer(count + 1, 0, 0, std::nullopt, LogsNow{FileLogs{{"More of its log"}, {}}});
+        QTRY_COMPARE(seen.size(), 2);
+        QCOMPARE(seen.last(), (std::pair<bool, QString>{true, label}));
+        QCOMPARE(s.bridge.episodeLog(), QStringList{"More of its log"});
+        QCOMPARE(current(s.bridge), QStringList{label});
+        QCOMPARE(shown.count(), 1);
+
+        s.answer(count + 2, 1, 0, std::nullopt, LogsNow{FileLogs{{"Other's log"}, {}}});
+        QTRY_COMPARE(seen.size(), 3);
+        QCOMPARE(seen.last(), (std::pair<bool, QString>{true, "Other"}));
+        QCOMPARE(s.bridge.episodeLog(), QStringList{"Other's log"});
+        QCOMPARE(current(s.bridge), QStringList{"Other"});
+        QCOMPARE(shown.count(), 2);
+    }
+
+    // Under a question, review only lets it go, whatever else is asked, and keeps the finding
+    // selected. A select, a move, a step to another episode and an undo each still end a greyed
+    // episode's view, with that answer, whatever the bridge last heard of a question: the finding
+    // review keeps then shows, which is where the view would end without the question.
+    void underAQuestionAMoveOrUndoStillEndsTheEpisodesView() {
+        Opened o({clean(), media()});
+        bool asked = false;
+        connect(&o.bridge, &SessionBridge::eventArrived, &o.bridge, [&asked](const Event &e) {
+            if (const auto *change = std::get_if<Event::kChanged>(&e.get_variant())) {
+                asked = change->summary.question.has_value();
+            }
+        });
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        const std::vector<std::pair<QString, std::function<void()>>> asks = {
+            {"Select", [&o] { o.bridge.select(o.bridge.selected()); }},
+            {"Undo", [&o] { o.bridge.undo(); }},
+            {"Move 1", [&o] { o.bridge.move(1); }},
+            {"NextFile", [&o] { o.bridge.nextEpisode(); }},
+            {"PreviousFile", [&o] { o.bridge.previousEpisode(); }},
+        };
+        for (const auto &[action, call] : asks) {
+            // Review's file is still the one with no findings: the view shows with the click's
+            // answer.
+            o.bridge.openEpisode(0);
+            QTRY_VERIFY2(o.bridge.showingEpisode(), qPrintable(action));
+            // Recheck asks first. The window has no way to ask it yet, so the test sends it.
+            o.bridge.send(Action(Action::kRecheck{}));
+            QTRY_VERIFY2(asked, qPrintable(action));
+            call();
+            QVERIFY2(o.bridge.sent.last().startsWith(action), qPrintable(o.bridge.sent.last()));
+            QVERIFY2(o.bridge.showingEpisode(), qPrintable(action));
+            QTRY_VERIFY2(!asked, qPrintable(action));
+            QVERIFY2(!o.bridge.showingEpisode(), qPrintable(action));
+            QCOMPARE(o.bridge.episodeName(), QString());
+            QCOMPARE(current(o.bridge), QStringList{"E01"});
+            QCOMPARE(o.bridge.selected(), 0);
+        }
     }
 
     // Another entry selected is said, a row or a member of one; a row expanded where it is, still

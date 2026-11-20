@@ -30,7 +30,7 @@ MpvItem::MpvItem(QQuickItem *parent) : MpvAbstractItem(parent) {
     connect(mpv, &MpvController::propertyChanged, this, &MpvItem::heard);
     connect(mpv, &MpvController::endFile, this, [this](const QString &reason) {
         if (port) {
-            port->ended(reason == QStringLiteral("error"));
+            port->ended(endOf(reason));
         }
     });
     observeProperty(QStringLiteral("time-pos"), MPV_FORMAT_DOUBLE);
@@ -38,6 +38,11 @@ MpvItem::MpvItem(QQuickItem *parent) : MpvAbstractItem(parent) {
     // After vo-configured: a change of pause is then a sign that mpv's first word on vo-configured
     // has been heard, which a test waits on.
     observeProperty(QStringLiteral("pause"), MPV_FORMAT_FLAG);
+    // mpv's render call otherwise waits out each frame's display time, and the window's frame,
+    // which waits on that call, with it: the whole window is held to the video's frame rate while
+    // it plays. At 0 the call draws the frame due and returns. A global option, it holds for every
+    // file after.
+    MpvAbstractItem::setProperty(QStringLiteral("video-timing-offset"), 0.0);
 }
 
 // The player must not send this pane requests once it has gone.
@@ -88,10 +93,39 @@ void MpvItem::heard(const QString &name, const QVariant &value) {
     }
 }
 
+// Once the stretch ends, the frame is drawn again at the pane's size: MpvQt draws only when mpv
+// asks, which mpv does not while paused, and the frame would stay stretched.
+void MpvItem::setStretching(bool stretching) {
+    if (stretching == isStretching) {
+        return;
+    }
+    isStretching = stretching;
+    setTextureFollowsItemSize(!stretching);
+    if (!stretching) {
+        update();
+    }
+    emit stretchingChanged();
+}
+
 void MpvItem::command(std::uint64_t id, const QStringList &args) {
     commandAsync(args, static_cast<int>(id));
 }
 
 void MpvItem::get(std::uint64_t id, const QString &name) {
     getPropertyAsync(name, static_cast<int>(id));
+}
+
+// MpvQt 1.2.1 names mpv's ends "eof", "stop" and "error", and passes on no other. Any other name is
+// taken for a stop, which ends no wait, so that a name that is no end of the load cannot end its
+// wait early. The cost falls on a real error under a new name: while the load settles it goes
+// unseen, the Open reports opened when the settle time ends, and the load stays late, the animation
+// up, as any late load does, until something ends that wait (`late` in player_port.h).
+PlayerPort::End MpvItem::endOf(const QString &reason) {
+    if (reason == QLatin1String("error")) {
+        return PlayerPort::End::Failed;
+    }
+    if (reason == QLatin1String("eof")) {
+        return PlayerPort::End::Finished;
+    }
+    return PlayerPort::End::Stopped;
 }

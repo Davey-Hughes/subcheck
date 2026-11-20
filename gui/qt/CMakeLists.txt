@@ -107,13 +107,14 @@ qt_add_qml_module(subcheck_window
     VERSION 1.0
     OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/qml/Subcheck"
     QML_FILES qml/Main.qml qml/Sidebar.qml qml/FindingRow.qml qml/DetailsPanel.qml
-            qml/PlayIndicator.qml qml/ChangeBlock.qml qml/SettingsWindow.qml
+            qml/PlayIndicator.qml qml/ChangeBlock.qml qml/SettingsWindow.qml qml/LoadingArc.qml
+            qml/ListScrollBar.qml
     SOURCES src/findings_model.h src/findings_model.cpp src/session_bridge.h
             src/session_bridge.cpp src/status_words.h src/status_words.cpp src/player_port.h
             src/player_port.cpp src/mpv_item.h src/mpv_item.cpp src/overloaded.h src/spliced.h
             src/words.h src/words.cpp src/sidebar_models.h src/sidebar_models.cpp
             src/detail_view.h src/detail_view.cpp src/window_settings.h src/window_settings.cpp
-            src/menu_keys.h src/menu_keys.cpp)
+            src/menu_keys.h src/menu_keys.cpp src/loading_flag.h src/loading_flag.cpp)
 target_include_directories(subcheck_window PUBLIC src)
 target_link_libraries(subcheck_window PUBLIC subcheck_bindings Qt6::Quick MpvQt::MpvQt)
 subcheck_warnings(subcheck_window)
@@ -186,9 +187,9 @@ set_tests_properties(findings_model_test PROPERTIES
 
 # The window's code that needs no session, each test on its own: the status bar's words for each
 # message, the window's other words and colours, the sidebar's lists, the details panel's words,
-# and what the window remembers.
+# what the window remembers, and when the busy animation over the video shows.
 foreach(name IN ITEMS status_words_test words_test sidebar_models_test detail_view_test
-                      window_settings_test)
+                      window_settings_test loading_flag_test)
     qt_add_executable(${name} tests/${name}.cpp)
     target_link_libraries(${name} PRIVATE subcheck_window Qt6::Test)
     subcheck_warnings(${name})

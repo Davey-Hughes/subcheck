@@ -1,8 +1,9 @@
 // The sidebar: the store's reviews, what the list shows, and the view's episodes, each a list of
-// review's that a click asks review about. The reviews scroll on their own, in a third of the
-// sidebar at most, so that the filters and the episodes stay in view however many reviews the
-// store holds; the episodes scroll in what is left, and on a short window keep room for a few
-// entries, which the reviews give up. None takes the window's keys.
+// review's that a click asks review about; an episode the check found nothing in is greyed, and
+// its word says so, so that the grey is never the only sign. The reviews scroll on their own, in
+// a third of the sidebar at most, so that the filters and the episodes stay in view however many
+// reviews the store holds; the episodes scroll in what is left, and on a short window keep room
+// for a few entries, which the reviews give up. None takes the window's keys.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -25,11 +26,17 @@ ColumnLayout {
         opacity: 0.7
     }
 
-    // An entry: its name, with a count or a stage on its right; highlighted while it is shown.
+    // An entry: its name, with a count or a stage on its right; highlighted while it is shown, and
+    // greyed while it has nothing to show, yet still clickable.
     component Entry: ItemDelegate {
         id: entry
 
         property string side
+        property bool greyed
+        // Both labels' colour: the highlight's own while highlighted, so that a greyed entry
+        // shown stays readable on it.
+        readonly property color ink: entry.highlighted ? entry.palette.highlightedText
+            : entry.greyed ? entry.palette.disabled.text : entry.palette.text
 
         Layout.fillWidth: true
         focusPolicy: Qt.NoFocus
@@ -38,15 +45,17 @@ ColumnLayout {
                 text: entry.text
                 textFormat: Text.PlainText
                 elide: Text.ElideRight
-                color: entry.highlighted ? entry.palette.highlightedText : entry.palette.text
+                color: entry.ink
                 Layout.fillWidth: true
             }
+            // Dimmed beside the name, but for a greyed entry's: its word is the one sign of the
+            // grey that is not a colour, and the disabled colour alone dims it enough.
             Label {
                 objectName: "entrySide"
                 text: entry.side
                 textFormat: Text.PlainText
-                opacity: 0.7
-                color: entry.highlighted ? entry.palette.highlightedText : entry.palette.text
+                opacity: entry.greyed ? 1 : 0.7
+                color: entry.ink
             }
         }
     }
@@ -64,7 +73,11 @@ ColumnLayout {
         Layout.fillHeight: true
         Layout.preferredHeight: Math.min(contentHeight, sidebar.height / 3)
         Layout.maximumHeight: Layout.preferredHeight
-        ScrollBar.vertical: ScrollBar {}
+        ScrollBar.vertical: ListScrollBar {
+            id: reviewsBar
+
+            objectName: "reviewsScrollBar"
+        }
 
         delegate: Entry {
             id: review
@@ -76,7 +89,7 @@ ColumnLayout {
             required property bool open
 
             objectName: "review" + index
-            width: ListView.view.width
+            width: ListView.view.width - reviewsBar.room
             text: name
             side: count > 0 ? count : ""
             highlighted: open
@@ -134,6 +147,8 @@ ColumnLayout {
         text: qsTr("Episodes")
     }
     ListView {
+        id: episodeList
+
         objectName: "episodes"
         clip: true
         boundsBehavior: Flickable.StopAtBounds
@@ -141,19 +156,38 @@ ColumnLayout {
         Layout.fillWidth: true
         Layout.fillHeight: true
         Layout.minimumHeight: 3 * check.implicitHeight
-        ScrollBar.vertical: ScrollBar {}
+        ScrollBar.vertical: ListScrollBar {
+            id: episodesBar
+
+            objectName: "episodesScrollBar"
+        }
+
+        // The marked episode kept in view as the View menu changes the order, so that a person
+        // keeps their place in the list; with none marked, nothing is scrolled to.
+        Connections {
+            target: sidebar.bridge.episodes
+
+            function onReordered() {
+                const row = sidebar.bridge.episodes.markedRow();
+                if (row >= 0) {
+                    episodeList.positionViewAtIndex(row, ListView.Contain);
+                }
+            }
+        }
 
         delegate: Entry {
             required property int index
             required property string label
             required property string stage
             required property bool current
+            required property bool noFindings
 
             objectName: "episode" + index
-            width: ListView.view.width
+            width: ListView.view.width - episodesBar.room
             text: label
             side: stage
             highlighted: current
+            greyed: noFindings
             onClicked: sidebar.bridge.openEpisode(index)
         }
     }

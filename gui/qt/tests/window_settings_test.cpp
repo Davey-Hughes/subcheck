@@ -524,6 +524,34 @@ private slots:
         QCOMPARE(colours(), Colours::Default);
     }
 
+    // Episodes Without Findings Last is off until it is set, then kept; a kept value that is not
+    // true is off, though QVariant would read most words as true.
+    void noFindingsLastIsKeptAndOffByDefault() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        {
+            WindowSettings settings(in(dir), "offscreen");
+            QVERIFY(!settings.noFindingsLast());
+            QSignalSpy changed(&settings, &WindowSettings::noFindingsLastChanged);
+            settings.setNoFindingsLast(true);
+            QCOMPARE(changed.count(), 1);
+            QVERIFY(settings.noFindingsLast());
+            // The same again changes nothing.
+            settings.setNoFindingsLast(true);
+            QCOMPARE(changed.count(), 1);
+        }
+        WindowSettings again(in(dir), "offscreen");
+        QVERIFY(again.noFindingsLast());
+        QCOMPARE(in(dir)->value("view/noFindingsLast").toString(), "true");
+        QSignalSpy changed(&again, &WindowSettings::noFindingsLastChanged);
+        again.setNoFindingsLast(false);
+        QCOMPARE(changed.count(), 1);
+        QVERIFY(!WindowSettings(in(dir), "offscreen").noFindingsLast());
+
+        in(dir)->setValue("view/noFindingsLast", "yes");
+        QVERIFY(!WindowSettings(in(dir), "offscreen").noFindingsLast());
+    }
+
     // The Settings window's radio buttons, one for each palette in its order; the arrows step
     // through them and stop at either end.
     void eachPaletteIsAChoiceInOrderAndTheArrowsStopAtTheEnds() {

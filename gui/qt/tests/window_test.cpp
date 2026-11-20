@@ -12,7 +12,9 @@
 #include "window_settings.h"
 #include "words.h"
 
+#include <QAccessible>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QFont>
@@ -45,6 +47,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
 Q_IMPORT_QML_PLUGIN(SubcheckPlugin)
@@ -75,14 +78,33 @@ void quietOffscreen(QtMsgType type, const QMessageLogContext &context, const QSt
     }
 }
 
-// More reviews than the sidebar has room for.
-std::vector<subcheck_ffi::FolderView> manyReviews() {
+// More reviews than the sidebar has room for, each with `count` findings.
+std::vector<subcheck_ffi::FolderView> manyReviews(uint64_t count = 0) {
     std::vector<subcheck_ffi::FolderView> folders;
     for (int i = 0; i < 30; ++i) {
         const std::string name = "Show " + std::to_string(i);
-        folders.push_back(subcheck_ffi::FolderView{"/m/" + name, name, 0, false});
+        folders.push_back(subcheck_ffi::FolderView{"/m/" + name, name, count, false});
     }
     return folders;
+}
+
+// More episodes than the sidebar has room for at the window's least height: E00 to E39, of which
+// the first twenty have no findings.
+std::vector<subcheck_ffi::FileView> manyEpisodes() {
+    std::vector<subcheck_ffi::FileView> files;
+    for (int i = 0; i < 40; ++i) {
+        const std::string label = (i < 10 ? "E0" : "E") + std::to_string(i);
+        const uint64_t findings = i < 20 ? 0 : 2;
+        files.push_back(subcheck_ffi::FileView{
+            .path = "/m/S1/" + label + ".mkv",
+            .label = label,
+            .stage = subcheck_ffi::ScanStage(subcheck_ffi::ScanStage::kDone{findings}),
+            .applying = std::nullopt,
+            .lines = 400,
+            .timing_only = false,
+        });
+    }
+    return files;
 }
 
 // A finding with every part the details panel draws, each unlike the others.
@@ -302,15 +324,20 @@ struct Shown {
         QTest::mouseClick(in, Qt::LeftButton, {}, middle(of));
     }
 
-    // The handle between the column `left` ends and the one `right` starts, dragged `by` across.
-    void drag(QQuickItem *left, QQuickItem *right, int by) {
+    // The middle of the handle between the column `left` ends and the one `right` starts.
+    QPoint handle(QQuickItem *left, QQuickItem *right) const {
         const qreal end = left->mapToScene(QPointF(left->width(), 0)).x();
         const qreal start = right->mapToScene(QPointF(0, 0)).x();
-        const QPoint handle(qRound((end + start) / 2), window->height() / 2);
-        QTest::mousePress(window, Qt::LeftButton, {}, handle);
-        QTest::mouseMove(window, handle + QPoint(by / 3, 0));
-        QTest::mouseMove(window, handle + QPoint(by, 0));
-        QTest::mouseRelease(window, Qt::LeftButton, {}, handle + QPoint(by, 0));
+        return {qRound((end + start) / 2), window->height() / 2};
+    }
+
+    // That handle dragged `by` across.
+    void drag(QQuickItem *left, QQuickItem *right, int by) {
+        const QPoint at = handle(left, right);
+        QTest::mousePress(window, Qt::LeftButton, {}, at);
+        QTest::mouseMove(window, at + QPoint(by / 3, 0));
+        QTest::mouseMove(window, at + QPoint(by, 0));
+        QTest::mouseRelease(window, Qt::LeftButton, {}, at + QPoint(by, 0));
     }
 
     // The actions sent since `from`, the count of those sent before; and the last, none before
@@ -328,6 +355,60 @@ private:
         return QTest::qWaitForWindowActive(window);
     }
 };
+
+// The file of the episode the check found nothing in, in a view of the run with no findings and
+// the run with two episodes: first in review's order, as its folder's path sorts first, so the file
+// review selects as that view opens.
+QString noFindingsFile() { return QString::fromStdString(clean()) + "/typos.mkv"; }
+
+// The details panel's view of what it scrolls.
+QQuickItem *detailsView(const Shown &w) {
+    return w.item("detailsScroll")->property("contentItem").value<QQuickItem *>();
+}
+
+// Where `item` starts in the details panel's view, and whether it lies wholly inside it.
+qreal topInDetails(const Shown &w, QQuickItem *item) {
+    return item->mapToItem(detailsView(w), QPointF(0, 0)).y();
+}
+bool inDetailsView(const Shown &w, QQuickItem *item) {
+    const qreal top = topInDetails(w, item);
+    return top >= -0.5 && top + item->height() <= detailsView(w)->height() + 0.5;
+}
+
+// The colour of the window palette's `role`.
+QColor paletteColour(const Shown &w, const char *role) {
+    return w.window->property("palette").value<QObject *>()->property(role).value<QColor>();
+}
+
+// The outline of the findings list's highlight, which marks the selected row.
+QColor selectionOutline(const Shown &w) {
+    auto *selection = w.find("findings")->property("highlightItem").value<QQuickItem *>();
+    auto *border = selection ? selection->property("border").value<QObject *>() : nullptr;
+    return border ? border->property("color").value<QColor>() : QColor();
+}
+
+// The window on that view at its least size, E01 clicked: its file selected and its first
+// finding, so that what its check said shows below the finding, out of view. Review answers a
+// click on the episode with no findings after this with a change, as it selects another file.
+void clickE01AtTheLeastSize(Shown &w) {
+    QVERIFY(w.start());
+    QTRY_COMPARE(w.rows(), 2);
+    w.window->resize(w.window->minimumSize());
+    QTRY_COMPARE(w.window->height(), 480);
+    QTRY_VERIFY(w.item("episode0") && w.item("episode1"));
+    QCOMPARE(w.bridge.episodes()
+                 ->data(w.bridge.episodes()->index(0, 0), EpisodesModel::PathRole)
+                 .toString(),
+             noFindingsFile());
+    w.click(w.item("episode1"));
+    QCOMPARE(w.bridge.sent,
+             (QStringList{"SelectFile " + QString::fromStdString(media()) + "/typos - E01.mkv",
+                          "ShowFileFindings"}));
+    QTRY_COMPARE(w.bridge.episodeName(), "E01");
+    QQuickItem *heading = w.item("episodeLogHeading");
+    QTRY_VERIFY(heading->isVisible());
+    QTRY_VERIFY(topInDetails(w, heading) >= detailsView(w)->height());
+}
 
 } // namespace
 
@@ -610,7 +691,7 @@ private slots:
 
         // What each menu holds: the items above, and only those.
         const std::vector<std::pair<const char *, int>> counts = {
-            {"&File", 4}, {"&Edit", 1}, {"&View", 2}, {"&Show", 4}, {"F&inding", 8}, {"Vi&deo", 9}};
+            {"&File", 4}, {"&Edit", 1}, {"&View", 3}, {"&Show", 4}, {"F&inding", 8}, {"Vi&deo", 9}};
         for (const auto &[title, count] : counts) {
             QObject *each = w.menu(title);
             QVERIFY2(each, title);
@@ -838,12 +919,12 @@ private slots:
         QTRY_COMPARE(w.rows(), 2);
         QTRY_VERIFY(entry("episode", 1));
 
-        EpisodesModel *files = w.bridge.episodes();
+        EpisodeOrder *files = w.bridge.episodes();
         QCOMPARE(files->rowCount(), 2);
         QTRY_VERIFY(marked("episode", 0));
         QVERIFY(!marked("episode", 1));
         for (const int row : {1, 0}) {
-            const QModelIndex at = files->index(row);
+            const QModelIndex at = files->index(row, 0);
             const QString stage = files->data(at, EpisodesModel::StageRole).toString();
             QVERIFY(!stage.isEmpty());
             QCOMPARE(Shown::text(entry("episode", row), "entrySide"), stage);
@@ -873,6 +954,590 @@ private slots:
             QTRY_VERIFY(entry("review", row) && marked("review", row));
             QVERIFY(!marked("review", 1 - row));
         }
+    }
+
+    // View ▸ Episodes Without Findings Last lists the episodes the check found nothing in after the
+    // rest, and keeps the choice; a click on an entry then opens the episode it shows, not the one
+    // review has at that row, and N and P still step through review's own order.
+    void theViewMenuPutsEpisodesWithoutFindingsLastAndAClickOpensTheRowUnderIt() {
+        Shown w({clean(), media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        EpisodeOrder *episodes = w.bridge.episodes();
+        QTRY_COMPARE(episodes->rowCount(), 3);
+        const auto paths = [episodes] {
+            QStringList each;
+            for (int row = 0; row < episodes->rowCount(); ++row) {
+                each << episodes->data(episodes->index(row, 0), EpisodesModel::PathRole).toString();
+            }
+            return each;
+        };
+        const auto drawn = [&w] {
+            QStringList labels;
+            for (const char *name : {"episode0", "episode1", "episode2"}) {
+                QQuickItem *entry = w.item(name);
+                labels << (entry ? entry->property("text").toString() : QString());
+            }
+            return labels;
+        };
+        // Review lists the folder with no findings first, as its path sorts first.
+        const QString folder = QString::fromStdString(media());
+        const QString none = QString::fromStdString(clean()) + "/typos.mkv";
+        const QString e01 = folder + "/typos - E01.mkv";
+        const QString e02 = folder + "/typos - E02.mkv";
+        QCOMPARE(paths(), (QStringList{none, e01, e02}));
+        const QString noneLabel =
+            episodes->data(episodes->index(0, 0), EpisodesModel::LabelRole).toString();
+        QTRY_COMPARE(drawn(), (QStringList{noneLabel, "E01", "E02"}));
+
+        QObject *last = w.find("noFindingsLast");
+        QVERIFY(last);
+        QCOMPARE(last->property("text").toString(), "&Episodes Without Findings Last");
+        QVERIFY(!last->property("checked").toBool());
+        QVERIFY(!w.settings.noFindingsLast());
+        QVERIFY(QMetaObject::invokeMethod(last, "trigger"));
+        QVERIFY(last->property("checked").toBool());
+        QVERIFY(w.settings.noFindingsLast());
+        QVERIFY(episodes->noFindingsLast());
+        QCOMPARE(paths(), (QStringList{e01, e02, none}));
+        QTRY_COMPARE(drawn(), (QStringList{"E01", "E02", noneLabel}));
+        // The greyed entry says why wherever it is listed, in the disabled colour alone: the word
+        // is the one sign of the grey that is not a colour, so it is not dimmed as other words are.
+        QCOMPARE(Shown::text(w.item("episode2"), "entrySide"), "No findings");
+        QQuickItem *greyedWord = Shown::item(w.item("episode2"), "entrySide");
+        QQuickItem *word = Shown::item(w.item("episode0"), "entrySide");
+        QVERIFY(greyedWord && word);
+        QCOMPARE(greyedWord->opacity(), 1.0);
+        QCOMPARE(word->opacity(), 0.7);
+
+        const qsizetype from = w.bridge.sent.size();
+        w.click(w.item("episode0"));
+        QCOMPARE(w.since(from), (QStringList{"SelectFile " + e01, "ShowFileFindings"}));
+        QTRY_COMPARE(w.bridge.episodeName(), "E01");
+        QTRY_VERIFY(w.item("episode0")->property("highlighted").toBool());
+        QVERIFY(!w.item("episode2")->property("highlighted").toBool());
+        // The greyed entry, last now, opens its own file too, which has no finding to go to.
+        const qsizetype quiet = w.bridge.sent.size();
+        w.click(w.item("episode2"));
+        QCOMPARE(w.since(quiet), QStringList{"SelectFile " + none});
+        QTRY_COMPARE(w.bridge.episodeName(), noneLabel);
+        QTRY_VERIFY(w.item("episode2")->property("highlighted").toBool());
+        QVERIFY(!w.item("episode0")->property("highlighted").toBool());
+
+        QTest::keyClick(w.window, Qt::Key_N);
+        QCOMPARE(w.last(), "NextFile");
+        QTest::keyClick(w.window, Qt::Key_P);
+        QCOMPARE(w.last(), "PreviousFile");
+    }
+
+    // View ▸ Episodes Without Findings Last, on and then off again, keeps the marked episode in
+    // view at its row in the new order, which the list would otherwise not scroll to. The episodes
+    // are made up, in a window whose review is not started, at the least height, where the list
+    // shows fewer than ten: the marked episode's two rows are twenty apart, and the nearer is ten
+    // from the top.
+    void theSortKeepsTheMarkedEpisodeInView() {
+        Shown w({media()});
+        QVERIFY(w.show());
+        auto *files = qobject_cast<EpisodesModel *>(w.bridge.episodes()->sourceModel());
+        QVERIFY(files);
+        QVERIFY(files->apply(subcheck_ffi::FilesSplice{0, 0, manyEpisodes()}));
+        w.window->resize(w.window->minimumSize());
+        QTRY_COMPARE(w.window->height(), 480);
+        QQuickItem *sidebar = w.item("sidebar");
+        QVERIFY(sidebar);
+        QQuickItem *list = Shown::item(sidebar, "episodes");
+        QVERIFY(list);
+        EpisodeOrder *order = w.bridge.episodes();
+        const QString marked = QStringLiteral("/m/S1/E30.mkv");
+        // The marked episode's row in the list's order now, and the entry the list draws for it.
+        const auto row = [order, &marked] {
+            for (int each = 0; each < order->rowCount(); ++each) {
+                if (order->data(order->index(each, 0), EpisodesModel::PathRole).toString() ==
+                    marked) {
+                    return each;
+                }
+            }
+            return -1;
+        };
+        const auto drawn = [list](int at) {
+            QQuickItem *each = nullptr;
+            QMetaObject::invokeMethod(list, "itemAtIndex", Q_RETURN_ARG(QQuickItem *, each),
+                                      Q_ARG(int, at));
+            return each;
+        };
+        const auto entry = [&drawn, &row] { return drawn(row()); };
+        const auto inView = [list](QQuickItem *of) {
+            if (!of) {
+                return false;
+            }
+            const qreal top = of->mapToItem(list, QPointF(0, 0)).y();
+            return top >= -0.5 && top + of->height() <= list->height() + 0.5;
+        };
+
+        // Laid out at the least height.
+        QTRY_VERIFY(drawn(0) && list->height() < 10 * drawn(0)->height());
+
+        files->follow(marked.toStdString());
+        QCOMPARE(row(), 30);
+        // Scrolled to it, as a person would to find it: ListView.Beginning.
+        const int beginning = 0;
+        QVERIFY(QMetaObject::invokeMethod(list, "positionViewAtIndex", Q_ARG(int, row()),
+                                          Q_ARG(int, beginning)));
+        QTRY_VERIFY(inView(entry()));
+        QVERIFY(entry()->property("highlighted").toBool());
+
+        QObject *last = w.find("noFindingsLast");
+        QVERIFY(last);
+        QVERIFY(QMetaObject::invokeMethod(last, "trigger"));
+        QVERIFY(order->noFindingsLast());
+        QCOMPARE(row(), 10);
+        QTRY_VERIFY(inView(entry()));
+        QVERIFY(entry()->property("highlighted").toBool());
+
+        QVERIFY(QMetaObject::invokeMethod(last, "trigger"));
+        QVERIFY(!order->noFindingsLast());
+        QCOMPARE(row(), 30);
+        QTRY_VERIFY(inView(entry()));
+        QVERIFY(entry()->property("highlighted").toBool());
+    }
+
+    // A click on an episode the check found nothing in selects its file alone: it has no finding
+    // to go to, and review's word for that would take the status bar. What the check said of it
+    // shows, scrolled into view, while review keeps the finding selected; and the sidebar marks the
+    // episode clicked.
+    void aClickOnAnEpisodeWithNoFindingsShowsItsLogAndKeepsTheFinding() {
+        Shown w({clean(), media()});
+        QSignalSpy shown(&w.bridge, &SessionBridge::episodeShown);
+        clickE01AtTheLeastSize(w);
+        if (QTest::currentTestFailed()) {
+            return;
+        }
+        const QStringList e01Log = w.bridge.episodeLog();
+        DetailView *detail = w.bridge.detail();
+        QVERIFY(detail->shown() && detail->isOf("E01"));
+        const QString place = detail->place();
+        const QString label = w.bridge.episodes()
+                                  ->data(w.bridge.episodes()->index(0, 0), EpisodesModel::LabelRole)
+                                  .toString();
+        QVERIFY(!label.isEmpty() && label != "E01");
+
+        const qsizetype from = w.bridge.sent.size();
+        w.click(w.item("episode0"));
+        QCOMPARE(w.since(from), QStringList{"SelectFile " + noFindingsFile()});
+        QTRY_COMPARE(w.bridge.episodeName(), label);
+        QCOMPARE(shown.count(), 1);
+        QQuickItem *heading = w.item("episodeLogHeading");
+        QCOMPARE(heading->property("text").toString(), "What the check said of " + label);
+        QVERIFY(heading->isVisible());
+        QTRY_VERIFY2(inDetailsView(w, heading),
+                     qPrintable(QStringLiteral("the heading starts at %1 of %2")
+                                    .arg(topInDetails(w, heading))
+                                    .arg(detailsView(w)->height())));
+        QVERIFY(!w.bridge.episodeLog().isEmpty());
+        QVERIFY(w.bridge.episodeLog() != e01Log);
+        QTRY_COMPARE(Shown::lines(w.item("episodeLog")), w.bridge.episodeLog());
+        QCOMPARE(w.bridge.selected(), 0);
+        QVERIFY(detail->shown() && detail->isOf("E01"));
+        QCOMPARE(detail->place(), place);
+        QTRY_VERIFY(w.item("episode0")->property("highlighted").toBool());
+        QVERIFY(!w.item("episode1")->property("highlighted").toBool());
+        QCOMPARE(w.bridge.statusLine(), QString());
+    }
+
+    // As the view opens, review's file is its first episode's, here the one with no findings. A
+    // click on it changes nothing of review's but its count, yet what its check said, never shown
+    // till then, shows with review's answer and is scrolled into view.
+    void aClickOnTheEpisodeSelectedAsTheViewOpensShowsItsLog() {
+        Shown w({clean(), media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        w.window->resize(w.window->minimumSize());
+        QTRY_COMPARE(w.window->height(), 480);
+        QTRY_VERIFY(w.item("episode0") && w.item("episode1"));
+        QQuickItem *heading = w.item("episodeLogHeading");
+        QVERIFY(!heading->isVisible());
+        QTRY_VERIFY(w.item("episode1")->property("highlighted").toBool());
+        // The finding alone is taller than the panel at this size, so that a log after it would be
+        // out of view.
+        QTRY_VERIFY(detailsView(w)->property("contentHeight").toReal() > detailsView(w)->height());
+
+        w.click(w.item("episode0"));
+        QCOMPARE(w.bridge.sent, QStringList{"SelectFile " + noFindingsFile()});
+        QTRY_VERIFY(heading->isVisible());
+        // In the finding's place, at the top of what the panel scrolls; and in view.
+        QTRY_VERIFY(!w.item("nowBlock")->isVisible());
+        QTRY_COMPARE(heading->y(), 0.0);
+        QTRY_COMPARE(Shown::lines(w.item("episodeLog")), w.bridge.episodeLog());
+        QVERIFY2(inDetailsView(w, heading),
+                 qPrintable(QStringLiteral("the heading starts at %1 of %2")
+                                .arg(topInDetails(w, heading))
+                                .arg(detailsView(w)->height())));
+        QTRY_VERIFY(w.item("episode0")->property("highlighted").toBool());
+        QVERIFY(!w.item("episode1")->property("highlighted").toBool());
+    }
+
+    // What the check said of an episode with no findings goes once another finding is selected,
+    // and the sidebar marks that finding's episode again.
+    void theLogGoesOnceTheSelectedFindingChanges() {
+        Shown w({clean(), media()});
+        clickE01AtTheLeastSize(w);
+        if (QTest::currentTestFailed()) {
+            return;
+        }
+        w.click(w.item("episode0"));
+        QTRY_VERIFY(w.item("episode0")->property("highlighted").toBool());
+        QVERIFY(!w.bridge.episodeName().isEmpty() && w.bridge.episodeName() != "E01");
+
+        QTest::keyClick(w.window, Qt::Key_Down);
+        QCOMPARE(w.last(), "Move 1");
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        QVERIFY(w.bridge.detail()->isOf("E01"));
+        QCOMPARE(w.bridge.episodeName(), QString());
+        QCOMPARE(w.bridge.episodeLog(), QStringList());
+        QTRY_VERIFY(!w.item("episodeLogHeading")->isVisible());
+        QTRY_VERIFY(w.item("episode1")->property("highlighted").toBool());
+        QVERIFY(!w.item("episode0")->property("highlighted").toBool());
+    }
+
+    // Under a filter that shows no finding, a click on an episode with no findings still shows
+    // what its check said: alone in the details panel, with nothing of a finding.
+    void aClickOnAnEpisodeWithNoFindingsShowsItsLogWithNoFindingSelected() {
+        Shown w({clean(), media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.item("episode0") && w.item("episode1") && w.item("filter2"));
+        // E01's file first, so that review answers the click with a change.
+        w.click(w.item("episode1"));
+        QTRY_COMPARE(w.bridge.episodeName(), "E01");
+        w.click(w.item("filter2"));
+        QCOMPARE(w.last(), "SetFilter Accepted");
+        QTRY_COMPARE(w.rows(), 0);
+        QTRY_VERIFY(!w.bridge.detail()->shown());
+        QQuickItem *heading = w.item("episodeLogHeading");
+        QTRY_VERIFY(!heading->isVisible());
+
+        const qsizetype from = w.bridge.sent.size();
+        w.click(w.item("episode0"));
+        QCOMPARE(w.since(from), QStringList{"SelectFile " + noFindingsFile()});
+        QTRY_VERIFY(!w.bridge.episodeName().isEmpty());
+        QCOMPARE(heading->property("text").toString(),
+                 "What the check said of " + w.bridge.episodeName());
+        QTRY_VERIFY(heading->isVisible());
+        QTRY_VERIFY(inDetailsView(w, heading));
+        QVERIFY(!w.bridge.episodeLog().isEmpty());
+        QTRY_COMPARE(Shown::lines(w.item("episodeLog")), w.bridge.episodeLog());
+        QVERIFY(!w.item("acceptButton")->isVisible());
+        QTRY_VERIFY(w.item("episode0")->property("highlighted").toBool());
+        QCOMPARE(w.bridge.statusLine(), QString());
+    }
+
+    // A click on an episode with no findings while a question is open only lets the question go,
+    // as review then selects nothing: no log of it shows, and the mark stays. As the view opens,
+    // that episode's file is the one selected, which the click names again; then with E01's
+    // selected, which the click would change.
+    void aClickOnAnEpisodeWithNoFindingsUnderAQuestionOnlyLetsItGo() {
+        Shown w({clean(), media()});
+        bool asked = false;
+        connect(&w.bridge, &SessionBridge::eventArrived, &w.bridge,
+                [&asked](const subcheck_ffi::Event &e) {
+                    if (const auto *change =
+                            std::get_if<subcheck_ffi::Event::kChanged>(&e.get_variant())) {
+                        asked = change->summary.question.has_value();
+                    }
+                });
+        QSignalSpy shown(&w.bridge, &SessionBridge::episodeShown);
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.item("episode0") && w.item("episode1"));
+        QTRY_VERIFY(w.item("episode1")->property("highlighted").toBool());
+        QCOMPARE(w.bridge.episodeName(), QString());
+        // Recheck asks first. The window has no way to ask it yet, so the test sends it.
+        w.bridge.send(subcheck_ffi::Action(subcheck_ffi::Action::kRecheck{}));
+        QTRY_VERIFY(asked);
+        qsizetype from = w.bridge.sent.size();
+        w.click(w.item("episode0"));
+        QCOMPARE(w.since(from), QStringList{"SelectFile " + noFindingsFile()});
+        QTRY_VERIFY(!asked);
+        QCOMPARE(w.bridge.episodeName(), QString());
+        QVERIFY(!w.item("episodeLogHeading")->isVisible());
+        QVERIFY(w.item("episode1")->property("highlighted").toBool());
+        QVERIFY(!w.item("episode0")->property("highlighted").toBool());
+
+        w.click(w.item("episode1"));
+        QTRY_COMPARE(w.bridge.episodeName(), "E01");
+        w.bridge.send(subcheck_ffi::Action(subcheck_ffi::Action::kRecheck{}));
+        QTRY_VERIFY(asked);
+        from = w.bridge.sent.size();
+        w.click(w.item("episode0"));
+        QCOMPARE(w.since(from), QStringList{"SelectFile " + noFindingsFile()});
+        QTRY_VERIFY(!asked);
+        QCOMPARE(w.bridge.episodeName(), "E01");
+        QCOMPARE(w.item("episodeLogHeading")->property("text").toString(),
+                 "What the check said of E01");
+        QVERIFY(w.item("episode1")->property("highlighted").toBool());
+        QVERIFY(!w.item("episode0")->property("highlighted").toBool());
+        QCOMPARE(shown.count(), 0);
+    }
+
+    // A click on an episode the check found nothing in, with a finding selected, shows what its
+    // check said alone under the video: nothing of the finding, which review still has selected,
+    // and no line above the log, which has nothing above it to set it off from. The list draws the
+    // finding's row in the inactive grey.
+    void aGreyedEpisodesViewShowsItsLogAlone() {
+        Shown w({clean(), media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.item("episode0") && w.item("episode1"));
+        QTRY_VERIFY(w.item("nowBlock")->isVisible());
+        const QString label = w.bridge.episodes()
+                                  ->data(w.bridge.episodes()->index(0, 0), EpisodesModel::LabelRole)
+                                  .toString();
+        w.click(w.item("episode0"));
+        QTRY_VERIFY(w.bridge.showingEpisode());
+        QCOMPARE(w.bridge.selected(), 0);
+        for (const char *name :
+             {"nowBlock", "fixedBlock", "acceptButton", "rejectButton", "detailKind"}) {
+            QTRY_VERIFY2(!w.item(name)->isVisible(), name);
+        }
+        QQuickItem *heading = w.item("episodeLogHeading");
+        QVERIFY(heading->isVisible());
+        QCOMPARE(heading->property("text").toString(), "What the check said of " + label);
+        QTRY_COMPARE(Shown::lines(w.item("episodeLog")), w.bridge.episodeLog());
+        QQuickItem *divider = w.item("episodeLogDivider");
+        QVERIFY(divider);
+        QVERIFY(!divider->isVisible());
+
+        const QColor mid = paletteColour(w, "mid");
+        QVERIFY(mid != paletteColour(w, "highlight"));
+        QTRY_COMPARE(selectionOutline(w), mid);
+        auto *selection = w.find("findings")->property("highlightItem").value<QQuickItem *>();
+        const QColor tint = selection->property("color").value<QColor>();
+        QCOMPARE(tint.rgb(), mid.rgb());
+        QVERIFY(qAbs(tint.alphaF() - 0.3) < 0.01);
+    }
+
+    // While a greyed episode's view shows, the keys and menu items that act on the finding wait,
+    // as the finding is not shown: Accept, Reject, Back to Undecided, Show in Video and Enter. The
+    // rest still work. Undo, which takes a decision back and with it the selection, ends the view.
+    void theFindingKeysWaitWhileAnEpisodesViewShows() {
+        Shown w({clean(), media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.item("episode0"));
+        w.click(w.item("episode0"));
+        QTRY_VERIFY(w.bridge.showingEpisode());
+
+        const qsizetype from = w.bridge.sent.size();
+        for (const Qt::Key key : {Qt::Key_A, Qt::Key_R, Qt::Key_X, Qt::Key_O, Qt::Key_Return}) {
+            QTest::keyClick(w.window, key);
+        }
+        QTest::keyClick(w.window, Qt::Key_Enter, Qt::KeypadModifier);
+        QCOMPARE(w.since(from), QStringList());
+        for (const char *name : {"accept", "reject", "clear", "play"}) {
+            QObject *action = w.find(name);
+            QVERIFY2(action, name);
+            QVERIFY2(!action->property("enabled").toBool(), name);
+        }
+        QVERIFY(w.find("undo")->property("enabled").toBool());
+        QVERIFY(w.find("nextEpisode")->property("enabled").toBool());
+
+        QTest::keyClick(w.window, Qt::Key_O, Qt::ShiftModifier);
+        QCOMPARE(w.since(from), QStringList{"ClosePlayer"});
+        QTest::keyClick(w.window, Qt::Key_Space);
+        QCOMPARE(w.since(from), (QStringList{"ClosePlayer", "Playback Pause"}));
+        QVERIFY(w.bridge.showingEpisode());
+
+        QTest::keyClick(w.window, Qt::Key_U);
+        QCOMPARE(w.since(from), (QStringList{"ClosePlayer", "Playback Pause", "Undo"}));
+        QTRY_VERIFY(!w.bridge.showingEpisode());
+        QTRY_VERIFY(w.item("nowBlock")->isVisible());
+        QTRY_COMPARE(selectionOutline(w), paletteColour(w, "highlight"));
+        for (const char *name : {"accept", "reject", "clear", "play"}) {
+            QVERIFY2(w.find(name)->property("enabled").toBool(), name);
+        }
+    }
+
+    // A click on the grey row, the row already selected, moves nothing in review, and still ends a
+    // greyed episode's view with review's answer: its finding shows again, and the sidebar marks
+    // the finding's episode.
+    void aClickOnTheGreyRowEndsTheEpisodesView() {
+        Shown w({clean(), media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.item("episode0") && w.item("episode1") && w.delegate(0));
+        QTRY_VERIFY(w.item("episode1")->property("highlighted").toBool());
+        w.click(w.item("episode0"));
+        QTRY_VERIFY(w.bridge.showingEpisode());
+        QTRY_VERIFY(w.item("episode0")->property("highlighted").toBool());
+        QTRY_VERIFY(!w.item("nowBlock")->isVisible());
+
+        const qsizetype from = w.bridge.sent.size();
+        w.click(w.delegate(w.bridge.selected()));
+        const QStringList sent = w.since(from);
+        QVERIFY2(sent.size() == 1 && sent.first().startsWith("Select row "),
+                 qPrintable(sent.join(" | ")));
+        QTRY_VERIFY(!w.bridge.showingEpisode());
+        QTRY_VERIFY(w.item("nowBlock")->isVisible());
+        QVERIFY(w.item("acceptButton")->isVisible());
+        QTRY_VERIFY(w.item("episode1")->property("highlighted").toBool());
+        QVERIFY(!w.item("episode0")->property("highlighted").toBool());
+        QCOMPARE(w.bridge.selected(), 0);
+    }
+
+    // A greyed episode's view scrolled down its log ends at a click on the grey row, which moves no
+    // selection: the finding comes back at its top, as another finding opens at its own. The
+    // details column is made wide enough that its video leaves the log too little room.
+    void theFindingComesBackAtItsTopWhenAnEpisodesViewEnds() {
+        Shown w({clean(), media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.item("episode0") && w.delegate(0));
+        w.window->resize(1400, 480);
+        QTRY_COMPARE(w.window->size(), QSize(1400, 480));
+        QQuickItem *details = w.item("details");
+        QTRY_VERIFY(details->height() < 480);
+        const int wide = qRound((details->height() - 24) * 16 / 9);
+        w.settings.keepColumns(w.settings.sidebarWidth(), wide);
+        QTRY_COMPARE(qRound(details->width()), wide);
+
+        w.click(w.item("episode0"));
+        QTRY_VERIFY(w.bridge.showingEpisode());
+        QTRY_VERIFY(!w.item("nowBlock")->isVisible());
+        QQuickItem *view = detailsView(w);
+        QTRY_VERIFY(view->property("contentHeight").toReal() - view->height() > 10);
+        const qreal down = view->property("contentHeight").toReal() - view->height();
+        view->setProperty("contentY", down);
+        QCOMPARE(view->property("contentY").toReal(), down);
+
+        const qsizetype from = w.bridge.sent.size();
+        w.click(w.delegate(w.bridge.selected()));
+        QVERIFY(w.since(from).size() == 1 && w.since(from).first().startsWith("Select row "));
+        QTRY_VERIFY(!w.bridge.showingEpisode());
+        QTRY_VERIFY(w.item("nowBlock")->isVisible());
+        QTRY_COMPARE(view->property("contentY").toReal(), 0.0);
+    }
+
+    // J at the last finding moves nothing, and review's answer says nothing else: the view still
+    // ends with it, and the finding and its keys are back.
+    void jAtTheLastFindingEndsTheEpisodesView() {
+        Shown w({clean(), media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.item("episode0") && w.item("episode1"));
+        QTest::keyClick(w.window, Qt::Key_J);
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        w.click(w.item("episode0"));
+        QTRY_VERIFY(w.bridge.showingEpisode());
+        QTRY_VERIFY(!w.item("nowBlock")->isVisible());
+
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_J);
+        QCOMPARE(w.since(from), QStringList{"Move 1"});
+        QTRY_VERIFY(w.item("nowBlock")->isVisible());
+        QCOMPARE(selectionOutline(w), paletteColour(w, "highlight"));
+        QVERIFY(w.find("accept")->property("enabled").toBool());
+        QTRY_VERIFY(w.item("episode1")->property("highlighted").toBool());
+        QCOMPARE(w.bridge.selected(), 1);
+    }
+
+    // A list longer than its view has a scroll bar, the style's own, and the rows give way to it
+    // while it shows, so that it covers none of their words: at the least size, where a row is at
+    // its narrowest, its state still ends before the bar. The highlight that marks the selected row
+    // is as wide as the rows, with the bar and without it.
+    void aLongListOfFindingsHasAScrollBar() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        w.window->resize(w.window->minimumSize());
+        QTRY_COMPARE(w.window->height(), 480);
+        auto *list = qobject_cast<QQuickItem *>(w.find("findings"));
+        QQuickItem *bar = w.item("findingsScrollBar");
+        QVERIFY(list && bar);
+        QCOMPARE(bar->property("orientation").toInt(), int(Qt::Vertical));
+        QTRY_COMPARE(bar->property("size").toReal(), 1.0);
+        QTRY_VERIFY(w.delegate(0));
+        QCOMPARE(w.delegate(0)->width(), list->width());
+        auto *selection = list->property("highlightItem").value<QQuickItem *>();
+        QVERIFY(selection);
+        QCOMPARE(selection->width(), w.delegate(0)->width());
+        // Rows made up after review's two, enough for the list to scroll.
+        std::vector<subcheck_ffi::EntryView> more;
+        for (uint64_t id = 100; id < 120; ++id) {
+            more.push_back(rowOfTwelve(subcheck_ffi::EntryKey(subcheck_ffi::EntryKey::kRow{{id}})));
+        }
+        QVERIFY(w.bridge.findings()->apply(subcheck_ffi::Splice{2, 0, more}));
+        QTRY_VERIFY(list->property("contentHeight").toReal() > list->height());
+        QTRY_VERIFY(bar->property("size").toReal() < 1);
+        QVERIFY(bar->isVisible());
+        QTRY_VERIFY(w.delegate(0));
+        QTRY_COMPARE(w.delegate(0)->width(), list->width() - bar->width());
+        QTRY_COMPARE(selection->width(), w.delegate(0)->width());
+        QQuickItem *state = Shown::item(w.delegate(0), "rowState");
+        QVERIFY(state);
+        const auto stateEnds = [list, state] {
+            return state->mapToItem(list, QPointF(state->width(), 0)).x();
+        };
+        QTRY_VERIFY2(stateEnds() <= bar->x() + 0.5,
+                     qPrintable(QStringLiteral("the state ends at %1, the bar starts at %2")
+                                    .arg(stateEnds())
+                                    .arg(bar->x())));
+    }
+
+    // The sidebar's lists give way to their scroll bars too, while they show: a review's count and
+    // an episode's word end before the bar. The reviews and episodes are made up, in a window whose
+    // review is not started, at the least size, where each list is longer than its view.
+    void theSidebarsEntriesGiveWayToTheirScrollBars() {
+        Shown w({media()});
+        QVERIFY(w.show());
+        w.bridge.folders()->set(manyReviews(12));
+        auto *files = qobject_cast<EpisodesModel *>(w.bridge.episodes()->sourceModel());
+        QVERIFY(files);
+        QVERIFY(files->apply(subcheck_ffi::FilesSplice{0, 0, manyEpisodes()}));
+        w.window->resize(w.window->minimumSize());
+        QTRY_COMPARE(w.window->height(), 480);
+        for (const auto &[listName, barName, entryName] :
+             {std::tuple{"reviews", "reviewsScrollBar", "review0"},
+              std::tuple{"episodes", "episodesScrollBar", "episode0"}}) {
+            QQuickItem *list = w.item(listName);
+            QQuickItem *bar = w.item(barName);
+            QVERIFY2(list && bar, barName);
+            QTRY_VERIFY2(bar->property("size").toReal() < 1, barName);
+            QVERIFY2(bar->isVisible(), barName);
+            QTRY_VERIFY2(w.item(entryName), entryName);
+            QQuickItem *entry = w.item(entryName);
+            QTRY_COMPARE(entry->width(), list->width() - bar->width());
+            QQuickItem *side = Shown::item(entry, "entrySide");
+            QVERIFY2(side && !side->property("text").toString().isEmpty(), entryName);
+            const qreal sideEnds = side->mapToItem(list, QPointF(side->width(), 0)).x();
+            QVERIFY2(sideEnds <= bar->x() + 0.5,
+                     qPrintable(QStringLiteral("%1's word ends at %2, the bar starts at %3")
+                                    .arg(entryName)
+                                    .arg(sideEnds)
+                                    .arg(bar->x())));
+        }
+    }
+
+    // The log of the selected finding's own episode sits below the finding, set off by a line in
+    // the colour of the window's other lines.
+    void theLogUnderAFindingSitsBelowADivider() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.bridge.detail()->shown());
+        QQuickItem *heading = w.item("episodeLogHeading");
+        QQuickItem *divider = w.item("episodeLogDivider");
+        QVERIFY(heading && divider);
+        QTRY_VERIFY(heading->isVisible());
+        QVERIFY(w.item("nowBlock")->isVisible());
+        QVERIFY(divider->isVisible());
+        QCOMPARE(divider->height(), 1.0);
+        QCOMPARE(divider->property("color").value<QColor>(),
+                 w.window->property("separator").value<QColor>());
+        QTRY_VERIFY2(topInDetails(w, divider) < topInDetails(w, heading),
+                     qPrintable(QStringLiteral("the line starts at %1, the heading at %2")
+                                    .arg(topInDetails(w, divider))
+                                    .arg(topInDetails(w, heading))));
+        QVERIFY(topInDetails(w, w.item("acceptButton")) < topInDetails(w, divider));
     }
 
     // Each review's path shows as its tooltip while the pointer is on it. Whether controls follow
@@ -1602,6 +2267,149 @@ private slots:
         QVERIFY(indicator->isVisible());
     }
 
+    // While Show in Video waits, a busy animation is centred on the video, once the wait has lasted
+    // 150 ms, so that a quick open shows none; on a backing of the window's colour, which the
+    // style's own ink reads on in any palette, as the black of the pane does not in a light one.
+    // Neither takes a click, and a screen reader names the animation. Close Video ends both, and
+    // so does review's end, each once the 100 ms are up that keep a load which ends as the next
+    // starts from blinking. Offscreen, mpv never becomes ready, so the Open waits for the pane as
+    // long as the test needs.
+    void theLoadingAnimationShowsWhileAShowInVideoWaits() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *video = w.item("video");
+        QQuickItem *loading = w.item("videoLoading");
+        QQuickItem *backing = w.item("videoLoadingBacking");
+        QVERIFY(video && loading && backing);
+        QVERIFY(!loading->property("running").toBool());
+        QVERIFY(!loading->isVisible());
+        QVERIFY(!backing->isVisible());
+        // Whether it runs as the player takes the Open; and when it starts to, on a clock started
+        // before the key, so that the time is never short of the wait's own.
+        QElapsedTimer clock;
+        std::optional<bool> atOnce;
+        qint64 shownAt = -1;
+        QObject watching;
+        connect(&w.player, &PlayerPort::openingChanged, &watching, [&] {
+            if (w.player.opening() && !atOnce) {
+                atOnce = loading->property("running").toBool();
+            }
+        });
+        connect(&w.bridge, &SessionBridge::videoLoadingChanged, &watching, [&] {
+            if (w.bridge.videoLoading() && shownAt < 0) {
+                shownAt = clock.elapsed();
+            }
+        });
+        clock.start();
+        QTest::keyClick(w.window, Qt::Key_O);
+        QTRY_VERIFY(atOnce.has_value());
+        QVERIFY(!*atOnce);
+        QTRY_VERIFY(loading->property("running").toBool());
+        QVERIFY2(shownAt >= 150, qPrintable(QString::number(shownAt)));
+        QVERIFY(loading->isVisible());
+        QVERIFY(backing->isVisible());
+        // Each within the half pixel that centring rounds to, so that it draws sharp.
+        for (QQuickItem *each : {loading, backing}) {
+            const QPointF off =
+                each->mapToItem(video, QPointF(each->width() / 2, each->height() / 2)) -
+                QPointF(video->width() / 2, video->height() / 2);
+            QVERIFY2(qAbs(off.x()) <= 0.5 && qAbs(off.y()) <= 0.5,
+                     qPrintable(QStringLiteral("%1 is off by %2, %3")
+                                    .arg(each->objectName())
+                                    .arg(off.x())
+                                    .arg(off.y())));
+        }
+        // The animation wholly on its backing, with room around it.
+        const QRectF on = loading->mapRectToItem(backing, loading->boundingRect());
+        QVERIFY2(on.left() > 0 && on.top() > 0 && on.right() < backing->width() &&
+                     on.bottom() < backing->height(),
+                 qPrintable(QStringLiteral("%1, %2 %3x%4 on %5x%6")
+                                .arg(on.x())
+                                .arg(on.y())
+                                .arg(on.width())
+                                .arg(on.height())
+                                .arg(backing->width())
+                                .arg(backing->height())));
+        // The window palette's colour, mostly opaque, so that what is behind shows through too
+        // little to take the ink's contrast.
+        const QColor window = w.item("details")
+                                  ->property("palette")
+                                  .value<QObject *>()
+                                  ->property("window")
+                                  .value<QColor>();
+        const QColor drawn = backing->property("color").value<QColor>();
+        QCOMPARE(drawn.rgb(), window.rgb());
+        QVERIFY2(drawn.alphaF() >= 0.8, qPrintable(QString::number(drawn.alphaF())));
+        QAccessibleInterface *named = QAccessible::queryAccessibleInterface(loading);
+        QVERIFY(named);
+        QCOMPARE(named->text(QAccessible::Name), "Loading video");
+        QCOMPARE(loading->acceptedMouseButtons(), Qt::NoButton);
+        QCOMPARE(backing->acceptedMouseButtons(), Qt::NoButton);
+        const qsizetype from = w.bridge.sent.size();
+        w.click(loading);
+        QCOMPARE(w.since(from), QStringList());
+
+        QTest::keyClick(w.window, Qt::Key_O, Qt::ShiftModifier);
+        QTRY_COMPARE(w.bridge.statusLine(), "Video closed");
+        QTRY_VERIFY(!loading->property("running").toBool());
+        QVERIFY(!loading->isVisible());
+        QVERIFY(!backing->isVisible());
+
+        QSignalSpy finished(&w.bridge, &SessionBridge::finished);
+        QTest::keyClick(w.window, Qt::Key_O);
+        QTRY_VERIFY(loading->property("running").toBool());
+        QVERIFY(backing->isVisible());
+        QTest::keyClick(w.window, Qt::Key_Q);
+        QTRY_COMPARE(finished.count(), 1);
+        QTRY_VERIFY(!loading->property("running").toBool());
+        QVERIFY(!backing->isVisible());
+    }
+
+    // Show in Video on a finding whose file has gone opens nothing, so nothing loads: no animation,
+    // then or once its moment has passed, and the status bar says why.
+    void theLoadingAnimationEndsWhenTheFileIsMissing() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *loading = w.item("videoLoading");
+        QVERIFY(loading);
+        const QString file = QString::fromStdString(media()) + "/typos - E01.mkv";
+        const QString away = file + ".away";
+        QVERIFY(QFile::rename(file, away));
+        // Back however the test ends: every test leaves the run as it found it.
+        const auto restore = qScopeGuard([&file, &away] { QFile::rename(away, file); });
+        QSignalSpy changed(&w.bridge, &SessionBridge::videoLoadingChanged);
+        QTest::keyClick(w.window, Qt::Key_O);
+        QTRY_COMPARE(w.bridge.statusLine(), "The file is missing: " + file);
+        QTest::qWait(300);
+        QVERIFY(!loading->property("running").toBool());
+        QVERIFY(!w.player.opening());
+        QCOMPARE(changed.count(), 0);
+    }
+
+    // The busy animation is Material's arc in every style, the tests' Fusion among them, as it
+    // reads as loading in every style; drawn in the window palette's highlight colour. The control
+    // is 48 px across, read at a glance over the video with the frame around it still in view, and
+    // its arc inside Material's padding.
+    void theLoadingArcIsMaterialsInTheHighlightColour() {
+        Shown w({media()});
+        QVERIFY(w.show());
+        QQuickItem *loading = w.item("videoLoading");
+        QVERIFY(loading);
+        auto *arc = loading->property("contentItem").value<QQuickItem *>();
+        QVERIFY(arc);
+        // Material's own class, which the instance in its style's QML derives a class from.
+        QVERIFY2(arc->inherits("QQuickMaterialBusyIndicator"), arc->metaObject()->className());
+        QCOMPARE(arc->property("color").value<QColor>().name(QColor::HexArgb),
+                 paletteColour(w, "highlight").name(QColor::HexArgb));
+        QVERIFY2(loading->size() == QSizeF(48, 48),
+                 qPrintable(QStringLiteral("the control, whose arc Material draws inside its "
+                                           "padding, is %1 by %2, not 48 px")
+                                .arg(loading->width())
+                                .arg(loading->height())));
+    }
+
     // A row of another height takes the highlight's height at once, as a move takes its place.
     void theHighlightTakesARowsSizeAtOnce() {
         Shown w({media()});
@@ -1728,6 +2536,39 @@ private slots:
         QTest::mouseRelease(w.window, Qt::LeftButton, {}, at + QPoint(0, 30));
         QTRY_VERIFY(reviews->property("contentY").toReal() > 0);
         QCOMPARE(sidebar->width(), before);
+    }
+
+    // A column dragged stretches the video's frame across its changing size until the drag ends,
+    // rather than have mpv draw it again at each step. The window's edge dragged, which resizes
+    // the window alone, stretches nothing: mpv draws the frame at each size.
+    void aColumnDragStretchesTheVideoAndAnEdgeDragDoesNot() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *list = w.item("findings");
+        QQuickItem *details = w.item("details");
+        auto *video = qobject_cast<MpvItem *>(w.item("video"));
+        QVERIFY(list && details && video);
+        QVERIFY(!video->stretching());
+        QVERIFY(video->textureFollowsItemSize());
+        const qreal wide = details->width();
+        const QPoint at = w.handle(list, details);
+        QTest::mousePress(w.window, Qt::LeftButton, {}, at);
+        QTest::mouseMove(w.window, at + QPoint(-15, 0));
+        QTest::mouseMove(w.window, at + QPoint(-45, 0));
+        QTRY_VERIFY(video->stretching());
+        QVERIFY(!video->textureFollowsItemSize());
+        QTest::mouseRelease(w.window, Qt::LeftButton, {}, at + QPoint(-45, 0));
+        QTRY_VERIFY(!video->stretching());
+        QVERIFY(video->textureFollowsItemSize());
+        QTRY_COMPARE(details->width(), wide + 45);
+
+        // Narrow enough that the details panel, and the video with it, gives way too.
+        QSignalSpy changed(video, &MpvItem::stretchingChanged);
+        w.window->resize(830, 800);
+        QTRY_VERIFY(video->width() < wide);
+        QVERIFY(!video->stretching());
+        QCOMPARE(changed.count(), 0);
     }
 
     // A line across the window, under the menu bar and above the toolbar's words.

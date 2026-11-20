@@ -77,6 +77,13 @@ ApplicationWindow {
         }
     }
 
+    // The sidebar lists the episodes in the order the View menu chose, from the first frame.
+    Binding {
+        target: window.bridge.episodes
+        property: "noFindingsLast"
+        value: window.settings.noFindingsLast
+    }
+
     menuBar: MenuBar {
         id: bar
 
@@ -156,6 +163,13 @@ ApplicationWindow {
                 }
             }
             Action {
+                objectName: "noFindingsLast"
+                text: qsTr("&Episodes Without Findings Last")
+                checkable: true
+                checked: window.settings.noFindingsLast
+                onTriggered: window.settings.noFindingsLast = checked
+            }
+            Action {
                 objectName: "switchView"
                 enabled: window.keysToReview
                 text: window.bridge.switchLabel
@@ -166,23 +180,26 @@ ApplicationWindow {
         Menu {
             title: qsTr("F&inding")
 
+            // These four, and Enter, wait while a greyed episode's view shows: review still has the
+            // finding selected, but the panel shows the episode's log in its place, so a key would
+            // act on a finding not in view.
             Action {
                 objectName: "accept"
-                enabled: window.keysToReview
+                enabled: window.keysToReview && !window.bridge.showingEpisode
                 text: qsTr("&Accept Fix")
                 shortcut: "A"
                 onTriggered: window.bridge.accept()
             }
             Action {
                 objectName: "reject"
-                enabled: window.keysToReview
+                enabled: window.keysToReview && !window.bridge.showingEpisode
                 text: qsTr("&Reject Fix")
                 shortcut: "R"
                 onTriggered: window.bridge.reject()
             }
             Action {
                 objectName: "clear"
-                enabled: window.keysToReview
+                enabled: window.keysToReview && !window.bridge.showingEpisode
                 text: qsTr("&Back to Undecided")
                 shortcut: "X"
                 onTriggered: window.bridge.clear()
@@ -190,7 +207,7 @@ ApplicationWindow {
             MenuSeparator {}
             Action {
                 objectName: "play"
-                enabled: window.keysToReview
+                enabled: window.keysToReview && !window.bridge.showingEpisode
                 text: qsTr("Show in &Video")
                 shortcut: "O"
                 onTriggered: window.bridge.play()
@@ -285,8 +302,9 @@ ApplicationWindow {
         sequences: ["K", "Up"]
         onActivated: window.bridge.move(-1)
     }
+    // As the Finding menu's items, it waits while a greyed episode's view shows.
     Shortcut {
-        enabled: window.keysToReview
+        enabled: window.keysToReview && !window.bridge.showingEpisode
         sequences: ["Return", "Enter"]
         onActivated: window.bridge.toggle()
     }
@@ -447,18 +465,31 @@ ApplicationWindow {
                 // The selection is review's: the list only shows it.
                 keyNavigationEnabled: false
                 model: window.bridge.findings
+                // Where the list is in a long run, and a handle to drag through it.
+                ScrollBar.vertical: ListScrollBar {
+                    id: listBar
+
+                    objectName: "findingsScrollBar"
+                }
                 currentIndex: window.bridge.selected
                 highlightMoveDuration: 0
                 highlightResizeDuration: 0
                 highlight: Rectangle {
+                    // The inactive grey while a greyed episode's view shows: the finding is still
+                    // review's selection, where a move goes on from, but not the one in view.
+                    readonly property color tone: window.bridge.showingEpisode
+                                                  ? window.palette.mid : window.palette.highlight
+
+                    // As wide as the rows, which give way to the scroll bar.
+                    width: ListView.view.width - listBar.room
                     // A tint, so that the row's own colours still read over it, and an outline
                     // at full strength, so that the selection shows on a pale highlight too.
-                    color: Qt.alpha(window.palette.highlight, 0.3)
-                    border.color: window.palette.highlight
+                    color: Qt.alpha(tone, 0.3)
+                    border.color: tone
                     border.width: 1
                 }
                 delegate: FindingRow {
-                    width: ListView.view.width
+                    width: ListView.view.width - listBar.room
                     onPicked: window.bridge.select(index)
                     onOpened: window.bridge.play()
                 }
@@ -477,6 +508,8 @@ ApplicationWindow {
 
             objectName: "details"
             bridge: window.bridge
+            separator: window.separator
+            columnsResizing: columns.resizing
             font.pointSize: window.settings.detailsTextSize
             SplitView.preferredWidth: window.settings.detailsWidth
             SplitView.minimumWidth: window.detailsLeast

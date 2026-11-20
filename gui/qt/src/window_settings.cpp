@@ -31,6 +31,7 @@ const QString paletteKey = QStringLiteral("look/colours");
 const QString windowTextKey = QStringLiteral("text/window");
 const QString listTextKey = QStringLiteral("text/list");
 const QString detailsTextKey = QStringLiteral("text/details");
+const QString noFindingsLastKey = QStringLiteral("view/noFindingsLast");
 const QSize defaultSize(1280, 800);
 const int defaultSidebar = 220;
 const int defaultDetails = 480;
@@ -305,4 +306,18 @@ int WindowSettings::widestSize(const QFont &font, int from, int to) {
         }
     }
     return widest;
+}
+
+bool WindowSettings::noFindingsLast() const {
+    // Not QVariant's toBool, which reads as true any text but "", "0" and "false", and an INI file
+    // gives every value back as text: a value set by hand to anything but true leaves it off.
+    return store->value(noFindingsLastKey).toString() == QLatin1String("true");
+}
+
+void WindowSettings::setNoFindingsLast(bool on) {
+    if (on == noFindingsLast()) {
+        return;
+    }
+    store->setValue(noFindingsLastKey, on);
+    emit noFindingsLastChanged();
 }

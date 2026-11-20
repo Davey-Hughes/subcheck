@@ -168,14 +168,19 @@ QVariant EpisodesModel::data(const QModelIndex &index, int role) const {
         return stage(file);
     case CurrentRole:
         return !followed.empty() && file.path == followed;
+    case NoFindingsRole:
+        return hasNoFindings(file);
     default:
         return {};
     }
 }
 
 QHash<int, QByteArray> EpisodesModel::roleNames() const {
-    return {
-        {LabelRole, "label"}, {PathRole, "path"}, {StageRole, "stage"}, {CurrentRole, "current"}};
+    return {{LabelRole, "label"},
+            {PathRole, "path"},
+            {StageRole, "stage"},
+            {CurrentRole, "current"},
+            {NoFindingsRole, "noFindings"}};
 }
 
 bool EpisodesModel::apply(const FilesSplice &change) {
@@ -210,6 +215,14 @@ std::optional<std::string> EpisodesModel::labelAt(int row) const {
     return files[static_cast<size_t>(row)].label;
 }
 
+std::optional<std::string> EpisodesModel::labelOf(const std::string &file) const {
+    return labelAt(rowOf(file));
+}
+
+bool EpisodesModel::hasNoFindingsAt(int row) const {
+    return row >= 0 && row < rowCount() && hasNoFindings(files[static_cast<size_t>(row)]);
+}
+
 int EpisodesModel::rowOf(const std::string &file) const {
     if (file.empty()) {
         return -1;
@@ -242,8 +255,64 @@ QString EpisodesModel::stage(const FileView &file) {
                           },
                           [](const ScanStage::kReading &) { return QStringLiteral("Checking"); },
                           [](const ScanStage::kAsking &) { return QStringLiteral("Checking"); },
-                          [](const ScanStage::kDone &) { return QStringLiteral("Checked"); },
+                          [](const ScanStage::kDone &d) {
+                              return d.findings == 0 ? QStringLiteral("No findings")
+                                                     : QStringLiteral("Checked");
+                          },
                           [](const ScanStage::kFailed &) { return QStringLiteral("Failed"); },
                       },
                       file.stage.get_variant());
+}
+
+bool EpisodesModel::hasNoFindings(const FileView &file) {
+    const auto *done = std::get_if<ScanStage::kDone>(&file.stage.get_variant());
+    return !file.applying && done != nullptr && done->findings == 0;
+}
+
+EpisodeOrder::EpisodeOrder(EpisodesModel *episodes, QObject *parent)
+    : QSortFilterProxyModel(parent) {
+    setSourceModel(episodes);
+    setDynamicSortFilter(true);
+    sort(0);
+}
+
+bool EpisodeOrder::noFindingsLast() const { return last; }
+
+void EpisodeOrder::setNoFindingsLast(bool on) {
+    if (on == last) {
+        return;
+    }
+    last = on;
+    invalidate();
+    emit noFindingsLastChanged();
+    emit reordered();
+}
+
+std::optional<int> EpisodeOrder::sourceRow(int row) const {
+    if (row < 0 || row >= rowCount()) {
+        return std::nullopt;
+    }
+    return mapToSource(index(row, 0)).row();
+}
+
+int EpisodeOrder::markedRow() const {
+    const QAbstractItemModel *episodes = sourceModel();
+    for (int row = 0; row < episodes->rowCount(); ++row) {
+        const QModelIndex at = episodes->index(row, 0);
+        if (at.data(EpisodesModel::CurrentRole).toBool()) {
+            return mapFromSource(at).row();
+        }
+    }
+    return -1;
+}
+
+bool EpisodeOrder::lessThan(const QModelIndex &left, const QModelIndex &right) const {
+    if (last) {
+        const bool leftNone = left.data(EpisodesModel::NoFindingsRole).toBool();
+        const bool rightNone = right.data(EpisodesModel::NoFindingsRole).toBool();
+        if (leftNone != rightNone) {
+            return rightNone;
+        }
+    }
+    return left.row() < right.row();
 }

@@ -1,6 +1,7 @@
 // The window's player: review's player commands, run on mpv one at a time, and what came of each
-// reported back to review, as the terminal's player does over mpv's socket (cli/src/mpv.rs).
-// The mpv is the video item's, or a test's fake, behind `Mpv`.
+// reported back to review, as the terminal's player does over mpv's socket (cli/src/mpv.rs); and
+// whether an Open is under way, which the window shows over the video while it waits. The mpv is
+// the video item's, or a test's fake, behind `Mpv`.
 #pragma once
 
 #include "subcheck_ffi.hpp"
@@ -36,8 +37,16 @@ class PlayerPort : public QObject {
     Q_OBJECT
     QML_ELEMENT
     QML_UNCREATABLE("main.cpp makes the one player")
+    // Whether an Open is under way: queued, waiting for the pane, run, or late, a load that
+    // reported opened as its settle time ended (`late`). From review's Open until the video shows
+    // what it opened, cannot, or is closed.
+    Q_PROPERTY(bool opening READ opening NOTIFY openingChanged)
 
 public:
+    // How mpv says a file ended: stopped, as a file replaced by a load or by a stop is; at the
+    // file's own end; or on an error.
+    enum class End { Stopped, Finished, Failed };
+
     // `settle` is how long a load or a seek is given to land before the port goes on as if it
     // had: mpv says when one has, and a test gives a short one. `answer` is how long mpv is given
     // to answer a request, as the terminal's socket gives it, and `ready` how long an Open waits
@@ -61,17 +70,20 @@ public:
 
     // What mpv says: that it can show video; a request's answer, with mpv's error text or none;
     // that playback has started again after a load or a seek; that the position has changed; and
-    // that a file has ended, on an error or not. mpv's events come in its order, but it holds a
-    // change of a property until its queue of events is empty, so a position can come after
-    // events that came about later than it did.
+    // that a file has ended, and how. mpv's events come in its order, but it holds a change of a
+    // property until its queue of events is empty, so a position can come after events that came
+    // about later than it did.
     void ready();
     void answered(std::uint64_t id, const QString &error, const QVariant &data);
     void restarted();
     void moved();
-    void ended(bool failed);
+    void ended(End end);
+
+    bool opening() const;
 
 signals:
     void reported(const subcheck_ffi::PlayerReport &report);
+    void openingChanged();
 
 private:
     using Answer = std::function<void(const QVariant &data)>;
@@ -81,6 +93,17 @@ private:
     // changing, after a frame step, which mpv starts no playback again for.
     enum class Landing { OnRestart, OnPosition };
 
+    // run's work, without saying whether an Open is under way: attach runs again the commands it
+    // took out of the queue, and says that once all have run, as midway an Open yet to run again
+    // would count as none.
+    void take(const subcheck_ffi::PlayerCommand &command);
+    // Stops waiting for the late load and says at once whether an Open is still under way: for a
+    // caller that has nothing to report of the late load itself. ended reports the late load's
+    // failure between the two, so does both itself; load, attach and release clear `late` inside a
+    // larger change that says it once at its end.
+    void stopWaitingForLate();
+    // Says whether an Open is under way, should that have changed since it last said.
+    void noteOpening();
     void drop();
     void next();
     void open(const subcheck_ffi::PlayerCommand::kOpen &command);
@@ -131,6 +154,9 @@ private:
     std::string loadingFile;
     std::function<void()> onLanded;
     // A load that reported opened when its settle time ended, mpv having said nothing: until it
-    // plays, the port loads or stops, or mpv ends it on an error, which is reported then.
+    // plays, reaches its file's end, the port loads or stops, mpv ends it on an error, which is
+    // reported then, another mpv takes its place, or review ends.
     std::optional<std::string> late;
+    // What openingChanged last said.
+    bool saidOpening = false;
 };

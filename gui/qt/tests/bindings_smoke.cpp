@@ -54,6 +54,9 @@ std::string came(const std::optional<Event> &e) {
     if (const Event::kEnded *end = as<Event::kEnded>(*e)) {
         return "the end, fatal: " + end->fatal.value_or("none");
     }
+    if (as<Event::kAnswered>(*e)) {
+        return "an answer alone";
+    }
     return as<Event::kChanged>(*e) ? "a change" : "a player command";
 }
 
@@ -91,6 +94,11 @@ struct Ui {
                     folders = *c->folders;
                 }
                 summary = c->summary;
+            } else if (const Event::kAnswered *a = e ? as<Event::kAnswered>(*e) : nullptr) {
+                // An action's answer alone: the summary as last sent, with this count.
+                if (summary) {
+                    summary->answered = a->answered;
+                }
             } else if (const Event::kPlayer *p = e ? as<Event::kPlayer>(*e) : nullptr) {
                 played.push_back(p->v1);
             } else {

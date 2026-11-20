@@ -61,6 +61,9 @@ SessionBridge::SessionBridge(std::vector<std::string> selector, PlayerPort &play
                              QObject *parent)
     : QObject(parent), selector(std::move(selector)), port(player), out(out), err(err) {
     connect(&port, &PlayerPort::reported, this, &SessionBridge::report);
+    // The end's release ends any Open, and with it the animation.
+    connect(&port, &PlayerPort::openingChanged, this, [this] { loading.set(port.opening()); });
+    connect(&loading, &LoadingFlag::shownChanged, this, &SessionBridge::videoLoadingChanged);
     // Queued: each event the pump reads is applied on this object's thread, in the pump's order.
     connect(this, &SessionBridge::eventArrived, this, &SessionBridge::apply, Qt::QueuedConnection);
     // Precise, as a coarse timer may fire early, before review has had the whole wait.
@@ -126,7 +129,7 @@ FoldersModel *SessionBridge::folders() { return &reviews; }
 
 FiltersModel *SessionBridge::filters() { return &shows; }
 
-EpisodesModel *SessionBridge::episodes() { return &files; }
+EpisodeOrder *SessionBridge::episodes() { return &order; }
 
 DetailView *SessionBridge::detail() { return &details; }
 
@@ -180,9 +183,14 @@ QString SessionBridge::emptyWords() const {
 }
 
 QString SessionBridge::episodeName() const {
-    // Review sends the logs of the file selected, which stays where a click on an episode left it
-    // while the finding selected moves on: beside a finding of another episode, they are not
-    // its. A row of several is each of its episodes', and its members name them as the list does.
+    // An episode with no findings, clicked, has no finding to be beside: its view shows what the
+    // click asked for, until it ends as the header's showingEpisode says. Else review sends the
+    // logs of the file selected, which stays where a click on an episode left it while the finding
+    // selected moves on: beside a finding of another episode, they are not its. A row of several
+    // is each of its episodes', and its members name them as the list does.
+    if (showsQuietEpisode()) {
+        return QString::fromStdString(*files.labelOf(quiet->path));
+    }
     if (!logs || !summary.file_selected) {
         return {};
     }
@@ -195,25 +203,31 @@ QStringList SessionBridge::episodeLog() const {
     if (episodeName().isEmpty()) {
         return {};
     }
+    const FileLogs &of = showsQuietEpisode() ? quiet->logs : *logs;
     QStringList said;
-    for (const std::string &line : logs->log) {
+    for (const std::string &line : of.log) {
         said << QString::fromStdString(line);
     }
-    if (!logs->apply_log.empty()) {
+    if (!of.apply_log.empty()) {
         said << QString();
-        for (const std::string &line : logs->apply_log) {
+        for (const std::string &line : of.apply_log) {
             said << QString::fromStdString(line);
         }
     }
     return said;
 }
 
+bool SessionBridge::showingEpisode() const { return showsQuietEpisode(); }
+
 QString SessionBridge::fatal() const { return fatalText; }
+
+bool SessionBridge::videoLoading() const { return loading.shown(); }
 
 void SessionBridge::select(int row) {
     // The core owns the selection: the list's moves wait for the summary that follows.
     if (std::optional<EntryKey> key = list.keyAt(row)) {
         send(Action(Action::kSelect{*key}));
+        leaveQuietEpisode();
     }
 }
 
@@ -221,6 +235,7 @@ void SessionBridge::move(int by) {
     // Review works out where a move lands, from its own selection: a move asked for before it has
     // answered the one before still moves on from where that one landed.
     send(Action(Action::kMove{by}));
+    leaveQuietEpisode();
 }
 
 void SessionBridge::toggle() { send(Action(Action::kToggle{})); }
@@ -231,7 +246,10 @@ void SessionBridge::reject() { send(Action(Action::kReject{})); }
 
 void SessionBridge::clear() { send(Action(Action::kClear{})); }
 
-void SessionBridge::undo() { send(Action(Action::kUndo{})); }
+void SessionBridge::undo() {
+    send(Action(Action::kUndo{}));
+    leaveQuietEpisode();
+}
 
 void SessionBridge::play() { send(Action(Action::kPlay{})); }
 
@@ -253,9 +271,15 @@ void SessionBridge::setFilter(int row) {
 
 void SessionBridge::cycleFilter() { send(Action(Action::kSetFilter{shows.next()})); }
 
-void SessionBridge::nextEpisode() { send(Action(Action::kNextFile{})); }
+void SessionBridge::nextEpisode() {
+    send(Action(Action::kNextFile{}));
+    leaveQuietEpisode();
+}
 
-void SessionBridge::previousEpisode() { send(Action(Action::kPreviousFile{})); }
+void SessionBridge::previousEpisode() {
+    send(Action(Action::kPreviousFile{}));
+    leaveQuietEpisode();
+}
 
 void SessionBridge::switchView() { send(Action(Action::kSwitchView{})); }
 
@@ -266,10 +290,25 @@ void SessionBridge::openFolder(int row) {
 }
 
 void SessionBridge::openEpisode(int row) {
-    if (std::optional<std::string> path = files.pathAt(row)) {
+    const std::optional<int> at = order.sourceRow(row);
+    const std::optional<std::string> path = at ? files.pathAt(*at) : std::nullopt;
+    if (!path) {
+        return;
+    }
+    if (!files.hasNoFindingsAt(*at)) {
         send(Action(Action::kSelectFile{*path}));
         send(Action(Action::kShowFileFindings{}));
+        leaveQuietEpisode();
+        return;
     }
+    send(Action(Action::kSelectFile{*path}));
+    // Its view shows with review's answer to this click, and not before: a change of review's that
+    // comes first answers an action sent before the click, and has the file selected before it.
+    // The answer tells too whether review was asking as it took the click, whatever the bridge last
+    // heard of a question: then it only let the question go, and the view stays as it was.
+    beforeClick = BeforeClick{lastClick, viewChange};
+    lastClick = asked;
+    viewChange = ViewChange{asked, path};
 }
 
 void SessionBridge::playback(Playback playback) {
@@ -317,6 +356,7 @@ void SessionBridge::apply(const Event &event) {
     }
     std::visit(Overloaded{
                    [this](const Event::kChanged &change) { changed(change); },
+                   [this](const Event::kAnswered &answer) { answered(answer.answered); },
                    [this](const Event::kPlayer &player) { port.run(player.v1); },
                    [this](const Event::kEnded &end) { ended(end); },
                },
@@ -341,25 +381,123 @@ void SessionBridge::changed(const Event::kChanged &change) {
     if (change.logs) {
         logs = change.logs->logs;
     }
+    // Whether review was asking as it took the action this change answers: the change before says.
+    const bool asking = summary.question.has_value();
     summary = change.summary;
     shows.show(summary);
     opened = true;
-    // The episode marked is the one last clicked while it is the selected finding's or one of its
-    // row's, so that a click on an episode whose first finding is in a row of several marks it;
-    // else the selected finding's own. Either is the episode the details panel shows.
-    const std::optional<std::string> clicked =
-        episodeName().isEmpty() || !summary.file_selected
-            ? std::nullopt
-            : files.pathAt(static_cast<int>(*summary.file_selected));
-    files.follow(clicked ? *clicked : details.file());
     const std::optional<EntryKey> entry =
         summary.selected ? list.keyAt(static_cast<int>(*summary.selected)) : std::nullopt;
     const bool moved = !sameEntry(selectedEntry, entry);
     selectedEntry = entry;
+    const bool shown = settleView(moved, asking).shown;
+    markEpisode();
     emit summaryChanged();
     if (moved) {
         emit selectionMoved();
     }
+    if (shown) {
+        emit episodeShown();
+    }
+}
+
+void SessionBridge::answered(uint64_t count) {
+    // The summary as last sent stands, with this count: review asked, or did not, as it said then.
+    const bool asking = summary.question.has_value();
+    summary.answered = count;
+    const Settled view = settleView(false, asking);
+    if (!view.changed) {
+        return;
+    }
+    markEpisode();
+    emit summaryChanged();
+    if (view.shown) {
+        emit episodeShown();
+    }
+}
+
+SessionBridge::Settled SessionBridge::settleView(bool moved, bool asking) {
+    // Review's answer to the last action that changes a greyed episode's view: the view as that
+    // action leaves it, a click's episode shown and scrolled to, or none. A click's answer that
+    // leaves another file selected shows none. Another finding selected ends the view too, but not
+    // in a change that answers an action sent before the last greyed click: that click's view would
+    // end before it had shown. A click review took while it asked only let the question go: what it
+    // put aside is put back, and another finding selected meanwhile, in a change that would have
+    // ended the view but for the click, ends it now. While the view shows, its logs follow review's
+    // for its file, which a check can add to; once review has another file selected, with no answer
+    // awaited that changes the view, it ends.
+    const std::optional<std::string> file = selectedFile();
+    const auto held = [this] {
+        return quiet ? std::optional<std::string>(quiet->path) : std::nullopt;
+    };
+    const std::optional<std::string> before = held();
+    bool shown = false;
+    if (viewChange && summary.answered >= viewChange->at) {
+        const std::optional<std::string> path = std::move(viewChange->path);
+        viewChange.reset();
+        const std::optional<BeforeClick> aside = std::exchange(beforeClick, std::nullopt);
+        if (!path || !asking) {
+            shown = showView(path, file);
+        } else if (aside) {
+            lastClick = aside->lastClick;
+            viewChange = aside->viewChange;
+            if (viewChange && summary.answered >= viewChange->at) {
+                shown = showView(std::exchange(viewChange, std::nullopt)->path, file);
+            }
+            if (aside->moved) {
+                quiet.reset();
+                shown = false;
+            }
+        }
+    } else if (moved && summary.answered >= lastClick) {
+        quiet.reset();
+    } else if (moved && beforeClick && summary.answered >= beforeClick->lastClick) {
+        beforeClick->moved = true;
+    }
+    if (quiet && logs && file == quiet->path) {
+        quiet->logs = *logs;
+    }
+    if (quiet && !viewChange && file != quiet->path) {
+        quiet.reset();
+    }
+    return Settled{.changed = shown || before != held(), .shown = shown};
+}
+
+bool SessionBridge::showView(const std::optional<std::string> &path,
+                             const std::optional<std::string> &file) {
+    quiet.reset();
+    if (path && logs && file == path) {
+        quiet = QuietView{*path, *logs};
+    }
+    return showsQuietEpisode();
+}
+
+void SessionBridge::markEpisode() {
+    // The greyed episode whose view shows; or the one last clicked while it is the selected
+    // finding's or one of its row's, so that a click on an episode whose first finding is in a row
+    // of several marks it; else the selected finding's own. Each is the episode the details panel
+    // shows.
+    std::optional<std::string> marked;
+    if (showsQuietEpisode()) {
+        marked = quiet->path;
+    } else if (!episodeName().isEmpty()) {
+        marked = selectedFile();
+    }
+    files.follow(marked ? *marked : details.file());
+}
+
+bool SessionBridge::showsQuietEpisode() const {
+    return quiet && files.labelOf(quiet->path) && (viewChange || selectedFile() == quiet->path);
+}
+
+std::optional<std::string> SessionBridge::selectedFile() const {
+    return summary.file_selected ? files.pathAt(static_cast<int>(*summary.file_selected))
+                                 : std::nullopt;
+}
+
+void SessionBridge::leaveQuietEpisode() {
+    viewChange = ViewChange{asked, std::nullopt};
+    beforeClick.reset();
 }
 
 void SessionBridge::ended(const Event::kEnded &end) {
@@ -379,6 +517,7 @@ void SessionBridge::ended(const Event::kEnded &end) {
 
 void SessionBridge::send(Action action) {
     if (session) {
+        ++asked;
         guarded([&] { session->send(std::move(action)); });
     }
 }

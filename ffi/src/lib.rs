@@ -305,6 +305,10 @@ pub struct Summary {
     /// `SwitchView` opens from it, the newest run that named the selected file where a run's view
     /// opens the run's folders.
     pub of_paths: bool,
+    /// How many of the UI's actions review has taken. Each one adds to it, so every action is
+    /// answered, by the first event to carry its count: a change, or `Event::Answered` when
+    /// nothing else changed.
+    pub answered: u64,
 }
 
 /// An edit under way ([`session::Editing`]).
@@ -634,6 +638,9 @@ pub enum Event {
         /// The store's show folders, newest first, the whole list when any of it changed.
         folders: Option<Vec<FolderView>>,
     },
+    /// Review took one of the UI's actions, and nothing the UI shows changed: the count of actions
+    /// taken alone (`Summary::answered`), the rest of the summary as last sent.
+    Answered { answered: u64 },
     /// For the UI's player, which runs it and says how it went through `Session::report`.
     Player(PlayerCommand),
     /// The last event: why review could not go on, if it could not, and what is left to say of the
@@ -1379,6 +1386,7 @@ impl From<session::Summary> for Summary {
             file_selected,
             spent,
             of_paths,
+            answered,
         } = summary;
         Summary {
             title,
@@ -1396,6 +1404,7 @@ impl From<session::Summary> for Summary {
             file_selected: file_selected.map(wide),
             spent: spent.into(),
             of_paths,
+            answered,
         }
     }
 }
@@ -1785,6 +1794,7 @@ impl From<session::Event> for Event {
                 }),
                 folders: folders.map(|all| all.into_iter().map(FolderView::from).collect()),
             },
+            session::Event::Answered { answered } => Event::Answered { answered },
             session::Event::Player(command) => Event::Player(command.into()),
             session::Event::Ended { fatal, outro } => Event::Ended { fatal, outro },
         }
@@ -2370,6 +2380,7 @@ mod tests {
                     cost_usd: 1.5,
                 },
                 of_paths: false,
+                answered: 12,
             },
             detail: Some(Some(core_detail())),
             files: Some(session::Splice {
@@ -2454,6 +2465,7 @@ mod tests {
                     cost_usd: 1.5,
                 },
                 of_paths: false,
+                answered: 12,
             },
             detail: Some(DetailNow {
                 detail: Some(detail()),
@@ -3063,6 +3075,7 @@ mod tests {
             file_selected: None,
             spent: llm::Spent::default(),
             of_paths: false,
+            answered: 0,
         };
         // Unchanged, and now none: the detail unchanged and the logs none, then the other way;
         // the folders unchanged, then none now.
@@ -3204,6 +3217,10 @@ mod tests {
             })
         };
         let cases = [
+            (
+                session::Event::Answered { answered: 7 },
+                Event::Answered { answered: 7 },
+            ),
             (
                 session::Event::Player(open(player::How::Seek)),
                 crossed(How::Seek),
@@ -3883,6 +3900,9 @@ mod tests {
                             self.folders = now;
                         }
                         self.summary = Some(summary);
+                    }
+                    Some(Event::Answered { answered }) => {
+                        self.summary.as_mut().unwrap().answered = answered;
                     }
                     Some(Event::Player(command)) => self.played.push(command),
                     other => panic!("after {what}: {other:?}"),

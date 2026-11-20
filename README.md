@@ -83,40 +83,51 @@ The app is `subcheck-qt [run | paths…]`, which takes the run or paths `subchec
 with none opens the newest check's folders, as bare `subcheck review` does. Its window has three
 columns: a sidebar with the reviews (one per show folder the store holds, which a click opens), what
 the list shows (each filter with its count) and the view's episodes (a click selects one and its
-first finding); the findings, two lines a row (what found it, its episode and time, its decision,
-and its line with the change marked, or for a timing row whose members the filter shows differ in
-their fixes, those fixes, counted); and the details panel, the video at its top, a mark in the
-video's corner saying whether it plays or is paused, then the selected finding, its line as the
-subtitles have it now in a block above the line with the fix, with Reject and Accept Fix. File ▸
-Settings… (Ctrl+, or ⌘, on macOS) opens a window of its own that chooses the window's colours, the
-default or a palette for deuteranomaly/deuteranopia, protanomaly/protanopia, tritanomaly/tritanopia,
-or little or no colour vision, with a sample, and the size of the text of the window, the findings
-list and the details panel, each the platform's until set; each choice applies at once, and while
-Settings is open no key of the main window's reaches review. The menus hold the rest, and the
-terminal's keys work too: `j` and `k` (or the up and down arrows) move, Enter expands a row into its
-members, `a`, `r`, `x` and `u` accept, reject, put back to undecided and undo, `f` steps through the
-filters, `n` and `p` go to the next and previous episode, `v` switches between a check and its
-folders, `o` opens the selected finding in the video pane as the terminal's `o` does in mpv, playing
-on if the pane plays and paused if not, and `O` stops playback, leaving the pane black and review
-open; Space plays and pauses, ← and → seek 5 s, `,` and `.` 1 s, and `[` and `]` step a frame; `q`
-quits. The window keeps its size, its place on X11 and macOS (Wayland lets no window place itself),
-its columns' widths and its settings for the next run, in
-`$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf` on Linux and macOS when `XDG_CONFIG_HOME` is an
-absolute path; otherwise in `~/.config/subcheck/subcheck-qt.conf` on Linux and in the app's
-preferences on macOS. At the end it prints the counts as the terminal does, but names a view of
-paths as its window's title does: by the first path's last part, and `+N` for the others. It exits
-with 1 after an error, or when review has not ended 10 s after quitting, and with 0 otherwise. The
-10 s gives one decision's write time to wait out another process's lock on the store, which the
-store waits up to 5 s for. It is not enough for several writes queued behind a lock held longer, or
-for an open that waits on the lock more than once: the window then closes review, which can lose a
-decision not yet written.
+first finding, when it has one); the findings, two lines a row (what found it, its episode and time,
+its decision, and its line with the change marked, or for a timing row whose members the filter
+shows differ in their fixes, those fixes, counted); and the details panel, the video at its top, a
+mark in the video's corner saying whether it plays or is paused, then the selected finding, its line
+as the subtitles have it now in a block above the line with the fix, with Reject and Accept Fix. An
+episode the check found nothing in is greyed in the sidebar and says `No findings`. A click on one
+shows what its check said, alone under the video; the finding you were on stays greyed in the list,
+as the episode has none to go to, and Accept, Reject, Back to Undecided, Show in Video and Enter
+wait until you move to a finding again, by a move, a click or Undo. View ▸ Episodes Without Findings
+Last lists those episodes after the rest, while `n` and `p` still go to the next and previous
+episode in review's order. File ▸ Settings… (Ctrl+, or ⌘, on macOS) opens a window of its own that
+chooses the window's colours, the default or a palette for deuteranomaly/deuteranopia,
+protanomaly/protanopia, tritanomaly/tritanopia, or little or no colour vision, with a sample, and
+the size of the text of the window, the findings list and the details panel, each the platform's
+until set; each choice applies at once, and while Settings is open no key of the main window's
+reaches review. The menus hold the rest, and the terminal's keys work too: `j` and `k` (or the up
+and down arrows) move, Enter expands a row into its members, `a`, `r`, `x` and `u` accept, reject,
+put back to undecided and undo, `f` steps through the filters, `n` and `p` go to the next and
+previous episode, `v` switches between a check and its folders, `o` opens the selected finding in
+the video pane as the terminal's `o` does in mpv, playing on if the pane plays and paused if not,
+and `O` stops playback, leaving the pane black and review open; Space plays and pauses, ← and → seek
+5 s, `,` and `.` 1 s, and `[` and `]` step a frame; `q` quits. While Show in Video (`o`) waits for a
+file that is slow to open, a busy animation shows over the video once the wait has lasted 150 ms; it
+goes once the video shows, or once Close Video (`O`) has closed the video. While a video plays, a
+drag of a column or of the window's edge stays smooth. A column drag stretches the video's frame
+until the drag ends, when mpv draws it again at its new size. The window keeps its size, its place
+on X11 and macOS (Wayland lets no window place itself), its columns' widths, the episodes' order and
+its settings for the next run, in `$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf` on Linux and macOS
+when `XDG_CONFIG_HOME` is an absolute path; otherwise in `~/.config/subcheck/subcheck-qt.conf` on
+Linux and in the app's preferences on macOS. At the end it prints the counts as the terminal does,
+but names a view of paths as its window's title does: by the first path's last part, and `+N` for
+the others. It exits with 1 after an error, or when review has not ended 10 s after quitting, and
+with 0 otherwise. The 10 s gives one decision's write time to wait out another process's lock on the
+store, which the store waits up to 5 s for. It is not enough for several writes queued behind a lock
+held longer, or for an open that waits on the lock more than once: the window then closes review,
+which can lose a decision not yet written.
 
 The video pane is mpv, inside the window through MpvQt. It reads its options from
 `$XDG_CONFIG_HOME/mpvqt/mpvqt.conf` on Linux (by default `~/.config/mpvqt/mpvqt.conf`) and
 `~/Library/Preferences/mpvqt/mpvqt.conf` on macOS, not from `~/.config/mpv/mpv.conf` as the
 terminal's mpv does, so subtitle styling set there does not reach it; a line
-`include=~/.config/mpv/mpv.conf` in `mpvqt.conf` brings it in. To build and run the app, with the
-same tools (on Linux, Xvfb and xdotool among them: configuring adds the tests that use them):
+`include=~/.config/mpv/mpv.conf` in `mpvqt.conf` brings it in. The window sets `video-timing-offset`
+to 0 over any value set there, so that it keeps its own frame rate while a video plays. To build and
+run the app, with the same tools (on Linux, Xvfb and xdotool among them: configuring adds the tests
+that use them):
 
 ```sh
 cmake -S gui/qt -B ~/.cache/subcheck-qt-build -G Ninja -DCMAKE_BUILD_TYPE=Debug

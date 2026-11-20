@@ -1,8 +1,8 @@
 // What the window remembers between runs: its size, the place of its frame where the platform lets
 // a window place itself, and the widths of its sidebar and details panel, the list taking what is
-// left; and what the Settings window chooses, the palette and the size of each part's text. The
-// frame's place is what is kept and what is restored, so that a window comes back to one place
-// however many times it starts.
+// left; what the Settings window chooses, the palette and the size of each part's text; and whether
+// the View menu lists the episodes without findings last. The frame's place is what is kept and
+// what is restored, so that a window comes back to one place however many times it starts.
 #pragma once
 
 #include <QFont>
@@ -46,6 +46,10 @@ class WindowSettings : public QObject {
     // The least and most of those sizes, in half points, as the Settings window's boxes count them.
     Q_PROPERTY(int leastHalfPoints READ leastHalfPoints CONSTANT)
     Q_PROPERTY(int mostHalfPoints READ mostHalfPoints CONSTANT)
+    // Whether the sidebar lists the episodes the check found nothing in after the rest
+    // (EpisodeOrder). Off until set: a kept value is on only if it is true.
+    Q_PROPERTY(bool noFindingsLast READ noFindingsLast WRITE setNoFindingsLast NOTIFY
+                   noFindingsLastChanged)
 
 public:
     // `store` is where they stick: the app's own settings (appStore), or a test's file. `platform`
@@ -130,10 +134,15 @@ public:
     // font's digits need not all be as wide as each other.
     Q_INVOKABLE static int widestSize(const QFont &font, int from, int to);
 
+    bool noFindingsLast() const;
+    // Kept at once.
+    void setNoFindingsLast(bool on);
+
 signals:
     void columnsChanged();
     void coloursChanged();
     void textSizesChanged();
+    void noFindingsLastChanged();
 
 private:
     // The window as it last said it was, read whole at each thing it says: a platform can report a

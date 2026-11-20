@@ -3,9 +3,10 @@
 // a move in time. A load and a seek end when playback starts again, a frame step when the position
 // moves, and a load that fails when its file ends on an error. A line opens on its first frame,
 // paused or playing as mpv was, and the pane draws it. Once closed, the pane is black again. mpv's
-// config is one a user could have: `hr-seek=no`, which would land a load on a keyframe but for the
-// option review gives each load, and `reset-on-next-file=pause`, under which the play state still
-// holds. Linux only: Xvfb is X11's.
+// render call never holds the window to the video's frame rate, and a frame stretched is drawn
+// again once the stretch ends. mpv's config is one a user could have: `hr-seek=no`, which would
+// land a load on a keyframe but for the option review gives each load, and
+// `reset-on-next-file=pause`, under which the play state still holds. Linux only: Xvfb is X11's.
 #include "desktop_session.h"
 #include "mpv_item.h"
 #include "player_port.h"
@@ -18,6 +19,7 @@
 #include <QQmlEngine>
 #include <QQuickWindow>
 #include <QScopeGuard>
+#include <QSignalSpy>
 #include <QTest>
 #include <QtQml/QQmlExtensionPlugin>
 
@@ -317,6 +319,54 @@ private slots:
         player.run(PlayerCommand(PlayerCommand::kClose{}));
         QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"closed"}, 5000);
         QTRY_VERIFY_WITH_TIMEOUT(!pane->showing(), 5000);
+    }
+
+    // mpv's render call would otherwise wait out each frame's display time, and the window's frame
+    // with it. The pane sets the offset as it is made. It is read once mpv is ready, as the tests
+    // before have opened files through it; then with a file open, and once it is closed, as a
+    // global option holds for every file.
+    void theVideoDoesNotHoldTheWindowToItsFrameRate() {
+        QCOMPARE(pane->getProperty("video-timing-offset").toDouble(), 0.0);
+        reports.clear();
+        player.run(open(video, 2'500'000, 4));
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened paused"}, 10000);
+        QCOMPARE(pane->getProperty("video-timing-offset").toDouble(), 0.0);
+        reports.clear();
+        player.run(PlayerCommand(PlayerCommand::kClose{}));
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"closed"}, 5000);
+        QCOMPARE(pane->getProperty("video-timing-offset").toDouble(), 0.0);
+    }
+
+    // While it stretches, as during a column drag, the pane shows the frame it has stretched to
+    // its size; once it stops, the frame is drawn again at that size, which mpv, paused, would not
+    // ask for. The window is let go quiet first, so that a frame still to come from the test
+    // before is not taken for the one asked for here.
+    void aStretchedFrameIsDrawnAgainOnceItEnds() {
+        QSignalSpy changed(pane, &MpvItem::stretchingChanged);
+        QVERIFY(!pane->stretching());
+        QVERIFY(pane->textureFollowsItemSize());
+        pane->setStretching(true);
+        QVERIFY(pane->stretching());
+        QVERIFY(!pane->textureFollowsItemSize());
+        QCOMPARE(changed.count(), 1);
+        pane->setStretching(true);
+        QCOMPARE(changed.count(), 1);
+        // Counted on the test's thread, as the render thread can swap.
+        int frames = 0;
+        QObject counting;
+        connect(qobject_cast<QQuickWindow *>(window.get()), &QQuickWindow::frameSwapped, &counting,
+                [&frames] { ++frames; });
+        QVERIFY(QTest::qWaitFor([&frames] {
+            const int before = frames;
+            QTest::qWait(200);
+            return frames == before;
+        }));
+        frames = 0;
+        pane->setStretching(false);
+        QVERIFY(!pane->stretching());
+        QVERIFY(pane->textureFollowsItemSize());
+        QCOMPARE(changed.count(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(frames > 0, 5000);
     }
 };
 

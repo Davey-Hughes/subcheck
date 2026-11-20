@@ -4,6 +4,7 @@
 
 #include <mpv/client.h>
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <utility>
@@ -85,8 +86,9 @@ void PlayerPort::attach(Mpv *mpv) {
     this->mpv = mpv;
     isReady = false;
     for (const PlayerCommand &command : again) {
-        run(command);
+        take(command);
     }
+    noteOpening();
 }
 
 void PlayerPort::detach(Mpv *mpv) {
@@ -96,6 +98,11 @@ void PlayerPort::detach(Mpv *mpv) {
 }
 
 void PlayerPort::run(const PlayerCommand &command) {
+    take(command);
+    noteOpening();
+}
+
+void PlayerPort::take(const PlayerCommand &command) {
     if (!isReady) {
         // Nothing has opened yet, so nothing can play or need closing; an Open waits for mpv
         // to show what it opens, and a newer one replaces it, as review's status names only it,
@@ -136,6 +143,7 @@ void PlayerPort::release() {
     if (mpv && isReady) {
         mpv->command(nextId++, {QStringLiteral("stop")});
     }
+    noteOpening();
 }
 
 void PlayerPort::ready() {
@@ -167,7 +175,7 @@ void PlayerPort::answered(std::uint64_t id, const QString &error, const QVariant
 
 void PlayerPort::restarted() {
     // A file plays: a late load's has landed, or another move did after it.
-    late.reset();
+    stopWaitingForLate();
     if (landing == Landing::OnRestart) {
         landed();
     }
@@ -179,21 +187,51 @@ void PlayerPort::moved() {
     }
 }
 
-void PlayerPort::ended(bool failed) {
-    // Only the load under way can fail the Open: a file replaced by it ends too, stopped. A late
-    // load that ends on an error is reported as it is, its Open long since reported. An end with
-    // no error leaves the late load waiting: it is most often the file the late load replaced,
-    // whose end comes after its reads, which can outlast the settle time on a stalled mount.
-    if (!failed) {
+void PlayerPort::ended(End end) {
+    // A stop is the end of a file a load replaced, which can come after the load's own reads, and
+    // those can outlast the settle time on a stalled mount: it leaves the load waited for. Any
+    // other end is the loading file's own, as the load replaced whatever played before, and counts
+    // only while the load settles or is late. An error fails the Open while the load settles, and
+    // once the load is late, is reported as it is, its Open long since reported. An end at the
+    // file's end, after which no playback starts again, lands the Open while the load settles, as
+    // the settle time's end would, but not late; once the load is late, it is no longer waited
+    // for, and nothing is reported, as nothing more is known of whether it opened.
+    if (end == End::Stopped) {
         return;
     }
     if (settling && loading) {
-        settle.stop();
-        settling = false;
-        fail(couldNotOpen(loadingFile));
+        if (end == End::Failed) {
+            settle.stop();
+            settling = false;
+            fail(couldNotOpen(loadingFile));
+        } else {
+            landed();
+        }
     } else if (late) {
-        emit reported(
-            PlayerReport(PlayerReport::kFailed{couldNotOpen(*std::exchange(late, std::nullopt))}));
+        const std::string file = *std::exchange(late, std::nullopt);
+        if (end == End::Failed) {
+            emit reported(PlayerReport(PlayerReport::kFailed{couldNotOpen(file)}));
+        }
+        noteOpening();
+    }
+}
+
+bool PlayerPort::opening() const {
+    const auto isOpen = [](const PlayerCommand &command) {
+        return std::holds_alternative<PlayerCommand::kOpen>(command.get_variant());
+    };
+    return waiting || late || (busy && isOpen(*busy)) || std::ranges::any_of(queue, isOpen);
+}
+
+void PlayerPort::stopWaitingForLate() {
+    late.reset();
+    noteOpening();
+}
+
+void PlayerPort::noteOpening() {
+    if (opening() != saidOpening) {
+        saidOpening = !saidOpening;
+        emit openingChanged();
     }
 }
 
@@ -371,7 +409,7 @@ void PlayerPort::playback(Playback playback) {
 // same, as mpv names no path for a load it has taken and not yet started, which would then play.
 void PlayerPort::close() {
     const auto stop = [this](std::optional<PlayerError> said) {
-        late.reset();
+        stopWaitingForLate();
         ask({QStringLiteral("stop")},
             [this, said](const QVariant &) { finish(PlayerReport(PlayerReport::kClosed{said})); });
     };
@@ -486,6 +524,7 @@ void PlayerPort::notReady() {
         waiting.reset();
         emit reported(
             PlayerReport(PlayerReport::kOpenFailed{PlayerError(PlayerError::kNoVideo{})}));
+        noteOpening();
     }
 }
 
@@ -507,4 +546,5 @@ void PlayerPort::finish(const PlayerReport &report) {
     busy.reset();
     emit reported(report);
     next();
+    noteOpening();
 }
