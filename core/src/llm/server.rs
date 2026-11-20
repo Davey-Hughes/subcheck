@@ -24,7 +24,7 @@ use ureq::tls::{RootCerts, TlsConfig};
 use ureq::{Agent, Body, RequestBuilder};
 
 use super::key::{self, Key};
-use super::{Answer, Budget, Output, SYSTEM, TooBig, Usage, Used, classify};
+use super::{Answer, Budget, Output, SYSTEM, TooBig, Usage, Used, Wait, Waits, classify};
 use crate::settings::{KeySource, ServerEntry, Thinking};
 
 #[cfg(test)]
@@ -147,6 +147,28 @@ struct Ask<'a> {
     path: &'a str,
     body: Option<&'a str>,
     timeout: Duration,
+    /// The wait the request belongs to, which is under way again once a key command its 401 ran
+    /// has ended: the check's, for `/models`. `None` for a chat, which waits on the LLM, and for
+    /// a request sent other than through [`Server::asked`], whose 401 runs nothing.
+    during: Option<&'a Wait>,
+}
+
+/// A wait reported as started, and reported as ended once this is dropped: on every way out of
+/// what it names, a `?` included, so nothing that shows waits keeps showing one that is over.
+struct Waiting<'a>(Waits<'a>);
+
+impl<'a> Waiting<'a> {
+    /// `wait` reported through `waits` as started.
+    fn start(waits: Waits<'a>, wait: Wait) -> Self {
+        waits(Some(wait));
+        Waiting(waits)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        (self.0)(None);
+    }
 }
 
 /// How a request sent as the key's rule says ([`Server::asked`]) ended. Each message has hidden
@@ -236,8 +258,15 @@ impl Server {
     /// ([`Server::cut_off`]). An error has the key hidden, since a server may echo back the key it
     /// refused. The request goes as the key's rule says ([`Server::asked`]): a call whose key is
     /// refused sends nothing, so it has nothing to count. A 2xx marks the key as one that has
-    /// worked ([`key::worked`]), which no other request's does.
-    pub(super) fn call(&self, prompt: &str, timeout: Duration, budget: Option<Budget>) -> Answer {
+    /// worked ([`key::worked`]), which no other request's does. The one wait it reports through
+    /// `waits` is a key command a 401 runs.
+    pub(super) fn call(
+        &self,
+        prompt: &str,
+        timeout: Duration,
+        budget: Option<Budget>,
+        waits: Waits<'_>,
+    ) -> Answer {
         let max_reply = budget.map(Budget::cap);
         let Some(model) = &self.model else {
             return Answer {
@@ -263,6 +292,7 @@ impl Server {
             path,
             body: Some(&body),
             timeout,
+            during: None,
         };
         let says = |status: u16, text: &str| {
             let mut why = error_text(status, text);
@@ -271,7 +301,7 @@ impl Server {
             }
             why
         };
-        match self.asked(&ask, says) {
+        match self.asked(&ask, says, waits) {
             Told::Answer(text, key) => {
                 // Only a chat's answer shows that a key works. Some servers (llama-server,
                 // OpenRouter) list their models without checking the key: a wrong key marked at
@@ -338,26 +368,29 @@ impl Server {
     /// can refuse one request that way (a chunk it moderates, a model the key may not use), so
     /// this scan's calls go on with the key, and the next scan or recheck runs the key command
     /// again ([`key::forbidden`]). Both say to check the entry's key. A request that sent no key
-    /// changes nothing and says nothing of one.
-    fn asked(&self, ask: &Ask<'_>, says: impl Fn(u16, &str) -> String) -> Told {
+    /// changes nothing and says nothing of one. A key command a 401 runs is reported through
+    /// `waits` ([`Server::once`]).
+    fn asked(&self, ask: &Ask<'_>, says: impl Fn(u16, &str) -> String, waits: Waits<'_>) -> Told {
         let key = match self.sending() {
             Ok(key) => key,
             Err(why) => return Told::Unsent(why),
         };
-        match self.once(ask, key, &says) {
-            (_, Some(fetched)) => self.once(ask, Some(fetched), &says).0,
+        match self.once(ask, key, &says, waits) {
+            (_, Some(fetched)) => self.once(ask, Some(fetched), &says, waits).0,
             (told, None) => told,
         }
     }
 
     /// One request of [`Server::asked`]: `ask` sent with `key`, and what its answer does about
     /// the key. With how it ended, the key a 401 fetched to send in its place, when the server
-    /// still sends one.
+    /// still sends one. A key command the 401 runs is reported through `waits` as it starts, and
+    /// once it ends, the wait `ask` belongs to as under way again, or none.
     fn once(
         &self,
         ask: &Ask<'_>,
         key: Option<Key>,
         says: &impl Fn(u16, &str) -> String,
+        waits: Waits<'_>,
     ) -> (Told, Option<Key>) {
         let source = &self.entry.key;
         match (self.send(ask, key.as_ref()), key) {
@@ -377,7 +410,14 @@ impl Server {
                         why.push_str(CHECK_KEY);
                         // The state's lock is not held here: the command can wait on a
                         // passphrase window.
-                        key::refetch(source, &sent).unwrap_or_else(|failed| {
+                        let running = |on: bool| {
+                            waits(if on {
+                                Some(self.key_wait())
+                            } else {
+                                ask.during.cloned()
+                            });
+                        };
+                        key::refetch(source, &sent, &running).unwrap_or_else(|failed| {
                             let _ = write!(why, "; {failed}");
                             None
                         })
@@ -491,13 +531,20 @@ impl Server {
 
     /// The server readied for calls, as [`Backend::ready`](super::Backend::ready) says, with the
     /// warnings to show. An error has the key hidden, since a server may echo back the key it
-    /// refused.
-    pub(super) fn ready(mut self) -> Result<(Server, Vec<String>), String> {
-        let key = key::fetch(&self.entry.key)?;
+    /// refused. It reports through `waits` the key command while it runs, then the check from
+    /// before `/models` is asked to after `/api/ps` is, or to whatever fails first.
+    pub(super) fn ready(mut self, waits: Waits<'_>) -> Result<(Server, Vec<String>), String> {
+        let key_wait = self.key_wait();
+        let running = |on: bool| waits(on.then(|| key_wait.clone()));
+        let key = key::fetch(&self.entry.key, &running)?;
         let keyed = key.is_some();
         // The key as fetched, whatever state the server came with: a scan starts unrefused.
         self.key = SharedKey::new(key.map_or(KeyState::None, KeyState::Sending));
-        let models = self.models()?;
+        // Worded once the key is fetched, so that the key is hidden from it.
+        let line = format!("{}: asking {} what it serves", self.name, self.entry.url);
+        let asking = Wait::Asking(self.hidden(line));
+        let _checking = Waiting::start(waits, asking.clone());
+        let models = self.models(&asking, waits)?;
         let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
         // The ids are the server's, so the key is hidden: the one sent to `/models`.
         let model = settle(&self.entry.url, self.model.as_deref(), &ids).map_err(|mut why| {
@@ -518,9 +565,13 @@ impl Server {
 
     /// The server sized, as [`Backend::sized`](super::Backend::sized) says: with a context that is
     /// `NotLoaded`, its model loaded within `timeout` and `/api/ps` asked again. An error has the
-    /// key hidden, since a server may echo back the key it refused.
-    pub(super) fn sized(mut self, timeout: Duration) -> Result<Server, String> {
+    /// key hidden, since a server may echo back the key it refused. The load is reported through
+    /// `waits` from before it starts to after `/api/ps` is asked again, or to its failure.
+    pub(super) fn sized(mut self, timeout: Duration, waits: Waits<'_>) -> Result<Server, String> {
         if let Some((root, model)) = self.to_load() {
+            // The model's name is the server's, so the key is hidden.
+            let line = self.hidden(format!("loading {model} into Ollama at {root}"));
+            let _loading = Waiting::start(waits, Wait::Loading(line));
             self.load(root, model, timeout)?;
             // A model still not listed once loaded leaves the context `Unknown`, not `NotLoaded`,
             // so nothing loads it again.
@@ -541,12 +592,11 @@ impl Server {
         }
     }
 
-    /// The line to show while [`Server::sized`] loads a model, which can take a while with
-    /// nothing else said: the model and Ollama's address. `None` when sizing loads nothing. The
-    /// model's name is the server's, so the key is hidden.
-    pub(super) fn loading(&self) -> Option<String> {
-        let (root, model) = self.to_load()?;
-        Some(self.hidden(format!("loading {model} into Ollama at {root}")))
+    /// The entry's key command running, worded here alone so that readying the server and a
+    /// call's 401 name it the same. The line names the entry, never the command, whose text can
+    /// hold a key.
+    fn key_wait(&self) -> Wait {
+        Wait::KeyCommand(format!("{}: waiting for its key command", self.name))
     }
 
     /// Ollama made to load `model`: `POST <root>/api/generate` naming the model and no prompt,
@@ -562,6 +612,7 @@ impl Server {
             path: "api/generate",
             body: Some(&body),
             timeout,
+            during: None,
         };
         let why = match self.send(&ask, key) {
             Ok((status, _)) if (200..300).contains(&status) => return Ok(()),
@@ -599,6 +650,7 @@ impl Server {
             path: "api/ps",
             body: None,
             timeout: MODELS_TIMEOUT,
+            during: None,
         };
         match self.send(&ask, key.as_ref()) {
             Ok((status, text)) if (200..300).contains(&status) => ps_context(&text, model),
@@ -651,20 +703,22 @@ impl Server {
     }
 
     /// The models `GET <url>/models` lists, asked as the key's rule says ([`Server::asked`]). An
-    /// error has hidden the key its request sent.
-    fn models(&self) -> Result<Vec<Listed>, String> {
+    /// error has hidden the key its request sent. `asking` is the check's wait, under way again
+    /// once a key command a 401 runs through `waits` has ended.
+    fn models(&self, asking: &Wait, waits: Waits<'_>) -> Result<Vec<Listed>, String> {
         let url = &self.entry.url;
         let ask = Ask {
             base: url,
             path: "models",
             body: None,
             timeout: MODELS_TIMEOUT,
+            during: Some(asking),
         };
         let says = |status: u16, text: &str| match server_said(text) {
             Some(said) => format!("HTTP {status} from {url}/models: {said}"),
             None => format!("HTTP {status} from {url}/models"),
         };
-        match self.asked(&ask, says) {
+        match self.asked(&ask, says, waits) {
             Told::Answer(text, key) => {
                 // Read before the key is hidden: a model's id may hold it.
                 let Ok(list) = serde_json::from_str::<ModelList>(&text) else {
@@ -1180,7 +1234,7 @@ mod tests {
         let Via::Server(mut s) = b.via else {
             unreachable!()
         };
-        let key = key::fetch(source).unwrap();
+        let key = key::fetch(source, &|_| {}).unwrap();
         s.key = SharedKey::new(key.map_or(KeyState::None, KeyState::Sending));
         Backend {
             via: Via::Server(s),
@@ -1196,19 +1250,43 @@ mod tests {
         s
     }
 
-    /// An entry `srv` at `fake` whose key command adds a line to `dir`'s `count` each run, then
-    /// runs `print`; readied, so its first key is fetched and no chat has shown that it works.
+    /// An entry `srv` at `url` whose key command adds a line to `dir`'s `count` each run, then
+    /// runs `print`; not readied, so the command has not run.
+    fn entry_by(url: &str, dir: &Path, print: &str) -> (Backend, impl Fn() -> usize + use<>) {
+        let count = dir.join("count");
+        let cmd = format!("echo x >> '{}'; {print}", count.display());
+        let entry = backend(url, &format!("api_key_cmd = \"{cmd}\"\n"));
+        let runs = move || std::fs::read_to_string(&count).unwrap().lines().count();
+        (entry, runs)
+    }
+
+    /// [`entry_by`] at `fake`, readied, so its first key is fetched and no chat has shown that it
+    /// works.
     fn readied_by(
         fake: &FakeServer,
         dir: &Path,
         print: &str,
     ) -> (Backend, impl Fn() -> usize + use<>) {
-        let count = dir.join("count");
-        let cmd = format!("echo x >> '{}'; {print}", count.display());
-        let entry = backend(&fake.url, &format!("api_key_cmd = \"{cmd}\"\n"));
-        let (b, _) = entry.ready().unwrap();
-        let runs = move || std::fs::read_to_string(&count).unwrap().lines().count();
+        let (entry, runs) = entry_by(&fake.url, dir, print);
+        let (b, _) = entry.ready(&|_| {}).unwrap();
         (b, runs)
+    }
+
+    /// Each wait `run` reports through the [`Waits`] it is given, in the order reported.
+    fn heard(run: impl FnOnce(Waits<'_>)) -> Vec<Option<Wait>> {
+        let heard = Mutex::new(Vec::new());
+        run(&|wait| heard.lock().unwrap().push(wait));
+        heard.into_inner().unwrap()
+    }
+
+    /// `srv`'s key command running, as its waits name it.
+    fn key_command() -> Wait {
+        Wait::KeyCommand("srv: waiting for its key command".into())
+    }
+
+    /// `srv` asking the server at `url` what it serves, as its waits name it.
+    fn asking(url: &str) -> Wait {
+        Wait::Asking(format!("srv: asking {url} what it serves"))
     }
 
     /// [`readied_by`], with its first key marked as one that has worked, as a first good chat
@@ -1308,7 +1386,7 @@ mod tests {
             &fake.url,
             "[llm.srv.request]\ntemperature = 1.0\nreasoning_effort = \"low\"\n",
         );
-        let a = b.call("PROMPT", TIMEOUT, None);
+        let a = b.call("PROMPT", TIMEOUT, None, &|_| {});
         assert_eq!(a.reply.as_deref(), Ok("NONE\n"));
         assert_eq!(
             a.used,
@@ -1350,9 +1428,14 @@ mod tests {
         // A quarter of 1024 tokens.
         let capped = Some(Budget::new(1024, None));
         let b = backend(&fake.url, "");
-        b.call("P", TIMEOUT, capped);
-        b.call("P", TIMEOUT, None);
-        backend(&fake.url, "[llm.srv.request]\nmax_tokens = 4000\n").call("P", TIMEOUT, capped);
+        b.call("P", TIMEOUT, capped, &|_| {});
+        b.call("P", TIMEOUT, None, &|_| {});
+        backend(&fake.url, "[llm.srv.request]\nmax_tokens = 4000\n").call(
+            "P",
+            TIMEOUT,
+            capped,
+            &|_| {},
+        );
         let caps: Vec<Option<u64>> = fake
             .requests()
             .iter()
@@ -1365,7 +1448,7 @@ mod tests {
             &newer.url,
             "[llm.srv.request]\nmax_completion_tokens = 4000\n",
         )
-        .call("P", TIMEOUT, capped);
+        .call("P", TIMEOUT, capped, &|_| {});
         let body = newer.requests()[0].json();
         assert_eq!(
             (
@@ -1379,7 +1462,8 @@ mod tests {
     #[test]
     fn a_call_before_the_key_is_fetched_sends_nothing() {
         let fake = FakeServer::start(|_| Reply::ok(OPENAI));
-        let a = backend(&fake.url, "api_key_cmd = \"echo sk-1\"\n").call("P", TIMEOUT, None);
+        let a =
+            backend(&fake.url, "api_key_cmd = \"echo sk-1\"\n").call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             (a.reply, a.used),
             (Err("the key is not fetched".into()), Used::Untracked)
@@ -1390,7 +1474,7 @@ mod tests {
     #[test]
     fn thinking_left_to_the_server_sends_neither_switch() {
         let fake = FakeServer::start(|_| Reply::ok(OPENAI));
-        backend(&fake.url, "thinking = \"server\"\n").call("P", TIMEOUT, None);
+        backend(&fake.url, "thinking = \"server\"\n").call("P", TIMEOUT, None, &|_| {});
         let body = fake.requests()[0].json();
         assert_eq!(
             (
@@ -1410,7 +1494,7 @@ mod tests {
             backend(&fake.url, ""),
             &KeySource::Command("echo sk-6".into()),
         );
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             fake.requests()[0].header("authorization"),
             Some("Bearer sk-6")
@@ -1449,7 +1533,7 @@ mod tests {
                 backend(&fake.url, ""),
                 &KeySource::Command(format!("echo {key}")),
             );
-            let said = b.call("P", TIMEOUT, None).reply.unwrap_err();
+            let said = b.call("P", TIMEOUT, None, &|_| {}).reply.unwrap_err();
             assert!(
                 said.contains("Invalid token <key>") && !shows_part_of(&said, &key),
                 "{said}"
@@ -1470,7 +1554,7 @@ mod tests {
             &KeySource::Command("echo secret".into()),
         );
         assert_eq!(
-            b.call("P", TIMEOUT, None).reply.as_deref(),
+            b.call("P", TIMEOUT, None, &|_| {}).reply.as_deref(),
             Ok("L3\tKeep it secret.\tsecert misspelt\n")
         );
     }
@@ -1484,7 +1568,7 @@ mod tests {
                 &KeySource::Command(format!("echo {key}")),
             );
             assert_eq!(
-                b.call("P", TIMEOUT, None).reply.as_deref(),
+                b.call("P", TIMEOUT, None, &|_| {}).reply.as_deref(),
                 Ok("NONE\n"),
                 "{key}"
             );
@@ -1499,7 +1583,7 @@ mod tests {
             backend(&fake.url, ""),
             &KeySource::Command("echo length".into()),
         );
-        assert!(b.call("P", TIMEOUT, None).reply.is_err());
+        assert!(b.call("P", TIMEOUT, None, &|_| {}).reply.is_err());
     }
 
     #[test]
@@ -1512,8 +1596,8 @@ mod tests {
         // The key of the command the entry names, which no server has taken: the call's 403 marks
         // it, so the next fetch runs the command.
         let entry = backend(&fake.url, &format!("api_key_cmd = \"{cmd}\"\n"));
-        with_key(entry, &source).call("P", TIMEOUT, None);
-        key::fetch(&source).unwrap();
+        with_key(entry, &source).call("P", TIMEOUT, None, &|_| {});
+        key::fetch(&source, &|_| {}).unwrap();
         assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 2);
     }
 
@@ -1527,7 +1611,7 @@ mod tests {
         std::fs::write(dir.path().join("key"), "sk-old\n").unwrap();
         let (b, key, runs) = keyed(&fake, dir.path());
         std::fs::write(&key, "sk-new\n").unwrap();
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!(a.reply.as_deref(), Ok("NONE\n"));
         // The refused request is no call of its own: the usage is the second one's.
         assert_eq!(
@@ -1542,12 +1626,36 @@ mod tests {
         );
         assert_eq!(bearers(&fake), ["Bearer sk-old", "Bearer sk-new"]);
         assert_eq!(runs(), 2);
-        assert_eq!(b.call("P", TIMEOUT, None).reply.as_deref(), Ok("NONE\n"));
+        assert_eq!(
+            b.call("P", TIMEOUT, None, &|_| {}).reply.as_deref(),
+            Ok("NONE\n")
+        );
         assert_eq!(
             bearers(&fake),
             ["Bearer sk-old", "Bearer sk-new", "Bearer sk-new"]
         );
         assert_eq!(runs(), 2);
+    }
+
+    #[test]
+    fn a_call_names_the_key_command_a_401_runs_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = chatting(|r| match r.header("authorization") {
+            Some("Bearer sk-new") => Reply::ok(OPENAI),
+            _ => Reply::status(401, ""),
+        });
+        std::fs::write(dir.path().join("key"), "sk-old\n").unwrap();
+        let (b, key, _) = keyed(&fake, dir.path());
+        std::fs::write(&key, "sk-new\n").unwrap();
+        let first = heard(|waits| {
+            let a = b.call("P", TIMEOUT, None, waits);
+            assert_eq!(a.reply.as_deref(), Ok("NONE\n"));
+        });
+        assert_eq!(first, [Some(key_command()), None]);
+        let next = heard(|waits| {
+            b.call("P", TIMEOUT, None, waits);
+        });
+        assert_eq!(next, []);
     }
 
     #[test]
@@ -1557,10 +1665,10 @@ mod tests {
         let fake = chatting(|_| Reply::status(401, ""));
         let (b, runs) = readied_by(&fake, dir.path(), "echo sk-wrong");
         let refusal = Err("HTTP 401; check the entry's key".to_string());
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!((a.reply, a.used), (refusal.clone(), Used::Unreported));
         assert_eq!(runs(), 1);
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!((a.reply, a.used), (refusal, Used::Untracked));
         assert_eq!(fake.completions().len(), 1);
         assert_eq!(runs(), 1);
@@ -1573,10 +1681,10 @@ mod tests {
         std::fs::write(dir.path().join("key"), "sk-same\n").unwrap();
         let (b, _, runs) = keyed(&fake, dir.path());
         let refusal = Err("HTTP 401: bad key <key>; check the entry's key".to_string());
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!((a.reply, a.used), (refusal.clone(), Used::Unreported));
         assert_eq!(runs(), 2);
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             (a.reply, a.used, a.too_big),
             (refusal, Used::Untracked, None)
@@ -1584,7 +1692,7 @@ mod tests {
         assert_eq!(fake.completions().len(), 1);
         assert_eq!(runs(), 2);
         // A refused key is not left kept, so the next scan runs the command.
-        key::fetch(&server(&b).entry.key).unwrap();
+        key::fetch(&server(&b).entry.key, &|_| {}).unwrap();
         assert_eq!(runs(), 3);
     }
 
@@ -1594,8 +1702,8 @@ mod tests {
         let fake = chatting(|_| Reply::status(401, ""));
         std::fs::write(dir.path().join("key"), "sk-gone\n").unwrap();
         let (b, _, _) = keyed(&fake, dir.path());
-        b.call("P", TIMEOUT, None);
-        assert_eq!(b.call("P", TIMEOUT, None).used, Used::Untracked);
+        b.call("P", TIMEOUT, None, &|_| {});
+        assert_eq!(b.call("P", TIMEOUT, None, &|_| {}).used, Used::Untracked);
         assert_eq!(
             server(&b).hidden("loading sk-gone into Ollama".to_string()),
             "loading <key> into Ollama"
@@ -1617,11 +1725,11 @@ mod tests {
         let (b, runs) = keyed_by(&fake, dir.path(), &print);
         // The second request's refusal, hidden with the key that request sent.
         let refusal = Err("HTTP 401: no such key: Bearer <key>; check the entry's key".to_string());
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!((a.reply, a.used), (refusal.clone(), Used::Unreported));
         assert_eq!(bearers(&fake), ["Bearer sk-1", "Bearer sk-2"]);
         assert_eq!(runs(), 2);
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!((a.reply, a.used), (refusal, Used::Untracked));
         assert_eq!(fake.completions().len(), 2);
         assert_eq!(runs(), 2);
@@ -1638,7 +1746,7 @@ mod tests {
         let fake = chatting(move |r| {
             if r.header("authorization") == Some("Bearer sk-2") {
                 let source = theirs.get().unwrap();
-                let sent = key::fetch(source).unwrap().unwrap();
+                let sent = key::fetch(source, &|_| {}).unwrap().unwrap();
                 key::worked(source, &sent);
                 std::fs::write(&rotated, "sk-3\n").unwrap();
             }
@@ -1648,7 +1756,7 @@ mod tests {
         let (b, _, runs) = keyed(&fake, dir.path());
         source.set(server(&b).entry.key.clone()).unwrap();
         std::fs::write(&file, "sk-2\n").unwrap();
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             (a.reply, a.used),
             (
@@ -1658,7 +1766,7 @@ mod tests {
         );
         assert_eq!(bearers(&fake), ["Bearer sk-1", "Bearer sk-2"]);
         assert_eq!(runs(), 3);
-        b.call("P", TIMEOUT, None);
+        b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             bearers(&fake),
             ["Bearer sk-1", "Bearer sk-2", "Bearer sk-3"]
@@ -1670,12 +1778,12 @@ mod tests {
     fn a_401_for_a_variables_key_refuses_it_at_once() {
         let fake = chatting(|_| Reply::status(401, ""));
         let (b, _) = backend(&fake.url, "api_key_env = \"HOME\"\n")
-            .ready()
+            .ready(&|_| {})
             .unwrap();
         let refusal = Err("HTTP 401; check the entry's key".to_string());
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!((a.reply, a.used), (refusal.clone(), Used::Unreported));
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!((a.reply, a.used), (refusal, Used::Untracked));
         assert_eq!(fake.completions().len(), 1);
     }
@@ -1689,16 +1797,16 @@ mod tests {
             move |b| {
                 // Another worker's call is refused with the same key, which the command prints
                 // again, so the server is refused; then another scan's fetch keeps a new key.
-                b.call("P", TIMEOUT, None);
+                b.call("P", TIMEOUT, None, &|_| {});
                 std::fs::write(&rotated, "sk-3\n").unwrap();
-                key::fetch(&server(b).entry.key).unwrap();
+                key::fetch(&server(b).entry.key, &|_| {}).unwrap();
             },
             |_| Reply::status(401, ""),
         );
         std::fs::write(&file, "sk-1\n").unwrap();
         let (b, _, runs) = keyed(&fake, dir.path());
         let b = cell.get_or_init(|| b);
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             (a.reply, a.used),
             (
@@ -1721,11 +1829,11 @@ mod tests {
                 // then a 401 for that key at another backend of the same command, as a recheck's
                 // can be, leaves nothing kept.
                 std::fs::write(&rotated, "sk-2\n").unwrap();
-                b.call("P", TIMEOUT, None);
+                b.call("P", TIMEOUT, None, &|_| {});
                 let KeyState::Sending(new) = server(b).key.get() else {
                     unreachable!()
                 };
-                assert_eq!(key::refetch(&server(b).entry.key, &new), Ok(None));
+                assert_eq!(key::refetch(&server(b).entry.key, &new, &|_| {}), Ok(None));
             },
             |r| match r.header("authorization") {
                 Some("Bearer sk-2") => Reply::status(403, ""),
@@ -1735,7 +1843,7 @@ mod tests {
         std::fs::write(&file, "sk-1\n").unwrap();
         let (b, _, runs) = keyed(&fake, dir.path());
         let b = cell.get_or_init(|| b);
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             (a.reply, a.used),
             (
@@ -1748,7 +1856,7 @@ mod tests {
             ["Bearer sk-1", "Bearer sk-2", "Bearer sk-1"]
         );
         // The old key's refusal says nothing of the new one, which the next call sends.
-        b.call("P", TIMEOUT, None);
+        b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             bearers(&fake),
             ["Bearer sk-1", "Bearer sk-2", "Bearer sk-1", "Bearer sk-2"]
@@ -1766,7 +1874,7 @@ mod tests {
             move |b| {
                 // Another worker's call fetches a new key, and its chunk is refused with it.
                 std::fs::write(&rotated, "sk-2\n").unwrap();
-                b.call("P", TIMEOUT, None);
+                b.call("P", TIMEOUT, None, &|_| {});
             },
             move |r| match r.header("authorization") {
                 Some("Bearer sk-2") if !flagged.swap(true, Ordering::SeqCst) => {
@@ -1779,7 +1887,10 @@ mod tests {
         std::fs::write(&file, "sk-1\n").unwrap();
         let (b, _, runs) = keyed(&fake, dir.path());
         let b = cell.get_or_init(|| b);
-        assert_eq!(b.call("P", TIMEOUT, None).reply.as_deref(), Ok("NONE\n"));
+        assert_eq!(
+            b.call("P", TIMEOUT, None, &|_| {}).reply.as_deref(),
+            Ok("NONE\n")
+        );
         assert_eq!(
             bearers(&fake),
             ["Bearer sk-1", "Bearer sk-2", "Bearer sk-1", "Bearer sk-2"]
@@ -1799,11 +1910,14 @@ mod tests {
         std::fs::write(dir.path().join("key"), "sk-old\n").unwrap();
         let (b, key, runs) = keyed(&fake, dir.path());
         assert_eq!(
-            b.call("P", TIMEOUT, None).reply,
+            b.call("P", TIMEOUT, None, &|_| {}).reply,
             Err("HTTP 403; check the entry's key".to_string())
         );
         std::fs::write(&key, "sk-new\n").unwrap();
-        assert_eq!(b.call("P", TIMEOUT, None).reply.as_deref(), Ok("NONE\n"));
+        assert_eq!(
+            b.call("P", TIMEOUT, None, &|_| {}).reply.as_deref(),
+            Ok("NONE\n")
+        );
         assert_eq!(
             bearers(&fake),
             ["Bearer sk-old", "Bearer sk-old", "Bearer sk-new"]
@@ -1829,12 +1943,18 @@ mod tests {
         std::fs::write(&key, "sk-old\n").unwrap();
         let (b, runs) = readied_by(&fake, dir.path(), &format!("cat '{}'", key.display()));
         assert_eq!(
-            b.call("P", TIMEOUT, None).reply,
+            b.call("P", TIMEOUT, None, &|_| {}).reply,
             Err("HTTP 403; check the entry's key".to_string())
         );
-        assert_eq!(b.call("P", TIMEOUT, None).reply.as_deref(), Ok("NONE\n"));
+        assert_eq!(
+            b.call("P", TIMEOUT, None, &|_| {}).reply.as_deref(),
+            Ok("NONE\n")
+        );
         std::fs::write(&key, "sk-new\n").unwrap();
-        assert_eq!(b.call("P", TIMEOUT, None).reply.as_deref(), Ok("NONE\n"));
+        assert_eq!(
+            b.call("P", TIMEOUT, None, &|_| {}).reply.as_deref(),
+            Ok("NONE\n")
+        );
         assert_eq!(
             bearers(&fake),
             [
@@ -1853,11 +1973,11 @@ mod tests {
         let fake = chatting(|_| Reply::status(403, ""));
         std::fs::write(dir.path().join("key"), "sk-old\n").unwrap();
         let (b, key, runs) = keyed(&fake, dir.path());
-        b.call("P", TIMEOUT, None);
+        b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!(runs(), 1);
         std::fs::write(&key, "sk-new\n").unwrap();
         // As the next scan or recheck: a new backend for the same entry.
-        moved(&b, &fake.url).ready().unwrap();
+        moved(&b, &fake.url).ready(&|_| {}).unwrap();
         assert_eq!(runs(), 2);
         let listed: Vec<_> = fake
             .requests()
@@ -1875,7 +1995,7 @@ mod tests {
         std::fs::write(dir.path().join("key"), "sk-ok\n").unwrap();
         let (b, _, runs) = keyed(&fake, dir.path());
         for sent in 1..=2 {
-            let a = b.call("P", TIMEOUT, None);
+            let a = b.call("P", TIMEOUT, None, &|_| {});
             assert_eq!(
                 (a.reply, a.used),
                 (
@@ -1892,9 +2012,9 @@ mod tests {
     fn an_entry_without_a_key_is_not_told_to_check_one() {
         for status in [401, 403] {
             let fake = chatting(move |_| Reply::status(status, r#"{"error":{"message":"no"}}"#));
-            let (b, _) = backend(&fake.url, "").ready().unwrap();
+            let (b, _) = backend(&fake.url, "").ready(&|_| {}).unwrap();
             for sent in 1..=2 {
-                let a = b.call("P", TIMEOUT, None);
+                let a = b.call("P", TIMEOUT, None, &|_| {});
                 assert_eq!(
                     (a.reply, a.used),
                     (Err(format!("HTTP {status}: no")), Used::Unreported)
@@ -1903,7 +2023,7 @@ mod tests {
             }
             let refusing = FakeServer::start(move |_| Reply::status(status, ""));
             assert_eq!(
-                backend(&refusing.url, "").ready().unwrap_err(),
+                backend(&refusing.url, "").ready(&|_| {}).unwrap_err(),
                 format!("srv@m: HTTP {status} from {}/models", refusing.url)
             );
         }
@@ -1924,10 +2044,10 @@ mod tests {
              status: 2: locked"
                 .to_string(),
         );
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!((a.reply, a.used), (refusal.clone(), Used::Unreported));
         assert_eq!(runs(), 2);
-        let a = b.call("P", TIMEOUT, None);
+        let a = b.call("P", TIMEOUT, None, &|_| {});
         assert_eq!((a.reply, a.used), (refusal, Used::Untracked));
         assert_eq!(fake.completions().len(), 1);
         assert_eq!(runs(), 2);
@@ -1946,12 +2066,15 @@ mod tests {
             Reply::status(401, "")
         });
         let (b, runs) = keyed_by(&fake, dir.path(), "sleep 0.3; echo sk-same");
-        let replies: Vec<_> = std::thread::scope(|s| {
-            let both = [
-                s.spawn(|| b.call("P", patience, None)),
-                s.spawn(|| b.call("P", patience, None)),
-            ];
-            both.map(|t| t.join().unwrap().reply).into()
+        let mut replies = Vec::new();
+        let waits = heard(|waits| {
+            replies = std::thread::scope(|s| {
+                let both = [
+                    s.spawn(|| b.call("P", patience, None, waits)),
+                    s.spawn(|| b.call("P", patience, None, waits)),
+                ];
+                both.map(|t| t.join().unwrap().reply).into()
+            });
         });
         assert_eq!(
             replies,
@@ -1960,24 +2083,31 @@ mod tests {
         // Both were sent, so both were refused: neither found the server refused already.
         assert_eq!(fake.completions().len(), 2);
         assert_eq!(runs(), 2);
+        assert_eq!(waits, [Some(key_command()), None]);
     }
 
     #[test]
     fn a_clone_of_a_refused_server_is_refused_too_and_changes_apart() {
         let fake = chatting(|_| Reply::status(401, ""));
         let (b, _) = backend(&fake.url, "api_key_env = \"HOME\"\n")
-            .ready()
+            .ready(&|_| {})
             .unwrap();
         let before = b.clone();
         assert_eq!(before, b);
-        b.call("P", TIMEOUT, None);
+        b.call("P", TIMEOUT, None, &|_| {});
         assert_ne!(before, b);
         let after = b.clone();
         assert_eq!(after, b);
-        assert_eq!(after.call("P", TIMEOUT, None).used, Used::Untracked);
+        assert_eq!(
+            after.call("P", TIMEOUT, None, &|_| {}).used,
+            Used::Untracked
+        );
         assert_eq!(fake.completions().len(), 1);
         // The clone made before the refusal still sends its key, and is refused for itself.
-        assert_eq!(before.call("P", TIMEOUT, None).used, Used::Unreported);
+        assert_eq!(
+            before.call("P", TIMEOUT, None, &|_| {}).used,
+            Used::Unreported
+        );
         assert_eq!(fake.completions().len(), 2);
         assert_eq!(before, b);
     }
@@ -2001,7 +2131,7 @@ mod tests {
             (503, "", "HTTP 503"),
         ] {
             let fake = FakeServer::start(move |_| Reply::status(status, body));
-            let a = backend(&fake.url, "").call("P", TIMEOUT, None);
+            let a = backend(&fake.url, "").call("P", TIMEOUT, None, &|_| {});
             assert_eq!(
                 (a.reply, a.used),
                 (Err(said.to_string()), Used::Unreported),
@@ -2037,7 +2167,7 @@ mod tests {
             ),
         ] {
             let fake = FakeServer::start(move |_| Reply::ok(body.clone()));
-            let a = backend(&fake.url, "").call("P", TIMEOUT, None);
+            let a = backend(&fake.url, "").call("P", TIMEOUT, None, &|_| {});
             assert_eq!((a.reply, a.used), (reply, used));
         }
     }
@@ -2053,8 +2183,8 @@ mod tests {
             _ => Reply::ok(cut.clone()),
         });
         let cut_off = |url: &str, extra: &str| {
-            let (b, _) = backend(url, extra).ready().unwrap();
-            let a = b.call("P", TIMEOUT, b.budget(2));
+            let (b, _) = backend(url, extra).ready(&|_| {}).unwrap();
+            let a = b.call("P", TIMEOUT, b.budget(2), &|_| {});
             assert_eq!(a.too_big, Some(TooBig::Reply), "{extra:?}");
             a.reply.unwrap_err()
         };
@@ -2106,7 +2236,7 @@ mod tests {
         );
         // Ollama's own API, with no entry to set another.
         let (_, ollama) = ollama_answering(Reply::ok(OLLAMA_CHAT_CUT), Some(4096));
-        let a = ollama.call("P", TIMEOUT, ollama.budget(2));
+        let a = ollama.call("P", TIMEOUT, ollama.budget(2), &|_| {});
         assert_eq!(
             (a.too_big, a.reply),
             (
@@ -2160,12 +2290,17 @@ mod tests {
             "/v1/chat/completions" => Reply::ok(reply.clone()),
             _ => Reply::status(404, ""),
         });
-        let (ready, _) = backend(&fake.url, "").ready().unwrap();
+        let (ready, _) = backend(&fake.url, "").ready(&|_| {}).unwrap();
         assert_eq!(
             ready.context(),
             Some(n_ctx.map_or(Context::Unknown, Context::Tokens))
         );
-        ready.call("P", TIMEOUT, jobs.and_then(|jobs| ready.budget(jobs)))
+        ready.call(
+            "P",
+            TIMEOUT,
+            jobs.and_then(|jobs| ready.budget(jobs)),
+            &|_| {},
+        )
     }
 
     #[test]
@@ -2250,7 +2385,7 @@ mod tests {
                 &format!(r#""prompt_tokens":{prompt_tokens}"#),
             );
             let fake = FakeServer::start(move |_| Reply::ok(body.clone()));
-            let a = backend(&fake.url, "").call("P", TIMEOUT, Some(budget));
+            let a = backend(&fake.url, "").call("P", TIMEOUT, Some(budget), &|_| {});
             assert_eq!((a.too_big, a.reply), (too_big, reply), "{prompt_tokens}");
         }
     }
@@ -2258,7 +2393,7 @@ mod tests {
     #[test]
     fn no_server_or_a_slow_one_fails_the_call() {
         let closed = closed_port_url();
-        let a = backend(&closed, "").call("P", TIMEOUT, None);
+        let a = backend(&closed, "").call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             (a.reply, a.used),
             (
@@ -2270,7 +2405,7 @@ mod tests {
         );
         let slow = FakeServer::start(|_| Reply::ok(OPENAI).after(Duration::from_secs(5)));
         let started = Instant::now();
-        let a = backend(&slow.url, "").call("P", Duration::from_secs(1), None);
+        let a = backend(&slow.url, "").call("P", Duration::from_secs(1), None, &|_| {});
         assert_eq!(
             (a.reply, a.used),
             (
@@ -2301,17 +2436,17 @@ mod tests {
     #[test]
     fn ready_asks_the_server_for_its_model_and_labels_the_backend_with_it() {
         let fake = FakeServer::start(|_| models_reply(&["gemma4"]));
-        let (b, warnings) = any(&fake.url).ready().unwrap();
+        let (b, warnings) = any(&fake.url).ready(&|_| {}).unwrap();
         assert_eq!((b.label.as_str(), warnings.len()), ("any@gemma4", 0));
         assert!(matches!(&b.via, Via::Server(s) if s.model.as_deref() == Some("gemma4")));
         assert_eq!(asked(&fake), ["GET /v1/models", "GET /api/ps"]);
         let named = FakeServer::start(|_| models_reply(&["x", "m"]));
         assert_eq!(
-            backend(&named.url, "").ready().map(|(b, _)| b.label),
+            backend(&named.url, "").ready(&|_| {}).map(|(b, _)| b.label),
             Ok("srv@m".into())
         );
         let shell = Backend::shell("x");
-        assert_eq!(shell.clone().ready(), Ok((shell, Vec::new())));
+        assert_eq!(shell.clone().ready(&|_| {}), Ok((shell, Vec::new())));
     }
 
     #[test]
@@ -2322,14 +2457,14 @@ mod tests {
         let reply = models_reply(&ids);
         let fake = FakeServer::start(move |_| reply.clone());
         assert_eq!(
-            backend(&fake.url, "").ready().unwrap_err(),
+            backend(&fake.url, "").ready(&|_| {}).unwrap_err(),
             format!(
                 "srv@m: {} does not serve \"m\"; it serves {listed}",
                 fake.url
             )
         );
         assert_eq!(
-            any(&fake.url).ready().unwrap_err(),
+            any(&fake.url).ready(&|_| {}).unwrap_err(),
             format!(
                 "any: {} serves {listed}: name one as the entry's model",
                 fake.url
@@ -2337,7 +2472,7 @@ mod tests {
         );
         let none = FakeServer::start(|_| models_reply(&[]));
         assert_eq!(
-            any(&none.url).ready().unwrap_err(),
+            any(&none.url).ready(&|_| {}).unwrap_err(),
             format!("any: {} serves no model", none.url)
         );
         let open = Settings::parse(
@@ -2348,13 +2483,13 @@ mod tests {
         assert!(
             Backend::from_label("srv@m3", &open)
                 .unwrap()
-                .ready()
+                .ready(&|_| {})
                 .is_ok()
         );
         assert_eq!(
             Backend::from_label("srv@a", &open)
                 .unwrap()
-                .ready()
+                .ready(&|_| {})
                 .unwrap_err(),
             format!(
                 "srv@a: {} does not serve \"a\"; it serves {listed}",
@@ -2367,17 +2502,17 @@ mod tests {
     fn ready_says_why_it_cannot_reach_or_read_the_server() {
         let closed = closed_port_url();
         assert_eq!(
-            backend(&closed, "").ready().unwrap_err(),
+            backend(&closed, "").ready(&|_| {}).unwrap_err(),
             format!("srv@m: nothing answering at {closed}: is the server running?")
         );
         let failing = FakeServer::start(|_| Reply::status(500, r#"{"error":{"message":"boom"}}"#));
         assert_eq!(
-            backend(&failing.url, "").ready().unwrap_err(),
+            backend(&failing.url, "").ready(&|_| {}).unwrap_err(),
             format!("srv@m: HTTP 500 from {}/models: boom", failing.url)
         );
         let odd = FakeServer::start(|_| Reply::ok("nope"));
         assert_eq!(
-            backend(&odd.url, "").ready().unwrap_err(),
+            backend(&odd.url, "").ready(&|_| {}).unwrap_err(),
             format!("srv@m: {}/models gave no list of models: nope", odd.url)
         );
         let unset = backend(
@@ -2385,7 +2520,7 @@ mod tests {
             "api_key_env = \"SUBCHECK_TEST_KEY_NEVER_SET\"\n",
         );
         assert_eq!(
-            unset.ready().unwrap_err(),
+            unset.ready(&|_| {}).unwrap_err(),
             "srv@m: api_key_env names SUBCHECK_TEST_KEY_NEVER_SET, which is unset or empty"
         );
         assert_eq!(
@@ -2405,7 +2540,7 @@ mod tests {
         });
         let b = backend(&fake.url, &format!("api_key_cmd = \"{cmd}\"\n"));
         assert_eq!(
-            b.clone().ready().unwrap_err(),
+            b.clone().ready(&|_| {}).unwrap_err(),
             format!(
                 "srv@m: HTTP 401 from {}/models: no such key <key>; check the entry's key",
                 fake.url
@@ -2415,7 +2550,7 @@ mod tests {
             fake.requests()[0].header("authorization"),
             Some("Bearer sk-8")
         );
-        b.ready().unwrap_err();
+        b.ready(&|_| {}).unwrap_err();
         assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 2);
     }
 
@@ -2427,13 +2562,16 @@ mod tests {
         let taking = chatting(|_| Reply::ok(OPENAI));
         std::fs::write(&key, "sk-old\n").unwrap();
         let (b, runs) = readied_by(&taking, dir.path(), &format!("cat '{}'", key.display()));
-        assert_eq!(b.call("P", TIMEOUT, None).reply.as_deref(), Ok("NONE\n"));
+        assert_eq!(
+            b.call("P", TIMEOUT, None, &|_| {}).reply.as_deref(),
+            Ok("NONE\n")
+        );
         std::fs::write(&key, "sk-new\n").unwrap();
         let strict = FakeServer::start(|r| match r.header("authorization") {
             Some("Bearer sk-new") => models_reply(&["m"]),
             _ => Reply::status(401, ""),
         });
-        moved(&b, &strict.url).ready().unwrap();
+        moved(&b, &strict.url).ready(&|_| {}).unwrap();
         let listed: Vec<_> = strict
             .requests()
             .into_iter()
@@ -2442,6 +2580,58 @@ mod tests {
             .collect();
         assert_eq!(listed, ["Bearer sk-old", "Bearer sk-new"]);
         assert_eq!(runs(), 2);
+    }
+
+    #[test]
+    fn a_401_at_models_names_the_key_command_then_the_check_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let taking = chatting(|_| Reply::ok(OPENAI));
+        std::fs::write(dir.path().join("key"), "sk-old\n").unwrap();
+        let (b, key, _) = keyed(&taking, dir.path());
+        std::fs::write(&key, "sk-new\n").unwrap();
+        let strict = FakeServer::start(|r| match r.header("authorization") {
+            Some("Bearer sk-new") => models_reply(&["m"]),
+            _ => Reply::status(401, ""),
+        });
+        let waits = heard(|waits| {
+            moved(&b, &strict.url).ready(waits).unwrap();
+        });
+        let check = Some(asking(&strict.url));
+        assert_eq!(waits, [check.clone(), Some(key_command()), check, None]);
+    }
+
+    #[test]
+    fn ready_names_its_key_command_then_its_check_and_ends_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = chatting(|_| Reply::ok(OPENAI));
+        let (entry, _) = entry_by(&fake.url, dir.path(), "echo sk-1");
+        let first = heard(|waits| {
+            entry.clone().ready(waits).unwrap();
+        });
+        assert_eq!(
+            first,
+            [Some(key_command()), None, Some(asking(&fake.url)), None]
+        );
+        // The key is kept, so no command runs.
+        let again = heard(|waits| {
+            entry.ready(waits).unwrap();
+        });
+        assert_eq!(again, [Some(asking(&fake.url)), None]);
+    }
+
+    #[test]
+    fn a_check_that_fails_still_ends_its_wait() {
+        let closed = closed_port_url();
+        let nothing = heard(|waits| {
+            backend(&closed, "").ready(waits).unwrap_err();
+        });
+        assert_eq!(nothing, [Some(asking(&closed)), None]);
+        let dir = tempfile::tempdir().unwrap();
+        let (entry, _) = entry_by(&closed, dir.path(), "exit 1");
+        let failing = heard(|waits| {
+            entry.ready(waits).unwrap_err();
+        });
+        assert_eq!(failing, [Some(key_command()), None]);
     }
 
     #[test]
@@ -2456,7 +2646,7 @@ mod tests {
         ] {
             let fake = FakeServer::start(move |_| Reply::status(status, body.clone()));
             let b = backend(&fake.url, &format!("api_key_cmd = \"echo {key}\"\n"));
-            let said = b.ready().unwrap_err();
+            let said = b.ready(&|_| {}).unwrap_err();
             assert!(
                 said.contains("Invalid token <key>") && !shows_part_of(&said, &key),
                 "{said}"
@@ -2473,7 +2663,7 @@ mod tests {
                 fake.url
             );
             let s = Settings::parse(Path::new("/c/config.toml"), &text).unwrap();
-            let ready = Backend::named("srv", &s).unwrap().ready();
+            let ready = Backend::named("srv", &s).unwrap().ready(&|_| {});
             assert_eq!(
                 ready.map(|(b, _)| b.label),
                 Ok("srv@my-secret-model".into()),
@@ -2535,14 +2725,14 @@ mod tests {
                 "/v1/models" => Reply::ok(models),
                 _ => Reply::status(404, ""),
             });
-            let (ready, _) = backend(&fake.url, "").ready().unwrap();
+            let (ready, _) = backend(&fake.url, "").ready(&|_| {}).unwrap();
             assert_eq!(ready.context(), Some(context), "{models}");
         }
         let zero = FakeServer::start(|r| match r.path.as_str() {
             "/v1/models" => Reply::ok(r#"{"data":[{"id":"m","context_length":0}]}"#),
             _ => ps_reply(&[("m", 2048)]),
         });
-        let (ready, _) = backend(&zero.url, "").ready().unwrap();
+        let (ready, _) = backend(&zero.url, "").ready(&|_| {}).unwrap();
         assert_eq!(
             ready.context(),
             Some(Context::Tokens(2048)),
@@ -2556,7 +2746,9 @@ mod tests {
     fn api_ps_is_asked_only_of_a_url_ending_in_v1() {
         let fake = FakeServer::start(|_| models_reply(&["m"]));
         let root = fake.url.strip_suffix("/v1").unwrap();
-        let (ready, _) = backend(&format!("{root}/openai"), "").ready().unwrap();
+        let (ready, _) = backend(&format!("{root}/openai"), "")
+            .ready(&|_| {})
+            .unwrap();
         assert_eq!(ready.context(), Some(Context::Unknown));
         assert_eq!(asked(&fake), ["GET /openai/models"]);
     }
@@ -2629,7 +2821,7 @@ mod tests {
         });
         let b = backend(&fake.url, &format!("api_key_cmd = \"{cmd}\"\n"));
         for _ in 0..2 {
-            let (ready, _) = b.clone().ready().unwrap();
+            let (ready, _) = b.clone().ready(&|_| {}).unwrap();
             assert_eq!(ready.context(), Some(Context::Unknown));
         }
         assert_eq!(
@@ -2652,16 +2844,15 @@ mod tests {
     #[test]
     fn sized_loads_a_model_ollama_has_not_loaded_then_reads_its_context() {
         let fake = FakeServer::ollama("gemma4:latest", 8192);
-        let (ready, _) = any(&fake.url).ready().unwrap();
+        let (ready, _) = any(&fake.url).ready(&|_| {}).unwrap();
         assert_eq!(ready.context(), Some(Context::NotLoaded));
         let root = fake.url.strip_suffix("/v1").unwrap();
-        assert_eq!(
-            ready.loading(),
-            Some(format!("loading gemma4:latest into Ollama at {root}"))
-        );
-        let sized = ready.sized().unwrap();
+        let mut sized = None;
+        let loading = heard(|waits| sized = Some(ready.sized(waits).unwrap()));
+        let line = format!("loading gemma4:latest into Ollama at {root}");
+        assert_eq!(loading, [Some(Wait::Loading(line)), None]);
+        let sized = sized.unwrap();
         assert_eq!(sized.context(), Some(Context::Tokens(8192)));
-        assert_eq!(sized.loading(), None);
         assert_eq!(
             asked(&fake),
             [
@@ -2676,10 +2867,12 @@ mod tests {
             serde_json::json!({"model": "gemma4:latest"})
         );
         let n = fake.requests().len();
-        sized.sized().unwrap();
-        Backend::shell("x").sized().unwrap();
+        let again = heard(|waits| {
+            sized.sized(waits).unwrap();
+        });
+        assert_eq!(again, []);
+        Backend::shell("x").sized(&|_| {}).unwrap();
         assert_eq!(fake.requests().len(), n, "nothing more to ask");
-        assert_eq!(Backend::shell("x").loading(), None);
     }
 
     #[test]
@@ -2689,8 +2882,11 @@ mod tests {
             "/api/ps" => ps_reply(&[]),
             _ => Reply::ok("{}"),
         });
-        let (ready, _) = any(&fake.url).ready().unwrap();
-        assert_eq!(ready.sized().unwrap().context(), Some(Context::Unknown));
+        let (ready, _) = any(&fake.url).ready(&|_| {}).unwrap();
+        assert_eq!(
+            ready.sized(&|_| {}).unwrap().context(),
+            Some(Context::Unknown)
+        );
     }
 
     #[test]
@@ -2704,10 +2900,16 @@ mod tests {
             ),
             _ => Reply::status(404, ""),
         });
+        let ready = any(&fake.url).ready(&|_| {}).unwrap().0;
+        let mut sized = None;
+        let loading = heard(|waits| sized = Some(ready.sized(waits)));
         assert_eq!(
-            any(&fake.url).ready().unwrap().0.sized().unwrap_err(),
+            sized.unwrap().unwrap_err(),
             "any@m: Ollama could not load m: HTTP 500: model requires more system memory (9.1 GiB) than is available (6.0 GiB)"
         );
+        let root = fake.url.strip_suffix("/v1").unwrap();
+        let line = format!("loading m into Ollama at {root}");
+        assert_eq!(loading, [Some(Wait::Loading(line)), None]);
         let echoing = FakeServer::start(|r| match r.path.as_str() {
             "/v1/models" => models_reply(&["m"]),
             "/api/ps" => ps_reply(&[]),
@@ -2715,7 +2917,7 @@ mod tests {
         });
         let b = backend(&echoing.url, "api_key_cmd = \"echo sk-5\"\n");
         assert_eq!(
-            b.ready().unwrap().0.sized().unwrap_err(),
+            b.ready(&|_| {}).unwrap().0.sized(&|_| {}).unwrap_err(),
             "srv@m: Ollama could not load m: HTTP 500: bad key <key>"
         );
     }
@@ -2733,7 +2935,12 @@ mod tests {
             ..any(&fake.url)
         };
         let began = Instant::now();
-        let why = backend.ready().unwrap().0.sized().unwrap_err();
+        let why = backend
+            .ready(&|_| {})
+            .unwrap()
+            .0
+            .sized(&|_| {})
+            .unwrap_err();
         assert!(why.ends_with("/api/generate timed out after 1s"), "{why}");
         assert!(began.elapsed() < Duration::from_secs(4));
     }
@@ -2781,9 +2988,9 @@ mod tests {
             (b.label.as_str(), b.chunk_lines, b.jobs),
             ("ollama:gemma4", None, JOBS)
         );
-        let (ready, warnings) = b.ready().unwrap();
+        let (ready, warnings) = b.ready(&|_| {}).unwrap();
         assert_eq!((ready.label.as_str(), warnings.len()), ("ollama:gemma4", 0));
-        let sized = ready.sized().unwrap();
+        let sized = ready.sized(&|_| {}).unwrap();
         assert_eq!(
             (sized.label.as_str(), sized.context()),
             ("ollama:gemma4", Some(Context::Tokens(4096)))
@@ -2796,7 +3003,7 @@ mod tests {
             ),
             (fitting_lines(4096), fitting_lines(4096))
         );
-        assert!(sized.call("P", TIMEOUT, None).reply.is_ok());
+        assert!(sized.call("P", TIMEOUT, None, &|_| {}).reply.is_ok());
         let chats = fake.chats();
         assert_eq!(chats.len(), 1, "{:?}", asked(&fake));
         assert_eq!(chats[0].json()["model"], "gemma4:latest");
@@ -2805,8 +3012,8 @@ mod tests {
     #[test]
     fn ollama_gives_each_call_the_whole_context() {
         let fake = FakeServer::ollama("gemma4:latest", 16384);
-        let (ready, _) = Backend::ollama("gemma4", &fake.url).ready().unwrap();
-        let sized = ready.sized().unwrap();
+        let (ready, _) = Backend::ollama("gemma4", &fake.url).ready(&|_| {}).unwrap();
+        let sized = ready.sized(&|_| {}).unwrap();
         for jobs in [1, 2, 4] {
             assert_eq!(
                 sized.budget(jobs),
@@ -2828,7 +3035,7 @@ mod tests {
                     _ => Reply::status(404, "{}"),
                 },
             );
-        let (ready, _) = Backend::ollama("gemma4", &fake.url).ready().unwrap();
+        let (ready, _) = Backend::ollama("gemma4", &fake.url).ready(&|_| {}).unwrap();
         (fake, ready)
     }
 
@@ -2837,7 +3044,7 @@ mod tests {
         let (fake, b) = ollama_answering(Reply::ok(OLLAMA_CHAT), None);
         let root = fake.url.strip_suffix("/v1").unwrap();
         assert_eq!(b.command_line(), [format!("{root}/api/chat")]);
-        let a = b.call("PROMPT", TIMEOUT, None);
+        let a = b.call("PROMPT", TIMEOUT, None, &|_| {});
         assert_eq!(
             (a.reply.as_deref(), a.too_big),
             (Ok("We should leave before it rains.\n"), None)
@@ -2868,9 +3075,10 @@ mod tests {
                 "truncate": false,
             })
         );
-        let cut = ollama_answering(Reply::ok(OLLAMA_CHAT_CUT), None)
-            .1
-            .call("P", TIMEOUT, None);
+        let cut =
+            ollama_answering(Reply::ok(OLLAMA_CHAT_CUT), None)
+                .1
+                .call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             (cut.too_big, cut.reply),
             (
@@ -2890,7 +3098,7 @@ mod tests {
         );
         let over = ollama_answering(Reply::status(400, OLLAMA_OVERFLOW), None)
             .1
-            .call("P", TIMEOUT, None);
+            .call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             (over.too_big, over.reply, over.used),
             (
@@ -2900,9 +3108,10 @@ mod tests {
             )
         );
         // A prompt that fills the context may have been cut, whatever `truncate` says.
-        let filled = ollama_answering(Reply::ok(OLLAMA_CHAT), Some(49))
-            .1
-            .call("P", TIMEOUT, None);
+        let filled =
+            ollama_answering(Reply::ok(OLLAMA_CHAT), Some(49))
+                .1
+                .call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             (filled.too_big, filled.reply),
             (
@@ -2919,8 +3128,8 @@ mod tests {
     fn ollama_caps_a_reply_in_its_own_words() {
         let (fake, b) = ollama_answering(Reply::ok(OLLAMA_CHAT), None);
         // A quarter of 1024 tokens.
-        b.call("P", TIMEOUT, Some(Budget::new(1024, None)));
-        b.call("P", TIMEOUT, None);
+        b.call("P", TIMEOUT, Some(Budget::new(1024, None)), &|_| {});
+        b.call("P", TIMEOUT, None, &|_| {});
         let options: Vec<Option<Value>> = fake
             .chats()
             .iter()
@@ -2961,7 +3170,7 @@ mod tests {
         ] {
             let a = ollama_answering(Reply::ok(body), None)
                 .1
-                .call("P", TIMEOUT, None);
+                .call("P", TIMEOUT, None, &|_| {});
             assert_eq!(
                 (a.reply, a.used, a.too_big),
                 (reply.map(String::from).map_err(String::from), used, None),
@@ -2974,7 +3183,9 @@ mod tests {
     fn a_model_ollama_lacks_says_to_pull_it() {
         let other = FakeServer::start(|_| models_reply(&["other:latest"]));
         assert_eq!(
-            Backend::ollama("gemma4", &other.url).ready().unwrap_err(),
+            Backend::ollama("gemma4", &other.url)
+                .ready(&|_| {})
+                .unwrap_err(),
             format!(
                 "ollama:gemma4: {} does not serve \"gemma4\"; it serves \"other:latest\"; \
                  ollama pull gemma4 fetches it",
@@ -2983,14 +3194,16 @@ mod tests {
         );
         let none = FakeServer::start(|_| models_reply(&[]));
         assert_eq!(
-            Backend::ollama("gemma4", &none.url).ready().unwrap_err(),
+            Backend::ollama("gemma4", &none.url)
+                .ready(&|_| {})
+                .unwrap_err(),
             format!(
                 "ollama:gemma4: {} serves no model; ollama pull gemma4 fetches it",
                 none.url
             )
         );
         let fake = FakeServer::start(|_| Reply::status(404, OLLAMA_UNKNOWN));
-        let a = Backend::ollama("no-such-model", &fake.url).call("P", TIMEOUT, None);
+        let a = Backend::ollama("no-such-model", &fake.url).call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             (a.reply, a.used),
             (
@@ -2999,7 +3212,7 @@ mod tests {
             )
         );
         // An entry's server is not told to pull: it need not be Ollama.
-        let entry = backend(&fake.url, "").call("P", TIMEOUT, None);
+        let entry = backend(&fake.url, "").call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             entry.reply,
             Err("HTTP 404: model 'no-such-model' not found".into())
@@ -3012,7 +3225,7 @@ mod tests {
             "/v1/models" => models_reply(&["gemma4:latest"]),
             _ => Reply::status(404, "{}"),
         });
-        let (b, _) = Backend::ollama("gemma4", &fake.url).ready().unwrap();
+        let (b, _) = Backend::ollama("gemma4", &fake.url).ready(&|_| {}).unwrap();
         assert_eq!(b.context(), Some(Context::Unknown));
         assert_eq!(
             b.size_warning(2).as_deref(),

@@ -19,8 +19,10 @@ use crate::text::{Line, timestamp};
 
 mod key;
 mod server;
+mod wait;
 pub(crate) use server::same_model;
 pub use server::{Context, Server};
+pub use wait::{HOLD, Wait, WaitLines, Waits};
 
 /// Stored with every scan and every LLM check, so findings can be traced to the prompt that
 /// produced them.
@@ -400,11 +402,14 @@ impl Backend {
     /// to do needs no server up; a recheck on its job's thread, so a server or a key command that
     /// hangs freezes neither the screen nor the window. It sends only `GET`s, so it never makes a
     /// server load a model; [`Backend::sized`] does.
-    pub fn ready(self) -> Result<(Backend, Vec<String>), String> {
+    ///
+    /// A server reports through `waits` its key command while it runs, then its check, each
+    /// ended on every path; a command, or an LLM that cannot be built again, reports nothing.
+    pub fn ready(self, waits: Waits<'_>) -> Result<(Backend, Vec<String>), String> {
         match self.via {
             Via::Server(server) => {
                 let (server, warnings) = server
-                    .ready()
+                    .ready(waits)
                     .map_err(|why| format!("{}: {why}", self.label))?;
                 let ready = Backend {
                     label: server.label(),
@@ -514,12 +519,13 @@ impl Backend {
     /// waiting up to [`Backend::timeout`]), then `/api/ps` is asked again: [`Context::Tokens`], else
     /// [`Context::Unknown`]. Anything else comes back as it is, asking nothing. A load takes the
     /// model's memory on the server, which is why [`Backend::ready`] never makes one. Every error
-    /// starts with the label.
-    pub fn sized(self) -> Result<Backend, String> {
+    /// starts with the label. A load is reported through `waits` until it and the second
+    /// `/api/ps` are over, or it has failed; nothing else is.
+    pub fn sized(self, waits: Waits<'_>) -> Result<Backend, String> {
         match self.via {
             Via::Server(server) => {
                 let server = server
-                    .sized(self.timeout)
+                    .sized(self.timeout, waits)
                     .map_err(|why| format!("{}: {why}", self.label))?;
                 Ok(Backend {
                     via: Via::Server(server),
@@ -527,15 +533,6 @@ impl Backend {
                 })
             }
             via => Ok(Backend { via, ..self }),
-        }
-    }
-
-    /// The line to show before [`Backend::sized`] has Ollama load a model, which can take a while
-    /// with nothing else said; `None` when sizing loads nothing.
-    pub fn loading(&self) -> Option<String> {
-        match &self.via {
-            Via::Server(server) => server.loading(),
-            _ => None,
         }
     }
 
@@ -552,11 +549,19 @@ impl Backend {
     /// One call: the prompt in, the reply out, read as the backend gives it. A server's call takes
     /// `budget` of its context when that is `Some` ([`Backend::budget`]): its reply is capped at
     /// [`Budget::cap`], and a prompt that came to 95% of [`Budget::share`] or more, and over
-    /// [`Budget::prompt`], is [`TooBig::Prompt`]. A command has neither.
-    pub fn call(&self, prompt: &str, timeout: Duration, budget: Option<Budget>) -> Answer {
+    /// [`Budget::prompt`], is [`TooBig::Prompt`]. A command has neither. A server reports
+    /// through `waits` a key command its 401 runs; a command, or an LLM that cannot be built
+    /// again, reports nothing.
+    pub fn call(
+        &self,
+        prompt: &str,
+        timeout: Duration,
+        budget: Option<Budget>,
+        waits: Waits<'_>,
+    ) -> Answer {
         match &self.via {
             Via::Command { argv, output } => call_command(argv, *output, prompt, timeout),
-            Via::Server(server) => server.call(prompt, timeout, budget),
+            Via::Server(server) => server.call(prompt, timeout, budget, waits),
             Via::Unknown(why) => Answer {
                 reply: Err(why.clone()),
                 used: Used::Untracked,
@@ -1695,7 +1700,7 @@ mod tests {
                 cost_usd: None,
             })
         );
-        let a = shell_as(Output::OpenAi, "cat").call(OPENAI, TIMEOUT, None);
+        let a = shell_as(Output::OpenAi, "cat").call(OPENAI, TIMEOUT, None, &|_| {});
         assert_eq!(a.reply.as_deref(), Ok("NONE\n"));
     }
 
@@ -1756,7 +1761,7 @@ mod tests {
         );
         let a = Output::OpenAi.read(&cut);
         assert_eq!((a.too_big, a.reply), cut_off);
-        let a = shell_as(Output::OpenAi, "cat").call(&cut, TIMEOUT, None);
+        let a = shell_as(Output::OpenAi, "cat").call(&cut, TIMEOUT, None, &|_| {});
         assert_eq!((a.too_big, a.reply), cut_off);
         let stopped = OPENAI.replace(
             r#""finish_reason":"stop""#,
@@ -1824,7 +1829,7 @@ mod tests {
             format!("echo '{stderr}' >&2; ")
         };
         let cmd = format!("cat '{}'; {say}exit 1", out.display());
-        shell_as(output, &cmd).call("", TIMEOUT, None)
+        shell_as(output, &cmd).call("", TIMEOUT, None, &|_| {})
     }
 
     #[test]
@@ -1923,7 +1928,7 @@ mod tests {
         );
         assert_eq!(reported(&a.used).map(|u| u.output_tokens), Some(5));
         // Text on stdout is never taken for a reason.
-        let a = Backend::shell("echo NONE; exit 1").call("", TIMEOUT, None);
+        let a = Backend::shell("echo NONE; exit 1").call("", TIMEOUT, None, &|_| {});
         assert_eq!(a.reply, Err("sh exited with exit status: 1".into()));
     }
 
@@ -1942,10 +1947,10 @@ mod tests {
 
     #[test]
     fn a_call_reads_its_reply_as_the_backend_prints_it() {
-        let a = shell_as(Output::Claude, "cat").call(CLAUDE, TIMEOUT, None);
+        let a = shell_as(Output::Claude, "cat").call(CLAUDE, TIMEOUT, None, &|_| {});
         assert_eq!(a.reply.as_deref(), Ok("NONE\n"));
         assert!(reported(&a.used).is_some());
-        let a = Backend::shell("exit 3").call("", TIMEOUT, None);
+        let a = Backend::shell("exit 3").call("", TIMEOUT, None, &|_| {});
         assert!(a.reply.unwrap_err().contains("exit status: 3"));
         assert_eq!(a.used, Used::Untracked);
     }
@@ -1954,7 +1959,7 @@ mod tests {
     fn an_llm_command_has_no_terminal_and_no_gpg_tty() {
         let tty = "if (: </dev/tty) 2>/dev/null; then echo tty; else echo none; fi";
         let (pid, session, a) = crate::test_support::a_commands_session(tty, |cmd| {
-            Backend::shell(cmd).call("", TIMEOUT, None)
+            Backend::shell(cmd).call("", TIMEOUT, None, &|_| {})
         });
         // Its own session, which a run with no terminal (CI) can tell apart.
         assert_eq!(session, Ok(pid));
@@ -1973,7 +1978,12 @@ mod tests {
     #[test]
     fn an_llm_command_that_reads_the_terminal_fails_at_once() {
         let began = Instant::now();
-        let a = Backend::shell("read x </dev/tty && cat").call("P", Duration::from_secs(30), None);
+        let a = Backend::shell("read x </dev/tty && cat").call(
+            "P",
+            Duration::from_secs(30),
+            None,
+            &|_| {},
+        );
         let why = a.reply.unwrap_err();
         assert!(why.starts_with("sh exited with"), "{why}");
         assert!(began.elapsed() < Duration::from_secs(10));
@@ -1983,7 +1993,7 @@ mod tests {
     fn every_call_a_json_backend_started_is_counted_with_numbers_or_without() {
         let claude = |cmd: &str| shell_as(Output::Claude, cmd);
         // Killed at the timeout.
-        let a = claude("sleep 5; echo late").call("", Duration::from_millis(200), None);
+        let a = claude("sleep 5; echo late").call("", Duration::from_millis(200), None, &|_| {});
         assert!(a.reply.unwrap_err().contains("timed out"));
         assert_eq!(a.used, Used::Unreported);
         // Not its JSON, exiting 0 or not; nothing on stdout; its JSON with no usage in it.
@@ -1994,7 +2004,7 @@ mod tests {
             r#"echo '{"type":"result","is_error":true,"result":"no"}'; exit 1"#,
         ] {
             assert_eq!(
-                claude(cmd).call("", TIMEOUT, None).used,
+                claude(cmd).call("", TIMEOUT, None, &|_| {}).used,
                 Used::Unreported,
                 "{cmd}"
             );
@@ -2003,7 +2013,10 @@ mod tests {
             Output::Codex,
             r#"echo '{"type":"thread.started","thread_id":"t"}'; exit 1"#,
         );
-        assert_eq!(codex.call("", TIMEOUT, None).used, Used::Unreported);
+        assert_eq!(
+            codex.call("", TIMEOUT, None, &|_| {}).used,
+            Used::Unreported
+        );
         // It never started: nothing to count.
         let gone = Backend {
             via: Via::Command {
@@ -2012,7 +2025,7 @@ mod tests {
             },
             ..claude("")
         };
-        let a = gone.call("", TIMEOUT, None);
+        let a = gone.call("", TIMEOUT, None, &|_| {});
         assert!(a.reply.unwrap_err().contains("cannot run"));
         assert_eq!(a.used, Used::Untracked);
         // A backend that never reports: nothing to count, whatever happened.
@@ -2021,7 +2034,7 @@ mod tests {
             ("exit 1", TIMEOUT),
         ] {
             assert_eq!(
-                Backend::shell(cmd).call("", timeout, None).used,
+                Backend::shell(cmd).call("", timeout, None, &|_| {}).used,
                 Used::Untracked,
                 "{cmd}"
             );
@@ -2389,11 +2402,35 @@ mod tests {
     }
 
     #[test]
+    fn a_command_reports_no_wait() {
+        let heard = Mutex::new(Vec::new());
+        let waits: Waits = &|wait| heard.lock().unwrap().push(wait);
+        let (b, _) = Backend::shell("cat").ready(waits).unwrap();
+        let b = b.sized(waits).unwrap();
+        b.call("P", TIMEOUT, None, waits);
+        assert_eq!(heard.into_inner().unwrap(), []);
+    }
+
+    #[test]
+    fn an_llm_that_cannot_be_built_again_reports_no_wait() {
+        let heard = Mutex::new(Vec::new());
+        let waits: Waits = &|wait| heard.lock().unwrap().push(wait);
+        let b = Backend {
+            via: Via::Unknown("gone, which …".into()),
+            ..Backend::shell("x")
+        };
+        let (b, _) = b.ready(waits).unwrap();
+        let b = b.sized(waits).unwrap();
+        b.call("P", TIMEOUT, None, waits);
+        assert_eq!(heard.into_inner().unwrap(), []);
+    }
+
+    #[test]
     fn a_command_takes_no_cap() {
         let b = shell_as(Output::OpenAi, "cat");
         assert_eq!(
-            b.call(OPENAI, TIMEOUT, Some(Budget::new(4, None))),
-            b.call(OPENAI, TIMEOUT, None)
+            b.call(OPENAI, TIMEOUT, Some(Budget::new(4, None)), &|_| {}),
+            b.call(OPENAI, TIMEOUT, None, &|_| {})
         );
     }
 
@@ -2404,7 +2441,7 @@ mod tests {
             ..Backend::shell("x")
         };
         assert_eq!(
-            b.call("P", TIMEOUT, None),
+            b.call("P", TIMEOUT, None, &|_| {}),
             Answer {
                 reply: Err("gone, which …".into()),
                 used: Used::Untracked,

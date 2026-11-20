@@ -79,7 +79,12 @@ impl Key {
 /// command runs again, since the 403 may have meant the key has run out. The key it prints, the
 /// same or another, is kept as one that has not worked: its next chat settles whether it works,
 /// and a 401 before then must not open a second passphrase window for a key just printed.
-pub(super) fn fetch(source: &KeySource) -> Result<Option<Key>, String> {
+///
+/// `running(true)` is called just before the command runs and `running(false)` once it returns,
+/// whether it printed a key or failed; neither is called when no command runs. It is called with
+/// the kept keys' lock held, so it must not call back into this module: it would wait on that lock
+/// forever.
+pub(super) fn fetch(source: &KeySource, running: &dyn Fn(bool)) -> Result<Option<Key>, String> {
     match source {
         KeySource::None => Ok(None),
         KeySource::Env(var) => from_env(var, std::env::var_os(var)).map(Some),
@@ -91,7 +96,7 @@ pub(super) fn fetch(source: &KeySource) -> Result<Option<Key>, String> {
             // Dropped before the command runs, so a failure leaves nothing kept, a key a 403
             // marked included, and the next `fetch` starts over.
             kept.remove(cmd);
-            let key = from_command(cmd)?;
+            let key = run_command(cmd, running)?;
             kept.insert(cmd.clone(), Kept::new(&key));
             Ok(Some(key))
         }
@@ -114,7 +119,14 @@ pub(super) fn worked(source: &KeySource, sent: &Key) {
 /// worked, and a key it prints is kept as one that has not, so the calls refused with one kept key
 /// have it fetched again at most once between them. A key a 403 marked ([`forbidden`]) is treated
 /// as any other: what a 403 said of it changes nothing of what a 401 says.
-pub(super) fn refetch(source: &KeySource, refused: &Key) -> Result<Option<Key>, String> {
+///
+/// `running` is called as for [`fetch`], and only when the command runs, with the kept keys' lock
+/// held: it must not call back into this module, or it would wait on that lock forever.
+pub(super) fn refetch(
+    source: &KeySource,
+    refused: &Key,
+    running: &dyn Fn(bool),
+) -> Result<Option<Key>, String> {
     let KeySource::Command(cmd) = source else {
         return Ok(None);
     };
@@ -132,7 +144,7 @@ pub(super) fn refetch(source: &KeySource, refused: &Key) -> Result<Option<Key>, 
     if !had_worked {
         return Ok(None);
     }
-    let key = from_command(cmd)?;
+    let key = run_command(cmd, running)?;
     if key == *refused {
         return Ok(None);
     }
@@ -165,6 +177,14 @@ fn from_env(var: &str, value: Option<OsString>) -> Result<Key, String> {
         Some(Err(_)) => Err(format!("api_key_env names {var}, which is not valid UTF-8")),
         _ => Err(format!("api_key_env names {var}, which is unset or empty")),
     }
+}
+
+/// Runs the command with `running` told before and after, so the end is reported on a failure too.
+fn run_command(cmd: &str, running: &dyn Fn(bool)) -> Result<Key, String> {
+    running(true);
+    let key = from_command(cmd);
+    running(false);
+    key
 }
 
 fn from_command(cmd: &str) -> Result<Key, String> {
@@ -200,6 +220,60 @@ mod tests {
 
     use super::*;
 
+    /// `running`'s calls, in order.
+    #[derive(Default)]
+    struct Said(Mutex<Vec<bool>>);
+
+    impl Said {
+        fn say(&self) -> impl Fn(bool) + '_ {
+            |on| self.0.lock().unwrap().push(on)
+        }
+        fn take(&self) -> Vec<bool> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    #[test]
+    fn fetch_says_when_its_command_runs_and_when_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = KeySource::Command(format!("echo sk-10 # {}", dir.path().display()));
+        let said = Said::default();
+        fetch(&cmd, &said.say()).unwrap();
+        assert_eq!(said.take(), [true, false]);
+        fetch(&cmd, &said.say()).unwrap();
+        assert_eq!(said.take(), Vec::<bool>::new());
+        fetch(&KeySource::Env("HOME".into()), &said.say()).unwrap();
+        fetch(&KeySource::None, &said.say()).unwrap();
+        assert_eq!(said.take(), Vec::<bool>::new());
+        let failing = KeySource::Command(format!("exit 3 # {}", dir.path().display()));
+        assert!(fetch(&failing, &said.say()).is_err());
+        assert_eq!(said.take(), [true, false]);
+    }
+
+    #[test]
+    fn refetch_says_when_its_command_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (never, key, _) = printing(&dir.path().join("a"));
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(&key, "sk-11\n").unwrap();
+        let said = Said::default();
+        let k = fetch(&never, &|_| {}).unwrap().unwrap();
+        assert_eq!(refetch(&never, &k, &said.say()), Ok(None));
+        assert_eq!(said.take(), Vec::<bool>::new());
+
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        let (ran, key, _) = printing(&dir.path().join("b"));
+        std::fs::write(&key, "sk-12\n").unwrap();
+        let k1 = fetch(&ran, &|_| {}).unwrap().unwrap();
+        worked(&ran, &k1);
+        std::fs::write(&key, "sk-13\n").unwrap();
+        assert!(refetch(&ran, &k1, &said.say()).unwrap().is_some());
+        assert_eq!(said.take(), [true, false]);
+        // Another call's key is already fetched, so no command runs.
+        assert!(refetch(&ran, &k1, &said.say()).unwrap().is_some());
+        assert_eq!(said.take(), Vec::<bool>::new());
+    }
+
     #[test]
     fn a_key_from_a_variable_is_its_value_read_each_time() {
         assert_eq!(from_env("K", Some("sk-1".into())), Ok(Key("sk-1".into())));
@@ -223,8 +297,11 @@ mod tests {
             );
         }
         let home = std::env::var("HOME").unwrap();
-        assert_eq!(fetch(&KeySource::Env("HOME".into())), Ok(Some(Key(home))));
-        assert_eq!(fetch(&KeySource::None), Ok(None));
+        assert_eq!(
+            fetch(&KeySource::Env("HOME".into()), &|_| {}),
+            Ok(Some(Key(home)))
+        );
+        assert_eq!(fetch(&KeySource::None, &|_| {}), Ok(None));
     }
 
     #[test]
@@ -233,15 +310,15 @@ mod tests {
         let count = dir.path().join("count");
         let cmd = KeySource::Command(format!("echo x >> '{}'; printf ' sk-2\n'", count.display()));
         let runs = || std::fs::read_to_string(&count).unwrap().lines().count();
-        assert_eq!(fetch(&cmd), Ok(Some(Key("sk-2".into()))));
-        assert_eq!(fetch(&cmd), Ok(Some(Key("sk-2".into()))));
+        assert_eq!(fetch(&cmd, &|_| {}), Ok(Some(Key("sk-2".into()))));
+        assert_eq!(fetch(&cmd, &|_| {}), Ok(Some(Key("sk-2".into()))));
         assert_eq!(runs(), 1);
         // A refused key fetched before the kept one leaves it kept.
         forbidden(&cmd, &Key("sk-1".into()));
-        fetch(&cmd).unwrap();
+        fetch(&cmd, &|_| {}).unwrap();
         assert_eq!(runs(), 1);
         forbidden(&cmd, &Key("sk-2".into()));
-        fetch(&cmd).unwrap();
+        fetch(&cmd, &|_| {}).unwrap();
         assert_eq!(runs(), 2);
     }
 
@@ -250,17 +327,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cmd, key, runs) = printing(dir.path());
         std::fs::write(&key, "sk-1\n").unwrap();
-        let k1 = fetch(&cmd).unwrap().unwrap();
+        let k1 = fetch(&cmd, &|_| {}).unwrap().unwrap();
         worked(&cmd, &k1);
         forbidden(&cmd, &k1);
         // It is still known to have worked, so a 401 runs the command, once.
         std::fs::write(&key, "sk-2\n").unwrap();
         let k2 = Key("sk-2".into());
-        assert_eq!(refetch(&cmd, &k1), Ok(Some(k2.clone())));
-        assert_eq!(refetch(&cmd, &k1), Ok(Some(k2.clone())));
+        assert_eq!(refetch(&cmd, &k1, &|_| {}), Ok(Some(k2.clone())));
+        assert_eq!(refetch(&cmd, &k1, &|_| {}), Ok(Some(k2.clone())));
         assert_eq!(runs(), 2);
         // The key kept anew carries no 403's mark, so the next fetch gives it.
-        assert_eq!(fetch(&cmd), Ok(Some(k2)));
+        assert_eq!(fetch(&cmd, &|_| {}), Ok(Some(k2)));
         assert_eq!(runs(), 2);
     }
 
@@ -269,17 +346,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cmd, key, runs) = printing(dir.path());
         std::fs::write(&key, "sk-1\n").unwrap();
-        let k1 = fetch(&cmd).unwrap().unwrap();
+        let k1 = fetch(&cmd, &|_| {}).unwrap().unwrap();
         worked(&cmd, &k1);
         forbidden(&cmd, &k1);
         std::fs::write(&key, "sk-2\n").unwrap();
         let k2 = Key("sk-2".into());
-        assert_eq!(fetch(&cmd), Ok(Some(k2.clone())));
+        assert_eq!(fetch(&cmd, &|_| {}), Ok(Some(k2.clone())));
         assert_eq!(runs(), 2);
-        assert_eq!(fetch(&cmd), Ok(Some(k2.clone())));
+        assert_eq!(fetch(&cmd, &|_| {}), Ok(Some(k2.clone())));
         assert_eq!(runs(), 2);
         // The new key has not worked: the old one's acceptance says nothing of it.
-        assert_eq!(refetch(&cmd, &k2), Ok(None));
+        assert_eq!(refetch(&cmd, &k2, &|_| {}), Ok(None));
         assert_eq!(runs(), 2);
     }
 
@@ -288,9 +365,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cmd, key, runs) = printing(dir.path());
         std::fs::write(&key, "sk-1\n").unwrap();
-        let k1 = fetch(&cmd).unwrap().unwrap();
+        let k1 = fetch(&cmd, &|_| {}).unwrap().unwrap();
         forbidden(&cmd, &k1);
-        assert_eq!(refetch(&cmd, &k1), Ok(None));
+        assert_eq!(refetch(&cmd, &k1, &|_| {}), Ok(None));
         assert_eq!(runs(), 1);
     }
 
@@ -299,12 +376,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cmd, key, runs) = printing(dir.path());
         std::fs::write(&key, "sk-1\n").unwrap();
-        let k1 = fetch(&cmd).unwrap().unwrap();
+        let k1 = fetch(&cmd, &|_| {}).unwrap().unwrap();
         // As a scan's first answer can be: one chunk refused before any chat is answered.
         forbidden(&cmd, &k1);
         worked(&cmd, &k1);
         std::fs::write(&key, "sk-2\n").unwrap();
-        assert_eq!(refetch(&cmd, &k1), Ok(Some(Key("sk-2".into()))));
+        assert_eq!(refetch(&cmd, &k1, &|_| {}), Ok(Some(Key("sk-2".into()))));
         assert_eq!(runs(), 2);
     }
 
@@ -313,15 +390,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cmd, key, runs) = printing(dir.path());
         std::fs::write(&key, "sk-1\n").unwrap();
-        let k1 = fetch(&cmd).unwrap().unwrap();
+        let k1 = fetch(&cmd, &|_| {}).unwrap().unwrap();
         worked(&cmd, &k1);
         forbidden(&cmd, &k1);
-        assert_eq!(fetch(&cmd), Ok(Some(k1.clone())));
+        assert_eq!(fetch(&cmd, &|_| {}), Ok(Some(k1.clone())));
         assert_eq!(runs(), 2);
-        assert_eq!(fetch(&cmd), Ok(Some(k1.clone())));
+        assert_eq!(fetch(&cmd, &|_| {}), Ok(Some(k1.clone())));
         assert_eq!(runs(), 2);
         // A 401 for the key just printed runs the command no third time.
-        assert_eq!(refetch(&cmd, &k1), Ok(None));
+        assert_eq!(refetch(&cmd, &k1, &|_| {}), Ok(None));
         assert_eq!(runs(), 2);
     }
 
@@ -336,13 +413,13 @@ mod tests {
         ));
         let runs = || std::fs::read_to_string(&count).unwrap().lines().count();
         let locked = Err("api_key_cmd failed: sh exited with exit status: 2: locked".to_string());
-        let k = fetch(&cmd).unwrap().unwrap();
+        let k = fetch(&cmd, &|_| {}).unwrap().unwrap();
         worked(&cmd, &k);
         forbidden(&cmd, &k);
-        assert_eq!(fetch(&cmd), locked);
+        assert_eq!(fetch(&cmd, &|_| {}), locked);
         assert_eq!(runs(), 2);
         // The old key is not kept behind the failure.
-        assert_eq!(fetch(&cmd), locked);
+        assert_eq!(fetch(&cmd, &|_| {}), locked);
         assert_eq!(runs(), 3);
     }
 
@@ -355,7 +432,10 @@ mod tests {
             count.display()
         ));
         let fetched: Vec<_> = thread::scope(|s| {
-            let both = [s.spawn(|| fetch(&cmd)), s.spawn(|| fetch(&cmd))];
+            let both = [
+                s.spawn(|| fetch(&cmd, &|_| {})),
+                s.spawn(|| fetch(&cmd, &|_| {})),
+            ];
             both.map(|t| t.join().unwrap()).into()
         });
         assert_eq!(fetched, vec![Ok(Some(Key("sk-6".into()))); 2]);
@@ -375,16 +455,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cmd, key, runs) = printing(dir.path());
         std::fs::write(&key, "sk-1\n").unwrap();
-        let k1 = fetch(&cmd).unwrap().unwrap();
+        let k1 = fetch(&cmd, &|_| {}).unwrap().unwrap();
         assert_eq!(k1, Key("sk-1".into()));
         worked(&cmd, &k1);
         std::fs::write(&key, "sk-2\n").unwrap();
-        assert_eq!(refetch(&cmd, &k1), Ok(Some(Key("sk-2".into()))));
+        assert_eq!(refetch(&cmd, &k1, &|_| {}), Ok(Some(Key("sk-2".into()))));
         assert_eq!(runs(), 2);
         // A second call refused with the same key finds the one fetched since.
-        assert_eq!(refetch(&cmd, &k1), Ok(Some(Key("sk-2".into()))));
+        assert_eq!(refetch(&cmd, &k1, &|_| {}), Ok(Some(Key("sk-2".into()))));
         assert_eq!(runs(), 2);
-        assert_eq!(fetch(&cmd), Ok(Some(Key("sk-2".into()))));
+        assert_eq!(fetch(&cmd, &|_| {}), Ok(Some(Key("sk-2".into()))));
         assert_eq!(runs(), 2);
     }
 
@@ -393,16 +473,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cmd, key, runs) = printing(dir.path());
         std::fs::write(&key, "sk-1\n").unwrap();
-        let k = fetch(&cmd).unwrap().unwrap();
-        assert_eq!(refetch(&cmd, &k), Ok(None));
+        let k = fetch(&cmd, &|_| {}).unwrap().unwrap();
+        assert_eq!(refetch(&cmd, &k, &|_| {}), Ok(None));
         assert_eq!(runs(), 1);
-        assert_eq!(fetch(&cmd), Ok(Some(k.clone())));
+        assert_eq!(fetch(&cmd, &|_| {}), Ok(Some(k.clone())));
         assert_eq!(runs(), 2);
         // Another key working says nothing of the kept one.
         worked(&cmd, &Key("other".into()));
-        assert_eq!(refetch(&cmd, &k), Ok(None));
+        assert_eq!(refetch(&cmd, &k, &|_| {}), Ok(None));
         assert_eq!(runs(), 2);
-        assert_eq!(fetch(&cmd), Ok(Some(k)));
+        assert_eq!(fetch(&cmd, &|_| {}), Ok(Some(k)));
         assert_eq!(runs(), 3);
     }
 
@@ -411,13 +491,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cmd, key, runs) = printing(dir.path());
         std::fs::write(&key, "sk-1\n").unwrap();
-        let k = fetch(&cmd).unwrap().unwrap();
+        let k = fetch(&cmd, &|_| {}).unwrap().unwrap();
         worked(&cmd, &k);
-        assert_eq!(refetch(&cmd, &k), Ok(None));
+        assert_eq!(refetch(&cmd, &k, &|_| {}), Ok(None));
         assert_eq!(runs(), 2);
-        assert_eq!(refetch(&cmd, &k), Ok(None));
+        assert_eq!(refetch(&cmd, &k, &|_| {}), Ok(None));
         assert_eq!(runs(), 2);
-        assert_eq!(fetch(&cmd), Ok(Some(k)));
+        assert_eq!(fetch(&cmd, &|_| {}), Ok(Some(k)));
         assert_eq!(runs(), 3);
     }
 
@@ -426,13 +506,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cmd, key, runs) = printing(dir.path());
         std::fs::write(&key, "sk-1\n").unwrap();
-        let k1 = fetch(&cmd).unwrap().unwrap();
+        let k1 = fetch(&cmd, &|_| {}).unwrap().unwrap();
         worked(&cmd, &k1);
         std::fs::write(&key, "sk-2\n").unwrap();
-        let k2 = refetch(&cmd, &k1).unwrap().unwrap();
+        let k2 = refetch(&cmd, &k1, &|_| {}).unwrap().unwrap();
         assert_eq!(k2, Key("sk-2".into()));
         assert_eq!(runs(), 2);
-        assert_eq!(refetch(&cmd, &k2), Ok(None));
+        assert_eq!(refetch(&cmd, &k2, &|_| {}), Ok(None));
         assert_eq!(runs(), 2);
     }
 
@@ -447,11 +527,11 @@ mod tests {
         ));
         let runs = || std::fs::read_to_string(&count).unwrap().lines().count();
         let locked = Err("api_key_cmd failed: sh exited with exit status: 2: locked".to_string());
-        let k = fetch(&cmd).unwrap().unwrap();
+        let k = fetch(&cmd, &|_| {}).unwrap().unwrap();
         worked(&cmd, &k);
-        assert_eq!(refetch(&cmd, &k), locked);
+        assert_eq!(refetch(&cmd, &k, &|_| {}), locked);
         assert_eq!(runs(), 2);
-        assert_eq!(fetch(&cmd), locked);
+        assert_eq!(fetch(&cmd, &|_| {}), locked);
         assert_eq!(runs(), 3);
     }
 
@@ -460,7 +540,7 @@ mod tests {
         let k = Key("sk-1".into());
         for source in [KeySource::Env("HOME".into()), KeySource::None] {
             worked(&source, &k);
-            assert_eq!(refetch(&source, &k), Ok(None), "{source:?}");
+            assert_eq!(refetch(&source, &k, &|_| {}), Ok(None), "{source:?}");
         }
     }
 
@@ -472,13 +552,21 @@ mod tests {
             "echo x >> '{}'; sleep 0.3; echo sk-9",
             count.display()
         ));
-        let k = fetch(&cmd).unwrap().unwrap();
+        let k = fetch(&cmd, &|_| {}).unwrap().unwrap();
         worked(&cmd, &k);
+        let said = Said::default();
         let refetched: Vec<_> = thread::scope(|s| {
-            let both = [s.spawn(|| refetch(&cmd, &k)), s.spawn(|| refetch(&cmd, &k))];
+            let both = [
+                s.spawn(|| refetch(&cmd, &k, &said.say())),
+                s.spawn(|| refetch(&cmd, &k, &said.say())),
+            ];
             both.map(|t| t.join().unwrap()).into()
         });
         assert_eq!(refetched, vec![Ok(None); 2]);
+        // The second finds nothing kept, so only one thread ran the command and said so.
+        let mut calls = said.take();
+        calls.sort_unstable();
+        assert_eq!(calls, [false, true]);
         assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 2);
     }
 
@@ -492,13 +580,16 @@ mod tests {
             "echo x >> '{0}'; sleep 0.3; echo sk-$(($(wc -l < '{0}')))",
             count.display()
         ));
-        let k = fetch(&cmd).unwrap().unwrap();
+        let k = fetch(&cmd, &|_| {}).unwrap().unwrap();
         assert_eq!(k, Key("sk-1".into()));
         worked(&cmd, &k);
         // The second waits for the lock through the first's run, and so finds its key; let go
         // while the command ran, the lock would show it nothing kept.
         let refetched: Vec<_> = thread::scope(|s| {
-            let both = [s.spawn(|| refetch(&cmd, &k)), s.spawn(|| refetch(&cmd, &k))];
+            let both = [
+                s.spawn(|| refetch(&cmd, &k, &|_| {})),
+                s.spawn(|| refetch(&cmd, &k, &|_| {})),
+            ];
             both.map(|t| t.join().unwrap()).into()
         });
         assert_eq!(refetched, vec![Ok(Some(Key("sk-2".into()))); 2]);
@@ -510,21 +601,25 @@ mod tests {
         let failed =
             KeySource::Command("echo sk-partial; echo 'gpg: decryption failed' >&2; exit 2".into());
         assert_eq!(
-            fetch(&failed),
+            fetch(&failed, &|_| {}),
             Err("api_key_cmd failed: sh exited with exit status: 2: gpg: decryption failed".into())
         );
         assert_eq!(
-            fetch(&KeySource::Command("true".into())),
+            fetch(&KeySource::Command("true".into()), &|_| {}),
             Err("api_key_cmd printed no key".into())
         );
-        let many = fetch(&KeySource::Command("printf 'sk-3\\nuser: me\\n'".into())).unwrap_err();
+        let many = fetch(
+            &KeySource::Command("printf 'sk-3\\nuser: me\\n'".into()),
+            &|_| {},
+        )
+        .unwrap_err();
         assert_eq!(
             many,
             "api_key_cmd printed more than one line: make it print the key alone"
         );
         for control in ["printf 'sk\\t-7'", "printf '\\033[1msk-7\\033[0m'"] {
             assert_eq!(
-                fetch(&KeySource::Command(control.into())),
+                fetch(&KeySource::Command(control.into()), &|_| {}),
                 Err("api_key_cmd printed a key holding a control character".into()),
                 "{control}"
             );
@@ -536,7 +631,7 @@ mod tests {
         // As written, quoted, and with a `$` that sh expands: each names a program sh cannot find.
         for pasted in ["sk-or-v1-0a1b", "'sk-or-v1-0a1b'", "sk-or-v1-0a$1b"] {
             assert_eq!(
-                fetch(&KeySource::Command(pasted.into())),
+                fetch(&KeySource::Command(pasted.into()), &|_| {}),
                 Err(
                     "api_key_cmd failed: a program it runs was not found (exit status 127); \
                      api_key_cmd is a command that prints the key, not the key"
@@ -549,9 +644,10 @@ mod tests {
 
     #[test]
     fn a_key_command_reads_an_empty_pipe_not_the_terminal() {
-        let k = fetch(&KeySource::Command(
-            "if [ -t 0 ]; then echo tty; else cat; echo sk-4; fi".into(),
-        ));
+        let k = fetch(
+            &KeySource::Command("if [ -t 0 ]; then echo tty; else cat; echo sk-4; fi".into()),
+            &|_| {},
+        );
         assert_eq!(k, Ok(Some(Key("sk-4".into()))));
     }
 
@@ -560,7 +656,7 @@ mod tests {
         // In subcheck's session the terminal opens, and a read of it stops the command.
         let tty = "if (: </dev/tty) 2>/dev/null; then echo tty; else echo sk-8; fi";
         let (pid, session, k) = crate::test_support::a_commands_session(tty, |cmd| {
-            fetch(&KeySource::Command(cmd.into()))
+            fetch(&KeySource::Command(cmd.into()), &|_| {})
         });
         // Its own session, which a run with no terminal (CI) can tell apart.
         assert_eq!(session, Ok(pid));

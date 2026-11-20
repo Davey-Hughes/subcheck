@@ -7,6 +7,8 @@ use subcheck_core::test_support as common;
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use common::{fitting_lines, fixture};
 use subcheck_core::list::shell_quote;
@@ -1837,6 +1839,91 @@ fn a_scan_says_so_while_ollama_loads_its_model() {
     let out = env.scan_preset("ollama:gemma4", &["--force", &file], &host);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(!stderr(&out).contains("into Ollama"), "{}", stderr(&out));
+}
+
+/// How many times stderr holds `line` and its line end.
+fn times_said(out: &Output, line: &str) -> usize {
+    stderr(out).matches(&format!("{line}\n")).count()
+}
+
+#[test]
+fn a_key_command_that_takes_a_while_is_named_on_stderr() {
+    let env = Env::new();
+    let fake = common::FakeServer::llm(&["m"]);
+    let cmd = "sleep 3; echo sk-x";
+    server_entry(&env, &fake.url, &format!("api_key_cmd = \"{cmd}\"\n"));
+    let out = env.scan_preset("srv", &[&env.typos()], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        times_said(&out, "srv: waiting for its key command"),
+        1,
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_server_slow_to_say_what_it_serves_is_named_on_stderr() {
+    let env = Env::new();
+    let fake = common::FakeServer::llm_slow(&["m"], Duration::from_secs(3));
+    server_entry(&env, &fake.url, "");
+    let out = env.scan_preset("srv", &[&env.typos()], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let asking = format!("srv: asking {} what it serves", fake.url);
+    assert_eq!(times_said(&out, &asking), 1, "{}", stderr(&out));
+}
+
+#[test]
+fn waits_that_end_within_a_second_say_nothing() {
+    let env = Env::new();
+    // The chat answered 3 s late keeps the scan going three holds past both waits' end, so a line
+    // still held for either would be on stderr by the time the scan ends.
+    let fake = common::FakeServer::start(|r| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", "/v1/models") => common::models_reply(&["m"]),
+        ("POST", "/v1/chat/completions") => common::answered(r).after(Duration::from_secs(3)),
+        _ => common::Reply::status(404, "{}"),
+    });
+    let cmd = "echo sk-x";
+    server_entry(&env, &fake.url, &format!("api_key_cmd = \"{cmd}\"\n"));
+    let out = env.scan_preset("srv", &[&env.typos()], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    for wait in ["waiting for its key command", "what it serves"] {
+        assert!(!stderr(&out).contains(wait), "{}", stderr(&out));
+    }
+}
+
+#[test]
+fn a_key_fetched_again_mid_scan_is_named_on_stderr() {
+    let env = Env::new();
+    // The first run leaves the marker, so each run after it takes a while and prints the second
+    // key.
+    let ran = env.state.path().join("ran");
+    let cmd = format!(
+        "if test -e '{0}'; then sleep 3; echo sk-2; else touch '{0}'; echo sk-1; fi",
+        ran.display()
+    );
+    let first = AtomicBool::new(true);
+    let fake = common::FakeServer::start(move |r| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", "/v1/models") => common::models_reply(&["m"]),
+        ("POST", "/v1/chat/completions") => match r.header("authorization") {
+            // An answer marks sk-1 as a key that has worked, which a 401 must find for the key
+            // command to run again.
+            Some("Bearer sk-1") if first.swap(false, Ordering::SeqCst) => common::answered(r),
+            Some("Bearer sk-2") => common::answered(r),
+            _ => common::Reply::status(401, ""),
+        },
+        _ => common::Reply::status(404, "{}"),
+    });
+    server_entry(&env, &fake.url, &format!("api_key_cmd = \"{cmd}\"\n"));
+    let args = ["--chunk-lines", "1", "-j", "1", &env.typos()];
+    let out = env.scan_preset("srv", &args, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        times_said(&out, "srv: waiting for its key command"),
+        1,
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]

@@ -17,7 +17,7 @@ use jiff::Timestamp;
 
 use crate::blocks::{self, ReadPath};
 use crate::list::shell_quote;
-use crate::llm::{self, Answer, Backend, Spent, Suggestion, TooBig, Usage, Used, Via};
+use crate::llm::{self, Answer, Backend, Spent, Suggestion, TooBig, Usage, Used, Via, Waits};
 use crate::mkv::{self, Layout, TRACK_TYPE_SUBTITLE, Track, Truncated};
 use crate::settings::Settings;
 use crate::store::{
@@ -110,6 +110,11 @@ pub enum Event {
         findings: usize,
         lines: Vec<String>,
     },
+    /// A wait on the LLM began (`Some`) or the one under way ended (`None`). In a scan, the key
+    /// command a 401 runs again, which every call waits on, said from a worker's thread; a recheck
+    /// also sends its start-up waits (the key command, the server check, a model's load) through
+    /// this event before the scan's first step.
+    Waiting(Option<llm::Wait>),
 }
 
 /// What [`plan`] found.
@@ -596,15 +601,18 @@ enum Msg {
 /// ([`llm::Budget::cap`]); a reply cut off there, or at the server's own length limit
 /// ([`TooBig::Reply`]), halves its chunk once only: a model that loops until the limit is cut off
 /// at any size, and halving it down to single lines would cost about two calls a line. A half that
-/// fails fails its chunk, and the other half is not sent.
+/// fails fails its chunk, and the other half is not sent. Each call reports what it waits on
+/// through `waits`.
 fn ask(
     backend: &Backend,
     lines: &[Line],
     budget: Option<llm::Budget>,
+    waits: Waits<'_>,
 ) -> (Result<Vec<Suggestion>, String>, Vec<Call>) {
     let mut asker = Asker {
         backend,
         budget,
+        waits,
         calls: Vec::new(),
     };
     let result = asker.part(lines, true);
@@ -618,6 +626,8 @@ type Call = (usize, Option<Usage>);
 struct Asker<'a> {
     backend: &'a Backend,
     budget: Option<llm::Budget>,
+    /// Where each call reports what it waits on.
+    waits: Waits<'a>,
     /// Each call made so far, in the order they went.
     calls: Vec<Call>,
 }
@@ -637,7 +647,7 @@ impl Asker<'_> {
                 too_big,
             } = self
                 .backend
-                .call(&prompt, self.backend.timeout, self.budget);
+                .call(&prompt, self.backend.timeout, self.budget, self.waits);
             match used {
                 Used::Reported(usage) => self.calls.push((lines.len(), Some(usage))),
                 Used::Unreported => self.calls.push((lines.len(), None)),
@@ -687,19 +697,21 @@ impl Asker<'_> {
 }
 
 /// A worker: runs chunks through the LLM until the queue closes or the collector hangs up. Each
-/// call may take `budget` of the server's context ([`ask`]).
+/// call may take `budget` of the server's context ([`ask`]); what it waits on goes to `report`.
 fn work(
     backend: &Backend,
     budget: Option<llm::Budget>,
     queue: &Mutex<mpsc::Receiver<Queued>>,
     out: &mpsc::Sender<Msg>,
+    report: &(dyn Fn(Event) + Sync),
 ) {
+    let waits = |wait| report(Event::Waiting(wait));
     loop {
         let next = queue.lock().map(|rx| rx.recv());
         let Ok(Ok(Queued { chunk, file })) = next else {
             return;
         };
-        let (result, made) = ask(backend, &chunk.lines, budget);
+        let (result, made) = ask(backend, &chunk.lines, budget, &waits);
         let calls = made
             .into_iter()
             .map(|(lines, usage)| LlmCall {
@@ -914,7 +926,7 @@ pub fn plan(
 
 /// Run `plan`: one reader thread, `-j` workers, and the collector on this thread, which saves
 /// each file the moment its lines are all answered. `report` hears each step (see [`Event`]),
-/// from the reader's thread and this one.
+/// from the reader's thread, the workers' and this one.
 pub fn execute(
     plan: Plan,
     opts: &Options,
@@ -948,7 +960,7 @@ pub fn execute(
         for _ in 0..opts.jobs.max(1) {
             let queue_rx = Arc::clone(&queue_rx);
             let msg_tx = msg_tx.clone();
-            scope.spawn(move || work(&opts.backend, budget, &queue_rx, &msg_tx));
+            scope.spawn(move || work(&opts.backend, budget, &queue_rx, &msg_tx, report));
         }
         let todo = &todo;
         scope.spawn(move || read(todo, opts, &queue_tx, &msg_tx, report));
@@ -1467,7 +1479,7 @@ mod tests {
             &format!("[llm.srv]\nurl = \"{}\"\nmodel = \"gemma4\"\n", fake.url),
         )
         .unwrap();
-        let (b, _) = Backend::named("srv", &s).unwrap().ready().unwrap();
+        let (b, _) = Backend::named("srv", &s).unwrap().ready(&|_| {}).unwrap();
         assert_eq!(b.label, "srv@gemma4:latest");
         assert_eq!(
             Backend::from_label("srv@gemma4:latest", &s).map(|b| b.label),
@@ -1504,7 +1516,7 @@ mod tests {
     fn through(server: &FakeServer, extra: &str, jobs: usize, flag: Option<usize>) -> Options {
         let text = format!("[llm.srv]\nurl = \"{}\"\n{extra}", server.url);
         let s = Settings::parse(Path::new("/c/config.toml"), &text).unwrap();
-        let (backend, _) = Backend::named("srv", &s).unwrap().ready().unwrap();
+        let (backend, _) = Backend::named("srv", &s).unwrap().ready(&|_| {}).unwrap();
         with(backend, jobs, flag)
     }
 
@@ -1801,7 +1813,12 @@ mod tests {
         let lines = prepare(&fixture("typos.mkv"), &opts.langs, &[Check::Llm]).lines;
         let (_, queued) = Chunker::new(opts.lines_per_chunk()).assign(&lines);
         for chunk in &queued {
-            let (result, _) = ask(&opts.backend, &chunk.lines, opts.backend.budget(opts.jobs));
+            let (result, _) = ask(
+                &opts.backend,
+                &chunk.lines,
+                opts.backend.budget(opts.jobs),
+                &|_| {},
+            );
             assert!(result.is_ok(), "{result:?}");
         }
         let sent: Vec<String> = server.completions().iter().map(prompt_of).collect();
@@ -2045,7 +2062,7 @@ mod tests {
             ..Backend::shell("sleep 20")
         };
         let began = Instant::now();
-        let (result, _) = ask(&backend, &[line("One.")], None);
+        let (result, _) = ask(&backend, &[line("One.")], None, &|_| {});
         assert_eq!(result, Err("sh timed out after 1s".to_string()));
         assert!(began.elapsed() < Duration::from_secs(10));
     }
@@ -2059,7 +2076,7 @@ mod tests {
                 completion(&finding(r), "stop", 600)
             }
         });
-        let (result, calls) = ask(&backend, &ten_lines(), None);
+        let (result, calls) = ask(&backend, &ten_lines(), None, &|_| {});
         assert_eq!(sent(&calls), [10, 5, 2, 3, 5, 2, 3]);
         let found = result.unwrap();
         assert_eq!(found.iter().map(|s| s.index).collect::<Vec<_>>(), [7]);
@@ -2069,7 +2086,7 @@ mod tests {
     #[test]
     fn a_line_that_never_fits_fails_its_chunk_after_its_second_attempt() {
         let backend = serving(None, |_, _| Reply::status(400, OVERFLOW));
-        let (result, calls) = ask(&backend, &[line("One."), line("Two.")], None);
+        let (result, calls) = ask(&backend, &[line("One."), line("Two.")], None, &|_| {});
         // Halved, then the first half's line refused twice; the second half is not sent.
         assert_eq!(sent(&calls), [2, 1, 1]);
         let error = result.unwrap_err();
@@ -2083,16 +2100,104 @@ mod tests {
             _ => Reply::status(401, r#"{"error":{"message":"bad key"}}"#),
         });
         let backend = through(&fake, "api_key_env = \"HOME\"\n", 1, None).backend;
-        let (result, calls) = ask(&backend, &ten_lines(), None);
+        let (result, calls) = ask(&backend, &ten_lines(), None, &|_| {});
         let error = result.unwrap_err();
         assert!(error.contains("HTTP 401"), "{error}");
         // The chunk's second try sends nothing, so it counts as no call.
         assert_eq!(sent(&calls), [10]);
         assert_eq!(fake.completions().len(), 1);
-        let (again, calls) = ask(&backend, &ten_lines(), None);
+        let (again, calls) = ask(&backend, &ten_lines(), None, &|_| {});
         assert_eq!(again, Err(error));
         assert_eq!(sent(&calls), Vec::<usize>::new());
         assert_eq!(fake.completions().len(), 1);
+    }
+
+    /// Each event an `execute` of typos.mkv with `opts` reports, in order, and its summary.
+    fn executed(opts: &Options) -> (Vec<Event>, Summary) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_at(&dir.path().join("subcheck.db")).unwrap();
+        let Planned::Scan(ready) =
+            plan(&[fixture("typos.mkv")], opts, &mut store, &mut io::sink()).unwrap()
+        else {
+            panic!("nothing to check");
+        };
+        let heard = Mutex::new(Vec::new());
+        let summary = execute(ready, opts, &mut store, &mut io::sink(), &|e| {
+            heard.lock().unwrap().push(e);
+        })
+        .unwrap();
+        (heard.into_inner().unwrap(), summary)
+    }
+
+    /// The waits among `events`, in the order they were reported.
+    fn waits_in(events: &[Event]) -> Vec<Option<llm::Wait>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Waiting(wait) => Some(wait.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_key_fetched_again_mid_scan_is_reported_as_a_wait_and_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        // The first run leaves the marker, so each run after it prints the second key.
+        let ran = dir.path().join("ran");
+        let cmd = format!(
+            "test -e '{0}' && echo sk-2 || {{ touch '{0}'; echo sk-1; }}",
+            ran.display()
+        );
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let server = FakeServer::start(move |r| match (r.method.as_str(), r.path.as_str()) {
+            ("GET", "/v1/models") => models_reply(&["m"]),
+            ("POST", "/v1/chat/completions") => match r.header("authorization") {
+                // An answer marks sk-1 as a key that has worked, which a 401 must find for the
+                // key command to run again.
+                Some("Bearer sk-1") if first.swap(false, std::sync::atomic::Ordering::SeqCst) => {
+                    completion("NONE", "stop", 600)
+                }
+                Some("Bearer sk-2") => completion("NONE", "stop", 600),
+                _ => Reply::status(401, ""),
+            },
+            _ => Reply::status(404, "{}"),
+        });
+        let opts = through(&server, &format!("api_key_cmd = \"{cmd}\"\n"), 1, Some(1));
+        let (events, summary) = executed(&opts);
+        assert_eq!(
+            waits_in(&events),
+            [
+                Some(llm::Wait::KeyCommand(
+                    "srv: waiting for its key command".into()
+                )),
+                None
+            ]
+        );
+        let at = |what: fn(&Event) -> bool| events.iter().rposition(what).unwrap();
+        assert!(
+            at(|e| matches!(e, Event::Waiting(_))) < at(|e| matches!(e, Event::Finished { .. })),
+            "{events:?}"
+        );
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[test]
+    fn a_scan_whose_key_is_kept_reports_no_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let cmd = format!("echo x >> '{}'; echo sk-kept", runs.display());
+        let server = FakeServer::start(move |r| match (r.method.as_str(), r.path.as_str()) {
+            ("GET", "/v1/models") => models_reply(&["m"]),
+            ("POST", "/v1/chat/completions") => completion("NONE", "stop", 600),
+            _ => Reply::status(404, "{}"),
+        });
+        let opts = through(&server, &format!("api_key_cmd = \"{cmd}\"\n"), 1, Some(1));
+        let (events, summary) = executed(&opts);
+        assert_eq!(waits_in(&events), []);
+        assert_eq!(summary.failed, 0);
+        // Run once, when the entry was readied: the scan kept that key.
+        assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
     }
 
     #[test]
@@ -2107,7 +2212,7 @@ mod tests {
                 Reply::status(500, SHARED_CACHE)
             }
         });
-        let (result, calls) = ask(&backend, &ten_lines()[7..8], None);
+        let (result, calls) = ask(&backend, &ten_lines()[7..8], None, &|_| {});
         assert_eq!(sent(&calls), [1, 1]);
         assert_eq!(found_at(result), [0]);
     }
@@ -2115,7 +2220,7 @@ mod tests {
     #[test]
     fn a_reply_cut_off_splits_once_and_a_half_cut_off_again_fails_after_its_retry() {
         let backend = serving(None, |_, r| completion(&finding(r), "length", 600));
-        let (result, calls) = ask(&backend, &ten_lines(), None);
+        let (result, calls) = ask(&backend, &ten_lines(), None, &|_| {});
         assert_eq!(sent(&calls), [10, 5, 5]);
         assert_eq!(
             result,
@@ -2129,7 +2234,7 @@ mod tests {
             let finish = if lines == 10 { "length" } else { "stop" };
             completion(&finding(r), finish, 600)
         });
-        let (result, calls) = ask(&backend, &ten_lines(), None);
+        let (result, calls) = ask(&backend, &ten_lines(), None, &|_| {});
         assert_eq!(sent(&calls), [10, 5, 5]);
         assert_eq!(found_at(result), [7]);
     }
@@ -2169,7 +2274,7 @@ mod tests {
         let found: Vec<Vec<usize>> = chunks
             .iter()
             .map(|chunk| {
-                let (result, calls) = ask(&backend, &chunk.lines, budget);
+                let (result, calls) = ask(&backend, &chunk.lines, budget, &|_| {});
                 assert_eq!(sent(&calls), [chunk.lines.len()]);
                 found_at(result)
             })
@@ -2180,7 +2285,7 @@ mod tests {
         // anyway: only the server can say it does not fit.
         let none = llm::Budget::new(1000, Some(1000));
         assert_eq!(none.fit(), 1);
-        let (result, calls) = ask(&backend, &ten_lines()[7..8], Some(none));
+        let (result, calls) = ask(&backend, &ten_lines()[7..8], Some(none), &|_| {});
         assert_eq!(sent(&calls), [1]);
         assert_eq!(found_at(result), [0]);
     }
@@ -2192,7 +2297,7 @@ mod tests {
             completion(&finding(r), "stop", prompt_tokens)
         });
         assert_eq!(backend.context(), Some(Context::Tokens(1000)));
-        let (result, calls) = ask(&backend, &ten_lines(), None);
+        let (result, calls) = ask(&backend, &ten_lines(), None, &|_| {});
         assert_eq!(sent(&calls), [10, 5, 2, 3, 5, 2, 3]);
         assert_eq!(found_at(result), [7]);
         // A prompt the server may have cut still counts what it used.
@@ -2203,7 +2308,7 @@ mod tests {
             let prompt_tokens = if lines > 4 { 8195 } else { 600 };
             completion(&finding(r), "stop", prompt_tokens)
         });
-        let (result, calls) = ask(&backend, &ten_lines(), backend.budget(2));
+        let (result, calls) = ask(&backend, &ten_lines(), backend.budget(2), &|_| {});
         assert_eq!(sent(&calls), [10, 5, 2, 3, 5, 2, 3]);
         assert_eq!(found_at(result), [7]);
     }
@@ -2250,7 +2355,7 @@ mod tests {
         let (_, chunks) = Chunker::new(forced.lines_per_chunk()).assign(&lines);
         let budget = forced.backend.budget(forced.jobs);
         for chunk in &chunks {
-            let (result, _) = ask(&forced.backend, &chunk.lines, budget);
+            let (result, _) = ask(&forced.backend, &chunk.lines, budget, &|_| {});
             assert!(result.is_ok(), "{result:?}");
         }
         let calls = server.completions();
@@ -2286,7 +2391,7 @@ mod tests {
         ] {
             let opts = through(server, extra, 2, None);
             let budget = opts.backend.budget(opts.jobs);
-            let (result, _) = ask(&opts.backend, &ten_lines(), budget);
+            let (result, _) = ask(&opts.backend, &ten_lines(), budget, &|_| {});
             assert!(result.is_ok(), "{result:?}");
             let body = server.completions().last().expect("a call").json();
             assert_eq!(

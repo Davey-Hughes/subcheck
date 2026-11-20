@@ -13,7 +13,7 @@ use subcheck_core::blocks::{self, ReadPath};
 use subcheck_core::ebml;
 use subcheck_core::group;
 use subcheck_core::list::{self, Filter};
-use subcheck_core::llm::Backend;
+use subcheck_core::llm::{self, Backend, WaitLines, Waits};
 use subcheck_core::mkv::{self, Track};
 use subcheck_core::review;
 use subcheck_core::scan::{self, Planned};
@@ -277,6 +277,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             // What readying the LLM, planning and sizing warn of goes to stderr as it comes, and is
             // kept for the screen, which covers it once it opens.
             let mut log = tui::Tee::new(std::io::stderr());
+            // A wait goes to stderr alone, never through `log`: the screen shows what `log` keeps
+            // as the scan's warnings once it opens, by when the wait is over.
+            let wait_lines = WaitLines::new(Box::new(std::io::stderr()), llm::HOLD);
+            let waits: Waits = &|wait| wait_lines.say(wait);
             let (backend, langs) = if let Some(name) = &run {
                 let scan = db
                     .scan_named(name)?
@@ -309,7 +313,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 // A new scan: readied before the dry run and before planning, since a server's
                 // label, which the run records and which says whether a file was checked already,
                 // waits on the model the server serves.
-                (ready(backend.limited_to(llm_timeout), &mut log)?, langs)
+                (
+                    ready(backend.limited_to(llm_timeout), &mut log, waits)?,
+                    langs,
+                )
             };
             let mut opts = scan::Options {
                 chunk_lines,
@@ -340,12 +347,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             // recorded. Sizing has Ollama load a model it has not, so the chunks fit its context.
             if matches!(&planned, Planned::Scan(plan) if plan.needs_llm()) {
                 if adding {
-                    opts.backend = ready(opts.backend, &mut log)?;
+                    opts.backend = ready(opts.backend, &mut log, waits)?;
                 }
-                if let Some(loading) = opts.backend.loading() {
-                    writeln!(log, "{loading}")?;
-                }
-                opts.backend = opts.backend.sized().map_err(anyhow::Error::msg)?;
+                opts.backend = opts.backend.sized(waits).map_err(anyhow::Error::msg)?;
                 if let Some(w) = opts.size_warning() {
                     writeln!(log, "warning: {w}")?;
                 }
@@ -371,7 +375,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     return tui::run(open, db, &state, karaoke);
                 }
                 Planned::Scan(plan) => {
-                    scan::execute(plan, &opts, &mut db, &mut std::io::stderr(), &|_| {})?
+                    let report = |event| {
+                        if let scan::Event::Waiting(wait) = event {
+                            waits(wait);
+                        }
+                    };
+                    scan::execute(plan, &opts, &mut db, &mut std::io::stderr(), &report)?
                 }
             };
             for line in scan::summary_lines(&s, adding) {
@@ -420,9 +429,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-/// `backend` made ready for calls ([`Backend::ready`]), each of its warnings written to `log`.
-fn ready(backend: Backend, log: &mut dyn Write) -> Result<Backend> {
-    let (backend, warnings) = backend.ready().map_err(anyhow::Error::msg)?;
+/// `backend` made ready for calls ([`Backend::ready`]), each of its warnings written to `log` and
+/// each wait reported through `waits`.
+fn ready(backend: Backend, log: &mut dyn Write, waits: Waits<'_>) -> Result<Backend> {
+    let (backend, warnings) = backend.ready(waits).map_err(anyhow::Error::msg)?;
     for w in &warnings {
         writeln!(log, "warning: {w}")?;
     }

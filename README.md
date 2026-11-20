@@ -178,11 +178,12 @@ what the scan said of it. `⏎` on a file goes to its first finding, and `u` und
 in the list. `c` checks the file again, as `subcheck scan --run <run> --force <file>` does: into
 the run you are reviewing, or in a view of files and folders, the newest run that named it, with
 that run's LLM and languages. It asks first, since it spends money, and while a scan runs it waits
-for that to end. While the scan runs, the list's title and the status line say how far it is; once
-it ends, the status line gives its summary. What the scan warns of as it starts (a folder it cannot
-read, a server that did not say its context size) stays on the terminal above the screen, and the
-first of it is on the status line as the screen opens. Files the scan skips as unchanged are in the
-list from the start.
+for that to end. While the scan runs, the list's title and the status line say how far it is, and
+while it waits on something before its LLM can answer, such as a key command, the status line says
+on what ([LLM settings](#llm-settings)); once it ends, the status line gives its summary. What the
+scan warns of as it starts (a folder it cannot read, a server that did not say its context size)
+stays on the terminal above the screen, and the first of it is on the status line as the screen
+opens. Files the scan skips as unchanged are in the list from the start.
 
 When a scan checks a file again, its earlier findings stay in the list until the new ones are saved,
 and you can decide them meanwhile: a decision carries over to each finding that comes back as the
@@ -365,6 +366,15 @@ scan with `--force`, or files checked by the old command are skipped as already 
 subcheck asks `<url>/models` before a scan or a dry run, so a server that is down stops it before
 any file is checked. llama-server lists the path given to `-m` unless it was started with
 `--alias <name>`.
+
+A scan names what it waits on before its LLM can answer: `<entry>: waiting for its key command`
+while `api_key_cmd` runs, `<entry>: asking <url> what it serves` while the server is asked for its
+models, and `loading <model> into Ollama at <address>` while Ollama loads a model
+([Fitting the context](#fitting-the-context)). On the terminal, each is a line on stderr once it has
+lasted a second, and the load's as it starts, so a key command and a server that answer at once add
+nothing. A recheck names each wait on the status line in place of its count. The scan the screen shows
+has its start-up waits as lines on stderr above the screen; only a key command that a 401 runs again
+mid-scan ([Keys](#keys)), which holds every call until it ends, is named on its status line.
 
 A run records `<entry>@<model>` for a server, so moving a server to another port checks nothing
 again, and serving another model checks every file again. `scan --run` and a recheck refuse a
@@ -631,10 +641,11 @@ server that loads its model on the first call. So compare first rows only betwee
 the same way, or name the LLM once more and leave its first row out, which works when that LLM's
 rows run back to back.
 
-Warnings, such as the one for a server that says no context size, go to stderr, as does the
-line saying Ollama is loading a model. `-v` also shows on stderr what the scans say of each file
-as they run, and after the table, under each row's number and LLM, a line for each typo it missed
-or fixed another way, each trap it flagged and each other finding:
+Warnings, such as the one for a server that says no context size, go to stderr, as do the lines
+naming a wait that lasts ([LLM settings](#llm-settings)): a key command, a server's check, Ollama
+loading a model. `-v` also shows on stderr what the scans say of each file as they run, and after
+the table, under each row's number and LLM, a line for each typo it missed or fixed another way,
+each trap it flagged and each other finding:
 
 ```
 1. <llm>

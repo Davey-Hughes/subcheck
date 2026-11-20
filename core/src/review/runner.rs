@@ -519,7 +519,8 @@ mod tests {
         let warned = Input::Warned(warning.into());
         let at = |wanted: &dyn Fn(&Input) -> bool| inputs.iter().position(wanted);
         let first_warning = at(&|i| matches!(i, Input::Warned(_)));
-        let first_step = at(&|i| matches!(i, Input::Scan(_)));
+        let first_step =
+            at(&|i| matches!(i, Input::Scan(e) if !matches!(e, scan::Event::Waiting(_))));
         assert!(
             matches!((first_warning, first_step), (Some(w), Some(s)) if w < s),
             "{inputs:?}"
@@ -535,6 +536,32 @@ mod tests {
         );
     }
 
+    // The status line names what a recheck waits on before it has a file to count.
+    #[test]
+    fn a_recheck_names_its_server_check_before_its_first_step() {
+        let server = FakeServer::llm(&["m"]);
+        let settings = format!("[llm.srv]\nurl = \"{}\"\n", server.url);
+        let (_dir, mut runner, rx, recheck_task) = rechecking("srv@m", &settings);
+        let Input::Started { job, .. } = runner.run(recheck_task) else {
+            panic!()
+        };
+        assert!(job.is_ok(), "{job:?}");
+        let inputs = until_ended(&rx);
+        let queued = inputs
+            .iter()
+            .position(|i| matches!(i, Input::Scan(scan::Event::Queued(_))))
+            .unwrap_or_else(|| panic!("{inputs:?}"));
+        let waits: Vec<&Input> = inputs[..queued]
+            .iter()
+            .filter(|i| matches!(i, Input::Scan(scan::Event::Waiting(_))))
+            .collect();
+        let asking = Input::Scan(scan::Event::Waiting(Some(llm::Wait::Asking(format!(
+            "srv: asking {} what it serves",
+            server.url
+        )))));
+        assert_eq!(waits, [&asking, &Input::Scan(scan::Event::Waiting(None))]);
+    }
+
     #[test]
     fn a_recheck_that_finds_no_server_ends_as_a_failed_scan() {
         let closed = closed_port_url();
@@ -544,12 +571,18 @@ mod tests {
             panic!()
         };
         assert!(job.is_ok());
-        // The first input is the end: nothing was queued or checked before the check failed.
+        // Nothing was queued or checked before the check failed, and its wait ended before the job.
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(30)).unwrap(),
-            Input::ScanEnded(Err(format!(
-                "srv@m: nothing answering at {closed}: is the server running?"
-            )))
+            until_ended(&rx),
+            [
+                Input::Scan(scan::Event::Waiting(Some(llm::Wait::Asking(format!(
+                    "srv: asking {closed} what it serves"
+                ))))),
+                Input::Scan(scan::Event::Waiting(None)),
+                Input::ScanEnded(Err(format!(
+                    "srv@m: nothing answering at {closed}: is the server running?"
+                ))),
+            ]
         );
     }
 

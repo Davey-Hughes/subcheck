@@ -31,7 +31,7 @@ fn readied(url: &str) -> Backend {
     let settings = Settings::parse(Path::new("/c/config.toml"), &text).unwrap();
     Backend::named("local", &settings)
         .unwrap()
-        .ready()
+        .ready(&|_| {})
         .unwrap()
         .0
 }
@@ -92,7 +92,7 @@ fn ready_settles_the_one_model_each_servers_list_names() {
         });
         let text = format!("[llm.local]\nurl = \"{}\"\n", fake.url);
         let settings = Settings::parse(Path::new("/c/config.toml"), &text).unwrap();
-        let ready = Backend::named("local", &settings).unwrap().ready();
+        let ready = Backend::named("local", &settings).unwrap().ready(&|_| {});
         assert_eq!(
             ready.map(|(b, _)| b.label),
             Ok(label.to_string()),
@@ -149,7 +149,7 @@ fn each_servers_answer_to_an_over_long_prompt_is_too_big_for_the_prompt() {
             "/v1/chat/completions" => Reply::status(status, body),
             _ => Reply::status(404, ""),
         });
-        let a = readied(&fake.url).call("P", TIMEOUT, None);
+        let a = readied(&fake.url).call("P", TIMEOUT, None, &|_| {});
         assert_eq!(
             (a.too_big, a.reply.is_err(), a.used),
             (Some(TooBig::Prompt), true, Used::Unreported),

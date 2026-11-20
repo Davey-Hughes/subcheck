@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::apply::{self, patch::Outcome};
 use crate::list::shell_quote;
-use crate::llm::Spent;
+use crate::llm::{Spent, Wait};
 use crate::scan::{self, Event};
 use crate::store::{Check, FileRecord, Record, Run};
 
@@ -431,6 +431,9 @@ pub struct Progress {
     pub earlier_apply_failed: bool,
     /// Apply started after the last scan did, so the status line speaks of it.
     apply_latest: bool,
+    /// What the scan waits on before its LLM can answer, until the wait ends: the status line
+    /// names it, so a scan whose counts stand still says why.
+    waiting: Option<Wait>,
 }
 
 impl Progress {
@@ -475,6 +478,7 @@ impl Progress {
             earlier_applies: Vec::new(),
             earlier_apply_failed: false,
             apply_latest: false,
+            waiting: None,
         }
     }
 
@@ -552,6 +556,7 @@ impl Progress {
                     f.log.clone_from(lines);
                 }
             }
+            Event::Waiting(wait) => self.waiting.clone_from(wait),
         }
     }
 
@@ -570,6 +575,8 @@ impl Progress {
         self.earlier_failed |= self.failed > 0 || matches!(self.scan, Scan::Ended(Err(_)));
         self.scan = Scan::Running;
         self.apply_latest = false;
+        // The last scan's wait is not this one's: it may have ended while waiting.
+        self.waiting = None;
         self.run = run.to_string();
         self.resume = resume;
         self.adding = adding;
@@ -970,9 +977,10 @@ impl Progress {
     }
 
     /// The status line's own text: while the scan runs, how far it is (`scan 7/24 · 31 findings ·
-    /// 1 failed · $0.84 at API prices`); once it ends, the first line of `scan`'s summary, or why
-    /// it failed. `None` with no scan. Once apply has started (and no scan since), apply's instead
-    /// (see `Applying::line`).
+    /// 1 failed · $0.84 at API prices`), a wait under way named in place of `scan 7/24`; once it
+    /// ends, the first line of `scan`'s summary, or why it failed, whatever wait it was left with.
+    /// `None` with no scan. Once apply has started (and no scan since), apply's instead (see
+    /// `Applying::line`).
     pub fn line(&self) -> Option<String> {
         if let Some(a) = self.latest_apply() {
             return Some(a.line());
@@ -980,10 +988,11 @@ impl Progress {
         match &self.scan {
             Scan::None => None,
             Scan::Running => {
-                let mut parts = vec![
-                    format!("scan {}/{}", self.done, self.queued),
-                    findings_text(self.findings),
-                ];
+                let head = match &self.waiting {
+                    Some(wait) => wait.line().to_string(),
+                    None => format!("scan {}/{}", self.done, self.queued),
+                };
+                let mut parts = vec![head, findings_text(self.findings)];
                 if self.failed > 0 {
                     parts.push(format!("{} failed", self.failed));
                 }
@@ -1233,6 +1242,35 @@ mod tests {
         assert_eq!(p.title('⠋'), None);
         p.scan = Scan::Ended(Err("disk full".into()));
         assert_eq!(p.line().as_deref(), Some("the scan failed: disk full"));
+    }
+
+    fn key_command() -> Event {
+        Event::Waiting(Some(Wait::KeyCommand(
+            "srv: waiting for its key command".into(),
+        )))
+    }
+
+    #[test]
+    fn a_wait_takes_the_counts_place_on_the_status_line_until_it_ends() {
+        let mut p = queued();
+        p.scan_event(&key_command());
+        let waiting = Some("srv: waiting for its key command · 0 findings");
+        assert_eq!(p.line().as_deref(), waiting);
+        // The reader goes on while the workers wait on the key: its steps leave the wait named.
+        p.scan_event(&Event::Reading("/m/E01.mkv".into()));
+        assert_eq!(p.line().as_deref(), waiting);
+        p.scan_event(&Event::Waiting(None));
+        assert_eq!(p.line().as_deref(), Some("scan 0/2 · 0 findings"));
+    }
+
+    #[test]
+    fn a_scan_that_ends_while_waiting_shows_how_it_ended_and_the_next_starts_without_the_wait() {
+        let mut p = queued();
+        p.scan_event(&key_command());
+        p.scan = Scan::Ended(Err("x".into()));
+        assert_eq!(p.line().as_deref(), Some("the scan failed: x"));
+        p.start("r", String::new(), true);
+        assert_eq!(p.line().as_deref(), Some("scan 0/0 · 0 findings"));
     }
 
     #[test]

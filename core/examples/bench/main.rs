@@ -7,9 +7,10 @@
 //! ```
 //!
 //! An LLM is named as `subcheck scan --llm` takes it: a preset, or an entry in the settings file.
-//! Warnings, and the line saying a model is loading, go to stderr. `-v` lists, after the table,
-//! each LLM's misses, its other fixes, its false alarms and its other findings under its row's
-//! number, and shows on stderr what the scans say of each file as they go.
+//! Warnings, and the lines naming a wait that lasts (a key command, a server's check, Ollama
+//! loading a model), go to stderr. `-v` lists, after the table, each LLM's misses, its other fixes,
+//! its false alarms and its other findings under its row's number, and shows on stderr what the
+//! scans say of each file as they go.
 //!
 //! Each LLM's scan goes into a store of its own in a scratch directory, deleted when the bench
 //! ends, by Ctrl-C too. A second Ctrl-C can end the bench while it deletes, and leaves what
@@ -30,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use subcheck_core::group;
-use subcheck_core::llm::{Backend, Spent};
+use subcheck_core::llm::{self, Backend, Spent, WaitLines, Waits};
 use subcheck_core::scan::{self, DEFAULT_LANG, Event, Options, Planned};
 use subcheck_core::settings::Settings;
 use subcheck_core::store::Store;
@@ -88,7 +89,7 @@ struct Measured {
 
 /// Each of `llms` scanning bench.mkv, as `subcheck scan` scans, into a store of its own,
 /// `scratch/row-<n>.db`, so no run of one is another's cache; its findings scored against `key`.
-/// Warnings, and the line saying a model is loading, go to `warn`; what the scans say of each
+/// Warnings go to `warn`, each wait is reported through `waits`, and what the scans say of each
 /// file goes to `log`. An LLM that fails gets its row saying why, and the rest still run.
 fn bench(
     llms: &[String],
@@ -96,6 +97,7 @@ fn bench(
     key: &Key,
     scratch: &Path,
     warn: &mut dyn Write,
+    waits: Waits<'_>,
     log: &mut dyn Write,
 ) -> Vec<Row> {
     let mut rows = Vec::new();
@@ -107,8 +109,8 @@ fn bench(
             outcome: Err(String::new()),
         };
         let store = scratch.join(format!("row-{n}.db"));
-        row.outcome =
-            measure(&mut row, settings, key, &store, warn, log).map_err(|e| format!("{e:#}"));
+        row.outcome = measure(&mut row, settings, key, &store, warn, waits, log)
+            .map_err(|e| format!("{e:#}"));
         rows.push(row);
     }
     rows
@@ -116,18 +118,20 @@ fn bench(
 
 /// The LLM `row` names scanning bench.mkv into the store at `store`, in the order cli's `scan`
 /// takes each step, minus the screen. The row's llm, jobs and lines/call are filled in as each is
-/// learnt, so a row that fails says how far it got. Where `warn` and `log` go is [`bench`]'s.
+/// learnt, so a row that fails says how far it got. Where `warn`, `waits` and `log` go is
+/// [`bench`]'s.
 fn measure(
     row: &mut Row,
     settings: &Settings,
     key: &Key,
     store: &Path,
     warn: &mut dyn Write,
+    waits: Waits<'_>,
     log: &mut dyn Write,
 ) -> anyhow::Result<Measured> {
     let backend = Backend::named(&row.llm, settings).map_err(anyhow::Error::msg)?;
     row.jobs = backend.jobs;
-    let (backend, warnings) = backend.ready().map_err(anyhow::Error::msg)?;
+    let (backend, warnings) = backend.ready(waits).map_err(anyhow::Error::msg)?;
     for w in &warnings {
         writeln!(warn, "warning: {w}")?;
     }
@@ -147,23 +151,21 @@ fn measure(
         Planned::Scan(plan) => plan,
         Planned::Nothing(s) => bail!("{}", scan::summary_lines(&s, false).join(" ")),
     };
-    if let Some(loading) = opts.backend.loading() {
-        writeln!(warn, "{loading}")?;
-    }
-    opts.backend = opts.backend.sized().map_err(anyhow::Error::msg)?;
+    opts.backend = opts.backend.sized(waits).map_err(anyhow::Error::msg)?;
     row.lines_per_call = opts.lines_per_chunk();
     if let Some(w) = opts.size_warning() {
         writeln!(warn, "warning: {w}")?;
     }
     // A failed file's error is in its event alone; the summary only counts it.
     let failure = Mutex::new(None);
-    let report = |event: Event| {
-        if let Event::Finished {
+    let report = |event: Event| match event {
+        Event::Finished {
             error: Some(why), ..
-        } = event
-        {
+        } => {
             failure.lock().unwrap().get_or_insert(why);
         }
+        Event::Waiting(wait) => waits(wait),
+        _ => {}
     };
     let started = Instant::now();
     let summary = scan::execute(plan, &opts, &mut store, log, &report)?;
@@ -372,12 +374,14 @@ fn run() -> ExitCode {
         Box::new(io::sink())
     };
     let mut warn = io::stderr();
+    let wait_lines = WaitLines::new(Box::new(io::stderr()), llm::HOLD);
     let rows = bench(
         &args.llms,
         &settings,
         &key,
         scratch.path(),
         &mut warn,
+        &|wait| wait_lines.say(wait),
         &mut log,
     );
     // Removed and forgotten with no signal between: one that came after the removal alone would
@@ -512,6 +516,7 @@ mod tests {
             &key(),
             scratch,
             &mut io::sink(),
+            &|_| {},
             &mut io::sink(),
         )
     }
@@ -572,6 +577,7 @@ mod tests {
             &key(),
             scratch.path(),
             &mut io::sink(),
+            &|_| {},
             &mut io::sink(),
         )
     }
@@ -587,6 +593,7 @@ mod tests {
             &key(),
             scratch.path(),
             &mut warn,
+            &|_| {},
             &mut log,
         );
         assert!(rows[0].outcome.is_ok(), "{:?}", rows[0].outcome);
