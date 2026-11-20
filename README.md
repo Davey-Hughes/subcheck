@@ -334,7 +334,9 @@ An entry has a `url` (a server that speaks the OpenAI chat API) or a `command`.
   `ollama:<model>` gives each call the whole context, as Ollama does; an entry whose `url` is
   Ollama's `/v1` can say `false` to do the same.
 - `command` is run through `sh -c`, as `--llm-cmd`'s is: it reads the prompt on stdin and prints
-  the reply on stdout.
+  the reply on stdout. It has no terminal, as a key command has none ([Keys](#keys)): a command
+  that asks for a password in the terminal fails at once, so the password must come from an agent
+  or a window (`ssh` can ask through `SSH_ASKPASS`).
 - `output` is what the command prints: `"text"` (the default) is the reply alone, and reports no
   usage; `"openai"` is an OpenAI chat completion, and reports its tokens; `"claude"` is
   `claude -p --output-format json`, and reports tokens and a price; `"codex"` is
@@ -343,12 +345,18 @@ An entry has a `url` (a server that speaks the OpenAI chat API) or a `command`.
 - `chunk_lines` is the lines sent in each call, for a server at most as many as fit its context.
   Left out, it is as many as fit, at most 400 ([Fitting the context](#fitting-the-context)), or 400
   for a command.
+- `timeout_minutes` is how long each call may take, and a model's load, in whole minutes from 1 to
+  1440 (10 when left out). A slow model with a long reply can need more. The limit is for each
+  request, so a call that fetches its key again ([Keys](#keys)) can take it twice, and the key
+  command's 2 minutes between.
 - `default` is the LLM `--llm` means when it is left out. It takes anything `--llm` takes, a
   preset as well as an entry.
 
-`subcheck scan --llm mine` runs the entry. `-j` and `--chunk-lines` beat the entry's `jobs` and
-`chunk_lines`. A recheck from the screen (`c`) uses the entry as the file has it then, not as it
-was when the run began, and no `-j` or `--chunk-lines` the scan was given.
+`subcheck scan --llm mine` runs the entry. `-j`, `--chunk-lines` and `--llm-timeout` beat the
+entry's `jobs`, `chunk_lines` and `timeout_minutes`; `--llm-timeout` is also the only way to give
+`claude`, `gpt`, `ollama:<model>` or `--llm-cmd` more than 10 minutes. A recheck from the screen
+(`c`) uses the entry as the file has it then, not as it was when the run began, and no `-j`,
+`--chunk-lines` or `--llm-timeout` the scan was given.
 
 An entry's name is letters, digits, `-` and `_`, and `claude` and `gpt` are taken. A run records
 a command entry's name, not its command: after changing what a command runs, rename the entry or
@@ -437,8 +445,13 @@ dry run: ollama:gemma4's model is not loaded, so these chunks are 400 lines; a s
 
 A key is never in the file: `api_key` is refused. `api_key_env` names a variable. `api_key_cmd`
 runs through `sh -c` with no terminal, within 2 minutes, and prints the key alone on one line. The
-key is kept for the process, so a passphrase is asked at most once a session; after a 401 or 403
-the next scan or recheck runs the command again.
+key is kept while the server takes it, so a passphrase is usually asked once a session. When a
+server answers 401 to a key that had worked (a call got an answer with it since the command
+printed it), as an hour-long token does when it runs out mid-scan, subcheck runs the command
+again, once: a new key carries the scan on, and the same key again stops its calls, each remaining
+file failing with the server's refusal. A key that never worked is not fetched again, and neither
+is a variable's. A 403 fails its call alone, since a server can refuse one request that way; the
+next scan or recheck runs the command again, as after any refusal.
 
 A prompt in the terminal is not supported. The command's stdin is empty and it runs in a session
 of its own, so a script that opens `/dev/tty` to ask fails at once. `GPG_TTY` is unset, but
@@ -572,9 +585,10 @@ opening, an insert song, an ending and signs, with typos planted in it. Its key,
 beside it, lists each planted typo, with the fixes that count as right, and each trap: a line with
 nothing to fix that looks as if it needs one, such as a name, an honorific, slang, a stutter or a
 lyric. Each LLM scans it into a store of its own in a scratch directory, which the bench deletes
-when it ends. A bench stopped with Ctrl-C leaves the directory behind, a `.tmp…` one in `$TMPDIR`
-or `/tmp`. Your store is never touched, and an LLM named twice is scanned twice, not skipped as
-checked.
+when it ends, by Ctrl-C too. A second Ctrl-C can end the bench while it deletes, and leaves what
+remains in `$TMPDIR` or `/tmp`: a `.tmp…` directory, its name ending in `.removing-<pid>` when a
+Ctrl-C began the deletion. Your store is never touched, and an LLM named twice is scanned twice,
+not skipped as checked.
 
 The first line it prints counts what the key holds, `bench.mkv: <n> planted typos, <n> traps`,
 and a table follows, with a row for each LLM, such as this one for a llama-server entry:
@@ -677,7 +691,7 @@ LLM: 98 calls, 1.23M in / 31.2k out tokens, $3.21 at API prices
 The tokens in are all of each call's input, read from the prompt cache or not.
 
 Every call claude or codex started is counted, failed ones too. One that said nothing of what it
-used (killed at the 10-minute limit, failing with nothing on stdout, printing something other
+used (killed at its time limit, failing with nothing on stdout, printing something other
 than its JSON, or JSON with no usage in it) is counted without numbers, and the sums leave it out;
 any call without a price makes the price a floor:
 

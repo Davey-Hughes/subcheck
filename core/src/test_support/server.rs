@@ -158,17 +158,20 @@ impl FakeServer {
         })
     }
 
-    /// Every request so far, in the order they arrived.
+    /// Every request so far, in the order they were answered: a request is recorded when its route
+    /// returns.
     pub fn requests(&self) -> Vec<Request> {
         self.seen.lock().unwrap().clone()
     }
 
-    /// The POSTs to `/v1/chat/completions`, in the order they came.
+    /// The POSTs to `/v1/chat/completions`, in the order they were answered
+    /// ([`FakeServer::requests`]).
     pub fn completions(&self) -> Vec<Request> {
         self.posts("/v1/chat/completions")
     }
 
-    /// The POSTs to Ollama's own `/api/chat`, in the order they came.
+    /// The POSTs to Ollama's own `/api/chat`, in the order they were answered
+    /// ([`FakeServer::requests`]).
     pub fn chats(&self) -> Vec<Request> {
         self.posts("/api/chat")
     }

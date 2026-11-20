@@ -17,7 +17,7 @@ use subcheck_core::llm::Backend;
 use subcheck_core::mkv::{self, Track};
 use subcheck_core::review;
 use subcheck_core::scan::{self, Planned};
-use subcheck_core::settings::Settings;
+use subcheck_core::settings::{MAX_TIMEOUT_MINUTES, Settings};
 use subcheck_core::store::{self, Selector, State, Store};
 use subcheck_core::subs::{self, Kind};
 use subcheck_core::text;
@@ -73,7 +73,8 @@ enum Command {
         /// settings file's `default`, else claude; with --run, the run's.
         #[arg(long)]
         llm: Option<String>,
-        /// Any other LLM: a shell command that reads the prompt on stdin and prints the reply.
+        /// Any other LLM: a shell command that reads the prompt on stdin and prints the reply. It
+        /// has no terminal.
         #[arg(long, conflicts_with = "llm")]
         llm_cmd: Option<String>,
         /// Subtitle languages to check, as ISO 639-2 codes. Repeat for more (--lang eng --lang und).
@@ -88,6 +89,14 @@ enum Command {
         /// `chunk_lines`, cut the same way; for a server, as many as fit, at most 400; else 400.
         #[arg(long)]
         chunk_lines: Option<usize>,
+        /// Minutes each LLM call, and a model's load, may take, 1 to 1440. Default: the entry's
+        /// `timeout_minutes`, else 10.
+        #[arg(
+            long,
+            value_name = "MINUTES",
+            value_parser = clap::value_parser!(u64).range(1..=MAX_TIMEOUT_MINUTES)
+        )]
+        llm_timeout: Option<u64>,
         /// Check files even if they are unchanged since an earlier scan.
         #[arg(long)]
         force: bool,
@@ -255,6 +264,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             langs,
             jobs,
             chunk_lines,
+            llm_timeout,
             force,
             dry_run,
             verbose,
@@ -271,8 +281,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 let scan = db
                     .scan_named(name)?
                     .with_context(|| format!("no run named {name}"))?;
-                scan::resume(&scan, llm.as_deref(), llm_cmd.as_deref(), &langs, &settings)
-                    .map_err(anyhow::Error::msg)?
+                let (backend, langs) =
+                    scan::resume(&scan, llm.as_deref(), llm_cmd.as_deref(), &langs, &settings)
+                        .map_err(anyhow::Error::msg)?;
+                (backend.limited_to(llm_timeout), langs)
             } else {
                 let backend = match (llm_cmd, llm, &settings.default) {
                     (Some(cmd), _, _) => Backend::shell(&cmd),
@@ -297,7 +309,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 // A new scan: readied before the dry run and before planning, since a server's
                 // label, which the run records and which says whether a file was checked already,
                 // waits on the model the server serves.
-                (ready(backend, &mut log)?, langs)
+                (ready(backend.limited_to(llm_timeout), &mut log)?, langs)
             };
             let mut opts = scan::Options {
                 chunk_lines,

@@ -1220,6 +1220,31 @@ fn chunk_lines_on_the_command_line_beats_the_entrys() {
 }
 
 #[test]
+fn llm_timeout_takes_one_to_1440_minutes() {
+    let env = Env::new();
+    // A refused flag ends the command before it opens the store, whose table `runs` reads.
+    drop(env.store());
+    for minutes in ["0", "1441"] {
+        let out = env.subcheck(&["scan", "--llm-timeout", minutes, &env.typos()], &[]);
+        assert_eq!(out.status.code(), Some(2), "{minutes}: {}", stderr(&out));
+        // clap's words for a value outside the range, not for a flag it does not know.
+        let said = format!("'--llm-timeout <MINUTES>': {minutes} is not in 1..=1440");
+        assert!(stderr(&out).contains(&said), "{}", stderr(&out));
+        assert_eq!(env.runs(), 0, "{minutes}");
+    }
+    let out = env.subcheck(&["scan", "--llm-timeout", "5", &env.typos()], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(
+            "1 files, 1 checked, 0 failed, 0 unchanged since an earlier scan; 2 findings"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.runs(), 1);
+}
+
+#[test]
 fn the_settings_files_default_is_the_llm_when_none_is_named() {
     let env = Env::new();
     env.settings(&format!(

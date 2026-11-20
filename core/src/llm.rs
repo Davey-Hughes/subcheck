@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::group;
-use crate::settings::{Entry, EntryKind, Settings};
+use crate::settings::{Entry, EntryKind, MAX_TIMEOUT_MINUTES, Settings};
 use crate::text::{Line, timestamp};
 
 mod key;
@@ -26,7 +26,8 @@ pub use server::{Context, Server};
 /// produced them.
 pub const PROMPT_VERSION: u32 = 1;
 
-/// One chunk's run limit; a chunk that takes longer is killed, retried once, then failed.
+/// One chunk's run limit unless the LLM's entry or `--llm-timeout` sets another
+/// ([`Backend::timeout`]); a chunk that takes longer is killed, retried once, then failed.
 pub const TIMEOUT: Duration = Duration::from_mins(10);
 
 /// Lines per chunk when neither `--chunk-lines`, the LLM's entry nor a server's context says
@@ -146,6 +147,9 @@ pub struct Backend {
     /// not say.
     pub chunk_lines: Option<usize>,
     pub jobs: usize,
+    /// How long each call, and a model's load, may take: the entry's `timeout_minutes`, else
+    /// [`TIMEOUT`].
+    pub timeout: Duration,
 }
 
 /// What a backend's calls go through.
@@ -245,6 +249,7 @@ impl Backend {
             },
             chunk_lines: None,
             jobs: JOBS,
+            timeout: TIMEOUT,
         })
     }
 
@@ -256,6 +261,7 @@ impl Backend {
             via: Via::Server(server),
             chunk_lines: None,
             jobs: JOBS,
+            timeout: TIMEOUT,
         }
     }
 
@@ -269,6 +275,7 @@ impl Backend {
             },
             chunk_lines: None,
             jobs: JOBS,
+            timeout: TIMEOUT,
         }
     }
 
@@ -296,6 +303,23 @@ impl Backend {
             via,
             chunk_lines: entry.chunk_lines,
             jobs: entry.jobs.unwrap_or(JOBS),
+            timeout: entry.timeout.unwrap_or(TIMEOUT),
+        }
+    }
+
+    /// The backend with each call's limit `minutes` when that is `Some` (`--llm-timeout`, which
+    /// beats the entry's `timeout_minutes`), and as it was when it is `None`. The minutes are kept
+    /// within 1 to [`MAX_TIMEOUT_MINUTES`], as the settings file keeps an entry's: more would
+    /// overflow the limit, or the clock it is added to when a call starts, and none would fail
+    /// every call as it starts.
+    #[must_use]
+    pub fn limited_to(self, minutes: Option<u64>) -> Backend {
+        match minutes {
+            Some(minutes) => Backend {
+                timeout: Duration::from_mins(minutes.clamp(1, MAX_TIMEOUT_MINUTES)),
+                ..self
+            },
+            None => self,
         }
     }
 
@@ -487,7 +511,7 @@ impl Backend {
 
     /// The backend with its context known where a load tells it: a server whose context is
     /// [`Context::NotLoaded`] has Ollama load its model (`POST <url without /v1>/api/generate`,
-    /// waiting up to [`TIMEOUT`]), then `/api/ps` is asked again: [`Context::Tokens`], else
+    /// waiting up to [`Backend::timeout`]), then `/api/ps` is asked again: [`Context::Tokens`], else
     /// [`Context::Unknown`]. Anything else comes back as it is, asking nothing. A load takes the
     /// model's memory on the server, which is why [`Backend::ready`] never makes one. Every error
     /// starts with the label.
@@ -495,7 +519,7 @@ impl Backend {
         match self.via {
             Via::Server(server) => {
                 let server = server
-                    .sized()
+                    .sized(self.timeout)
                     .map_err(|why| format!("{}: {why}", self.label))?;
                 Ok(Backend {
                     via: Via::Server(server),
@@ -544,7 +568,7 @@ impl Backend {
 
 /// One call of `argv`, its reply read as `output` says.
 fn call_command(argv: &[String], output: Output, prompt: &str, timeout: Duration) -> Answer {
-    let failed = match run(argv, prompt, timeout, group::spawn) {
+    let failed = match run(argv, prompt, timeout, without_terminal) {
         Ok(stdout) => return output.read(&stdout),
         Err(failed) => failed,
     };
@@ -1280,12 +1304,12 @@ impl Failed {
 /// Run `argv` with `input` on stdin, returning stdout; an error names the exit status or the
 /// timeout, plus the last line of stderr, and keeps what the command printed on stdout.
 ///
-/// `spawn` starts the command in its own process group ([`group::spawn`], or
-/// [`group::spawn_without_terminal`] for one that must not reach the terminal), so a timeout kills
-/// everything it started (a wrapper script's children, or what dash forks for `sh -c`), not just
-/// the direct child. That takes it out of the terminal's foreground group, where Ctrl-C would
-/// reach it, so when SIGINT, SIGTERM or SIGHUP ends subcheck, [`group`] kills every group still
-/// running.
+/// `spawn` starts the command in its own process group ([`without_terminal`] for an LLM command
+/// and a key command alike; [`group::spawn`] is what the tests of `run` itself pass, which need
+/// the group alone), so a timeout kills everything it started (a wrapper script's children, or
+/// what dash forks for `sh -c`), not just the direct child. That takes it out of the terminal's
+/// foreground group, where Ctrl-C would reach it, so when SIGINT, SIGTERM or SIGHUP ends
+/// subcheck, [`group`] kills every group still running.
 fn run(
     argv: &[String],
     input: &str,
@@ -1395,6 +1419,15 @@ fn run(
             code: status.code(),
         })
     }
+}
+
+/// How an LLM command and a key command start: with no terminal, and without `GPG_TTY`. A recheck
+/// runs both kinds of command while the screen owns the terminal, and the window has no terminal
+/// at all, so a command that asks there has to fail at once: in subcheck's session it would stop
+/// until its limit. `GPG_TTY` would have gpg-agent put pinentry-curses on subcheck's terminal; the
+/// agent can still use the terminal it started from.
+fn without_terminal(cmd: &mut Command) -> io::Result<(Child, group::Registered)> {
+    group::spawn_without_terminal(cmd.env_remove("GPG_TTY"))
 }
 
 #[cfg(test)]
@@ -1918,6 +1951,35 @@ mod tests {
     }
 
     #[test]
+    fn an_llm_command_has_no_terminal_and_no_gpg_tty() {
+        let tty = "if (: </dev/tty) 2>/dev/null; then echo tty; else echo none; fi";
+        let (pid, session, a) = crate::test_support::a_commands_session(tty, |cmd| {
+            Backend::shell(cmd).call("", TIMEOUT, None)
+        });
+        // Its own session, which a run with no terminal (CI) can tell apart.
+        assert_eq!(session, Ok(pid));
+        assert_eq!(a.reply.as_deref(), Ok("none\n"));
+        // A call's command has this process's variables, and no test sets one of those: the
+        // variable is given to a command started the way a call starts its own.
+        let mut sh = Command::new("sh");
+        sh.args(["-c", "echo \"${GPG_TTY:-unset}\""])
+            .env("GPG_TTY", "/dev/pts/9")
+            .stdout(Stdio::piped());
+        let (child, _running) = without_terminal(&mut sh).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset\n");
+    }
+
+    #[test]
+    fn an_llm_command_that_reads_the_terminal_fails_at_once() {
+        let began = Instant::now();
+        let a = Backend::shell("read x </dev/tty && cat").call("P", Duration::from_secs(30), None);
+        let why = a.reply.unwrap_err();
+        assert!(why.starts_with("sh exited with"), "{why}");
+        assert!(began.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
     fn every_call_a_json_backend_started_is_counted_with_numbers_or_without() {
         let claude = |cmd: &str| shell_as(Output::Claude, cmd);
         // Killed at the timeout.
@@ -2125,6 +2187,7 @@ mod tests {
                 },
                 chunk_lines: Some(200),
                 jobs: 4,
+                timeout: TIMEOUT,
             })
         );
         let p = Backend::named("plain", &s).unwrap();
@@ -2150,6 +2213,24 @@ mod tests {
             Backend::named("nope", &s),
             Err("unknown --llm \"nope\": use claude, gpt, ollama:<model>, an entry in /c/config.toml, or --llm-cmd".into())
         );
+    }
+
+    #[test]
+    fn a_backends_limit_is_its_entrys_else_ten_minutes_and_a_flag_beats_both() {
+        let text =
+            "[llm.slow]\ncommand = \"cat\"\ntimeout_minutes = 3\n[llm.plain]\ncommand = \"cat\"\n";
+        let s = Settings::parse(Path::new("/c/config.toml"), text).unwrap();
+        let mins = |m: u64| Duration::from_secs(m * 60);
+        assert_eq!(Backend::named("slow", &s).unwrap().timeout, mins(3));
+        assert_eq!(Backend::from_label("slow", &s).unwrap().timeout, mins(3));
+        assert_eq!(Backend::named("plain", &s).unwrap().timeout, TIMEOUT);
+        assert_eq!(Backend::preset("claude").unwrap().timeout, TIMEOUT);
+        assert_eq!(Backend::shell("cat").timeout, TIMEOUT);
+        let slow = Backend::named("slow", &s).unwrap();
+        assert_eq!(slow.clone().limited_to(Some(45)).timeout, mins(45));
+        assert_eq!(slow.clone().limited_to(Some(u64::MAX)).timeout, mins(1440));
+        assert_eq!(slow.clone().limited_to(Some(0)).timeout, mins(1));
+        assert_eq!(slow.limited_to(None).timeout, mins(3));
     }
 
     #[test]

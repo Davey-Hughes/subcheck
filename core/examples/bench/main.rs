@@ -12,9 +12,10 @@
 //! number, and shows on stderr what the scans say of each file as they go.
 //!
 //! Each LLM's scan goes into a store of its own in a scratch directory, deleted when the bench
-//! ends. Ctrl-C ends the bench before that, and leaves the directory behind, a `.tmp…` one in
-//! `$TMPDIR` or `/tmp`. The bench never opens the store `subcheck` keeps, so it leaves no runs
-//! there.
+//! ends, by Ctrl-C too. A second Ctrl-C can end the bench while it deletes, and leaves what
+//! remains in `$TMPDIR` or `/tmp`: a `.tmp…` directory, its name ending in `.removing-<pid>` when
+//! a Ctrl-C began the deletion. The bench never opens the store `subcheck` keeps, so it leaves no
+//! runs there.
 
 mod score;
 #[cfg(test)]
@@ -28,6 +29,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use subcheck_core::group;
 use subcheck_core::llm::{Backend, Spent};
 use subcheck_core::scan::{self, DEFAULT_LANG, Event, Options, Planned};
 use subcheck_core::settings::Settings;
@@ -331,6 +333,15 @@ fn time_cell(time: Duration) -> String {
 }
 
 fn main() -> ExitCode {
+    let code = run();
+    // A signal on the way out still ends the bench as a signal: a return here would end it first,
+    // with a status of its own.
+    group::finish();
+    code
+}
+
+/// The bench of the LLMs the command line names, to its exit status.
+fn run() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args = match parse_args(&args) {
         Ok(args) => args,
@@ -341,10 +352,14 @@ fn main() -> ExitCode {
     };
     let ready = Settings::load().and_then(|settings| {
         let key = Key::parse(ANSWERS)?;
-        let scratch = tempfile::tempdir().map_err(|e| format!("a scratch directory: {e}"))?;
+        // Registered as it is made, so that a signal that ends the bench removes it; and the
+        // signals are taken from here on, where a bench of servers alone starts no group to take
+        // them.
+        let scratch = group::create_removing_dir(tempfile::tempdir)
+            .map_err(|e| format!("a scratch directory: {e}"))?;
         Ok((settings, key, scratch))
     });
-    let (settings, key, scratch) = match ready {
+    let (settings, key, (scratch, removing)) = match ready {
         Ok(ready) => ready,
         Err(e) => {
             eprintln!("bench: {e}");
@@ -365,6 +380,9 @@ fn main() -> ExitCode {
         &mut warn,
         &mut log,
     );
+    // Removed and forgotten with no signal between: one that came after the removal alone would
+    // remove whatever had taken the directory's name since.
+    removing.forget_after(|| drop(scratch));
     // A closed stdout, as `| head` leaves, ends the table and not the bench: the exit status still
     // says whether every LLM ran.
     if let Err(e) = write_table(&mut io::stdout().lock(), &render(&rows, &key, args.verbose)) {

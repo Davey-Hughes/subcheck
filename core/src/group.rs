@@ -1,11 +1,12 @@
 //! The process groups subcheck started that are still running (LLM commands, review's mpv,
-//! apply's mkvmerge, audio's ffmpeg), and the files to remove, so that a signal that ends
-//! subcheck ends those groups too and leaves no half-written file behind.
+//! apply's mkvmerge, audio's ffmpeg), and the files and directories to remove, so that a signal
+//! that ends subcheck ends those groups too and leaves no half-written file or scratch directory
+//! behind.
 //!
 //! The signals are taken on a thread of their own, so ending the groups is ordinary code that
 //! waits for the groups being started to be registered, and stops new ones: a signal ends subcheck
-//! before a group starts or after it is registered, never between. Files have a lock of their own,
-//! so that a file stuck on a stalled mount does not keep a signal from the groups.
+//! before a group starts or after it is registered, never between. Files and directories have a
+//! lock of their own, so that one stuck on a stalled mount does not keep a signal from the groups.
 
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -23,6 +24,10 @@ use signal_hook::low_level::emulate_default_handler;
 const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 /// How long a signal's cleanup has before a second SIGINT or SIGTERM ends subcheck without it.
 const PATIENCE: Duration = Duration::from_secs(1);
+/// How many times a directory's removal is tried while it fails as not empty. Bounded, so that a
+/// thread adding files as fast as they are removed, to a directory that could not be renamed
+/// away, does not keep subcheck from dying: its directory is left.
+const DIR_TRIES: usize = 10;
 
 /// What a signal ends, each entry under the id its guard forgets it by.
 struct List<T> {
@@ -49,8 +54,59 @@ impl<T> List<T> {
     }
 }
 
+/// What a signal removes.
+enum Remove {
+    File(PathBuf),
+    /// With everything in it.
+    Dir(PathBuf),
+}
+
+impl Remove {
+    /// Remove it, as well as can be. A failure is dropped: the cleanup goes on to what else is
+    /// registered, under a signal and in a quit alike.
+    fn now(&self) {
+        match self {
+            Remove::File(path) => {
+                let _ = std::fs::remove_file(path);
+            }
+            // Renamed away first, to a sibling: from then on nothing can be made under the path its
+            // writers know, so a store's journal cannot land in a directory half removed and keep
+            // it. A rename that fails (the sibling's name taken by a file or by a directory that is
+            // not empty, say) leaves the removal where the directory is.
+            Remove::Dir(path) => {
+                let renamed = removing_name(path).filter(|to| std::fs::rename(path, to).is_ok());
+                let dir = renamed.as_deref().unwrap_or(path);
+                remove_with_tries(|| std::fs::remove_dir_all(dir));
+            }
+        }
+    }
+}
+
+/// The name `dir` is renamed to before it is removed: a sibling, so in the same filesystem, where
+/// a rename is one step, and with the process id, so that two processes' directories of one name
+/// do not meet. `None` for a path with no name of its own (`/`, one ending in `..`).
+fn removing_name(dir: &Path) -> Option<PathBuf> {
+    let mut name = dir.file_name()?.to_os_string();
+    name.push(format!(".removing-{}", std::process::id()));
+    Some(dir.with_file_name(name))
+}
+
+/// Call `remove`, a directory's removal, again while it fails as not empty, [`DIR_TRIES`] times at
+/// most. A file can be made in the directory between the removal's listing and its end, by a
+/// thread whose making it was under way at the rename, or by any thread where the rename failed:
+/// the next try takes that file too.
+fn remove_with_tries(mut remove: impl FnMut() -> io::Result<()>) {
+    for _ in 0..DIR_TRIES {
+        match remove() {
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+            _ => break,
+        }
+    }
+}
+
 static GROUPS: Mutex<List<Pid>> = Mutex::new(List::new());
-static FILES: Mutex<List<PathBuf>> = Mutex::new(List::new());
+/// The files and directories a signal removes.
+static FILES: Mutex<List<Remove>> = Mutex::new(List::new());
 /// Read by each spawn ([`spawn`], [`spawn_without_terminal`]) from before its child starts until
 /// the child is registered, side by side; written by the signal thread, which so waits for the
 /// spawns under way and stops new ones.
@@ -122,7 +178,7 @@ fn start_registered(cmd: &mut Command) -> io::Result<(Child, Registered)> {
     Ok((child, Registered(id)))
 }
 
-/// A file a signal removes; dropping it forgets the file (and removes nothing).
+/// A file or a directory a signal removes; dropping it forgets that (and removes nothing).
 pub struct Removing(u64);
 
 impl Drop for Removing {
@@ -133,10 +189,10 @@ impl Drop for Removing {
 }
 
 impl Removing {
-    /// Run `f`, then forget the file, with no signal between: one that ends subcheck does so
-    /// before `f` (removing the file) or after the file is forgotten. `f` runs with the files
-    /// locked, which the signal thread takes last: it must not call into this module or drop a
-    /// guard of it.
+    /// Run `f`, then forget the file or the directory, with no signal between: one that ends
+    /// subcheck does so before `f` (removing it) or after it is forgotten. `f` runs with the
+    /// files locked, which the signal thread takes last: it must not call into this module or
+    /// drop a guard of it.
     pub fn forget_after<T>(self, f: impl FnOnce() -> T) -> T {
         wait_if_ending();
         let mut files = lock(&FILES);
@@ -160,7 +216,28 @@ pub fn create_removing(
     wait_if_ending();
     let mut files = lock(&FILES);
     create(path)?;
-    Ok(Removing(files.add(path.to_path_buf())))
+    Ok(Removing(files.add(Remove::File(path.to_path_buf()))))
+}
+
+/// Make a directory with `create`, registered with no signal between the two, as
+/// [`create_removing`] does a file: a `create` that fails registers nothing, and it runs with the
+/// files locked, so it must not call into this module or drop a guard of it. If a signal ends
+/// subcheck before the returned guard is dropped, the directory is renamed away, to a sibling
+/// name, so that nothing more is made under its path, and then removed with everything in it. A
+/// caller that removes the directory itself does so inside the guard's
+/// [`forget_after`](Removing::forget_after): removed before the guard is dropped, a signal between
+/// the two would remove whatever had the name by then, and after, it would leave the directory.
+/// The signals are taken from here on, as from a group's start: a process that starts no group
+/// still removes its directory.
+pub fn create_removing_dir<D: AsRef<Path>>(
+    create: impl FnOnce() -> io::Result<D>,
+) -> io::Result<(D, Removing)> {
+    INSTALL.call_once(install);
+    wait_if_ending();
+    let mut files = lock(&FILES);
+    let dir = create()?;
+    let id = files.add(Remove::Dir(dir.as_ref().to_path_buf()));
+    Ok((dir, Removing(id)))
 }
 
 /// To call as subcheck's main returns. While a signal is ending subcheck, a run returning on the
@@ -246,29 +323,31 @@ fn ignored(sig: libc::c_int) -> bool {
     }
 }
 
-/// Kill every registered group, then remove every registered file, then die of `sig` as if there
-/// were no handler. Through [`end`]'s `Once`, as `end` holds the registry for good: after an `end`
-/// the cleanup is done, so it dies at once, and during one it waits for that cleanup to end, where
-/// a cleanup of its own would wait for a registry no one lets go of. Should `end`'s cleanup ever
-/// panic, which `end_all` cannot (each lock it takes recovers from poison), a later `end` marks the
-/// `Once` done with none run, and a signal after that dies with none.
+/// Kill every registered group, then remove every registered file and directory, then die of `sig`
+/// as if there were no handler. Through [`end`]'s `Once`, as `end` holds the registry for good:
+/// after an `end` the cleanup is done, so it dies at once, and during one it waits for that cleanup
+/// to end, where a cleanup of its own would wait for a registry no one lets go of. Should `end`'s
+/// cleanup ever panic, which `end_all` cannot (each lock it takes recovers from poison), a later
+/// `end` marks the `Once` done with none run, and a signal after that dies with none.
 fn end_by_signal(sig: libc::c_int) {
     let mut held = None;
     END.call_once_force(|_| held = Some(end_all()));
     let _ = emulate_default_handler(sig);
 }
 
-/// The registry as [`end_all`] leaves it: held, so no group starts and no file is made.
+/// The registry as [`end_all`] leaves it: held, so no group starts and no file or directory is
+/// made.
 type Held = (
     RwLockWriteGuard<'static, ()>,
     MutexGuard<'static, List<Pid>>,
-    MutexGuard<'static, List<PathBuf>>,
+    MutexGuard<'static, List<Remove>>,
 );
 
-/// Kill every registered group, then remove every registered file. The groups running now are
-/// killed first, so a start stuck in exec does not keep them alive; then, once no start is under
-/// way and none can begin, any registered since. The files come last, so one stuck on a stalled
-/// mount does not keep the groups alive either. Returns the registry, held.
+/// Kill every registered group, then remove every registered file and directory. The groups
+/// running now are killed first, so a start stuck in exec does not keep them alive; then, once no
+/// start is under way and none can begin, any registered since. The files and directories come
+/// last, so one stuck on a stalled mount does not keep the groups alive either. Returns the
+/// registry, held.
 fn end_all() -> Held {
     ENDING.store(true, Ordering::SeqCst);
     let kill_all = |groups: &List<Pid>| {
@@ -281,21 +360,21 @@ fn end_all() -> Held {
     let groups = lock(&GROUPS);
     kill_all(&groups);
     let files = lock(&FILES);
-    for (_, path) in &files.entries {
-        let _ = std::fs::remove_file(path);
+    for (_, remove) in &files.entries {
+        remove.now();
     }
     (starting, groups, files)
 }
 
-/// A signal's cleanup, for a quit that leaves work under way (review's screen quit mid-scan):
-/// every registered group killed and every registered file removed, and the registry held for
-/// good, so no group starts after. A thread that comes back through this module waits for the
-/// end, as under a signal: an LLM call killed under a worker is not recorded as a failure.
-/// Unlike a signal, it does not end subcheck: the caller says what it did and returns from main,
-/// where [`finish`] lets it. A second call, from any thread, returns once the first has ended the
-/// groups, or has panicked trying: a review session's `close` and its own thread can both end a
-/// job, and a later `close` must not panic, in `Drop` or across the FFI. After a signal's cleanup,
-/// which ends subcheck, it returns at once.
+/// A signal's cleanup, for a quit that leaves work under way (review's screen quit mid-scan): every
+/// registered group killed and every registered file and directory removed, and the registry held
+/// for good, so no group starts after. A thread that comes back through this module waits for the
+/// end, as under a signal: an LLM call killed under a worker is not recorded as a failure. Unlike a
+/// signal, it does not end subcheck: the caller says what it did and returns from main, where
+/// [`finish`] lets it. A second call, from any thread, returns once the first has ended the groups,
+/// or has panicked trying: a review session's `close` and its own thread can both end a job, and a
+/// later `close` must not panic, in `Drop` or across the FFI. After a signal's cleanup, which ends
+/// subcheck, it returns at once.
 ///
 /// Call it last: a guard of this module dropped after it (review's player) would wait forever.
 pub fn end() {
@@ -360,6 +439,13 @@ mod tests {
         create_removing(path, |_| Ok(())).unwrap()
     }
 
+    /// The file the child writes once it is ready, beside `path`: `<path>.ready`.
+    fn ready_file(path: &Path) -> PathBuf {
+        let mut ready = path.to_path_buf().into_os_string();
+        ready.push(".ready");
+        ready.into()
+    }
+
     /// Time enough for a child to die of a signal, on a loaded machine too.
     const DIES: Duration = Duration::from_secs(5);
 
@@ -378,13 +464,43 @@ mod tests {
             return;
         };
         let path = PathBuf::from(path);
-        let ready = || {
-            let mut ready = path.clone().into_os_string();
-            ready.push(".ready");
-            std::fs::write(ready, "").unwrap();
-        };
+        let ready = || std::fs::write(ready_file(&path), "").unwrap();
         let how = std::env::var("SUBCHECK_TEST_HOW").unwrap_or_default();
         let _removing = match how.as_str() {
+            // A scratch directory made through the module, a store and a subdirectory with a file
+            // in it; in `dir-written` a thread goes on making files in it until it cannot, and in
+            // `dir-dropped` its guard is dropped before the signal.
+            "dir" | "dir-written" | "dir-dropped" => {
+                // Ctrl-C is the signal these tests send, and a test run in the background of a
+                // script inherits it ignored, which the module would leave so.
+                // SAFETY: setting a disposition to SIG_DFL.
+                unsafe {
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                }
+                let (dir, removing) = create_removing_dir(|| {
+                    std::fs::create_dir(&path)?;
+                    Ok(path.clone())
+                })
+                .unwrap();
+                std::fs::write(dir.join("row-1.db"), "a store").unwrap();
+                std::fs::create_dir(dir.join("sub")).unwrap();
+                std::fs::write(dir.join("sub").join("file"), "in it").unwrap();
+                if how == "dir-written" {
+                    std::thread::spawn(move || {
+                        let mut n = 0_u64;
+                        while std::fs::write(dir.join(format!("more-{n}")), "").is_ok() {
+                            n += 1;
+                        }
+                    });
+                }
+                if how == "dir-dropped" {
+                    drop(removing);
+                    ready();
+                    std::thread::sleep(Duration::from_secs(10));
+                    return;
+                }
+                removing
+            }
             "nohup" => {
                 // SAFETY: setting a disposition to SIG_IGN.
                 unsafe {
@@ -738,7 +854,7 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let ready = path.with_extension("mkv.ready");
+        let ready = ready_file(path);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !ready.exists() {
             assert!(
@@ -860,6 +976,151 @@ mod tests {
         std::fs::write(&path, "half a remux").unwrap();
         assert_ends(&mut signalled(&path, "", Signal::TERM), DIES);
         assert!(!path.exists());
+    }
+
+    /// The names of what `dir` holds, sorted.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_signal_removes_a_registered_directory_and_what_is_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch");
+        let mut child = signalled(&path, "dir", Signal::INT);
+        let status = assert_ends(&mut child, DIES);
+        assert_eq!(status.signal(), Some(libc::SIGINT), "{status}");
+        // Neither the directory nor the sibling it was renamed to.
+        assert_eq!(names_in(dir.path()), ["scratch.ready"]);
+    }
+
+    #[test]
+    fn a_signal_removes_a_registered_directory_while_a_thread_still_writes_into_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch");
+        let mut child = signalled(&path, "dir-written", Signal::INT);
+        let status = assert_ends(&mut child, DIES);
+        assert_eq!(status.signal(), Some(libc::SIGINT), "{status}");
+        // Neither the directory nor the sibling it was renamed to.
+        assert_eq!(names_in(dir.path()), ["scratch.ready"]);
+    }
+
+    #[test]
+    fn a_directory_is_renamed_to_a_sibling_in_its_own_parent() {
+        let pid = std::process::id();
+        for (dir, sibling) in [
+            ("/tmp/.tmpAbC123", format!("/tmp/.tmpAbC123.removing-{pid}")),
+            ("/tmp/x/scratch", format!("/tmp/x/scratch.removing-{pid}")),
+            ("/tmp/x/scratch.", format!("/tmp/x/scratch..removing-{pid}")),
+            (
+                "/tmp/x/scratch.d",
+                format!("/tmp/x/scratch.d.removing-{pid}"),
+            ),
+            ("/tmp/x/scratch/", format!("/tmp/x/scratch.removing-{pid}")),
+            ("scratch", format!("scratch.removing-{pid}")),
+        ] {
+            let renamed = removing_name(Path::new(dir)).unwrap();
+            assert_eq!(renamed, Path::new(&sibling), "{dir}");
+            assert_eq!(renamed.parent(), Path::new(dir).parent(), "{dir}");
+        }
+        // No name of its own to put a sibling beside.
+        for dir in ["/", "..", "/tmp/x/.."] {
+            assert_eq!(removing_name(Path::new(dir)), None, "{dir}");
+        }
+    }
+
+    #[test]
+    fn a_directory_alone_in_its_parent_is_removed_whatever_its_name_and_nothing_is_left_there() {
+        for name in ["scratch", "scratch.", ".tmpAbC123", "scratch.d"] {
+            let parent = tempfile::tempdir().unwrap();
+            let dir = parent.path().join(name);
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            std::fs::write(dir.join("sub").join("file"), "in it").unwrap();
+            Remove::Dir(dir).now();
+            assert_eq!(names_in(parent.path()), [""; 0], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_renamed_away_is_removed_where_it_is() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("scratch");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("row-1.db"), "a store").unwrap();
+        // Its sibling's name is taken, by a directory that is not empty.
+        let taken = removing_name(&dir).unwrap();
+        std::fs::create_dir(&taken).unwrap();
+        std::fs::write(taken.join("kept"), "").unwrap();
+        Remove::Dir(dir.clone()).now();
+        assert!(!dir.exists());
+        assert!(
+            taken.join("kept").exists(),
+            "what had the name is left alone"
+        );
+    }
+
+    /// How many times a removal is called that gives `result(call)` on each call, from 1.
+    fn calls(result: impl Fn(usize) -> io::Result<()>) -> usize {
+        let mut calls = 0;
+        remove_with_tries(|| {
+            calls += 1;
+            result(calls)
+        });
+        calls
+    }
+
+    /// A removal's failure of the `kind`.
+    fn fails(kind: io::ErrorKind) -> io::Result<()> {
+        Err(io::Error::from(kind))
+    }
+
+    #[test]
+    fn a_removal_that_finds_the_directory_not_empty_is_tried_again_until_it_succeeds() {
+        let twice_not_empty = |call| match call {
+            1 | 2 => fails(io::ErrorKind::DirectoryNotEmpty),
+            _ => Ok(()),
+        };
+        assert_eq!(calls(twice_not_empty), 3);
+    }
+
+    #[test]
+    fn a_removal_that_never_finds_the_directory_empty_is_given_up_after_its_tries() {
+        assert_eq!(
+            calls(|_| fails(io::ErrorKind::DirectoryNotEmpty)),
+            DIR_TRIES
+        );
+    }
+
+    #[test]
+    fn a_removal_that_fails_another_way_is_not_tried_again() {
+        assert_eq!(calls(|_| fails(io::ErrorKind::PermissionDenied)), 1);
+    }
+
+    #[test]
+    fn a_directory_whose_guard_was_dropped_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch");
+        let mut child = signalled(&path, "dir-dropped", Signal::INT);
+        let status = assert_ends(&mut child, DIES);
+        assert_eq!(status.signal(), Some(libc::SIGINT), "{status}");
+        assert!(path.join("row-1.db").exists());
+        assert!(path.join("sub").join("file").exists());
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_made_registers_nothing() {
+        let made = create_removing_dir(|| {
+            Err::<PathBuf, _>(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(
+            made.err().map(|e| e.kind()),
+            Some(io::ErrorKind::PermissionDenied)
+        );
     }
 
     #[test]
@@ -1053,8 +1314,13 @@ mod tests {
 
         let path = Path::new("/nonexistent/x");
         let removing = remove_on_signal(path);
-        assert!(lock(&FILES).entries.iter().any(|(_, p)| p == path));
+        let registered = || {
+            let files = lock(&FILES);
+            let mut entries = files.entries.iter();
+            entries.any(|(_, remove)| matches!(remove, Remove::File(p) if p == path))
+        };
+        assert!(registered());
         drop(removing);
-        assert!(!lock(&FILES).entries.iter().any(|(_, p)| p == path));
+        assert!(!registered());
     }
 }

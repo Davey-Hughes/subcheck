@@ -27,6 +27,42 @@ pub fn a_childs_session(
     (pid, session)
 }
 
+/// The pid of the shell that runs a command, the session that shell is in, and what `run` gave.
+/// `run` is given the command's text and runs it through `sh -c` to its end, the way under test.
+/// Only a running process has a session to ask for, so the command says its pid and waits to be
+/// told it was asked, then does `then`.
+pub fn a_commands_session<T: Send>(
+    then: &str,
+    run: impl FnOnce(&str) -> T + Send,
+) -> (
+    rustix::process::Pid,
+    rustix::io::Result<rustix::process::Pid>,
+    T,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let (said, asked) = (dir.path().join("pid"), dir.path().join("asked"));
+    let cmd = format!(
+        "echo $$ > '{}'; until [ -e '{}' ]; do sleep 0.05; done; {then}",
+        said.display(),
+        asked.display()
+    );
+    std::thread::scope(|s| {
+        let ran = s.spawn(|| run(&cmd));
+        let pid = loop {
+            // The whole line: the shell makes the file, then writes it.
+            match std::fs::read_to_string(&said) {
+                Ok(line) if line.ends_with('\n') => break line.trim().parse().unwrap(),
+                _ if ran.is_finished() => panic!("the command ended without saying its pid"),
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+        let session = rustix::process::getsid(Some(pid));
+        std::fs::write(&asked, "").unwrap();
+        (pid, session, ran.join().unwrap())
+    })
+}
+
 /// A file under core/tests/fixtures/, built by dev/make-fixtures.sh.
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

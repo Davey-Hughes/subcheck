@@ -635,7 +635,9 @@ impl Asker<'_> {
                 reply,
                 used,
                 too_big,
-            } = self.backend.call(&prompt, llm::TIMEOUT, self.budget);
+            } = self
+                .backend
+                .call(&prompt, self.backend.timeout, self.budget);
             match used {
                 Used::Reported(usage) => self.calls.push((lines.len(), Some(usage))),
                 Used::Unreported => self.calls.push((lines.len(), None)),
@@ -791,6 +793,7 @@ pub fn resume(
         via: Via::Unknown(why),
         chunk_lines: None,
         jobs: llm::JOBS,
+        timeout: llm::TIMEOUT,
     });
     let set = |l: &[String]| CheckedWith::new("", l, 0).langs;
     if !langs.is_empty() && set(langs) != set(&header.langs) {
@@ -1338,6 +1341,8 @@ fn findings(
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::llm::Context;
     use crate::test_support::{
@@ -2034,6 +2039,18 @@ mod tests {
     }
 
     #[test]
+    fn each_call_gets_the_backends_limit() {
+        let backend = Backend {
+            timeout: Duration::from_secs(1),
+            ..Backend::shell("sleep 20")
+        };
+        let began = Instant::now();
+        let (result, _) = ask(&backend, &[line("One.")], None);
+        assert_eq!(result, Err("sh timed out after 1s".to_string()));
+        assert!(began.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
     fn a_chunk_refused_for_the_context_is_halved_until_it_fits_and_its_findings_keep_their_lines() {
         let backend = serving(None, |lines, r| {
             if lines > 4 {
@@ -2057,6 +2074,25 @@ mod tests {
         assert_eq!(sent(&calls), [2, 1, 1]);
         let error = result.unwrap_err();
         assert!(error.contains("HTTP 400"), "{error}");
+    }
+
+    #[test]
+    fn a_refused_key_fails_a_chunk_without_a_second_request() {
+        let fake = FakeServer::start(|r| match (r.method.as_str(), r.path.as_str()) {
+            ("GET", "/v1/models") => models_reply(&["m"]),
+            _ => Reply::status(401, r#"{"error":{"message":"bad key"}}"#),
+        });
+        let backend = through(&fake, "api_key_env = \"HOME\"\n", 1, None).backend;
+        let (result, calls) = ask(&backend, &ten_lines(), None);
+        let error = result.unwrap_err();
+        assert!(error.contains("HTTP 401"), "{error}");
+        // The chunk's second try sends nothing, so it counts as no call.
+        assert_eq!(sent(&calls), [10]);
+        assert_eq!(fake.completions().len(), 1);
+        let (again, calls) = ask(&backend, &ten_lines(), None);
+        assert_eq!(again, Err(error));
+        assert_eq!(sent(&calls), Vec::<usize>::new());
+        assert_eq!(fake.completions().len(), 1);
     }
 
     #[test]

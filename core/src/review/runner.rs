@@ -290,6 +290,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_recheck_takes_the_entrys_limit_as_the_settings_have_it_now() {
+        let s = Settings::parse(
+            Path::new("/c/config.toml"),
+            "[llm.mine]\ncommand = \"x\"\ntimeout_minutes = 25\n",
+        )
+        .unwrap();
+        let limit = |label| {
+            let opts = recheck_options(&scan_row(label, &["eng"]), "r", &s).unwrap();
+            opts.backend.timeout
+        };
+        assert_eq!(limit("mine"), Duration::from_mins(25));
+        assert_eq!(limit("claude"), llm::TIMEOUT);
+    }
+
     /// A store in a temp dir holding a run labelled `label`, begun on a copy of typos.mkv, and
     /// `settings` in config.toml beside it; a runner whose rechecks read that file, the channel its
     /// jobs send to, and the task that checks the copy again into the run.

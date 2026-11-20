@@ -11,10 +11,10 @@
 //! thinking off and `truncate: false`: Ollama's OpenAI API cuts a prompt longer than the context to
 //! fit and answers the rest without a word, where its own refuses it, so the chunk can be split.
 
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::io::ErrorKind;
 use std::net::IpAddr;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -24,7 +24,7 @@ use ureq::tls::{RootCerts, TlsConfig};
 use ureq::{Agent, Body, RequestBuilder};
 
 use super::key::{self, Key};
-use super::{Answer, Budget, Output, SYSTEM, TIMEOUT, TooBig, Usage, Used, classify};
+use super::{Answer, Budget, Output, SYSTEM, TooBig, Usage, Used, classify};
 use crate::settings::{KeySource, ServerEntry, Thinking};
 
 #[cfg(test)]
@@ -55,12 +55,121 @@ pub struct Server {
     /// The model the calls ask for: the entry's, or the one a run recorded. `None` until the
     /// server says which it serves, when the entry names none.
     pub model: Option<String>,
-    /// The key the calls send: `None` for an entry without one, and until it is fetched.
-    key: Option<Key>,
+    /// The key the calls send, which a 401 can change under them ([`Server::asked`]).
+    key: SharedKey,
     /// Read by `ready`, and again by `sized` once the model is loaded.
     context: Context,
     api: Api,
 }
+
+/// What a server's next request does about a key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyState {
+    /// It sends none: an entry without one, or a server not readied.
+    None,
+    /// The key it sends.
+    Sending(Key),
+    /// It is not sent: the server answered 401 to the key, and there is no other to send in its
+    /// place. Boxed, so that what a refusal keeps adds nothing to a [`Server`], which a backend
+    /// holds by value.
+    Refused(Box<Refusal>),
+}
+
+/// A key a server refused, and what the server's calls fail with from then on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Refusal {
+    /// Kept to hide it in what else is said of the server.
+    key: Key,
+    /// The refusal's words, the key hidden.
+    why: String,
+}
+
+/// A server's [`KeyState`], behind a lock: a scan's calls share the server, so the key one of them
+/// fetched again is the one the rest send, and a key refused for one is sent by none. The lock is
+/// held only to read the state or to change it, never while a request is in flight or a key
+/// command runs, which would hold every other call behind a passphrase window.
+struct SharedKey(Mutex<KeyState>);
+
+impl SharedKey {
+    fn new(state: KeyState) -> Self {
+        Self(Mutex::new(state))
+    }
+
+    /// A copy of the state as it is now.
+    fn get(&self) -> KeyState {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        state.clone()
+    }
+
+    /// Makes the state `next` while the key it sends is still `sent`, the one a request was
+    /// answered for, and gives the state as it is left. A state another call has changed since
+    /// stays: it holds a key that answer says nothing of, or a refusal already.
+    fn replace(&self, sent: &Key, next: KeyState) -> KeyState {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(&*state, KeyState::Sending(key) if key == sent) {
+            *state = next;
+        }
+        state.clone()
+    }
+}
+
+/// A copy of the state, not a share of it: a backend cloned for another scan is refused, or given
+/// a new key, by its own calls.
+impl Clone for SharedKey {
+    fn clone(&self) -> Self {
+        Self::new(self.get())
+    }
+}
+
+/// By what the states hold. Each is copied in turn, so the two locks are never held together,
+/// and a server compared with itself does not wait on its own lock.
+impl PartialEq for SharedKey {
+    fn eq(&self, other: &Self) -> bool {
+        let mine = self.get();
+        mine == other.get()
+    }
+}
+
+impl Eq for SharedKey {}
+
+/// The state alone, which shows no key: [`Key`]'s `Debug` hides it, and a refusal's message has
+/// it hidden.
+impl fmt::Debug for SharedKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+/// A request to the server that [`Server::asked`] may send twice: `<base>/<path>`, a `POST` of
+/// `body` as JSON when there is one, else a `GET`, answered within `timeout`.
+struct Ask<'a> {
+    base: &'a str,
+    path: &'a str,
+    body: Option<&'a str>,
+    timeout: Duration,
+}
+
+/// How a request sent as the key's rule says ([`Server::asked`]) ended. Each message has hidden
+/// the key its own request sent, whatever the server sends since.
+enum Told {
+    /// A 2xx answer's text as the server sent it, and the key its request sent, which hides what
+    /// is said of the text.
+    Answer(String, Option<Key>),
+    /// Any other status: its text as the server sent it, which says what kind of refusal it is,
+    /// and what to say of it.
+    Status {
+        status: u16,
+        text: String,
+        why: String,
+    },
+    /// No answer: why, and what the request may have used.
+    Nothing(String, Used),
+    /// Nothing was sent, and why: the key is refused, or is not fetched.
+    Unsent(String),
+}
+
+/// What a 401 or 403 for a request that sent a key says after the server's words.
+const CHECK_KEY: &str = "; check the entry's key";
 
 /// Which of a server's APIs its calls go through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +186,7 @@ impl Server {
             name: name.to_string(),
             entry: entry.clone(),
             model: model.map(ToString::to_string),
-            key: None,
+            key: SharedKey::new(KeyState::None),
             context: Context::Unknown,
             api: Api::OpenAi,
         }
@@ -125,7 +234,9 @@ impl Server {
     /// for the context, or a prompt the server may have cut ([`Server::cut_at`]), is
     /// [`TooBig::Prompt`]; a reply cut off where the call sent a cap says which
     /// ([`Server::cut_off`]). An error has the key hidden, since a server may echo back the key it
-    /// refused.
+    /// refused. The request goes as the key's rule says ([`Server::asked`]): a call whose key is
+    /// refused sends nothing, so it has nothing to count. A 2xx marks the key as one that has
+    /// worked ([`key::worked`]), which no other request's does.
     pub(super) fn call(&self, prompt: &str, timeout: Duration, budget: Option<Budget>) -> Answer {
         let max_reply = budget.map(Budget::cap);
         let Some(model) = &self.model else {
@@ -135,7 +246,6 @@ impl Server {
                 too_big: None,
             };
         };
-        let url = &self.entry.url;
         let (base, path) = self.endpoint();
         let body = match self.api {
             Api::OpenAi => body(
@@ -148,19 +258,29 @@ impl Server {
             Api::Ollama => ollama_body(model, prompt, max_reply),
         }
         .to_string();
-        let request = match self.prepared(agent(url).post(format!("{base}/{path}")), timeout) {
-            Ok(request) => request.header("Content-Type", "application/json"),
-            Err(why) => {
-                return Answer {
-                    reply: Err(why),
-                    used: Used::Untracked,
-                    too_big: None,
-                };
-            }
+        let ask = Ask {
+            base,
+            path,
+            body: Some(&body),
+            timeout,
         };
-        let mut answer = match request.send(body).and_then(status_and_text) {
-            Ok((status, text)) if (200..300).contains(&status) => {
-                let mut answer = self.read(text);
+        let says = |status: u16, text: &str| {
+            let mut why = error_text(status, text);
+            if status == 404 {
+                self.pull_hint(&mut why);
+            }
+            why
+        };
+        match self.asked(&ask, says) {
+            Told::Answer(text, key) => {
+                // Only a chat's answer shows that a key works. Some servers (llama-server,
+                // OpenRouter) list their models without checking the key: a wrong key marked at
+                // `/models` would have its first chat's 401 run the key command a second time,
+                // for a key that never worked.
+                if let Some(sent) = &key {
+                    key::worked(&self.entry.key, sent);
+                }
+                let mut answer = self.read(text, key.as_ref());
                 // A cap the call sent may be the length limit the reply met, not the server's, so
                 // the failure names it and what sets it.
                 if answer.too_big == Some(TooBig::Reply)
@@ -178,34 +298,145 @@ impl Server {
                     ));
                     answer.too_big = Some(TooBig::Prompt);
                 }
+                // An error `read` keeps as it was has not been hidden.
+                answer.reply = answer.reply.map_err(|why| hide(key.as_ref(), why));
                 answer
             }
-            Ok((status, text)) => {
-                // Read before the key is hidden: a key that is a word of the refusal would hide it.
-                let too_big = refused_for_context(status, &text).then_some(TooBig::Prompt);
-                let mut reply = error_text(status, &self.hidden(text));
-                self.refused(status, &mut reply);
-                if status == 404 {
-                    self.pull_hint(&mut reply);
-                }
-                Answer {
-                    reply: Err(reply),
-                    used: Used::Unreported,
-                    too_big,
-                }
-            }
-            Err(e) => {
-                let (why, used) = failed(base, path, &e, timeout);
-                Answer {
-                    reply: Err(why),
-                    used,
-                    too_big: None,
-                }
-            }
+            Told::Status { status, text, why } => Answer {
+                reply: Err(why),
+                used: Used::Unreported,
+                // Read from the text as sent: a key that is a word of the refusal would hide it.
+                too_big: refused_for_context(status, &text).then_some(TooBig::Prompt),
+            },
+            Told::Nothing(why, used) => Answer {
+                reply: Err(why),
+                used,
+                too_big: None,
+            },
+            Told::Unsent(why) => Answer {
+                reply: Err(why),
+                used: Used::Untracked,
+                too_big: None,
+            },
+        }
+    }
+
+    /// `ask` sent with the key, as the key's rule says, `says` wording an answer that is not 2xx
+    /// from its status and its text, key hidden.
+    ///
+    /// A 2xx changes nothing about the key here: whether it shows that the key works is the
+    /// caller's to say, and only a chat's does ([`Server::call`]). A 401 says the key is not
+    /// accepted, so [`key::refetch`] is asked for another: with one, the calls send it from now on
+    /// and `ask` is sent once more, that answer being the outcome; with none, or a key command
+    /// that fails, the key is refused, and until the server is readied again nothing is sent:
+    /// every call fails at once with this answer's words. That holds for a call whose 401 comes
+    /// after another's refusal too: the key fetched for it is not sent. A key that has not
+    /// worked is not fetched again, which would be a second passphrase window for a key likely
+    /// to be the same, so the request sent once more is the last this call sends: a 401 for it
+    /// asks [`key::refetch`] too, which refuses its key, or gives the next call the key fetched
+    /// since another call's request made this one work. A 403 is left to its own call: a server
+    /// can refuse one request that way (a chunk it moderates, a model the key may not use), so
+    /// this scan's calls go on with the key, and the next scan or recheck runs the key command
+    /// again ([`key::forbidden`]). Both say to check the entry's key. A request that sent no key
+    /// changes nothing and says nothing of one.
+    fn asked(&self, ask: &Ask<'_>, says: impl Fn(u16, &str) -> String) -> Told {
+        let key = match self.sending() {
+            Ok(key) => key,
+            Err(why) => return Told::Unsent(why),
         };
-        // What ureq says of a failure, and an error `read` keeps as it was, have not been hidden.
-        answer.reply = answer.reply.map_err(|why| self.hidden(why));
-        answer
+        match self.once(ask, key, &says) {
+            (_, Some(fetched)) => self.once(ask, Some(fetched), &says).0,
+            (told, None) => told,
+        }
+    }
+
+    /// One request of [`Server::asked`]: `ask` sent with `key`, and what its answer does about
+    /// the key. With how it ended, the key a 401 fetched to send in its place, when the server
+    /// still sends one.
+    fn once(
+        &self,
+        ask: &Ask<'_>,
+        key: Option<Key>,
+        says: &impl Fn(u16, &str) -> String,
+    ) -> (Told, Option<Key>) {
+        let source = &self.entry.key;
+        match (self.send(ask, key.as_ref()), key) {
+            (Ok((status, text)), key) if (200..300).contains(&status) => {
+                (Told::Answer(text, key), None)
+            }
+            (Ok((status, text)), None) => {
+                let why = says(status, &text);
+                (Told::Status { status, text, why }, None)
+            }
+            (Ok((status, text)), Some(sent)) => {
+                // Hidden before `says` cuts the server's words, so no part of a key is left that
+                // `hide` cannot find.
+                let mut why = says(status, &sent.hide(&text));
+                let fetched = match status {
+                    401 => {
+                        why.push_str(CHECK_KEY);
+                        // The state's lock is not held here: the command can wait on a
+                        // passphrase window.
+                        key::refetch(source, &sent).unwrap_or_else(|failed| {
+                            let _ = write!(why, "; {failed}");
+                            None
+                        })
+                    }
+                    403 => {
+                        key::forbidden(source, &sent);
+                        why.push_str(CHECK_KEY);
+                        None
+                    }
+                    _ => None,
+                };
+                // Hidden again: words read out of the server's JSON can hold a key that the
+                // text's escapes kept from the first pass.
+                let why = sent.hide(&why);
+                if status != 401 {
+                    return (Told::Status { status, text, why }, None);
+                }
+                let next = match &fetched {
+                    Some(new) => KeyState::Sending(new.clone()),
+                    None => KeyState::Refused(Box::new(Refusal {
+                        key: sent.clone(),
+                        why: why.clone(),
+                    })),
+                };
+                // A server another call's refusal has stopped sends nothing more, the key
+                // fetched here included: its calls stop together.
+                let stopped = matches!(self.key.replace(&sent, next), KeyState::Refused(_));
+                let fetched = fetched.filter(|_| !stopped);
+                (Told::Status { status, text, why }, fetched)
+            }
+            (Err(e), key) => {
+                let (why, used) = failed(ask.base, ask.path, &e, ask.timeout);
+                (Told::Nothing(hide(key.as_ref(), why), used), None)
+            }
+        }
+    }
+
+    /// `ask` sent with `key`, when there is one: the answer's status and text.
+    fn send(&self, ask: &Ask<'_>, key: Option<&Key>) -> Result<(u16, String), ureq::Error> {
+        let agent = agent(&self.entry.url);
+        let url = format!("{}/{}", ask.base, ask.path);
+        let answer = match ask.body {
+            Some(body) => prepared(agent.post(url), key, ask.timeout)
+                .header("Content-Type", "application/json")
+                .send(body),
+            None => prepared(agent.get(url), key, ask.timeout).call(),
+        };
+        answer.and_then(status_and_text)
+    }
+
+    /// The key a request sends now, `None` for an entry without one; or why nothing is sent: the
+    /// refusal of a refused key, or a key not fetched, which the server would refuse.
+    fn sending(&self) -> Result<Option<Key>, String> {
+        match (self.key.get(), &self.entry.key) {
+            (KeyState::Sending(key), _) => Ok(Some(key)),
+            (KeyState::Refused(refusal), _) => Err(refusal.why),
+            (KeyState::None, KeySource::None) => Ok(None),
+            (KeyState::None, _) => Err("the key is not fetched".into()),
+        }
     }
 
     /// Why a reply cut off at its length limit fails, when a call with `budget` sent a cap: the
@@ -262,36 +493,35 @@ impl Server {
     /// warnings to show. An error has the key hidden, since a server may echo back the key it
     /// refused.
     pub(super) fn ready(mut self) -> Result<(Server, Vec<String>), String> {
-        self.key = key::fetch(&self.entry.key)?;
-        let url = &self.entry.url;
-        let settled = self.models().and_then(|models| {
-            let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
-            let model = settle(url, self.model.as_deref(), &ids).map_err(|mut why| {
-                self.pull_hint(&mut why);
-                why
-            })?;
-            let context = models
-                .iter()
-                .find(|m| m.id == model)
-                .and_then(Listed::context);
-            Ok((model, context))
-        });
-        let (model, context) = settled.map_err(|why| self.hidden(why))?;
+        let key = key::fetch(&self.entry.key)?;
+        let keyed = key.is_some();
+        // The key as fetched, whatever state the server came with: a scan starts unrefused.
+        self.key = SharedKey::new(key.map_or(KeyState::None, KeyState::Sending));
+        let models = self.models()?;
+        let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+        // The ids are the server's, so the key is hidden: the one sent to `/models`.
+        let model = settle(&self.entry.url, self.model.as_deref(), &ids).map_err(|mut why| {
+            self.pull_hint(&mut why);
+            self.hidden(why)
+        })?;
+        let context = models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(Listed::context);
         self.model = Some(model);
         self.context = context.map_or_else(|| self.ps(), Context::Tokens);
-        let warning = self
-            .key
-            .as_ref()
-            .and_then(|_| key_warning(&self.label(), &self.entry.url));
+        let warning = keyed
+            .then(|| key_warning(&self.label(), &self.entry.url))
+            .flatten();
         Ok((self, warning.into_iter().collect()))
     }
 
     /// The server sized, as [`Backend::sized`](super::Backend::sized) says: with a context that is
-    /// `NotLoaded`, its model loaded and `/api/ps` asked again. An error has the key hidden, since
-    /// a server may echo back the key it refused.
-    pub(super) fn sized(mut self) -> Result<Server, String> {
+    /// `NotLoaded`, its model loaded within `timeout` and `/api/ps` asked again. An error has the
+    /// key hidden, since a server may echo back the key it refused.
+    pub(super) fn sized(mut self, timeout: Duration) -> Result<Server, String> {
         if let Some((root, model)) = self.to_load() {
-            self.load(root, model)?;
+            self.load(root, model, timeout)?;
             // A model still not listed once loaded leaves the context `Unknown`, not `NotLoaded`,
             // so nothing loads it again.
             self.context = match self.ps() {
@@ -320,18 +550,23 @@ impl Server {
     }
 
     /// Ollama made to load `model`: `POST <root>/api/generate` naming the model and no prompt,
-    /// which loads it and generates nothing. Any 2xx answer is a load.
-    fn load(&self, root: &str, model: &str) -> Result<(), String> {
-        let url = &self.entry.url;
+    /// which loads it and generates nothing. Any 2xx answer within `timeout` is a load. A 401 or
+    /// 403 changes nothing about the key: the refusal may be of the path alone, and the chats
+    /// settle whether the server takes the key.
+    fn load(&self, root: &str, model: &str, timeout: Duration) -> Result<(), String> {
+        let key = self.sending()?;
+        let key = key.as_ref();
         let body = serde_json::json!({"model": model}).to_string();
-        let request = self
-            .prepared(agent(url).post(format!("{root}/api/generate")), TIMEOUT)?
-            .header("Content-Type", "application/json");
-        // No key is forgotten on a 401 or 403: `/models` took it, so the refusal is of the path.
-        let why = match request.send(body).and_then(status_and_text) {
+        let ask = Ask {
+            base: root,
+            path: "api/generate",
+            body: Some(&body),
+            timeout,
+        };
+        let why = match self.send(&ask, key) {
             Ok((status, _)) if (200..300).contains(&status) => return Ok(()),
-            Ok((status, text)) => error_text(status, &self.hidden(text)),
-            Err(e) => self.hidden(failed(root, "api/generate", &e, TIMEOUT).0),
+            Ok((status, text)) => error_text(status, &hide(key, text)),
+            Err(e) => hide(key, failed(root, ask.path, &e, timeout).0),
         };
         Err(format!("Ollama could not load {model}: {why}"))
     }
@@ -349,19 +584,23 @@ impl Server {
     }
 
     /// What Ollama's `GET <root>/api/ps`, its list of loaded models, says of the settled model's
-    /// context; `Unknown` for a server not asked ([`Server::ps_root`]) or any failure. No key is
-    /// forgotten on a 401 or 403: `/models` took it, so the refusal is of the path, and a server
-    /// that is no Ollama may well refuse it.
+    /// context; `Unknown` for a server not asked ([`Server::ps_root`]) or any failure. A 401 or
+    /// 403 changes nothing about the key: a server that is no Ollama may well refuse the path
+    /// alone, and the chats settle whether the server takes the key.
     fn ps(&self) -> Context {
-        let url = &self.entry.url;
         let (Some(root), Some(model)) = (self.ps_root(), &self.model) else {
             return Context::Unknown;
         };
-        let Ok(request) = self.prepared(agent(url).get(format!("{root}/api/ps")), MODELS_TIMEOUT)
-        else {
+        let Ok(key) = self.sending() else {
             return Context::Unknown;
         };
-        match request.call().and_then(status_and_text) {
+        let ask = Ask {
+            base: root,
+            path: "api/ps",
+            body: None,
+            timeout: MODELS_TIMEOUT,
+        };
+        match self.send(&ask, key.as_ref()) {
             Ok((status, text)) if (200..300).contains(&status) => ps_context(&text, model),
             _ => Context::Unknown,
         }
@@ -411,53 +650,40 @@ impl Server {
         }
     }
 
-    /// The models `GET <url>/models` lists.
+    /// The models `GET <url>/models` lists, asked as the key's rule says ([`Server::asked`]). An
+    /// error has hidden the key its request sent.
     fn models(&self) -> Result<Vec<Listed>, String> {
         let url = &self.entry.url;
-        let (status, text) = self
-            .prepared(agent(url).get(format!("{url}/models")), MODELS_TIMEOUT)?
-            .call()
-            .and_then(status_and_text)
-            .map_err(|e| failed(url, "models", &e, MODELS_TIMEOUT).0)?;
-        if !(200..300).contains(&status) {
-            let mut why = format!("HTTP {status} from {url}/models");
-            if let Some(said) = server_said(&self.hidden(text)) {
-                let _ = write!(why, ": {said}");
-            }
-            self.refused(status, &mut why);
-            return Err(why);
-        }
-        // Read before the key is hidden: a model's id may hold it.
-        let Ok(list) = serde_json::from_str::<ModelList>(&text) else {
-            let text = self.hidden(text);
-            let first = text.trim().lines().next().unwrap_or("(empty)");
-            return Err(format!("{url}/models gave no list of models: {first:.80}"));
+        let ask = Ask {
+            base: url,
+            path: "models",
+            body: None,
+            timeout: MODELS_TIMEOUT,
         };
-        Ok(list.data)
-    }
-
-    /// `request` with what every request to the server carries: `timeout`, and the key when the
-    /// entry has one. Refused while that key is not fetched: the server would refuse the request,
-    /// and its 401 would drop the kept key.
-    fn prepared<B>(
-        &self,
-        request: RequestBuilder<B>,
-        timeout: Duration,
-    ) -> Result<RequestBuilder<B>, String> {
-        let request = request.config().timeout_global(Some(timeout)).build();
-        match (&self.key, &self.entry.key) {
-            (Some(key), _) => Ok(request.header("Authorization", key.bearer())),
-            (None, KeySource::None) => Ok(request),
-            (None, _) => Err("the key is not fetched".into()),
+        let says = |status: u16, text: &str| match server_said(text) {
+            Some(said) => format!("HTTP {status} from {url}/models: {said}"),
+            None => format!("HTTP {status} from {url}/models"),
+        };
+        match self.asked(&ask, says) {
+            Told::Answer(text, key) => {
+                // Read before the key is hidden: a model's id may hold it.
+                let Ok(list) = serde_json::from_str::<ModelList>(&text) else {
+                    let text = hide(key.as_ref(), text);
+                    let first = text.trim().lines().next().unwrap_or("(empty)");
+                    return Err(format!("{url}/models gave no list of models: {first:.80}"));
+                };
+                Ok(list.data)
+            }
+            Told::Status { why, .. } | Told::Nothing(why, _) | Told::Unsent(why) => Err(why),
         }
     }
 
     /// A 2xx reply read as a chat completion, or as Ollama's own API answers. What succeeds keeps
     /// the key as the server sent it: a key can be a plain word, which a correction may hold, and
     /// hiding it would change the correction or break the JSON around it. An error is read again
-    /// from the text with the key hidden, so a message cut through an echoed key keeps no part of
-    /// it that `hide` cannot find.
-    fn read(&self, text: String) -> Answer {
+    /// from the text with `key`, the one the request sent, hidden, so a message cut through an
+    /// echoed key keeps no part of it that `hide` cannot find.
+    fn read(&self, text: String, key: Option<&Key>) -> Answer {
         let read = |text: &str| match self.api {
             Api::OpenAi => Output::OpenAi.read(text),
             Api::Ollama => read_ollama(text),
@@ -466,7 +692,7 @@ impl Server {
         if answer.reply.is_ok() {
             return answer;
         }
-        let hidden = read(&self.hidden(text)).reply;
+        let hidden = read(&hide(key, text)).reply;
         Answer {
             // Hiding the key can change what the JSON says, so an error stays one.
             reply: hidden.and(answer.reply),
@@ -475,23 +701,36 @@ impl Server {
         }
     }
 
-    /// `text` with the key hidden, when there is one.
+    /// `text` with the server's key hidden, the one it sends or the one refused, when it has
+    /// one: for text that comes of no request of its own.
     fn hidden(&self, text: String) -> String {
-        match &self.key {
-            Some(key) => key.hide(&text),
-            None => text,
+        match self.key.get() {
+            KeyState::Sending(key) => key.hide(&text),
+            KeyState::Refused(refusal) => refusal.key.hide(&text),
+            KeyState::None => text,
         }
     }
+}
 
-    /// On a 401 or 403, the key is dropped, so the next fetch runs its command again, and `why`
-    /// says to check it.
-    fn refused(&self, status: u16, why: &mut String) {
-        if matches!(status, 401 | 403) {
-            if let Some(key) = &self.key {
-                key::forget(&self.entry.key, key);
-            }
-            why.push_str("; check the entry's key");
-        }
+/// `request` with what every request to a server carries: `timeout`, and `key` when there is
+/// one.
+fn prepared<B>(
+    request: RequestBuilder<B>,
+    key: Option<&Key>,
+    timeout: Duration,
+) -> RequestBuilder<B> {
+    let request = request.config().timeout_global(Some(timeout)).build();
+    match key {
+        Some(key) => request.header("Authorization", key.bearer()),
+        None => request,
+    }
+}
+
+/// `text` with `key` hidden, when there is one.
+fn hide(key: Option<&Key>, text: String) -> String {
+    match key {
+        Some(key) => key.hide(&text),
+        None => text,
     }
 }
 
@@ -914,14 +1153,16 @@ fn error_text(status: u16, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::time::Instant;
 
     use super::*;
     use crate::llm::{Backend, JOBS, TIMEOUT, Usage, Via};
     use crate::settings::{KeySource, Settings};
     use crate::test_support::{
-        FakeServer, Reply, closed_port_url, fitting_lines, models_reply, ps_reply,
+        FakeServer, Reply, Request, closed_port_url, fitting_lines, models_reply, ps_reply,
     };
 
     const OPENAI: &str = include_str!("../../tests/fixtures/llm/openai.json");
@@ -939,11 +1180,107 @@ mod tests {
         let Via::Server(mut s) = b.via else {
             unreachable!()
         };
-        s.key = key::fetch(source).unwrap();
+        let key = key::fetch(source).unwrap();
+        s.key = SharedKey::new(key.map_or(KeyState::None, KeyState::Sending));
         Backend {
             via: Via::Server(s),
             ..b
         }
+    }
+
+    /// The server `b` calls.
+    fn server(b: &Backend) -> &Server {
+        let Via::Server(s) = &b.via else {
+            unreachable!()
+        };
+        s
+    }
+
+    /// An entry `srv` at `fake` whose key command adds a line to `dir`'s `count` each run, then
+    /// runs `print`; readied, so its first key is fetched and no chat has shown that it works.
+    fn readied_by(
+        fake: &FakeServer,
+        dir: &Path,
+        print: &str,
+    ) -> (Backend, impl Fn() -> usize + use<>) {
+        let count = dir.join("count");
+        let cmd = format!("echo x >> '{}'; {print}", count.display());
+        let entry = backend(&fake.url, &format!("api_key_cmd = \"{cmd}\"\n"));
+        let (b, _) = entry.ready().unwrap();
+        let runs = move || std::fs::read_to_string(&count).unwrap().lines().count();
+        (b, runs)
+    }
+
+    /// [`readied_by`], with its first key marked as one that has worked, as a first good chat
+    /// leaves it. Marked by hand, not by a chat: most of these fakes refuse every chat, and a chat
+    /// sent here would be among the ones a test counts.
+    fn keyed_by(
+        fake: &FakeServer,
+        dir: &Path,
+        print: &str,
+    ) -> (Backend, impl Fn() -> usize + use<>) {
+        let (b, runs) = readied_by(fake, dir, print);
+        let KeyState::Sending(sent) = server(&b).key.get() else {
+            unreachable!()
+        };
+        key::worked(&server(&b).entry.key, &sent);
+        (b, runs)
+    }
+
+    /// An entry `srv` at `fake` whose key command prints `key`'s contents, a line added to `count`
+    /// each run; readied, its first key marked as one that has worked ([`keyed_by`]).
+    fn keyed(fake: &FakeServer, dir: &Path) -> (Backend, PathBuf, impl Fn() -> usize) {
+        let key = dir.join("key");
+        let (b, runs) = keyed_by(fake, dir, &format!("cat '{}'", key.display()));
+        (b, key, runs)
+    }
+
+    /// `b`'s entry at `url`, not readied.
+    fn moved(b: &Backend, url: &str) -> Backend {
+        let s = server(b);
+        let entry = ServerEntry {
+            url: url.to_string(),
+            ..s.entry.clone()
+        };
+        Backend {
+            via: Via::Server(Server::new(&s.name, &entry, Some("m"))),
+            ..b.clone()
+        }
+    }
+
+    /// A server that lists `m` whatever the key, and answers each chat with `chat` of its request.
+    /// It has no other path, so `chat` sees no request but the calls'.
+    fn chatting(chat: impl Fn(&Request) -> Reply + Send + Sync + 'static) -> FakeServer {
+        FakeServer::start(move |r| match r.path.as_str() {
+            "/v1/models" => models_reply(&["m"]),
+            "/v1/chat/completions" => chat(r),
+            _ => Reply::status(404, "{}"),
+        })
+    }
+
+    /// [`chatting`], with `meanwhile` run on the backend put in the cell before the first chat is
+    /// answered: what other workers' calls do while that request is in flight.
+    fn chatting_while(
+        meanwhile: impl Fn(&Backend) + Send + Sync + 'static,
+        chat: impl Fn(&Request) -> Reply + Send + Sync + 'static,
+    ) -> (FakeServer, Arc<OnceLock<Backend>>) {
+        let cell = Arc::new(OnceLock::new());
+        let (theirs, first) = (Arc::clone(&cell), AtomicBool::new(true));
+        let fake = chatting(move |r| {
+            if first.swap(false, Ordering::SeqCst) {
+                meanwhile(theirs.get().unwrap());
+            }
+            chat(r)
+        });
+        (fake, cell)
+    }
+
+    /// The `Authorization` header of each chat `fake` was sent, in the order they were answered.
+    fn bearers(fake: &FakeServer) -> Vec<String> {
+        let sent = fake.completions();
+        sent.iter()
+            .map(|r| r.header("authorization").unwrap_or_default().to_string())
+            .collect()
     }
 
     /// Each request `fake` has had, as `<method> <path>`.
@@ -1166,19 +1503,483 @@ mod tests {
     }
 
     #[test]
-    fn a_401_or_403_forgets_the_kept_key() {
+    fn a_403_has_the_next_fetch_run_the_command_for_a_key_that_has_not_worked() {
         let dir = tempfile::tempdir().unwrap();
         let count = dir.path().join("count");
         let cmd = format!("echo x >> '{}'; echo sk-7", count.display());
         let source = KeySource::Command(cmd.clone());
-        for status in [401, 403] {
-            let fake = FakeServer::start(move |_| Reply::status(status, ""));
-            // A call forgets the key of the command its entry names.
-            let entry = backend(&fake.url, &format!("api_key_cmd = \"{cmd}\"\n"));
-            with_key(entry, &source).call("P", TIMEOUT, None);
-            key::fetch(&source).unwrap();
+        let fake = FakeServer::start(|_| Reply::status(403, ""));
+        // The key of the command the entry names, which no server has taken: the call's 403 marks
+        // it, so the next fetch runs the command.
+        let entry = backend(&fake.url, &format!("api_key_cmd = \"{cmd}\"\n"));
+        with_key(entry, &source).call("P", TIMEOUT, None);
+        key::fetch(&source).unwrap();
+        assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn a_401_fetches_a_key_that_worked_again_and_sends_the_call_once_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = chatting(|r| match r.header("authorization") {
+            Some("Bearer sk-new") => Reply::ok(OPENAI),
+            _ => Reply::status(401, ""),
+        });
+        std::fs::write(dir.path().join("key"), "sk-old\n").unwrap();
+        let (b, key, runs) = keyed(&fake, dir.path());
+        std::fs::write(&key, "sk-new\n").unwrap();
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!(a.reply.as_deref(), Ok("NONE\n"));
+        // The refused request is no call of its own: the usage is the second one's.
+        assert_eq!(
+            a.used,
+            Used::Reported(Usage {
+                input_tokens: 624,
+                output_tokens: 5,
+                cache_read_tokens: Some(512),
+                cache_write_tokens: None,
+                cost_usd: None
+            })
+        );
+        assert_eq!(bearers(&fake), ["Bearer sk-old", "Bearer sk-new"]);
+        assert_eq!(runs(), 2);
+        assert_eq!(b.call("P", TIMEOUT, None).reply.as_deref(), Ok("NONE\n"));
+        assert_eq!(
+            bearers(&fake),
+            ["Bearer sk-old", "Bearer sk-new", "Bearer sk-new"]
+        );
+        assert_eq!(runs(), 2);
+    }
+
+    #[test]
+    fn a_key_only_models_took_is_not_fetched_again_when_its_first_chat_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        // As a server that lists its models without checking the key.
+        let fake = chatting(|_| Reply::status(401, ""));
+        let (b, runs) = readied_by(&fake, dir.path(), "echo sk-wrong");
+        let refusal = Err("HTTP 401; check the entry's key".to_string());
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!((a.reply, a.used), (refusal.clone(), Used::Unreported));
+        assert_eq!(runs(), 1);
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!((a.reply, a.used), (refusal, Used::Untracked));
+        assert_eq!(fake.completions().len(), 1);
+        assert_eq!(runs(), 1);
+    }
+
+    #[test]
+    fn a_401_for_the_same_key_again_refuses_it_for_the_rest_of_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = chatting(|_| Reply::status(401, r#"{"error":{"message":"bad key sk-same"}}"#));
+        std::fs::write(dir.path().join("key"), "sk-same\n").unwrap();
+        let (b, _, runs) = keyed(&fake, dir.path());
+        let refusal = Err("HTTP 401: bad key <key>; check the entry's key".to_string());
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!((a.reply, a.used), (refusal.clone(), Used::Unreported));
+        assert_eq!(runs(), 2);
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!(
+            (a.reply, a.used, a.too_big),
+            (refusal, Used::Untracked, None)
+        );
+        assert_eq!(fake.completions().len(), 1);
+        assert_eq!(runs(), 2);
+        // A refused key is not left kept, so the next scan runs the command.
+        key::fetch(&server(&b).entry.key).unwrap();
+        assert_eq!(runs(), 3);
+    }
+
+    #[test]
+    fn a_refused_server_still_hides_its_key_and_shows_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = chatting(|_| Reply::status(401, ""));
+        std::fs::write(dir.path().join("key"), "sk-gone\n").unwrap();
+        let (b, _, _) = keyed(&fake, dir.path());
+        b.call("P", TIMEOUT, None);
+        assert_eq!(b.call("P", TIMEOUT, None).used, Used::Untracked);
+        assert_eq!(
+            server(&b).hidden("loading sk-gone into Ollama".to_string()),
+            "loading <key> into Ollama"
+        );
+        assert!(!format!("{b:?}").contains("sk-gone"));
+    }
+
+    #[test]
+    fn a_key_fetched_again_and_refused_on_its_first_request_is_not_fetched_a_third_time() {
+        let dir = tempfile::tempdir().unwrap();
+        // As a server that echoes the key it refuses.
+        let fake = chatting(|r| {
+            let sent = r.header("authorization").unwrap_or_default();
+            Reply::status(401, format!("no such key: {sent}"))
+        });
+        // `sk-<runs so far>`: a new key each run.
+        let count = dir.path().join("count");
+        let print = format!("echo sk-$(grep -c x '{}')", count.display());
+        let (b, runs) = keyed_by(&fake, dir.path(), &print);
+        // The second request's refusal, hidden with the key that request sent.
+        let refusal = Err("HTTP 401: no such key: Bearer <key>; check the entry's key".to_string());
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!((a.reply, a.used), (refusal.clone(), Used::Unreported));
+        assert_eq!(bearers(&fake), ["Bearer sk-1", "Bearer sk-2"]);
+        assert_eq!(runs(), 2);
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!((a.reply, a.used), (refusal, Used::Untracked));
+        assert_eq!(fake.completions().len(), 2);
+        assert_eq!(runs(), 2);
+    }
+
+    #[test]
+    fn a_second_401_takes_a_key_fetched_meanwhile_and_sends_no_third_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("key");
+        let source = Arc::new(OnceLock::<KeySource>::new());
+        // As another worker's call, answered while this one's second request is on its way: the
+        // key that request sent works for it, then runs out.
+        let (theirs, rotated) = (Arc::clone(&source), file.clone());
+        let fake = chatting(move |r| {
+            if r.header("authorization") == Some("Bearer sk-2") {
+                let source = theirs.get().unwrap();
+                let sent = key::fetch(source).unwrap().unwrap();
+                key::worked(source, &sent);
+                std::fs::write(&rotated, "sk-3\n").unwrap();
+            }
+            Reply::status(401, "")
+        });
+        std::fs::write(&file, "sk-1\n").unwrap();
+        let (b, _, runs) = keyed(&fake, dir.path());
+        source.set(server(&b).entry.key.clone()).unwrap();
+        std::fs::write(&file, "sk-2\n").unwrap();
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!(
+            (a.reply, a.used),
+            (
+                Err("HTTP 401; check the entry's key".to_string()),
+                Used::Unreported
+            )
+        );
+        assert_eq!(bearers(&fake), ["Bearer sk-1", "Bearer sk-2"]);
+        assert_eq!(runs(), 3);
+        b.call("P", TIMEOUT, None);
+        assert_eq!(
+            bearers(&fake),
+            ["Bearer sk-1", "Bearer sk-2", "Bearer sk-3"]
+        );
+        assert_eq!(runs(), 3);
+    }
+
+    #[test]
+    fn a_401_for_a_variables_key_refuses_it_at_once() {
+        let fake = chatting(|_| Reply::status(401, ""));
+        let (b, _) = backend(&fake.url, "api_key_env = \"HOME\"\n")
+            .ready()
+            .unwrap();
+        let refusal = Err("HTTP 401; check the entry's key".to_string());
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!((a.reply, a.used), (refusal.clone(), Used::Unreported));
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!((a.reply, a.used), (refusal, Used::Untracked));
+        assert_eq!(fake.completions().len(), 1);
+    }
+
+    #[test]
+    fn a_key_fetched_for_a_server_refused_meanwhile_is_not_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("key");
+        let rotated = file.clone();
+        let (fake, cell) = chatting_while(
+            move |b| {
+                // Another worker's call is refused with the same key, which the command prints
+                // again, so the server is refused; then another scan's fetch keeps a new key.
+                b.call("P", TIMEOUT, None);
+                std::fs::write(&rotated, "sk-3\n").unwrap();
+                key::fetch(&server(b).entry.key).unwrap();
+            },
+            |_| Reply::status(401, ""),
+        );
+        std::fs::write(&file, "sk-1\n").unwrap();
+        let (b, _, runs) = keyed(&fake, dir.path());
+        let b = cell.get_or_init(|| b);
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!(
+            (a.reply, a.used),
+            (
+                Err("HTTP 401; check the entry's key".to_string()),
+                Used::Unreported
+            )
+        );
+        assert_eq!(bearers(&fake), ["Bearer sk-1", "Bearer sk-1"]);
+        assert_eq!(runs(), 3);
+    }
+
+    #[test]
+    fn a_late_401_for_an_old_key_leaves_a_newer_key_to_be_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("key");
+        let rotated = file.clone();
+        let (fake, cell) = chatting_while(
+            move |b| {
+                // Another worker's call fetches a new key, which its 403 leaves not known to work;
+                // then a 401 for that key at another backend of the same command, as a recheck's
+                // can be, leaves nothing kept.
+                std::fs::write(&rotated, "sk-2\n").unwrap();
+                b.call("P", TIMEOUT, None);
+                let KeyState::Sending(new) = server(b).key.get() else {
+                    unreachable!()
+                };
+                assert_eq!(key::refetch(&server(b).entry.key, &new), Ok(None));
+            },
+            |r| match r.header("authorization") {
+                Some("Bearer sk-2") => Reply::status(403, ""),
+                _ => Reply::status(401, ""),
+            },
+        );
+        std::fs::write(&file, "sk-1\n").unwrap();
+        let (b, _, runs) = keyed(&fake, dir.path());
+        let b = cell.get_or_init(|| b);
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!(
+            (a.reply, a.used),
+            (
+                Err("HTTP 401; check the entry's key".to_string()),
+                Used::Unreported
+            )
+        );
+        assert_eq!(
+            bearers(&fake),
+            ["Bearer sk-1", "Bearer sk-2", "Bearer sk-1"]
+        );
+        // The old key's refusal says nothing of the new one, which the next call sends.
+        b.call("P", TIMEOUT, None);
+        assert_eq!(
+            bearers(&fake),
+            ["Bearer sk-1", "Bearer sk-2", "Bearer sk-1", "Bearer sk-2"]
+        );
+        assert_eq!(runs(), 2);
+    }
+
+    #[test]
+    fn a_late_401_for_an_old_key_is_sent_again_with_a_newer_key_a_403_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("key");
+        let rotated = file.clone();
+        let flagged = AtomicBool::new(false);
+        let (fake, cell) = chatting_while(
+            move |b| {
+                // Another worker's call fetches a new key, and its chunk is refused with it.
+                std::fs::write(&rotated, "sk-2\n").unwrap();
+                b.call("P", TIMEOUT, None);
+            },
+            move |r| match r.header("authorization") {
+                Some("Bearer sk-2") if !flagged.swap(true, Ordering::SeqCst) => {
+                    Reply::status(403, "")
+                }
+                Some("Bearer sk-2") => Reply::ok(OPENAI),
+                _ => Reply::status(401, ""),
+            },
+        );
+        std::fs::write(&file, "sk-1\n").unwrap();
+        let (b, _, runs) = keyed(&fake, dir.path());
+        let b = cell.get_or_init(|| b);
+        assert_eq!(b.call("P", TIMEOUT, None).reply.as_deref(), Ok("NONE\n"));
+        assert_eq!(
+            bearers(&fake),
+            ["Bearer sk-1", "Bearer sk-2", "Bearer sk-1", "Bearer sk-2"]
+        );
+        assert_eq!(runs(), 2);
+    }
+
+    #[test]
+    fn a_403_then_a_401_still_fetches_a_key_that_worked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let flagged = AtomicBool::new(false);
+        let fake = chatting(move |r| match r.header("authorization") {
+            _ if !flagged.swap(true, Ordering::SeqCst) => Reply::status(403, ""),
+            Some("Bearer sk-new") => Reply::ok(OPENAI),
+            _ => Reply::status(401, ""),
+        });
+        std::fs::write(dir.path().join("key"), "sk-old\n").unwrap();
+        let (b, key, runs) = keyed(&fake, dir.path());
+        assert_eq!(
+            b.call("P", TIMEOUT, None).reply,
+            Err("HTTP 403; check the entry's key".to_string())
+        );
+        std::fs::write(&key, "sk-new\n").unwrap();
+        assert_eq!(b.call("P", TIMEOUT, None).reply.as_deref(), Ok("NONE\n"));
+        assert_eq!(
+            bearers(&fake),
+            ["Bearer sk-old", "Bearer sk-old", "Bearer sk-new"]
+        );
+        assert_eq!(runs(), 2);
+    }
+
+    #[test]
+    fn a_403_before_any_answer_leaves_a_later_401_to_fetch_the_key_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("key");
+        let sent = AtomicUsize::new(0);
+        let fake = chatting(move |r| {
+            match (
+                sent.fetch_add(1, Ordering::SeqCst),
+                r.header("authorization"),
+            ) {
+                (0, _) => Reply::status(403, ""),
+                (1, _) | (_, Some("Bearer sk-new")) => Reply::ok(OPENAI),
+                _ => Reply::status(401, ""),
+            }
+        });
+        std::fs::write(&key, "sk-old\n").unwrap();
+        let (b, runs) = readied_by(&fake, dir.path(), &format!("cat '{}'", key.display()));
+        assert_eq!(
+            b.call("P", TIMEOUT, None).reply,
+            Err("HTTP 403; check the entry's key".to_string())
+        );
+        assert_eq!(b.call("P", TIMEOUT, None).reply.as_deref(), Ok("NONE\n"));
+        std::fs::write(&key, "sk-new\n").unwrap();
+        assert_eq!(b.call("P", TIMEOUT, None).reply.as_deref(), Ok("NONE\n"));
+        assert_eq!(
+            bearers(&fake),
+            [
+                "Bearer sk-old",
+                "Bearer sk-old",
+                "Bearer sk-old",
+                "Bearer sk-new"
+            ]
+        );
+        assert_eq!(runs(), 2);
+    }
+
+    #[test]
+    fn after_a_403_the_next_ready_runs_the_key_command_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = chatting(|_| Reply::status(403, ""));
+        std::fs::write(dir.path().join("key"), "sk-old\n").unwrap();
+        let (b, key, runs) = keyed(&fake, dir.path());
+        b.call("P", TIMEOUT, None);
+        assert_eq!(runs(), 1);
+        std::fs::write(&key, "sk-new\n").unwrap();
+        // As the next scan or recheck: a new backend for the same entry.
+        moved(&b, &fake.url).ready().unwrap();
+        assert_eq!(runs(), 2);
+        let listed: Vec<_> = fake
+            .requests()
+            .into_iter()
+            .filter(|r| r.path == "/v1/models")
+            .map(|r| r.header("authorization").unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(listed, ["Bearer sk-old", "Bearer sk-new"]);
+    }
+
+    #[test]
+    fn a_403_fails_its_call_and_the_scan_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = chatting(|_| Reply::status(403, r#"{"error":{"message":"flagged"}}"#));
+        std::fs::write(dir.path().join("key"), "sk-ok\n").unwrap();
+        let (b, _, runs) = keyed(&fake, dir.path());
+        for sent in 1..=2 {
+            let a = b.call("P", TIMEOUT, None);
+            assert_eq!(
+                (a.reply, a.used),
+                (
+                    Err("HTTP 403: flagged; check the entry's key".to_string()),
+                    Used::Unreported
+                )
+            );
+            assert_eq!(fake.completions().len(), sent);
         }
-        assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 3);
+        assert_eq!(runs(), 1);
+    }
+
+    #[test]
+    fn an_entry_without_a_key_is_not_told_to_check_one() {
+        for status in [401, 403] {
+            let fake = chatting(move |_| Reply::status(status, r#"{"error":{"message":"no"}}"#));
+            let (b, _) = backend(&fake.url, "").ready().unwrap();
+            for sent in 1..=2 {
+                let a = b.call("P", TIMEOUT, None);
+                assert_eq!(
+                    (a.reply, a.used),
+                    (Err(format!("HTTP {status}: no")), Used::Unreported)
+                );
+                assert_eq!(fake.completions().len(), sent, "{status}");
+            }
+            let refusing = FakeServer::start(move |_| Reply::status(status, ""));
+            assert_eq!(
+                backend(&refusing.url, "").ready().unwrap_err(),
+                format!("srv@m: HTTP {status} from {}/models", refusing.url)
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_command_that_fails_when_run_again_adds_why_to_the_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = chatting(|_| Reply::status(401, r#"{"error":{"message":"bad key"}}"#));
+        let count = dir.path().join("count");
+        let print = format!(
+            "if [ $(wc -l < '{}') -gt 1 ]; then echo locked >&2; exit 2; fi; echo sk-1",
+            count.display()
+        );
+        let (b, runs) = keyed_by(&fake, dir.path(), &print);
+        let refusal = Err(
+            "HTTP 401: bad key; check the entry's key; api_key_cmd failed: sh exited with exit \
+             status: 2: locked"
+                .to_string(),
+        );
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!((a.reply, a.used), (refusal.clone(), Used::Unreported));
+        assert_eq!(runs(), 2);
+        let a = b.call("P", TIMEOUT, None);
+        assert_eq!((a.reply, a.used), (refusal, Used::Untracked));
+        assert_eq!(fake.completions().len(), 1);
+        assert_eq!(runs(), 2);
+    }
+
+    #[test]
+    fn workers_refused_together_run_the_key_command_once() {
+        let dir = tempfile::tempdir().unwrap();
+        // Neither chat is answered before both have come, so neither call finds the server
+        // refused before it sends. A chat with no partner is never answered, so the calls give up
+        // long before `TIMEOUT`: one chat or three fail the test within `patience`.
+        let patience = Duration::from_secs(30);
+        let both = Barrier::new(2);
+        let fake = chatting(move |_| {
+            both.wait();
+            Reply::status(401, "")
+        });
+        let (b, runs) = keyed_by(&fake, dir.path(), "sleep 0.3; echo sk-same");
+        let replies: Vec<_> = std::thread::scope(|s| {
+            let both = [
+                s.spawn(|| b.call("P", patience, None)),
+                s.spawn(|| b.call("P", patience, None)),
+            ];
+            both.map(|t| t.join().unwrap().reply).into()
+        });
+        assert_eq!(
+            replies,
+            vec![Err("HTTP 401; check the entry's key".to_string()); 2]
+        );
+        // Both were sent, so both were refused: neither found the server refused already.
+        assert_eq!(fake.completions().len(), 2);
+        assert_eq!(runs(), 2);
+    }
+
+    #[test]
+    fn a_clone_of_a_refused_server_is_refused_too_and_changes_apart() {
+        let fake = chatting(|_| Reply::status(401, ""));
+        let (b, _) = backend(&fake.url, "api_key_env = \"HOME\"\n")
+            .ready()
+            .unwrap();
+        let before = b.clone();
+        assert_eq!(before, b);
+        b.call("P", TIMEOUT, None);
+        assert_ne!(before, b);
+        let after = b.clone();
+        assert_eq!(after, b);
+        assert_eq!(after.call("P", TIMEOUT, None).used, Used::Untracked);
+        assert_eq!(fake.completions().len(), 1);
+        // The clone made before the refusal still sends its key, and is refused for itself.
+        assert_eq!(before.call("P", TIMEOUT, None).used, Used::Unreported);
+        assert_eq!(fake.completions().len(), 2);
+        assert_eq!(before, b);
     }
 
     #[test]
@@ -1595,7 +2396,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_sends_the_key_and_a_401_forgets_it_and_hides_it() {
+    fn ready_sends_the_key_and_a_401_drops_it_and_hides_it() {
         let dir = tempfile::tempdir().unwrap();
         let count = dir.path().join("count");
         let cmd = format!("echo x >> '{}'; echo sk-8", count.display());
@@ -1616,6 +2417,31 @@ mod tests {
         );
         b.ready().unwrap_err();
         assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn ready_fetches_a_kept_key_that_worked_again_when_models_refuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("key");
+        // An earlier scan's chat is what showed that the key works.
+        let taking = chatting(|_| Reply::ok(OPENAI));
+        std::fs::write(&key, "sk-old\n").unwrap();
+        let (b, runs) = readied_by(&taking, dir.path(), &format!("cat '{}'", key.display()));
+        assert_eq!(b.call("P", TIMEOUT, None).reply.as_deref(), Ok("NONE\n"));
+        std::fs::write(&key, "sk-new\n").unwrap();
+        let strict = FakeServer::start(|r| match r.header("authorization") {
+            Some("Bearer sk-new") => models_reply(&["m"]),
+            _ => Reply::status(401, ""),
+        });
+        moved(&b, &strict.url).ready().unwrap();
+        let listed: Vec<_> = strict
+            .requests()
+            .into_iter()
+            .filter(|r| r.path == "/v1/models")
+            .map(|r| r.header("authorization").unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(listed, ["Bearer sk-old", "Bearer sk-new"]);
+        assert_eq!(runs(), 2);
     }
 
     #[test]
@@ -1793,7 +2619,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_api_ps_is_unknown_and_forgets_no_key() {
+    fn a_refused_api_ps_is_unknown_and_drops_no_key() {
         let dir = tempfile::tempdir().unwrap();
         let count = dir.path().join("count");
         let cmd = format!("echo x >> '{}'; echo sk-9", count.display());
@@ -1892,6 +2718,24 @@ mod tests {
             b.ready().unwrap().0.sized().unwrap_err(),
             "srv@m: Ollama could not load m: HTTP 500: bad key <key>"
         );
+    }
+
+    #[test]
+    fn a_models_load_gets_the_backends_limit() {
+        let fake = FakeServer::start(|r| match (r.method.as_str(), r.path.as_str()) {
+            ("GET", "/v1/models") => models_reply(&["m"]),
+            ("GET", "/api/ps") => ps_reply(&[]),
+            ("POST", "/api/generate") => Reply::ok("{}").after(Duration::from_secs(5)),
+            _ => Reply::status(404, ""),
+        });
+        let backend = Backend {
+            timeout: Duration::from_secs(1),
+            ..any(&fake.url)
+        };
+        let began = Instant::now();
+        let why = backend.ready().unwrap().0.sized().unwrap_err();
+        assert!(why.ends_with("/api/generate timed out after 1s"), "{why}");
+        assert!(began.elapsed() < Duration::from_secs(4));
     }
 
     const OLLAMA_CHAT: &str = include_str!("../../tests/fixtures/llm/ollama-chat.json");

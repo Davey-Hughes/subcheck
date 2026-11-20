@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -53,6 +54,11 @@ pub fn config_path() -> Result<PathBuf, String> {
     )
 }
 
+/// The most minutes a call's limit may be, in an entry's `timeout_minutes` and in
+/// `--llm-timeout`: a day. The limit is added to the clock when a call starts, so it needs a
+/// bound, and no call is worth waiting longer for.
+pub const MAX_TIMEOUT_MINUTES: u64 = 1440;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     /// Where the file is, or would be when there is none: what a message about it names.
@@ -74,6 +80,8 @@ pub struct Entry {
     pub jobs: Option<usize>,
     /// Lines per call; `None` as for `jobs`.
     pub chunk_lines: Option<usize>,
+    /// Each call's limit; `None` as for `jobs`.
+    pub timeout: Option<Duration>,
 }
 
 /// What an entry runs: it has a `command` or a `url`, never both.
@@ -153,6 +161,7 @@ struct EntryShape {
     shared_context: Option<bool>,
     jobs: Option<usize>,
     chunk_lines: Option<usize>,
+    timeout_minutes: Option<u64>,
 }
 
 /// `thinking`'s values, as the file spells them.
@@ -249,10 +258,17 @@ impl Settings {
             if shape.chunk_lines == Some(0) {
                 return Err(at("chunk_lines must be at least 1"));
             }
+            let minutes = 1..=MAX_TIMEOUT_MINUTES;
+            if shape.timeout_minutes.is_some_and(|m| !minutes.contains(&m)) {
+                return Err(at(&format!(
+                    "timeout_minutes must be between 1 and {MAX_TIMEOUT_MINUTES}"
+                )));
+            }
             let entry = Entry {
                 kind,
                 jobs: shape.jobs,
                 chunk_lines: shape.chunk_lines,
+                timeout: shape.timeout_minutes.map(Duration::from_mins),
             };
             entries.insert(name, entry);
         }
@@ -438,7 +454,7 @@ mod tests {
 
     #[test]
     fn a_command_entry_reads_every_key_and_defaults_the_rest() {
-        let s = at("default = \"mine\"\n[llm.mine]\ncommand = \"my-llm --fast\"\noutput = \"openai\"\njobs = 4\nchunk_lines = 200\n").unwrap();
+        let s = at("default = \"mine\"\n[llm.mine]\ncommand = \"my-llm --fast\"\noutput = \"openai\"\njobs = 4\nchunk_lines = 200\ntimeout_minutes = 30\n").unwrap();
         assert_eq!(s.default.as_deref(), Some("mine"));
         assert_eq!(
             s.entries["mine"],
@@ -448,7 +464,8 @@ mod tests {
                     output: Output::OpenAi
                 },
                 jobs: Some(4),
-                chunk_lines: Some(200)
+                chunk_lines: Some(200),
+                timeout: Some(Duration::from_mins(30))
             }
         );
         assert_eq!(
@@ -459,7 +476,8 @@ mod tests {
                     output: Output::Text
                 },
                 jobs: None,
-                chunk_lines: None
+                chunk_lines: None,
+                timeout: None
             }
         );
         for (name, output) in [
@@ -480,7 +498,7 @@ mod tests {
 
     #[test]
     fn a_server_entry_reads_every_key_and_defaults_the_rest() {
-        let s = at("[llm.vllm]\nurl = \"http://127.0.0.1:8000/v1/\"\nmodel = \"gemma4\"\napi_key_cmd = \"pass show x\"\nthinking = \"server\"\nshared_context = false\njobs = 4\nchunk_lines = 150\n[llm.vllm.request]\ntemperature = 1.0\ntop_k = 64\n").unwrap();
+        let s = at("[llm.vllm]\nurl = \"http://127.0.0.1:8000/v1/\"\nmodel = \"gemma4\"\napi_key_cmd = \"pass show x\"\nthinking = \"server\"\nshared_context = false\njobs = 4\nchunk_lines = 150\ntimeout_minutes = 30\n[llm.vllm.request]\ntemperature = 1.0\ntop_k = 64\n").unwrap();
         let request = serde_json::json!({"temperature": 1.0, "top_k": 64});
         assert_eq!(
             s.entries["vllm"],
@@ -495,6 +513,7 @@ mod tests {
                 }),
                 jobs: Some(4),
                 chunk_lines: Some(150),
+                timeout: Some(Duration::from_mins(30)),
             }
         );
         let s = at("[llm.or]\nurl = \"https://openrouter.ai/api/v1\"\napi_key_env = \"OPENROUTER_KEY\"\n[llm.bare]\nurl = \"http://h/v1\"\n").unwrap();
@@ -519,9 +538,10 @@ mod tests {
             s.entries["bare"].kind,
             server("http://h/v1", KeySource::None)
         );
+        let bare = &s.entries["bare"];
         assert_eq!(
-            (s.entries["bare"].jobs, s.entries["bare"].chunk_lines),
-            (None, None)
+            (bare.jobs, bare.chunk_lines, bare.timeout),
+            (None, None, None)
         );
     }
 
@@ -668,6 +688,22 @@ mod tests {
             err("[llm.mine]\ncommand = \"x\"\nchunk_lines = 0\n"),
             "/c/config.toml: [llm.mine]: chunk_lines must be at least 1"
         );
+        for minutes in [0, 1441] {
+            assert_eq!(
+                err(&format!(
+                    "[llm.mine]\ncommand = \"x\"\ntimeout_minutes = {minutes}\n"
+                )),
+                "/c/config.toml: [llm.mine]: timeout_minutes must be between 1 and 1440",
+                "{minutes}"
+            );
+        }
+        for minutes in ["-1", "1.5"] {
+            has(
+                &format!("[llm.mine]\ncommand = \"x\"\ntimeout_minutes = {minutes}\n"),
+                "/c/config.toml: [llm.mine]: ",
+                minutes,
+            );
+        }
         for name in ["my llm", "a.b", ""] {
             assert_eq!(
                 err(&format!("[llm.\"{name}\"]\ncommand = \"x\"\n")),
