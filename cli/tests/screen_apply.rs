@@ -95,7 +95,7 @@ fn d_then_a_on_the_screen() {
     let fake = common::fake_llm();
     let backend = Backend::shell(&format!("'{}'", fake.display()));
     let opts = scan::Options {
-        chunk_lines: backend.chunk_lines,
+        chunk_lines: None,
         backend,
         jobs: 1,
         langs: vec![scan::DEFAULT_LANG.to_string()],

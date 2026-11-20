@@ -3,10 +3,12 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::fake_llm;
+use crate::llm;
 
 /// One request the server received.
 #[derive(Debug, Clone)]
@@ -98,10 +100,60 @@ impl FakeServer {
     /// [`FakeServer::llm`], answering `/v1/models` only after `models_delay`, as a server that is
     /// slow to say what it serves.
     pub fn llm_slow(models: &[&str], models_delay: Duration) -> FakeServer {
-        let models = models_reply(models).after(models_delay);
+        FakeServer::llm_listing(models_reply(models).after(models_delay))
+    }
+
+    /// [`FakeServer::llm`], listing each of `models` as llama-server does, with `n_ctx`, the
+    /// tokens its context holds, in `meta`.
+    pub fn llm_sized(models: &[&str], n_ctx: u64) -> FakeServer {
+        let data: Vec<_> = models
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "object": "model", "meta": {"n_ctx": n_ctx}}))
+            .collect();
+        let models = serde_json::json!({"object": "list", "data": data});
+        FakeServer::llm_listing(Reply::ok(models.to_string()))
+    }
+
+    /// Ollama serving `model`, not loaded, with a context of `context` tokens once it is:
+    /// `/v1/models` lists it, and `/api/ps` lists nothing until a `POST /api/generate` for it, then
+    /// lists it with `context`. Chat completions are answered as [`FakeServer::llm`] answers them,
+    /// and Ollama's own `/api/chat` with the same reply in Ollama's words; a load or a chat for
+    /// any other model is a 404, as Ollama answers one it lacks.
+    pub fn ollama(model: &str, context: u64) -> FakeServer {
+        let listed = models_reply(&[model]);
+        let model = model.to_string();
+        let loaded = AtomicBool::new(false);
+        FakeServer::start(move |r| match (r.method.as_str(), r.path.as_str()) {
+            ("GET", "/v1/models") => listed.clone(),
+            ("GET", "/api/ps") if loaded.load(Ordering::SeqCst) => ps_reply(&[(&model, context)]),
+            ("GET", "/api/ps") => ps_reply(&[]),
+            ("POST", "/api/generate" | "/api/chat") if r.json()["model"] != model.as_str() => {
+                let asked = r.json()["model"].as_str().unwrap_or_default().to_string();
+                let missing = format!("model '{asked}' not found");
+                Reply::status(404, serde_json::json!({"error": missing}).to_string())
+            }
+            ("POST", "/api/generate") => {
+                loaded.store(true, Ordering::SeqCst);
+                let done = serde_json::json!({
+                    "model": model,
+                    "created_at": "2026-11-19T00:00:00Z",
+                    "response": "",
+                    "done": true,
+                    "done_reason": "load",
+                });
+                Reply::ok(done.to_string())
+            }
+            ("POST", "/api/chat") => chatted(r),
+            ("POST", "/v1/chat/completions") => answered(r),
+            _ => Reply::status(404, "{}"),
+        })
+    }
+
+    /// A server that lists models with `models` and answers chat completions as an LLM would.
+    fn llm_listing(models: Reply) -> FakeServer {
         FakeServer::start(move |r| match (r.method.as_str(), r.path.as_str()) {
             ("GET", "/v1/models") => models.clone(),
-            ("POST", "/v1/chat/completions") => Reply::ok(complete(&last_content(r))),
+            ("POST", "/v1/chat/completions") => answered(r),
             _ => Reply::status(404, "{}"),
         })
     }
@@ -113,9 +165,18 @@ impl FakeServer {
 
     /// The POSTs to `/v1/chat/completions`, in the order they came.
     pub fn completions(&self) -> Vec<Request> {
+        self.posts("/v1/chat/completions")
+    }
+
+    /// The POSTs to Ollama's own `/api/chat`, in the order they came.
+    pub fn chats(&self) -> Vec<Request> {
+        self.posts("/api/chat")
+    }
+
+    fn posts(&self, path: &str) -> Vec<Request> {
         self.requests()
             .into_iter()
-            .filter(|r| r.method == "POST" && r.path == "/v1/chat/completions")
+            .filter(|r| r.method == "POST" && r.path == path)
             .collect()
     }
 }
@@ -127,6 +188,71 @@ pub fn models_reply(ids: &[&str]) -> Reply {
         .map(|id| serde_json::json!({"id": id, "object": "model"}))
         .collect();
     Reply::ok(serde_json::json!({"object": "list", "data": data}).to_string())
+}
+
+/// Ollama's `/api/ps` answer listing `models` as loaded, each by `name` and `model`, with the
+/// tokens its context holds.
+pub fn ps_reply(models: &[(&str, u64)]) -> Reply {
+    let models: Vec<_> = models
+        .iter()
+        .map(|(name, context)| {
+            serde_json::json!({"name": name, "model": name, "context_length": context})
+        })
+        .collect();
+    Reply::ok(serde_json::json!({"models": models}).to_string())
+}
+
+/// fake-llm.sh's chat completion for `r`'s last message ([`completion`]): what
+/// [`FakeServer::llm`] answers.
+pub fn answered(r: &Request) -> Reply {
+    Reply::ok(completion(r).to_string())
+}
+
+/// fake-llm.sh's chat completion for `r`'s last message, with the prompt counted as subcheck
+/// estimates it ([`llm::estimate`]) and none of it cached: fake-llm.sh gives every prompt the same
+/// count, too many for a call's share of the small contexts tests fit chunks to, where a count that
+/// fills the share is a prompt the server may have cut ([`llm::TooBig::Prompt`]).
+fn completion(r: &Request) -> serde_json::Value {
+    let mut completion: serde_json::Value =
+        serde_json::from_str(&complete(&last_content(r))).expect("fake-llm.sh printed JSON");
+    let prompt = llm::estimate(prompt_lines(r));
+    let reply = completion["usage"]["completion_tokens"]
+        .as_u64()
+        .expect("fake-llm.sh counts its reply");
+    completion["usage"] = serde_json::json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": reply,
+        "total_tokens": prompt + reply,
+    });
+    completion
+}
+
+/// fake-llm.sh's reply to `r`'s last message as Ollama's `/api/chat` gives it, with the chat
+/// completion's tokens as Ollama counts them.
+fn chatted(r: &Request) -> Reply {
+    let completion = completion(r);
+    let reply = serde_json::json!({
+        "model": r.json()["model"],
+        "created_at": "2026-11-19T00:00:00Z",
+        "message": {"role": "assistant", "content": completion["choices"][0]["message"]["content"]},
+        "done": true,
+        "done_reason": "stop",
+        "prompt_eval_count": completion["usage"]["prompt_tokens"],
+        "eval_count": completion["usage"]["completion_tokens"],
+    });
+    Reply::ok(reply.to_string())
+}
+
+/// How many lines of `r`'s last message start `L<digit>`: the subtitle lines a prompt sent.
+pub fn prompt_lines(r: &Request) -> usize {
+    last_content(r)
+        .lines()
+        .filter(|line| {
+            line.strip_prefix('L')
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(|c| c.is_ascii_digit())
+        })
+        .count()
 }
 
 /// A `/v1` URL on a port nothing listens on. [`FakeServer`] binds port 0, so the OS hands it an
@@ -334,7 +460,9 @@ mod tests {
             body["choices"][0]["message"]["content"],
             "L1\tWe should leave before it rains.\tplanted typo"
         );
-        assert_eq!(body["usage"]["prompt_tokens"], 1500);
+        // The one line's prompt, counted as subcheck estimates it, none of it cached.
+        assert_eq!(body["usage"]["prompt_tokens"], llm::estimate(1));
+        assert_eq!(body["usage"].get("prompt_tokens_details"), None);
         assert_eq!(server.completions().len(), 1);
 
         let other = get(&server.url, "/v1/nothing");
@@ -346,5 +474,99 @@ mod tests {
         let url = closed_port_url();
         assert_eq!(url, "http://127.0.0.1:1/v1");
         assert!(TcpStream::connect(("127.0.0.1", port(&url))).is_err());
+    }
+
+    /// The JSON body of a raw HTTP reply.
+    fn body_of(reply: &str) -> serde_json::Value {
+        serde_json::from_str(reply.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn the_ollama_server_lists_its_model_loaded_only_once_asked_to_load_it() {
+        let server = FakeServer::ollama("m", 8192);
+        assert_eq!(
+            body_of(&get(&server.url, "/v1/models"))["data"][0]["id"],
+            "m"
+        );
+        assert_eq!(
+            body_of(&get(&server.url, "/api/ps")),
+            serde_json::json!({"models": []})
+        );
+        let other = post(&server.url, "/api/generate", r#"{"model":"x"}"#);
+        assert!(other.starts_with("HTTP/1.1 404 "), "{other}");
+        assert_eq!(
+            body_of(&get(&server.url, "/api/ps")),
+            serde_json::json!({"models": []})
+        );
+        let load = post(&server.url, "/api/generate", r#"{"model":"m"}"#);
+        assert_eq!(body_of(&load)["done_reason"], "load");
+        assert_eq!(
+            body_of(&get(&server.url, "/api/ps")),
+            serde_json::json!({"models": [{"name": "m", "model": "m", "context_length": 8192}]})
+        );
+    }
+
+    #[test]
+    fn the_ollama_server_answers_its_own_chat_for_its_model_only() {
+        let server = FakeServer::ollama("m", 8192);
+        let prompt = "Check these.\nL1 [0:00:01.00] (Default) We should leave befor it rains.\n";
+        let chat = |model: &str| {
+            serde_json::json!({"model": model, "messages": [
+                {"role": "system", "content": "ignored"},
+                {"role": "user", "content": prompt},
+            ]})
+            .to_string()
+        };
+        let out = post(&server.url, "/api/chat", &chat("m"));
+        assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+        let body = body_of(&out);
+        assert_eq!(
+            (
+                &body["message"]["content"],
+                &body["done_reason"],
+                &body["prompt_eval_count"],
+                &body["eval_count"]
+            ),
+            (
+                &serde_json::json!("L1\tWe should leave before it rains.\tplanted typo"),
+                &serde_json::json!("stop"),
+                &serde_json::json!(llm::estimate(1)),
+                &serde_json::json!(40)
+            )
+        );
+        let other = post(&server.url, "/api/chat", &chat("x"));
+        assert!(other.starts_with("HTTP/1.1 404 "), "{other}");
+        assert_eq!(body_of(&other)["error"], "model 'x' not found");
+        let chats = server.chats();
+        assert_eq!(
+            (
+                chats.len(),
+                prompt_lines(&chats[0]),
+                server.completions().len()
+            ),
+            (2, 1, 0)
+        );
+    }
+
+    #[test]
+    fn the_sized_llm_server_lists_n_ctx_and_prompt_lines_counts_the_numbered_lines() {
+        let server = FakeServer::llm_sized(&["a", "b"], 4096);
+        let models = body_of(&get(&server.url, "/v1/models"));
+        assert_eq!(
+            (
+                &models["data"][1]["id"],
+                &models["data"][1]["meta"]["n_ctx"]
+            ),
+            (&serde_json::json!("b"), &serde_json::json!(4096))
+        );
+        let prompt = "Reply as L<ID>.\nL1 [0:00:01.00] (Default) One.\nLater\nL12 [0:00:02.00] (Default) Two.\n";
+        let request = serde_json::json!({"model": "a", "messages": [
+            {"role": "system", "content": "L1 L2 L3"},
+            {"role": "user", "content": prompt},
+        ]})
+        .to_string();
+        let out = post(&server.url, "/v1/chat/completions", &request);
+        assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+        assert_eq!(prompt_lines(&server.completions()[0]), 2);
     }
 }

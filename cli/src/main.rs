@@ -83,9 +83,9 @@ enum Command {
         /// LLM calls to run at once. Default: the entry's `jobs`, else 2.
         #[arg(short, long)]
         jobs: Option<usize>,
-        /// Lines per LLM call. Default: the entry's `chunk_lines`, else 400, or 150 for ollama (its
-        /// default context is 4k tokens). For a server, fit it to the server's context, about 150
-        /// for 4k: a server may cut an over-long prompt without saying so.
+        /// Lines per LLM call: for a server, at most as many as fit the context it reports, with no
+        /// limit of 400, and exactly these when it reports none. Default: the entry's
+        /// `chunk_lines`, cut the same way; for a server, as many as fit, at most 400; else 400.
         #[arg(long)]
         chunk_lines: Option<usize>,
         /// Check files even if they are unchanged since an earlier scan.
@@ -264,8 +264,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let settings = Settings::load().map_err(anyhow::Error::msg)?;
             let state = store::state_dir()?;
             let mut db = Store::open()?;
-            // What readying the LLM and planning warn of goes to stderr as it comes, and is kept
-            // for the screen, which covers it once it opens.
+            // What readying the LLM, planning and sizing warn of goes to stderr as it comes, and is
+            // kept for the screen, which covers it once it opens.
             let mut log = tui::Tee::new(std::io::stderr());
             let (backend, langs) = if let Some(name) = &run {
                 let scan = db
@@ -300,7 +300,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 (ready(backend, &mut log)?, langs)
             };
             let mut opts = scan::Options {
-                chunk_lines: chunk_lines.unwrap_or(backend.chunk_lines),
+                chunk_lines,
                 jobs: jobs.unwrap_or(backend.jobs),
                 backend,
                 langs,
@@ -322,11 +322,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let screen =
                 !no_tui && std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
             let planned = scan::plan(&paths, &opts, &mut db, &mut log)?;
-            // Adding to a run (--run): readied after planning, and only when a file needs the LLM,
-            // so adding nothing, or only the timing check, needs no server up. Planning asks the
-            // server nothing: the label is the one the run recorded.
-            if adding && matches!(&planned, Planned::Scan(plan) if plan.needs_llm()) {
-                opts.backend = ready(opts.backend, &mut log)?;
+            // Only once a file needs the LLM: a scan with nothing for it to do loads no model, and
+            // adding nothing to a run (--run), or only the timing check, needs no server up. Adding
+            // readies here, as planning asks the server nothing: the label is the one the run
+            // recorded. Sizing has Ollama load a model it has not, so the chunks fit its context.
+            if matches!(&planned, Planned::Scan(plan) if plan.needs_llm()) {
+                if adding {
+                    opts.backend = ready(opts.backend, &mut log)?;
+                }
+                if let Some(loading) = opts.backend.loading() {
+                    writeln!(log, "{loading}")?;
+                }
+                opts.backend = opts.backend.sized().map_err(anyhow::Error::msg)?;
+                if let Some(w) = opts.size_warning() {
+                    writeln!(log, "warning: {w}")?;
+                }
             }
             let s = match planned {
                 Planned::Nothing(s) if screen => {

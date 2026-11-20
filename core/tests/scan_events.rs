@@ -15,7 +15,7 @@ fn options() -> scan::Options {
     let fake = common::fake_llm();
     let backend = Backend::shell(&format!("'{}'", fake.display()));
     scan::Options {
-        chunk_lines: backend.chunk_lines,
+        chunk_lines: None,
         backend,
         jobs: 2,
         langs: vec![scan::DEFAULT_LANG.to_string()],

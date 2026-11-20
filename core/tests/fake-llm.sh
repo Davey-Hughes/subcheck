@@ -74,7 +74,7 @@ case "$name" in
     printf '{"type":"turn.completed","usage":{"input_tokens":1500,"cached_input_tokens":1000,"output_tokens":40}}\n'
     ;;
   openai)
-    printf '{"object":"chat.completion","model":"fake","choices":[{"index":0,"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1500,"completion_tokens":40,"total_tokens":1540,"prompt_tokens_details":{"cached_tokens":1000}}}\n' \
+    printf '{"object":"chat.completion","model":"fake","choices":[{"index":0,"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"usage":{"prompt_tokens":900,"completion_tokens":40,"total_tokens":940,"prompt_tokens_details":{"cached_tokens":600}}}\n' \
       "$(json "$reply")"
     ;;
   *)

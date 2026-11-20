@@ -31,9 +31,13 @@ pub fn scan<T: From<Input> + Send + 'static>(
 
 /// Run `plan` as [`scan()`] does, on a thread named `recheck`, readying `opts.backend` there first
 /// ([`Backend::ready`](crate::llm::Backend::ready)): a server's key fetched and the server asked
-/// what it serves. Its error ends the job as `Input::ScanEnded(Err(..))` with nothing checked. Its
-/// warnings are dropped, as no input carries one, so a warning the run's own scan did not say (its
-/// entry has changed since) goes unseen.
+/// what it serves; then sizing it ([`Backend::sized`](crate::llm::Backend::sized)), which has
+/// Ollama load a model it has not. An error of either ends the job as `Input::ScanEnded(Err(..))`
+/// with nothing checked. A warning of the server's context ([`Options::size_warning`]) is sent as
+/// `Input::Warned` before the scan's first step: a recheck sizes its chunks by the entry and the
+/// server as they are now, never by a `--chunk-lines` the run's own scan had, so that scan may not
+/// have said it. Readying's own warnings are dropped, as the scan that made the run said
+/// them; one it did not say (its entry has changed since) goes unseen.
 pub fn recheck<T: From<Input> + Send + 'static>(
     plan: Plan,
     opts: Options,
@@ -59,7 +63,10 @@ fn check<T: From<Input> + Send + 'static>(
             };
             let ran = panic::catch_unwind(AssertUnwindSafe(|| {
                 if ready_first {
-                    opts.backend = opts.backend.ready()?.0;
+                    opts.backend = opts.backend.ready()?.0.sized()?;
+                    if let Some(w) = opts.size_warning() {
+                        let _ = tx.send(Input::Warned(format!("warning: {w}")).into());
+                    }
                 }
                 scan::execute(plan, &opts, &mut store, &mut io::sink(), &report)
                     .map_err(|e| format!("{e:#}"))

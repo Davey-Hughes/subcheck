@@ -34,6 +34,15 @@ pub fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The subtitle lines typos.mkv sends the LLM.
+pub const TYPOS_LINES: usize = 4;
+
+/// The most lines a chunk holds in a call's share of `share` tokens, its reply given the room it
+/// has by default: [`llm::Budget::lines`].
+pub fn fitting_lines(share: u64) -> usize {
+    llm::Budget::new(share, None).lines()
+}
+
 /// core/tests/fake-llm.sh, the stand-in LLM the tests scan with.
 pub fn fake_llm() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh")

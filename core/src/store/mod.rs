@@ -311,9 +311,9 @@ pub struct Applied {
     pub at: Timestamp,
 }
 
-/// One LLM call a scan started with claude or codex, retries and failed ones too, with what its
-/// backend says it used: a `usage` row. A backend that never says (ollama, `--llm-cmd`), or a call
-/// that could not be started, leaves none.
+/// One LLM call a scan started, retries and failed ones too, with what its backend says it used: a
+/// `usage` row. A backend that never says (`--llm-cmd`), or a call that could not be started,
+/// leaves none.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LlmCall {
     /// The file whose lines it carried: a line other files share is sent once, with the first.

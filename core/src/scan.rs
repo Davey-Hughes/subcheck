@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -16,7 +17,7 @@ use jiff::Timestamp;
 
 use crate::blocks::{self, ReadPath};
 use crate::list::shell_quote;
-use crate::llm::{self, Answer, Backend, Spent, Suggestion, Usage, Used, Via};
+use crate::llm::{self, Answer, Backend, Spent, Suggestion, TooBig, Usage, Used, Via};
 use crate::mkv::{self, Layout, TRACK_TYPE_SUBTITLE, Track, Truncated};
 use crate::settings::Settings;
 use crate::store::{
@@ -32,7 +33,11 @@ pub const DEFAULT_LANG: &str = "eng";
 
 pub struct Options {
     pub backend: Backend,
-    pub chunk_lines: usize,
+    /// `--chunk-lines`: the lines in a chunk, at most as many as fit the context the server
+    /// reports, with no limit of 400, and exactly these with no size known
+    /// ([`Options::lines_per_chunk`]). `None` when it is not given, and for a recheck, so the
+    /// entry's `chunk_lines` or the backend sizes the chunks.
+    pub chunk_lines: Option<usize>,
     pub jobs: usize,
     /// ISO 639-2 codes; a track matches by `Language` or by its BCP 47 primary subtag.
     pub langs: Vec<String>,
@@ -40,6 +45,26 @@ pub struct Options {
     pub verbose: bool,
     /// The run to add to (`--run`), by name, instead of starting a run.
     pub into: Option<String>,
+}
+
+impl Options {
+    /// Lines per chunk: `--chunk-lines`, else the entry's `chunk_lines`, cut to what fits, else
+    /// fitted, for [`Options::jobs`] calls at once ([`Backend::lines_per_chunk`]).
+    pub fn lines_per_chunk(&self) -> usize {
+        self.backend.lines_per_chunk(self.jobs, self.chunk_lines)
+    }
+
+    /// The backend's warning of its context: that it did not say its size
+    /// ([`Backend::size_warning`]), unless `--chunk-lines` sets the size; or that the entry's own
+    /// cap on its replies leaves a call no room for a line ([`Backend::room_warning`]), which no
+    /// chunk size changes.
+    pub fn size_warning(&self) -> Option<String> {
+        let unknown = match self.chunk_lines {
+            Some(_) => None,
+            None => self.backend.size_warning(self.jobs),
+        };
+        unknown.or_else(|| self.backend.room_warning(self.jobs))
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -484,7 +509,27 @@ pub fn dry_run(
             files(cached)
         )?;
     }
-    let mut chunker = Chunker::new(opts.chunk_lines);
+    if let Some(w) = opts.size_warning() {
+        writeln!(log, "warning: {w}")?;
+    }
+    // `Backend::ready` sends only GETs, so a dry run never loads a model, and one Ollama has not
+    // loaded has no size until a scan loads it.
+    if opts.backend.context() == Some(llm::Context::NotLoaded) {
+        let size_set = opts.chunk_lines.or(opts.backend.chunk_lines).is_some();
+        let (set, then) = if size_set {
+            (" as set", "cuts them to what fits")
+        } else {
+            ("", "fits them to")
+        };
+        writeln!(
+            log,
+            "dry run: {}'s model is not loaded, so these chunks are {} lines{set}; a scan loads it \
+             and {then} its context",
+            opts.backend.label,
+            opts.lines_per_chunk()
+        )?;
+    }
+    let mut chunker = Chunker::new(opts.lines_per_chunk());
     for path in todo {
         let p = prepare(&path, &opts.langs, &[Check::Llm]);
         if let Some(t) = p.truncated {
@@ -534,42 +579,130 @@ enum Msg {
     Chunk(ChunkDone),
 }
 
-/// One chunk through the LLM: two attempts, where a failed run and an unreadable reply both
-/// count as failures. Also each call to count, with what it used when its backend said: a failed
-/// one costs too.
-fn ask(backend: &Backend, lines: &[Line]) -> (Result<Vec<Suggestion>, String>, Vec<Option<Usage>>) {
-    let refs: Vec<&Line> = lines.iter().collect();
-    let prompt = llm::prompt(&refs);
-    let mut calls = Vec::new();
-    let mut last = String::new();
-    for _ in 0..2 {
-        let Answer { reply, used } = backend.call(&prompt, llm::TIMEOUT);
-        match used {
-            Used::Reported(usage) => calls.push(Some(usage)),
-            Used::Unreported => calls.push(None),
-            Used::Untracked => {}
-        }
-        match reply.and_then(|reply| llm::parse(&reply, &refs)) {
-            Ok(reply) => return (Ok(reply.suggestions), calls),
-            Err(e) => last = e,
-        }
-    }
-    (Err(last), calls)
+/// One chunk through the LLM: its suggestions, and each call made for it to count, in the order
+/// they went, with how many lines it sent and what it used when its backend said (a failed call
+/// costs too).
+///
+/// A chunk, or a part of one, has two attempts, where a failed run and an unreadable reply both
+/// count as failures. A chunk is sent whole: when it was made, it was cut to the lines whose
+/// [`llm::estimate`] fits what `budget`, each call's part of the server's context
+/// ([`Backend::budget`]), leaves the prompt, whatever size was set
+/// ([`Backend::lines_per_chunk`]). One too big for the server all the same is halved, each half
+/// asked in turn, and a half's findings keep their own lines: once the server refuses it or may
+/// have cut it ([`TooBig::Prompt`]), down to single lines, which are sent whatever the estimate,
+/// since only the server knows what fits. A single line it refuses is a failed attempt like any
+/// other: llama-server refuses calls in flight that outgrew the cache they share, and the line can
+/// fit once the others are done. Each call's reply is capped at the room `budget` leaves it
+/// ([`llm::Budget::cap`]); a reply cut off there, or at the server's own length limit
+/// ([`TooBig::Reply`]), halves its chunk once only: a model that loops until the limit is cut off
+/// at any size, and halving it down to single lines would cost about two calls a line. A half that
+/// fails fails its chunk, and the other half is not sent.
+fn ask(
+    backend: &Backend,
+    lines: &[Line],
+    budget: Option<llm::Budget>,
+) -> (Result<Vec<Suggestion>, String>, Vec<Call>) {
+    let mut asker = Asker {
+        backend,
+        budget,
+        calls: Vec::new(),
+    };
+    let result = asker.part(lines, true);
+    (result, asker.calls)
 }
 
-/// A worker: runs chunks through the LLM until the queue closes or the collector hangs up.
-fn work(backend: &Backend, queue: &Mutex<mpsc::Receiver<Queued>>, out: &mpsc::Sender<Msg>) {
+/// A call made for a chunk: how many lines it sent, and what it used when its backend said.
+type Call = (usize, Option<Usage>);
+
+/// One chunk's calls ([`ask`]).
+struct Asker<'a> {
+    backend: &'a Backend,
+    budget: Option<llm::Budget>,
+    /// Each call made so far, in the order they went.
+    calls: Vec<Call>,
+}
+
+impl Asker<'_> {
+    /// `lines`, a chunk or part of one, through the LLM; a reply cut off halves them only when
+    /// `may_split_reply`.
+    fn part(&mut self, lines: &[Line], may_split_reply: bool) -> Result<Vec<Suggestion>, String> {
+        let several = lines.len() > 1;
+        let refs: Vec<&Line> = lines.iter().collect();
+        let prompt = llm::prompt(&refs);
+        let mut last = String::new();
+        for _ in 0..2 {
+            let Answer {
+                reply,
+                used,
+                too_big,
+            } = self.backend.call(&prompt, llm::TIMEOUT, self.budget);
+            match used {
+                Used::Reported(usage) => self.calls.push((lines.len(), Some(usage))),
+                Used::Unreported => self.calls.push((lines.len(), None)),
+                Used::Untracked => {}
+            }
+            match (too_big, reply) {
+                (Some(TooBig::Prompt), _) if several => {
+                    return self.halves(lines, may_split_reply);
+                }
+                (Some(TooBig::Reply), _) if several && may_split_reply => {
+                    return self.halves(lines, false);
+                }
+                (_, reply) => match reply.and_then(|reply| llm::parse(&reply, &refs)) {
+                    Ok(parsed) => return Ok(parsed.suggestions),
+                    Err(e) => last = e,
+                },
+            }
+        }
+        Err(last)
+    }
+
+    /// `lines` as two halves, the first sent first ([`Asker::in_pieces`]).
+    fn halves(&mut self, lines: &[Line], may_split_reply: bool) -> Result<Vec<Suggestion>, String> {
+        let mid = lines.len() / 2;
+        self.in_pieces(lines, vec![0..mid, mid..lines.len()], may_split_reply)
+    }
+
+    /// `lines` as `pieces`, each through the LLM in turn; the suggestions keep their lines'
+    /// indexes in `lines`. A piece that fails fails them all, and the pieces after it are not sent.
+    fn in_pieces(
+        &mut self,
+        lines: &[Line],
+        pieces: Vec<Range<usize>>,
+        may_split_reply: bool,
+    ) -> Result<Vec<Suggestion>, String> {
+        let mut found = Vec::new();
+        for piece in pieces {
+            let start = piece.start;
+            let suggestions = self.part(&lines[piece], may_split_reply)?;
+            found.extend(suggestions.into_iter().map(|s| Suggestion {
+                index: s.index + start,
+                ..s
+            }));
+        }
+        Ok(found)
+    }
+}
+
+/// A worker: runs chunks through the LLM until the queue closes or the collector hangs up. Each
+/// call may take `budget` of the server's context ([`ask`]).
+fn work(
+    backend: &Backend,
+    budget: Option<llm::Budget>,
+    queue: &Mutex<mpsc::Receiver<Queued>>,
+    out: &mpsc::Sender<Msg>,
+) {
     loop {
         let next = queue.lock().map(|rx| rx.recv());
         let Ok(Ok(Queued { chunk, file })) = next else {
             return;
         };
-        let (result, used) = ask(backend, &chunk.lines);
-        let calls = used
+        let (result, made) = ask(backend, &chunk.lines, budget);
+        let calls = made
             .into_iter()
-            .map(|usage| LlmCall {
+            .map(|(lines, usage)| LlmCall {
                 file: file.to_string(),
-                lines: chunk.lines.len(),
+                lines,
                 usage,
             })
             .collect();
@@ -594,7 +727,7 @@ fn read(
     out: &mpsc::Sender<Msg>,
     report: &(dyn Fn(Event) + Sync),
 ) {
-    let mut chunker = Chunker::new(opts.chunk_lines);
+    let mut chunker = Chunker::new(opts.lines_per_chunk());
     for (path, checks) in todo {
         report(Event::Reading(path.clone()));
         let prepared = prepare(path, &opts.langs, checks);
@@ -635,12 +768,15 @@ pub fn resume(
         (None, Some(name)) => Some(Backend::named(name, settings)?),
         (None, None) => None,
     };
-    // A server whose entry names no model has only the entry's name for a label until the server
-    // says its model, so it matches a run through that entry with any model.
+    // A server's label waits on the model it settles, so before then it matches a run through its
+    // entry with the model the entry asks for as the server named it ([`llm::same_model`]), or with
+    // any model when the entry names none.
     let same_llm = |b: &Backend| {
         b.label == header.backend
-            || matches!(&b.via, Via::Server(s) if s.model.is_none()
-                && header.backend.split_once('@').is_some_and(|(name, _)| name == s.name))
+            || matches!(&b.via, Via::Server(s) if header.backend.split_once('@').is_some_and(
+                |(name, model)| name == s.name
+                    && s.model.as_deref().is_none_or(|asked| llm::same_model(asked, model))
+            ))
     };
     if given.is_some_and(|b| !same_llm(&b)) {
         return Err(format!(
@@ -653,7 +789,7 @@ pub fn resume(
     let backend = Backend::from_label(&header.backend, settings).unwrap_or_else(|why| Backend {
         label: header.backend.clone(),
         via: Via::Unknown(why),
-        chunk_lines: llm::CHUNK_LINES,
+        chunk_lines: None,
         jobs: llm::JOBS,
     });
     let set = |l: &[String]| CheckedWith::new("", l, 0).langs;
@@ -805,10 +941,11 @@ pub fn execute(
         let (queue_tx, queue_rx) = mpsc::sync_channel::<Queued>(opts.jobs.max(1) * 2);
         let queue_rx = Arc::new(Mutex::new(queue_rx));
         let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+        let budget = opts.backend.budget(opts.jobs);
         for _ in 0..opts.jobs.max(1) {
             let queue_rx = Arc::clone(&queue_rx);
             let msg_tx = msg_tx.clone();
-            scope.spawn(move || work(&opts.backend, &queue_rx, &msg_tx));
+            scope.spawn(move || work(&opts.backend, budget, &queue_rx, &msg_tx));
         }
         let todo = &todo;
         scope.spawn(move || read(todo, opts, &queue_tx, &msg_tx, report));
@@ -1202,7 +1339,11 @@ fn findings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::scan_row;
+    use crate::llm::Context;
+    use crate::test_support::{
+        FakeServer, Reply, Request, TYPOS_LINES, copied, fitting_lines, fixture, models_reply,
+        prompt_lines, scan_row,
+    };
     use crate::text::Occurrence;
 
     fn line(text: &str) -> Line {
@@ -1311,6 +1452,373 @@ mod tests {
     }
 
     #[test]
+    fn an_entrys_untagged_model_settles_to_latest_and_its_run_resumes() {
+        let fake = FakeServer::start(|r| match r.path.as_str() {
+            "/v1/models" => models_reply(&["gemma4:latest", "x"]),
+            _ => Reply::status(404, "{}"),
+        });
+        let s = Settings::parse(
+            Path::new("/c/config.toml"),
+            &format!("[llm.srv]\nurl = \"{}\"\nmodel = \"gemma4\"\n", fake.url),
+        )
+        .unwrap();
+        let (b, _) = Backend::named("srv", &s).unwrap().ready().unwrap();
+        assert_eq!(b.label, "srv@gemma4:latest");
+        assert_eq!(
+            Backend::from_label("srv@gemma4:latest", &s).map(|b| b.label),
+            Ok("srv@gemma4:latest".into())
+        );
+        assert_eq!(
+            Backend::from_label("srv@gemma4:12b", &s),
+            Err("srv@gemma4:12b, but /c/config.toml now has srv ask for \"gemma4\"".into())
+        );
+        let run = scan_row("srv@gemma4:latest", &["eng"]);
+        for llm in [None, Some("srv")] {
+            let (b, _) = resume(&run, llm, None, &[], &s).unwrap();
+            assert_eq!(b.label, "srv@gemma4:latest", "{llm:?}");
+            assert!(
+                matches!(&b.via, Via::Server(s) if s.model.as_deref() == Some("gemma4:latest")),
+                "{llm:?}"
+            );
+        }
+        assert_eq!(
+            resume(
+                &scan_row("srv@gemma4:12b", &["eng"]),
+                Some("srv"),
+                None,
+                &[],
+                &s
+            )
+            .unwrap_err(),
+            "run r was scanned with srv@gemma4:12b; leave out --llm and --llm-cmd to use it"
+        );
+    }
+
+    /// Options for a scan through `[llm.srv]` on `server`, `extra` in its table, readied, with
+    /// `jobs` calls at once and `flag` as `--chunk-lines`.
+    fn through(server: &FakeServer, extra: &str, jobs: usize, flag: Option<usize>) -> Options {
+        let text = format!("[llm.srv]\nurl = \"{}\"\n{extra}", server.url);
+        let s = Settings::parse(Path::new("/c/config.toml"), &text).unwrap();
+        let (backend, _) = Backend::named("srv", &s).unwrap().ready().unwrap();
+        with(backend, jobs, flag)
+    }
+
+    /// Options for a scan through `backend`, with `jobs` calls at once and `flag` as
+    /// `--chunk-lines`.
+    fn with(backend: Backend, jobs: usize, flag: Option<usize>) -> Options {
+        Options {
+            backend,
+            chunk_lines: flag,
+            jobs,
+            langs: langs(&["eng"]),
+            force: false,
+            verbose: false,
+            into: None,
+        }
+    }
+
+    /// A command entry, `[llm.mine]`.
+    fn command_entry() -> Backend {
+        let s = Settings::parse(Path::new("/c/config.toml"), "[llm.mine]\ncommand = \"x\"\n");
+        Backend::named("mine", &s.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn chunk_size_is_the_flag_else_the_entrys_at_most_what_fits_else_fitted_else_400() {
+        // 4096 tokens shared by 2 jobs: 2048 a call, which fits 30 lines.
+        let sized = FakeServer::llm_sized(&["m"], 4096);
+        // 16384 tokens shared by 2 jobs: 8192 a call, which fits 155 lines.
+        let large = FakeServer::llm_sized(&["m"], 16384);
+        // 131072 tokens, each call's whole: 3420 lines fit.
+        let huge = FakeServer::llm_sized(&["m"], 131_072);
+        let silent = FakeServer::llm(&["m"]);
+        let whole = "shared_context = false\n";
+        for (server, extra, jobs, flag, lines) in [
+            (&sized, "", 1, None, fitting_lines(4096)),
+            (&sized, "", 0, None, fitting_lines(4096)),
+            (&sized, "", 2, None, fitting_lines(2048)),
+            (&sized, whole, 2, None, fitting_lines(4096)),
+            // A size set above what fits is cut to it; one below it is kept.
+            (&sized, "chunk_lines = 50\n", 2, None, 30),
+            (&sized, "chunk_lines = 20\n", 2, None, 20),
+            (&sized, "chunk_lines = 50\n", 2, Some(7), 7),
+            (&sized, "chunk_lines = 7\n", 2, Some(50), 30),
+            (&large, "", 2, Some(2000), 155),
+            (&large, "", 2, Some(7), 7),
+            // With no limit of 400 on what fits.
+            (&huge, whole, 2, Some(600), 600),
+            (&huge, whole, 2, None, llm::CHUNK_LINES),
+            // With no size known, as set.
+            (&silent, "", 2, None, llm::CHUNK_LINES),
+            (&silent, "", 2, Some(7), 7),
+            (&silent, "", 2, Some(2000), 2000),
+            (&silent, "chunk_lines = 2000\n", 2, None, 2000),
+        ] {
+            assert_eq!(
+                through(server, extra, jobs, flag).lines_per_chunk(),
+                lines,
+                "{extra:?} -j {jobs} --chunk-lines {flag:?}"
+            );
+        }
+        for backend in [
+            command_entry(),
+            Backend::preset("claude").unwrap(),
+            Backend::shell("x"),
+        ] {
+            let label = backend.label.clone();
+            assert_eq!(
+                with(backend, 2, None).lines_per_chunk(),
+                llm::CHUNK_LINES,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_server_that_did_not_say_its_size_warns_and_only_when_nothing_sets_the_size() {
+        let silent = FakeServer::llm(&["m"]);
+        let said = |k: u64| {
+            Some(format!(
+                "srv did not say its context size; set chunk_lines if it holds under {k}k tokens"
+            ))
+        };
+        for (extra, jobs, flag, warning) in [
+            ("", 1, None, said(19)),
+            ("", 2, None, said(38)),
+            ("shared_context = false\n", 2, None, said(19)),
+            ("chunk_lines = 50\n", 2, None, None),
+            ("", 2, Some(7), None),
+        ] {
+            assert_eq!(
+                through(&silent, extra, jobs, flag).size_warning(),
+                warning,
+                "{extra:?} -j {jobs} --chunk-lines {flag:?}"
+            );
+        }
+        // An entry's own max_tokens is the reply's room beside a full chunk: 400 lines' estimate
+        // and 8192 come to just under 23k.
+        for own in [
+            "[llm.srv.request]\nmax_tokens = 8192\n",
+            "[llm.srv.request]\nmax_completion_tokens = 8192\n",
+        ] {
+            assert_eq!(
+                through(&silent, own, 1, None).size_warning(),
+                said(23),
+                "{own:?}"
+            );
+        }
+        let sized = FakeServer::llm_sized(&["m"], 4096);
+        assert_eq!(through(&sized, "", 2, None).size_warning(), None);
+        let unloaded = FakeServer::ollama("m", 2048);
+        let opts = through(&unloaded, "", 2, None);
+        assert_eq!(
+            (opts.backend.context(), opts.size_warning()),
+            (Some(Context::NotLoaded), None)
+        );
+        assert_eq!(with(command_entry(), 2, None).size_warning(), None);
+    }
+
+    #[test]
+    fn an_entrys_cap_that_leaves_no_room_for_a_line_warns_whatever_sets_the_chunks() {
+        // 16384 tokens shared by 2 jobs: 8192 a call, all of it the reply's under a cap of 8192.
+        let server = FakeServer::llm_sized(&["m"], 16384);
+        let said = |field: &str, cap: u64, share: u64, fix: &str| {
+            Some(format!(
+                "srv's request.{field} ({cap}) leaves no room for lines in a call's {share} \
+                 tokens, so each line is sent alone; {fix}"
+            ))
+        };
+        let shared = "lower it, or set shared_context = false or fewer jobs";
+        let cap = |request: &str| format!("[llm.srv.request]\n{request}\n");
+        let whole = |request: &str| format!("shared_context = false\n{}", cap(request));
+        // The largest cap that leaves the prompt one line's estimate.
+        let fits = 8192 - llm::estimate(1);
+        let over = fits + 1;
+        for (extra, jobs, flag, warning) in [
+            (
+                cap("max_tokens = 8192"),
+                2,
+                None,
+                said("max_tokens", 8192, 8192, shared),
+            ),
+            (
+                cap("max_tokens = 8192"),
+                2,
+                Some(7),
+                said("max_tokens", 8192, 8192, shared),
+            ),
+            (
+                cap("max_completion_tokens = 9000"),
+                2,
+                None,
+                said("max_completion_tokens", 9000, 8192, shared),
+            ),
+            (
+                cap(&format!("max_tokens = {over}")),
+                2,
+                None,
+                said("max_tokens", over, 8192, shared),
+            ),
+            (cap(&format!("max_tokens = {fits}")), 2, None, None),
+            (cap("max_tokens = 8192"), 1, None, None),
+            (whole("max_tokens = 8192"), 2, None, None),
+            (
+                whole("max_tokens = 16384"),
+                2,
+                None,
+                said("max_tokens", 16384, 16384, "lower it"),
+            ),
+            (
+                cap("max_tokens = 16384"),
+                1,
+                None,
+                said("max_tokens", 16384, 16384, "lower it"),
+            ),
+            (String::new(), 2, None, None),
+        ] {
+            assert_eq!(
+                through(&server, &extra, jobs, flag).size_warning(),
+                warning,
+                "{extra:?} -j {jobs} --chunk-lines {flag:?}"
+            );
+        }
+        // Each line alone, as the warning says, whatever sets the size.
+        for flag in [None, Some(7)] {
+            let opts = through(&server, &cap("max_tokens = 8192"), 2, flag);
+            assert_eq!(opts.lines_per_chunk(), 1, "--chunk-lines {flag:?}");
+        }
+        // A server that did not say its size gives no share to warn of.
+        let silent = FakeServer::llm(&["m"]);
+        let opts = through(&silent, &cap("max_tokens = 100000"), 2, Some(7));
+        assert_eq!(opts.size_warning(), None);
+    }
+
+    /// What `dry_run` writes over a copy of typos.mkv with `opts`: its output, then its log.
+    fn dry_run_of_typos(opts: &Options) -> (String, String) {
+        let (dir, file) = copied("typos.mkv");
+        let store = Store::open_at(&dir.path().join("subcheck.db")).unwrap();
+        let (mut out, mut log) = (Vec::new(), Vec::new());
+        dry_run(&[file], opts, &store, &mut out, &mut log).unwrap();
+        (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(log).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_dry_run_through_an_unloaded_ollama_model_says_its_chunks_are_400_lines() {
+        let server = FakeServer::ollama("m", 2048);
+        let opts = through(&server, "", 2, None);
+        let (out, log) = dry_run_of_typos(&opts);
+        assert!(
+            log.contains(
+                "dry run: srv@m's model is not loaded, so these chunks are 400 lines; a scan \
+                 loads it and fits them to its context"
+            ),
+            "{log}"
+        );
+        assert!(!log.contains("warning: "), "{log}");
+        assert!(
+            out.contains(&format!("(chunk 0, {TYPOS_LINES} lines)")),
+            "{out}"
+        );
+        let requests = server.requests();
+        assert!(requests.iter().all(|r| r.method == "GET"), "{requests:?}");
+    }
+
+    #[test]
+    fn a_dry_run_through_an_unloaded_ollama_model_with_a_size_set_says_a_scan_cuts_it() {
+        let server = FakeServer::ollama("m", 2048);
+        for (extra, flag) in [("chunk_lines = 3\n", None), ("", Some(3))] {
+            let opts = through(&server, extra, 2, flag);
+            let (out, log) = dry_run_of_typos(&opts);
+            assert!(
+                log.contains(
+                    "dry run: srv@m's model is not loaded, so these chunks are 3 lines as set; a \
+                     scan loads it and cuts them to what fits its context"
+                ),
+                "{extra:?} {flag:?}: {log}"
+            );
+            assert!(out.contains("(chunk 0, 3 lines)"), "{out}");
+        }
+        let requests = server.requests();
+        assert!(requests.iter().all(|r| r.method == "GET"), "{requests:?}");
+    }
+
+    #[test]
+    fn a_dry_run_prints_the_chunks_a_scan_would_send() {
+        let n = fitting_lines(1024 / 2);
+        assert!(n < TYPOS_LINES);
+        let server = FakeServer::llm_sized(&["m"], 1024);
+        let (out, log) = dry_run_of_typos(&through(&server, "", 2, None));
+        assert!(out.contains(&format!("(chunk 0, {n} lines)")), "{out}");
+        let chunks = out.lines().filter(|l| l.starts_with("== ")).count();
+        assert_eq!(chunks, TYPOS_LINES.div_ceil(n), "{out}");
+        assert!(!log.contains("dry run: "), "{log}");
+    }
+
+    /// What a dry run printed: each chunk's header after the path, `(chunk <id>, <n> lines)`, and
+    /// its prompt.
+    fn printed(out: &str) -> Vec<(String, String)> {
+        let mut chunks: Vec<(String, String)> = Vec::new();
+        for l in out.split_inclusive('\n') {
+            if l.starts_with("== ") {
+                let (_, header) = l.trim_end().rsplit_once(" (").expect("a chunk's header");
+                chunks.push((format!("({header}"), String::new()));
+            } else {
+                chunks.last_mut().expect("a header first").1.push_str(l);
+            }
+        }
+        chunks
+    }
+
+    #[test]
+    fn a_dry_run_prints_a_forced_size_cut_to_what_fits_as_the_scan_sends_it() {
+        // 1400 tokens shared by 2 jobs: 700 a call, whose prompt holds fewer than all of
+        // typos.mkv's lines, which the chunks are forced to.
+        let fits = fitting_lines(1400 / 2);
+        assert!(fits < TYPOS_LINES);
+        let server = FakeServer::llm_sized(&["m"], 1400);
+        let opts = through(&server, "", 2, Some(TYPOS_LINES));
+        assert_eq!(opts.lines_per_chunk(), fits);
+        let (out, _) = dry_run_of_typos(&opts);
+        let chunks = printed(&out);
+        let headers = [
+            format!("(chunk 0, {fits} lines)"),
+            format!("(chunk 1, {} lines)", TYPOS_LINES - fits),
+        ];
+        assert_eq!(
+            chunks.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>(),
+            headers,
+            "{out}"
+        );
+        // The prompts the scan sends for the same chunks.
+        let lines = prepare(&fixture("typos.mkv"), &opts.langs, &[Check::Llm]).lines;
+        let (_, queued) = Chunker::new(opts.lines_per_chunk()).assign(&lines);
+        for chunk in &queued {
+            let (result, _) = ask(&opts.backend, &chunk.lines, opts.backend.budget(opts.jobs));
+            assert!(result.is_ok(), "{result:?}");
+        }
+        let sent: Vec<String> = server.completions().iter().map(prompt_of).collect();
+        assert_eq!(chunks.into_iter().map(|(_, p)| p).collect::<Vec<_>>(), sent);
+    }
+
+    #[test]
+    fn a_dry_run_through_a_server_that_did_not_say_its_size_warns_before_the_chunks() {
+        let server = FakeServer::llm(&["m"]);
+        let (out, log) = dry_run_of_typos(&through(&server, "", 1, None));
+        assert_eq!(
+            log,
+            "warning: srv did not say its context size; set chunk_lines if it holds under 19k \
+             tokens\n"
+        );
+        assert!(
+            out.contains(&format!("(chunk 0, {TYPOS_LINES} lines)")),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn a_plan_needs_the_llm_only_when_a_file_needs_its_check() {
         let plan = |checks: Vec<Check>| Plan {
             start: Start {
@@ -1355,7 +1863,7 @@ mod tests {
         let scan = store.begin_scan(&header, &files).unwrap();
         let opts = Options {
             backend: Backend::shell("true"),
-            chunk_lines: 10,
+            chunk_lines: Some(10),
             jobs: 1,
             langs: langs(&["eng"]),
             force: false,
@@ -1432,6 +1940,325 @@ mod tests {
         assert_eq!(refs, [(0, 1), (2, 0)]);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].lines[0].text, "d");
+    }
+
+    /// llama-server's refusal of a prompt over its context.
+    const OVERFLOW: &str = include_str!("../tests/fixtures/llm/llama-server-overflow.json");
+
+    /// llama-server's refusal of calls in flight that outgrew the cache they share.
+    const SHARED_CACHE: &str = include_str!("../tests/fixtures/llm/llama-server-shared-cache.json");
+
+    /// Ten lines, the eighth (index 7) with a typo.
+    fn ten_lines() -> Vec<Line> {
+        (0..10)
+            .map(|i| {
+                if i == 7 {
+                    line("We should leave befor it rains.")
+                } else {
+                    line(&format!("Line {i}."))
+                }
+            })
+            .collect()
+    }
+
+    /// The prompt `r` sent: its last message's text.
+    fn prompt_of(r: &Request) -> String {
+        r.json()["messages"]
+            .as_array()
+            .and_then(|m| m.last())
+            .and_then(|m| m["content"].as_str())
+            .expect("the last message has text content")
+            .to_string()
+    }
+
+    /// What a model that finds the one typo replies to `r`'s prompt: the `befor` line by the ID
+    /// that prompt gives it, corrected, else NONE.
+    fn finding(r: &Request) -> String {
+        prompt_of(r)
+            .lines()
+            .filter_map(|l| l.strip_prefix('L'))
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()) && l.contains("befor"))
+            .find_map(|l| l.split_once(' '))
+            .map_or_else(
+                || "NONE".to_string(),
+                |(id, _)| format!("L{id}\tWe should leave before it rains.\tbefor"),
+            )
+    }
+
+    /// An OpenAI chat completion of `content`, stopped for `finish`, its prompt `prompt_tokens`
+    /// long.
+    fn completion(content: &str, finish: &str, prompt_tokens: u64) -> Reply {
+        let body = serde_json::json!({
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": finish,
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 20,
+                "total_tokens": prompt_tokens + 20,
+            },
+        });
+        Reply::ok(body.to_string())
+    }
+
+    /// A readied backend for a server that lists `m`, with a context of `n_ctx` tokens when given,
+    /// and answers each chat completion with `answer` of the lines its prompt sent and the request.
+    fn serving(
+        n_ctx: Option<u64>,
+        answer: impl Fn(usize, &Request) -> Reply + Send + Sync + 'static,
+    ) -> Backend {
+        let model = match n_ctx {
+            Some(n) => serde_json::json!({"id": "m", "object": "model", "meta": {"n_ctx": n}}),
+            None => serde_json::json!({"id": "m", "object": "model"}),
+        };
+        let listed = serde_json::json!({"object": "list", "data": [model]}).to_string();
+        let server = FakeServer::start(move |r| match (r.method.as_str(), r.path.as_str()) {
+            ("GET", "/v1/models") => Reply::ok(listed.clone()),
+            ("POST", "/v1/chat/completions") => answer(prompt_lines(r), r),
+            _ => Reply::status(404, "{}"),
+        });
+        through(&server, "", 1, None).backend
+    }
+
+    /// How many lines each call sent, in the order they went.
+    fn sent(calls: &[Call]) -> Vec<usize> {
+        calls.iter().map(|c| c.0).collect()
+    }
+
+    /// The lines a chunk's suggestions are for.
+    fn found_at(result: Result<Vec<Suggestion>, String>) -> Vec<usize> {
+        result.unwrap().iter().map(|s| s.index).collect()
+    }
+
+    #[test]
+    fn a_chunk_refused_for_the_context_is_halved_until_it_fits_and_its_findings_keep_their_lines() {
+        let backend = serving(None, |lines, r| {
+            if lines > 4 {
+                Reply::status(400, OVERFLOW)
+            } else {
+                completion(&finding(r), "stop", 600)
+            }
+        });
+        let (result, calls) = ask(&backend, &ten_lines(), None);
+        assert_eq!(sent(&calls), [10, 5, 2, 3, 5, 2, 3]);
+        let found = result.unwrap();
+        assert_eq!(found.iter().map(|s| s.index).collect::<Vec<_>>(), [7]);
+        assert_eq!(found[0].corrected, "We should leave before it rains.");
+    }
+
+    #[test]
+    fn a_line_that_never_fits_fails_its_chunk_after_its_second_attempt() {
+        let backend = serving(None, |_, _| Reply::status(400, OVERFLOW));
+        let (result, calls) = ask(&backend, &[line("One."), line("Two.")], None);
+        // Halved, then the first half's line refused twice; the second half is not sent.
+        assert_eq!(sent(&calls), [2, 1, 1]);
+        let error = result.unwrap_err();
+        assert!(error.contains("HTTP 400"), "{error}");
+    }
+
+    #[test]
+    fn a_line_refused_once_for_the_context_lands_on_its_second_attempt() {
+        // llama-server refuses calls in flight that outgrow the cache they share, which a line
+        // sent again once the others are done can fit.
+        let refused = std::sync::atomic::AtomicBool::new(false);
+        let backend = serving(None, move |_, r| {
+            if refused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                completion(&finding(r), "stop", 600)
+            } else {
+                Reply::status(500, SHARED_CACHE)
+            }
+        });
+        let (result, calls) = ask(&backend, &ten_lines()[7..8], None);
+        assert_eq!(sent(&calls), [1, 1]);
+        assert_eq!(found_at(result), [0]);
+    }
+
+    #[test]
+    fn a_reply_cut_off_splits_once_and_a_half_cut_off_again_fails_after_its_retry() {
+        let backend = serving(None, |_, r| completion(&finding(r), "length", 600));
+        let (result, calls) = ask(&backend, &ten_lines(), None);
+        assert_eq!(sent(&calls), [10, 5, 5]);
+        assert_eq!(
+            result,
+            Err("the reply was cut off at the server's length limit".to_string())
+        );
+    }
+
+    #[test]
+    fn a_reply_cut_off_whole_lands_in_halves() {
+        let backend = serving(None, |lines, r| {
+            let finish = if lines == 10 { "length" } else { "stop" };
+            completion(&finding(r), finish, 600)
+        });
+        let (result, calls) = ask(&backend, &ten_lines(), None);
+        assert_eq!(sent(&calls), [10, 5, 5]);
+        assert_eq!(found_at(result), [7]);
+    }
+
+    /// The smallest share of a context whose budget leaves the prompt room for `lines` lines'
+    /// estimate.
+    fn holding(lines: usize) -> u64 {
+        // The prompt keeps three quarters of a share or more, so twice the estimate holds it.
+        (0..=2 * llm::estimate(lines))
+            .find(|&share| llm::Budget::new(share, None).prompt() >= llm::estimate(lines))
+            .expect("a share that holds them")
+    }
+
+    /// Options for a scan through a server whose calls each have `share` tokens, 2 at once, with
+    /// `flag` as `--chunk-lines`.
+    fn sharing(share: u64, flag: Option<usize>) -> Options {
+        through(&FakeServer::llm_sized(&["m"], 2 * share), "", 2, flag)
+    }
+
+    #[test]
+    fn a_forced_size_is_cut_to_the_lines_whose_estimate_the_prompt_holds() {
+        let share = holding(4);
+        assert_eq!(sharing(share, Some(4)).lines_per_chunk(), 4);
+        // A share a token smaller still holds the estimate, but not with the reply's room beside it.
+        assert!(llm::estimate(4) < share);
+        assert_eq!(sharing(share - 1, Some(4)).lines_per_chunk(), 3);
+    }
+
+    #[test]
+    fn a_chunk_forced_over_what_fits_is_cut_when_it_is_made_and_each_cut_goes_whole() {
+        let opts = sharing(holding(4), Some(10));
+        let (_, chunks) = Chunker::new(opts.lines_per_chunk()).assign(&ten_lines());
+        let sizes: Vec<usize> = chunks.iter().map(|c| c.lines.len()).collect();
+        assert_eq!(sizes, [4, 4, 2]);
+        let budget = opts.backend.budget(opts.jobs);
+        let backend = serving(None, |_, r| completion(&finding(r), "stop", 600));
+        let found: Vec<Vec<usize>> = chunks
+            .iter()
+            .map(|chunk| {
+                let (result, calls) = ask(&backend, &chunk.lines, budget);
+                assert_eq!(sent(&calls), [chunk.lines.len()]);
+                found_at(result)
+            })
+            .collect();
+        // The typo on line 7 is found in the second chunk, which starts at line 4.
+        assert_eq!(found, [vec![], vec![3], vec![]]);
+        // A line over what its budget leaves the prompt, here nothing, is a chunk of its own, sent
+        // anyway: only the server can say it does not fit.
+        let none = llm::Budget::new(1000, Some(1000));
+        assert_eq!(none.fit(), 1);
+        let (result, calls) = ask(&backend, &ten_lines()[7..8], Some(none));
+        assert_eq!(sent(&calls), [1]);
+        assert_eq!(found_at(result), [0]);
+    }
+
+    #[test]
+    fn a_prompt_the_server_may_have_cut_is_split_like_a_refusal() {
+        let backend = serving(Some(1000), |lines, r| {
+            let prompt_tokens = if lines > 4 { 990 } else { 600 };
+            completion(&finding(r), "stop", prompt_tokens)
+        });
+        assert_eq!(backend.context(), Some(Context::Tokens(1000)));
+        let (result, calls) = ask(&backend, &ten_lines(), None);
+        assert_eq!(sent(&calls), [10, 5, 2, 3, 5, 2, 3]);
+        assert_eq!(found_at(result), [7]);
+        // A prompt the server may have cut still counts what it used.
+        assert_eq!(calls[0].1.as_ref().map(|u| u.input_tokens), Some(990));
+        // Given a budget, a prompt is measured against the call's share of the context: 8192 of
+        // 16384 tokens, with 2 calls at once.
+        let backend = serving(Some(16384), |lines, r| {
+            let prompt_tokens = if lines > 4 { 8195 } else { 600 };
+            completion(&finding(r), "stop", prompt_tokens)
+        });
+        let (result, calls) = ask(&backend, &ten_lines(), backend.budget(2));
+        assert_eq!(sent(&calls), [10, 5, 2, 3, 5, 2, 3]);
+        assert_eq!(found_at(result), [7]);
+    }
+
+    #[test]
+    fn an_entrys_own_max_tokens_is_the_room_its_reply_is_sized_with() {
+        // 16384 tokens, each call's whole: the reply's quarter would leave the prompt 12288 of
+        // them, and the entry's own max_tokens of 8192 leaves it 8192.
+        let server = FakeServer::llm_sized(&["m"], 16384);
+        let whole = "shared_context = false\n";
+        let own = format!("{whole}[llm.srv.request]\nmax_tokens = 8192\n");
+        let quartered = through(&server, whole, 2, None).lines_per_chunk();
+        let opts = through(&server, &own, 2, None);
+        let n = opts.lines_per_chunk();
+        assert!(n < quartered, "{n} of {quartered}");
+        assert!(llm::estimate(n) <= 16384 - 8192 && llm::estimate(n + 1) > 16384 - 8192);
+        // A max_tokens that is no whole number leaves the reply its quarter.
+        let text = format!("{whole}[llm.srv.request]\nmax_tokens = \"8192\"\n");
+        assert_eq!(
+            through(&server, &text, 2, None).lines_per_chunk(),
+            quartered
+        );
+        // max_completion_tokens, OpenAI's newer name for it, counts the same, and of the two the
+        // larger is the room.
+        for request in [
+            "max_completion_tokens = 8192\n",
+            "max_tokens = 4000\nmax_completion_tokens = 8192\n",
+            "max_tokens = 8192\nmax_completion_tokens = 4000\n",
+        ] {
+            let text = format!("{whole}[llm.srv.request]\n{request}");
+            assert_eq!(
+                through(&server, &text, 2, None).lines_per_chunk(),
+                n,
+                "{request:?}"
+            );
+        }
+        // A size forced to the lines the quarter would fit is cut to what the entry's own
+        // max_tokens leaves, and each call sends that max_tokens.
+        let forced = through(&server, &own, 2, Some(quartered));
+        assert_eq!(forced.lines_per_chunk(), n);
+        let lines: Vec<Line> = (0..quartered)
+            .map(|i| line(&format!("Line {i}.")))
+            .collect();
+        let (_, chunks) = Chunker::new(forced.lines_per_chunk()).assign(&lines);
+        let budget = forced.backend.budget(forced.jobs);
+        for chunk in &chunks {
+            let (result, _) = ask(&forced.backend, &chunk.lines, budget);
+            assert!(result.is_ok(), "{result:?}");
+        }
+        let calls = server.completions();
+        assert_eq!(
+            calls.iter().map(prompt_lines).collect::<Vec<_>>(),
+            [n, quartered - n]
+        );
+        let caps: Vec<Option<u64>> = calls
+            .iter()
+            .map(|r| r.json()["max_tokens"].as_u64())
+            .collect();
+        assert_eq!(caps, [Some(8192), Some(8192)]);
+    }
+
+    #[test]
+    fn a_call_caps_its_reply_at_the_quarter_of_its_budget_up_to_4096() {
+        // 4096 tokens shared by 2 jobs: 2048 a call, the last 512 of them for the reply.
+        let sized = FakeServer::llm_sized(&["m"], 4096);
+        let silent = FakeServer::llm(&["m"]);
+        // 16384 tokens: 8192 a call, 2048 for the reply; with the calls not sharing it, the
+        // quarter of the whole is 4096. Of a million tokens, a quarter of a call's share would be
+        // over a hundred thousand, more than many hosted APIs let a reply take.
+        let large = FakeServer::llm_sized(&["m"], 16384);
+        let huge = FakeServer::llm_sized(&["m"], 1 << 20);
+        for (server, extra, cap) in [
+            (&sized, "", Some(512)),
+            (&sized, "[llm.srv.request]\nmax_tokens = 4000\n", Some(4000)),
+            (&silent, "", None),
+            (&large, "", Some(2048)),
+            (&large, "shared_context = false\n", Some(4096)),
+            (&huge, "", Some(4096)),
+            (&huge, "shared_context = false\n", Some(4096)),
+        ] {
+            let opts = through(server, extra, 2, None);
+            let budget = opts.backend.budget(opts.jobs);
+            let (result, _) = ask(&opts.backend, &ten_lines(), budget);
+            assert!(result.is_ok(), "{result:?}");
+            let body = server.completions().last().expect("a call").json();
+            assert_eq!(
+                body.get("max_tokens").and_then(serde_json::Value::as_u64),
+                cap,
+                "{extra:?}"
+            );
+        }
     }
 
     fn track(language: &str, bcp47: Option<&str>) -> Track {

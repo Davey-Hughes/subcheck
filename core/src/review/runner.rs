@@ -194,7 +194,7 @@ fn recheck_options(
         return Err(format!("run {run} was scanned with {why}"));
     }
     Ok(scan::Options {
-        chunk_lines: backend.chunk_lines,
+        chunk_lines: None,
         jobs: backend.jobs,
         backend,
         langs,
@@ -207,9 +207,9 @@ fn recheck_options(
 /// Check `files` again into run `run`, as `subcheck scan --run <run> --force <files>` does: with
 /// the run's backend and languages, on a thread of its own that sends to `tx`. An entry is as the
 /// settings file at `settings` has it now, or this process's file when that is `None`. The server
-/// and the key command are asked on the job's thread ([`jobs::recheck`]), never here: this runs on
-/// the screen's loop or the window's core thread, and one that hangs would freeze the screen or the
-/// window.
+/// and the key command are asked, and a model loaded, on the job's thread ([`jobs::recheck`]), never
+/// here: this runs on the screen's loop or the window's core thread, and a server or a key command
+/// that hangs, or a model's load, would freeze the screen or the window.
 fn recheck<T: From<Input> + Send + 'static>(
     store: &mut Store,
     tx: &Sender<T>,
@@ -254,7 +254,10 @@ mod tests {
 
     use crate::apply;
     use crate::llm;
-    use crate::test_support::{FakeServer, closed_port_url, copied, fake_llm, scan_row};
+    use crate::test_support::{
+        FakeServer, TYPOS_LINES, closed_port_url, copied, fake_llm, fitting_lines, prompt_lines,
+        scan_row,
+    };
 
     #[test]
     fn a_recheck_takes_the_entrys_jobs_and_chunk_lines_as_the_settings_have_them_now() {
@@ -269,13 +272,17 @@ mod tests {
                 opts.backend.label.as_str(),
                 opts.jobs,
                 opts.chunk_lines,
+                opts.lines_per_chunk(),
                 opts.force,
                 opts.into.as_deref()
             ),
-            ("mine", 4, 150, true, Some("r"))
+            ("mine", 4, None, 150, true, Some("r"))
         );
         let opts = recheck_options(&scan_row("cmd:my-llm", &["eng"]), "r", &s).unwrap();
-        assert_eq!((opts.jobs, opts.chunk_lines), (llm::JOBS, llm::CHUNK_LINES));
+        assert_eq!(
+            (opts.jobs, opts.lines_per_chunk()),
+            (llm::JOBS, llm::CHUNK_LINES)
+        );
         let none = Settings::parse(Path::new("/c/config.toml"), "").unwrap();
         assert_eq!(
             recheck_options(&scan_row("mine", &["eng"]), "r", &none).err(),
@@ -356,7 +363,11 @@ mod tests {
         .unwrap();
         let opts = recheck_options(&scan_row("srv@m", &["eng"]), "r", &s).unwrap();
         assert_eq!(
-            (opts.backend.label.as_str(), opts.jobs, opts.chunk_lines),
+            (
+                opts.backend.label.as_str(),
+                opts.jobs,
+                opts.lines_per_chunk()
+            ),
             ("srv@m", 5, 120)
         );
     }
@@ -390,6 +401,122 @@ mod tests {
         assert!(
             server.completions().len() > 2,
             "chunk_lines = 1: a call a line"
+        );
+    }
+
+    /// The inputs a job sends to `rx`, up to and with `Input::ScanEnded`.
+    fn until_ended(rx: &mpsc::Receiver<Input>) -> Vec<Input> {
+        let mut inputs = Vec::new();
+        loop {
+            let input = rx.recv_timeout(Duration::from_mins(1)).unwrap();
+            let ended = matches!(input, Input::ScanEnded(_));
+            inputs.push(input);
+            if ended {
+                return inputs;
+            }
+        }
+    }
+
+    #[test]
+    fn a_recheck_fits_its_chunks_to_the_servers_context() {
+        // 1024 tokens shared by the default 2 jobs.
+        let per_call = fitting_lines(1024 / 2);
+        assert!(per_call < TYPOS_LINES);
+        let server = FakeServer::llm_sized(&["m"], 1024);
+        let settings = format!("[llm.srv]\nurl = \"{}\"\n", server.url);
+        let (_dir, mut runner, rx, recheck_task) = rechecking("srv@m", &settings);
+        let Input::Started { job, .. } = runner.run(recheck_task) else {
+            panic!()
+        };
+        assert!(job.is_ok(), "{job:?}");
+        let inputs = until_ended(&rx);
+        let Some(Input::ScanEnded(Ok(summary))) = inputs.last() else {
+            panic!("{inputs:?}")
+        };
+        assert_eq!(summary.findings, 2);
+        let sent: Vec<usize> = server.completions().iter().map(prompt_lines).collect();
+        assert!(
+            sent.len() > 1 && sent.iter().all(|&n| n <= per_call),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_recheck_cuts_the_entrys_chunk_lines_to_what_fits_the_servers_context() {
+        // 1400 tokens shared by the default 2 jobs: 700 a call, which holds fewer lines than the
+        // entry's chunk_lines.
+        let fits = fitting_lines(1400 / 2);
+        assert!(fits < TYPOS_LINES);
+        let server = FakeServer::llm_sized(&["m"], 1400);
+        let settings = format!(
+            "[llm.srv]\nurl = \"{}\"\nchunk_lines = {TYPOS_LINES}\n",
+            server.url
+        );
+        let (_dir, mut runner, rx, recheck_task) = rechecking("srv@m", &settings);
+        let Input::Started { job, .. } = runner.run(recheck_task) else {
+            panic!()
+        };
+        assert!(job.is_ok(), "{job:?}");
+        let inputs = until_ended(&rx);
+        let Some(Input::ScanEnded(Ok(summary))) = inputs.last() else {
+            panic!("{inputs:?}")
+        };
+        assert_eq!(summary.findings, 2);
+        let mut sent: Vec<usize> = server.completions().iter().map(prompt_lines).collect();
+        sent.sort_unstable();
+        assert_eq!(sent, [TYPOS_LINES - fits, fits]);
+    }
+
+    #[test]
+    fn a_recheck_through_a_server_that_does_not_say_its_size_warns_before_it_scans() {
+        let server = FakeServer::llm(&["m"]);
+        recheck_warns(
+            &format!("[llm.srv]\nurl = \"{}\"\n", server.url),
+            "warning: srv did not say its context size; set chunk_lines if it holds under 38k \
+             tokens",
+        );
+    }
+
+    #[test]
+    fn a_recheck_through_an_entry_whose_cap_leaves_no_room_for_a_line_warns_before_it_scans() {
+        // 16384 tokens shared by the default 2 jobs: 8192 a call, all of it the reply's.
+        let server = FakeServer::llm_sized(&["m"], 16384);
+        recheck_warns(
+            &format!(
+                "[llm.srv]\nurl = \"{}\"\n[llm.srv.request]\nmax_tokens = 8192\n",
+                server.url
+            ),
+            "warning: srv's request.max_tokens (8192) leaves no room for lines in a call's 8192 \
+             tokens, so each line is sent alone; lower it, or set shared_context = false or fewer \
+             jobs",
+        );
+    }
+
+    /// A recheck of typos.mkv's run through `srv@m` with `settings` sends `warning` once, as an
+    /// `Input::Warned` before the scan's first step, and ends well.
+    fn recheck_warns(settings: &str, warning: &str) {
+        let (_dir, mut runner, rx, recheck_task) = rechecking("srv@m", settings);
+        let Input::Started { job, .. } = runner.run(recheck_task) else {
+            panic!()
+        };
+        assert!(job.is_ok(), "{job:?}");
+        let inputs = until_ended(&rx);
+        let warned = Input::Warned(warning.into());
+        let at = |wanted: &dyn Fn(&Input) -> bool| inputs.iter().position(wanted);
+        let first_warning = at(&|i| matches!(i, Input::Warned(_)));
+        let first_step = at(&|i| matches!(i, Input::Scan(_)));
+        assert!(
+            matches!((first_warning, first_step), (Some(w), Some(s)) if w < s),
+            "{inputs:?}"
+        );
+        let warnings: Vec<&Input> = inputs
+            .iter()
+            .filter(|i| matches!(i, Input::Warned(_)))
+            .collect();
+        assert_eq!(warnings, [&warned]);
+        assert!(
+            matches!(inputs.last(), Some(Input::ScanEnded(Ok(_)))),
+            "{inputs:?}"
         );
     }
 

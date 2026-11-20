@@ -7,8 +7,10 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
 - `subcheck scan` sends the English lines to an LLM and records each suggested fix in its database
   ([Where findings are kept](#where-findings-are-kept)), with each track `timing` finds shifted,
   and what each LLM call used ([LLM costs](#llm-costs)). `--llm` picks the LLM: `claude` (the
-  default), `gpt`, `ollama:<model>`, or an entry in the [settings file](#llm-settings). A file
-  unchanged since any earlier scan checked it the same way is skipped; `--force` checks it again.
+  default), `gpt`, `ollama:<model>`, or an entry in the [settings file](#llm-settings).
+  `ollama:<model>` calls Ollama's server, not the `ollama` command: the server at `OLLAMA_HOST`
+  (`127.0.0.1:11434` when unset), with the model pulled (`ollama pull <model>`). A file unchanged
+  since any earlier scan checked it the same way is skipped; `--force` checks it again.
   `--run <run>` adds the files to that run, making only the checks they need. On a terminal it opens
   review's screen as it starts, and each file's findings join the list when the file is done
   ([Review](#review)); `--no-tui` prints its log instead. `--karaoke` makes the screen's apply
@@ -47,7 +49,7 @@ Building needs a C compiler (SQLite is compiled in). At run time:
 
 | Needs | For |
 |---|---|
-| `claude`, `codex` or `ollama`, or any command (`--llm-cmd`, or an entry in the [settings file](#llm-settings)) | `scan` |
+| `claude` or `codex`, Ollama's server with the model pulled (for `ollama:<model>`), or a server or command of your own (`--llm-cmd`, or an entry in the [settings file](#llm-settings)) | `scan` |
 | `mpv` | `o` in review |
 | mkvtoolnix | `apply` |
 | ffmpeg | `audio` |
@@ -167,8 +169,9 @@ the run you are reviewing, or in a view of files and folders, the newest run tha
 that run's LLM and languages. It asks first, since it spends money, and while a scan runs it waits
 for that to end. While the scan runs, the list's title and the status line say how far it is; once
 it ends, the status line gives its summary. What the scan warns of as it starts (a folder it cannot
-read) stays on the terminal above the screen, and the first of it is on the status line as the
-screen opens. Files the scan skips as unchanged are in the list from the start.
+read, a server that did not say its context size) stays on the terminal above the screen, and the
+first of it is on the status line as the screen opens. Files the scan skips as unchanged are in the
+list from the start.
 
 When a scan checks a file again, its earlier findings stay in the list until the new ones are saved,
 and you can decide them meanwhile: a decision carries over to each finding that comes back as the
@@ -274,6 +277,7 @@ default = "local"
 [llm.local]
 url = "http://127.0.0.1:8000/v1"
 jobs = 4
+shared_context = false
 
 [llm.local.request]
 temperature = 1.0
@@ -297,14 +301,22 @@ An entry has a `url` (a server that speaks the OpenAI chat API) or a `command`.
 
 - `url` is the server's address up to and including `/v1`.
 - `model` is the model to ask for. Left out, it is the one model the server lists. Either way the
-  server must list it.
+  server must list it. A name without a tag, such as `gemma4`, also matches the `gemma4:latest`
+  Ollama lists for a model pulled without one.
 - `api_key_env` names an environment variable that holds the key, and `api_key_cmd` is a command
   that prints it; see [Keys](#keys).
 - `thinking` is `"off"` (the default), which sends `reasoning_effort: "none"` and
   `chat_template_kwargs.enable_thinking: false`, or `"server"`, which sends neither, for an API that
   refuses them.
 - `request` is a table merged over every request body, last, each key replacing subcheck's. It
-  cannot set `model`, `messages` or `stream`.
+  cannot set `model`, `messages` or `stream`. A `max_tokens` or `max_completion_tokens` there is
+  the reply's room in place of subcheck's cap ([Fitting the context](#fitting-the-context)).
+- `shared_context` says whether the calls in flight share the server's context. `true` (the
+  default) fits each chunk to the context divided by `jobs`: llama-server's slots share one cache,
+  so two calls that each fill the context fail when they run at once. `false` fits each chunk to the
+  whole context, for a server that gives each call all of it, as vLLM and Ollama do.
+  `ollama:<model>` gives each call the whole context, as Ollama does; an entry whose `url` is
+  Ollama's `/v1` can say `false` to do the same.
 - `command` is run through `sh -c`, as `--llm-cmd`'s is: it reads the prompt on stdin and prints
   the reply on stdout.
 - `output` is what the command prints: `"text"` (the default) is the reply alone, and reports no
@@ -312,23 +324,23 @@ An entry has a `url` (a server that speaks the OpenAI chat API) or a `command`.
   `claude -p --output-format json`, and reports tokens and a price; `"codex"` is
   `codex exec --json`, and reports tokens.
 - `jobs` is the calls in flight to this LLM at once (2 when left out).
-- `chunk_lines` is the lines sent in each call (400 when left out). For a server, set it to fit
-  the server's context, about 150 lines for a 4k context, because a server may cut an over-long
-  prompt without saying so: Ollama does at its default 4k context on cards under 24 GB, unless
-  `OLLAMA_CONTEXT_LENGTH` is set.
+- `chunk_lines` is the lines sent in each call, for a server at most as many as fit its context.
+  Left out, it is as many as fit, at most 400 ([Fitting the context](#fitting-the-context)), or 400
+  for a command.
 - `default` is the LLM `--llm` means when it is left out. It takes anything `--llm` takes, a
   preset as well as an entry.
 
 `subcheck scan --llm mine` runs the entry. `-j` and `--chunk-lines` beat the entry's `jobs` and
 `chunk_lines`. A recheck from the screen (`c`) uses the entry as the file has it then, not as it
-was when the run began.
+was when the run began, and no `-j` or `--chunk-lines` the scan was given.
 
 An entry's name is letters, digits, `-` and `_`, and `claude` and `gpt` are taken. A run records
 a command entry's name, not its command: after changing what a command runs, rename the entry or
 scan with `--force`, or files checked by the old command are skipped as already checked.
 
-subcheck asks `<url>/models` before a scan, so a server that is down stops it before any file is
-checked. llama-server lists the path given to `-m` unless it was started with `--alias <name>`.
+subcheck asks `<url>/models` before a scan or a dry run, so a server that is down stops it before
+any file is checked. llama-server lists the path given to `-m` unless it was started with
+`--alias <name>`.
 
 A run records `<entry>@<model>` for a server, so moving a server to another port checks nothing
 again, and serving another model checks every file again. `scan --run` and a recheck refuse a
@@ -337,6 +349,73 @@ run whose model the server no longer serves.
 A mistake in the file stops `scan` and review's rechecks, with a one-line message naming the file,
 then the entry or the line the mistake is in. `list` and `apply` do not read it, and `review` reads
 it only to recheck, so all else works with it broken.
+
+### Fitting the context
+
+A call to a server sends as many lines as fit the context the server reports, at most 400. With
+`shared_context` (the default), the calls in flight share it, so each call fits the context divided
+by `-j` or the entry's `jobs`. The last quarter of that, up to 4096 tokens, is left for the reply,
+and by an estimate of its tokens, the prompt takes the rest. `--chunk-lines`, or the entry's
+`chunk_lines`, sets the lines instead: at most as many as fit the context the server reports, with
+no limit of 400, and exactly that many when it reports none. `ollama:<model>` gives each call the
+whole context, as Ollama does.
+
+Each reply is capped at that room (`max_tokens`, or `num_predict` for `ollama:<model>`): a reply
+that outgrew its room would overflow a cache the calls in flight share, and a model that repeats
+itself would run on until the context is full. 4096 tokens is far more than a reply to 400 lines
+needs, as it names only the lines with a fix, and a hosted API refuses a call whose reply may take
+more than it allows, however large its context. A reply cut off at the cap is taken as one cut off
+at the server's own limit (below), and a chunk that fails for it names the cap and what sets it. An
+entry's `request` can set its own `max_tokens`, or `max_completion_tokens`, the name OpenAI's
+newer models take, as for a model whose thinking needs more room; subcheck then sends no cap of its
+own beside it. That is then the reply's room (the larger, if it sets both), at any size up to all
+of a call's share, and the prompt is fitted to what is left. A cap that leaves the prompt no room
+for a line, as `max_tokens = 8192` does in a call's 8192 tokens, sends each line in a call of its
+own, and the scan warns once as it starts (a recheck on the status line), naming the cap and the
+share.
+
+The size comes from the server's list of models: `meta.n_ctx` (llama-server), `max_model_len` (vLLM)
+or `context_length` (OpenRouter). Ollama's list has none, so when a list gives no size, subcheck
+asks Ollama's `/api/ps`, for `ollama:<model>` and for an entry whose `url` is plain `http://` and
+ends in `/v1`, as Ollama's is on this machine or a LAN. An `https://` entry, a hosted API, is not
+asked, and with no size in its list, it gets the warning below. `/api/ps` gives the context of a
+model once it is loaded, so a scan with a file for the LLM has Ollama load the model first, saying
+`loading <model> into Ollama at <address>` while it waits; a scan with nothing for the LLM loads
+nothing. `OLLAMA_CONTEXT_LENGTH` sets the context Ollama's server loads a model with by default,
+and a larger one means fewer calls.
+
+A server that says no size gets chunks of 400 lines and no cap on its replies, and the scan warns
+once, as it starts, here for an entry `lan` with the default 2 jobs:
+
+```
+warning: lan did not say its context size; set chunk_lines if it holds under 38k tokens
+```
+
+38k is the context that holds a 400-line chunk for each of the 2 calls in flight; with
+`shared_context = false` it would be 19k, one chunk's. A recheck (`c`) gives the warning on the
+status line. For `ollama:<model>` it names `--chunk-lines`.
+
+A chunk can be too big anyway. It is halved when the server refuses it for the context, as
+llama-server does with `500 Context size has been exceeded.` when the calls in flight outgrow the
+cache they share, or when its prompt took 95% of a call's share of the context or more, and more
+than the room left for the prompt, so the server may have cut it. Each half goes in turn, halved
+again the same way. A reply cut off at its cap or the server's length limit halves its chunk once.
+A single line the server refuses twice fails its chunk, as does a half that fails.
+
+`ollama:<model>` calls Ollama's own API (`/api/chat`), which refuses a prompt too big for the
+context, so its chunk is halved. An entry whose `url` is Ollama's `/v1` goes through Ollama's
+OpenAI API, which cuts such a prompt to fit without saying so and answers for what is left; fitting
+the chunks to the context guards against that, and a prompt it cut comes to 95% of a call's share
+of the context or more, so its chunk is halved too.
+
+`scan --dry-run` prints each chunk as the scan would send it. It asks the server for its models and
+its context but loads no model, so for an Ollama model not loaded yet its chunks are 400 lines, or
+the lines `--chunk-lines` or `chunk_lines` sets, which a scan cuts to what fits once the model is
+loaded, and it says so:
+
+```
+dry run: ollama:gemma4's model is not loaded, so these chunks are 400 lines; a scan loads it and fits them to its context
+```
 
 ### Keys
 
@@ -370,9 +449,9 @@ LLM: 98 calls, 1.23M in / 31.2k out tokens, $3.21 at API prices
   rates, not what a Claude subscription bills.
 - `gpt` (Codex) reports tokens only, so no price is shown: subcheck keeps no price list of its own
   to go stale.
-- `ollama:<model>`, `--llm-cmd` and entries that print text report nothing, and nothing is shown;
-  nor for a run made before calls were recorded.
-- An entry with a `url` reports tokens, and no price.
+- `--llm-cmd` and entries that print text report nothing, and nothing is shown; nor for a run made
+  before calls were recorded.
+- An entry with a `url`, and `ollama:<model>`, report tokens, and no price.
 - An entry with `output = "openai"`, `"claude"` or `"codex"` reports what its JSON says: tokens,
   and for `"claude"` a price too.
 

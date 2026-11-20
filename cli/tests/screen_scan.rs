@@ -66,7 +66,7 @@ fn a_scan_on_the_screen_fills_the_list_and_passes_decisions_on() {
     let fake = common::fake_llm();
     let backend = Backend::shell(&format!("'{}'", fake.display()));
     let opts = scan::Options {
-        chunk_lines: backend.chunk_lines,
+        chunk_lines: None,
         backend,
         jobs: 1,
         langs: vec![scan::DEFAULT_LANG.to_string()],
@@ -146,7 +146,7 @@ fn a_file_whose_llm_check_stands_shows_the_timing_check_alone() {
     let options = |into| {
         let backend = Backend::shell(&format!("'{}'", fake.display()));
         scan::Options {
-            chunk_lines: backend.chunk_lines,
+            chunk_lines: None,
             backend,
             jobs: 1,
             langs: vec![scan::DEFAULT_LANG.to_string()],
@@ -221,7 +221,7 @@ fn a_skipped_files_findings_are_on_the_screen_from_the_start() {
     let opts = || {
         let backend = Backend::shell(&format!("'{}'", fake.display()));
         scan::Options {
-            chunk_lines: backend.chunk_lines,
+            chunk_lines: None,
             backend,
             jobs: 1,
             langs: vec![scan::DEFAULT_LANG.to_string()],
@@ -321,7 +321,7 @@ fn fake_llm() -> Backend {
 
 fn options(backend: Backend, force: bool) -> scan::Options {
     scan::Options {
-        chunk_lines: backend.chunk_lines,
+        chunk_lines: None,
         backend,
         jobs: 1,
         langs: vec![scan::DEFAULT_LANG.to_string()],

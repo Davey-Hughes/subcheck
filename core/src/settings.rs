@@ -99,6 +99,11 @@ pub struct ServerEntry {
     pub thinking: Thinking,
     /// Fields added to every request body: sampling settings and the like.
     pub request: serde_json::Map<String, serde_json::Value>,
+    /// Whether the calls in flight share the server's context, so that each chunk fits its share
+    /// ([`Backend::budget`]). `true` when the file does not say: a server that shares it fails
+    /// calls that together outgrow it, where dividing a context that is not shared costs only
+    /// smaller chunks.
+    pub shared_context: bool,
 }
 
 /// Where a server's API key comes from. The key itself is never in the file.
@@ -145,6 +150,7 @@ struct EntryShape {
     api_key: Option<toml::Value>,
     thinking: Option<ThinkingShape>,
     request: Option<toml::Table>,
+    shared_context: Option<bool>,
     jobs: Option<usize>,
     chunk_lines: Option<usize>,
 }
@@ -278,6 +284,7 @@ fn entry_kind(shape: &EntryShape) -> Result<EntryKind, String> {
                 ("api_key_cmd", shape.api_key_cmd.is_some()),
                 ("thinking", shape.thinking.is_some()),
                 ("request", shape.request.is_some()),
+                ("shared_context", shape.shared_context.is_some()),
             ];
             if let Some((key, _)) = only_for_url.iter().find(|(_, present)| *present) {
                 return Err(format!("{key} is for an entry with a url"));
@@ -352,6 +359,7 @@ fn server_entry(shape: &EntryShape, url: &str) -> Result<ServerEntry, String> {
         key,
         thinking,
         request,
+        shared_context: shape.shared_context.unwrap_or(true),
     })
 }
 
@@ -472,7 +480,7 @@ mod tests {
 
     #[test]
     fn a_server_entry_reads_every_key_and_defaults_the_rest() {
-        let s = at("[llm.vllm]\nurl = \"http://127.0.0.1:8000/v1/\"\nmodel = \"gemma4\"\napi_key_cmd = \"pass show x\"\nthinking = \"server\"\njobs = 4\nchunk_lines = 150\n[llm.vllm.request]\ntemperature = 1.0\ntop_k = 64\n").unwrap();
+        let s = at("[llm.vllm]\nurl = \"http://127.0.0.1:8000/v1/\"\nmodel = \"gemma4\"\napi_key_cmd = \"pass show x\"\nthinking = \"server\"\nshared_context = false\njobs = 4\nchunk_lines = 150\n[llm.vllm.request]\ntemperature = 1.0\ntop_k = 64\n").unwrap();
         let request = serde_json::json!({"temperature": 1.0, "top_k": 64});
         assert_eq!(
             s.entries["vllm"],
@@ -483,6 +491,7 @@ mod tests {
                     key: KeySource::Command("pass show x".into()),
                     thinking: Thinking::Server,
                     request: request.as_object().unwrap().clone(),
+                    shared_context: false,
                 }),
                 jobs: Some(4),
                 chunk_lines: Some(150),
@@ -496,6 +505,7 @@ mod tests {
                 key,
                 thinking: Thinking::Off,
                 request: serde_json::Map::new(),
+                shared_context: true,
             })
         };
         assert_eq!(
@@ -539,6 +549,10 @@ mod tests {
             (
                 "command = \"x\"\nrequest = { top_k = 1 }\n",
                 "request is for an entry with a url",
+            ),
+            (
+                "command = \"x\"\nshared_context = false\n",
+                "shared_context is for an entry with a url",
             ),
             (
                 "url = \"http://h/v1\"\noutput = \"text\"\n",

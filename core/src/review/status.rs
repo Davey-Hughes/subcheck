@@ -71,8 +71,9 @@ pub enum Status {
     NoVideo,
     /// What failed, and its error in the words of whoever made it.
     Failed { what: Failure, error: String },
-    /// What the scan warned of as it planned, before the screen opened: the first warning, and
-    /// how many more.
+    /// What a scan warned of: as it planned, before the screen opened, the first warning and how
+    /// many more; or as a job began ([`Input::Warned`](crate::review::update::Input::Warned)),
+    /// its warning, with none more.
     Warned { first: String, more: usize },
 }
 

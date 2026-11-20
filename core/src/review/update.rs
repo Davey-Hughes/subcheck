@@ -64,6 +64,9 @@ pub enum Input {
     /// A file the player had said was open failed after all: the window's load that outlasted its
     /// wait, then ended on an error.
     PlayerFailed(PlayerError),
+    /// A job warned of something before its first step, in the words the status line shows: a
+    /// recheck, that its server did not say its context size.
+    Warned(String),
     /// What the scan under way just did.
     Scan(scan::Event),
     /// The scan ended: its summary, or why it failed.
@@ -279,6 +282,10 @@ pub fn update(m: &mut Review, input: Input, now: Timestamp) -> Vec<Effect> {
         Input::PlayerFailed(e) => {
             m.loaded = None;
             m.status = Some(player_status(m, Asked::Open, e));
+            Vec::new()
+        }
+        Input::Warned(first) => {
+            m.status = Some(Status::Warned { first, more: 0 });
             Vec::new()
         }
         Input::Scan(event) => scanned(m, event),
@@ -1787,6 +1794,7 @@ mod tests {
             })),
             Input::Closed(Err(PlayerError::NotOpen)),
             Input::PlayerFailed(PlayerError::CouldNotOpen { file: path(1) }),
+            Input::Warned("warning: x".into()),
         ];
         for input in inputs {
             for mut m in asking() {
@@ -1796,6 +1804,20 @@ mod tests {
                 assert_eq!(m.confirm, asked, "{what}");
             }
         }
+    }
+
+    #[test]
+    fn a_jobs_warning_shows_on_the_status_line() {
+        let mut m = sample();
+        let effects = update(&mut m, Input::Warned("warning: x".into()), now());
+        assert_eq!(effects, []);
+        assert_eq!(
+            m.status,
+            Some(Status::Warned {
+                first: "warning: x".into(),
+                more: 0
+            })
+        );
     }
 
     #[test]

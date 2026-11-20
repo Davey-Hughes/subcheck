@@ -1,8 +1,8 @@
 //! The LLM step: a backend is a command that reads the prompt on stdin and prints the reply on
-//! stdout, or an OpenAI-API server subcheck calls itself ([`Server`]). Presets cover claude, codex
-//! (gpt) and ollama; an entry in the settings file or `--llm-cmd` covers anything else. claude,
-//! codex and a command that prints an OpenAI chat completion give their reply as JSON, with what
-//! the call used.
+//! stdout, or a server subcheck calls itself ([`Server`]). Presets cover claude and codex (gpt),
+//! run as commands, and `ollama:<model>`, Ollama's server; an entry in the settings file or
+//! `--llm-cmd` covers anything else. claude, codex, a server and a command that prints an OpenAI
+//! chat completion give their reply as JSON, with what the call used.
 
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
@@ -19,7 +19,8 @@ use crate::text::{Line, timestamp};
 
 mod key;
 mod server;
-pub use server::Server;
+pub(crate) use server::same_model;
+pub use server::{Context, Server};
 
 /// Stored with every scan and every LLM check, so findings can be traced to the prompt that
 /// produced them.
@@ -28,14 +29,109 @@ pub const PROMPT_VERSION: u32 = 1;
 /// One chunk's run limit; a chunk that takes longer is killed, retried once, then failed.
 pub const TIMEOUT: Duration = Duration::from_mins(10);
 
-/// Lines per chunk unless `--chunk-lines` says otherwise. Ollama defaults to a 4k context on
-/// cards under 24 GiB and truncates silently, and 150 lines with the instructions fit it with room
-/// for the reply.
+/// Lines per chunk when neither `--chunk-lines`, the LLM's entry nor a server's context says
+/// otherwise, and the most a call's budget is fitted with ([`Budget::lines`]).
 pub const CHUNK_LINES: usize = 400;
-pub const CHUNK_LINES_OLLAMA: usize = 150;
+
+/// Tokens a prompt takes besides its subtitle lines: the instructions, the system message and the
+/// chat template around them.
+pub const PROMPT_TOKENS: u64 = 400;
+
+/// Tokens one subtitle line takes in a prompt, counted cautiously, so a chunk sized by it fits.
+pub const TOKENS_PER_LINE: u64 = 37;
 
 /// LLM calls a scan runs at once, unless `-j` or the LLM's entry in the settings file says.
 pub const JOBS: usize = 2;
+
+/// The most room a reply is given unless the entry's `request` sets its own cap ([`Budget::new`]).
+/// A reply to [`CHUNK_LINES`] lines names only the lines with a fix, so it needs far less, and many
+/// hosted APIs refuse a call that lets its reply take more than they allow, however large the
+/// context. A longer reply is cut off at it ([`TooBig::Reply`]) and its chunk split once.
+pub const MAX_REPLY: u64 = 4096;
+
+/// The tokens a prompt of `lines` subtitle lines takes, counted cautiously.
+pub fn estimate(lines: usize) -> u64 {
+    PROMPT_TOKENS.saturating_add((lines as u64).saturating_mul(TOKENS_PER_LINE))
+}
+
+/// The smallest share of a context whose [`Budget::lines`] are [`CHUNK_LINES`], the reply's room
+/// being `max_tokens` as [`Budget::new`] takes it. With that room, it is a full chunk's
+/// [`estimate`] `e` and the room beside it. With the quarter, the prompt keeps
+/// `share - share / 4`, three quarters of the share rounded up, which first holds `e` at
+/// `(4e - 1) / 3`; with the quarter bounded at [`MAX_REPLY`], it holds `e` from
+/// `e + MAX_REPLY`, and whichever comes first is the smallest.
+fn full_chunk_context(max_tokens: Option<u64>) -> u64 {
+    let full = estimate(CHUNK_LINES);
+    match max_tokens {
+        Some(room) => full.saturating_add(room),
+        None => ((4 * full - 1) / 3).min(full + MAX_REPLY),
+    }
+}
+
+/// What one call may take of a server's context ([`Backend::budget`]): its share of the context,
+/// and of that the room left for its reply, which the context holds too. The prompt gets the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    share: u64,
+    /// At most `share`.
+    reply: u64,
+}
+
+impl Budget {
+    /// A call's budget in a share of `share` tokens. The reply's room is `max_tokens`, an entry's
+    /// own cap on its replies, when it sets one, at most the whole share: the server lets a reply
+    /// run that far, so the prompt fits in what is left. Else it is the last quarter of the share,
+    /// at most [`MAX_REPLY`].
+    pub fn new(share: u64, max_tokens: Option<u64>) -> Budget {
+        let reply = max_tokens.map_or((share / 4).min(MAX_REPLY), |room| room.min(share));
+        Budget { share, reply }
+    }
+
+    /// The tokens a call may take of the server's context, its prompt and its reply together.
+    pub fn share(self) -> u64 {
+        self.share
+    }
+
+    /// The tokens the prompt may take: the share less the reply's room. A prompt over it, even
+    /// one within the share, leaves its reply less room than the call caps it at, and the two
+    /// together outgrow the share: vLLM refuses such a call, and on a server whose calls share one
+    /// cache it overflows the others'.
+    pub fn prompt(self) -> u64 {
+        self.share - self.reply
+    }
+
+    /// The most lines a chunk can hold: as many as its [`estimate`] fits in [`Budget::prompt`].
+    /// At least 1, with no upper limit: a size set for the chunks is cut to it.
+    pub fn fit(self) -> usize {
+        let room = self.prompt().saturating_sub(PROMPT_TOKENS);
+        usize::try_from(room / TOKENS_PER_LINE).map_or(usize::MAX, |n| n.max(1))
+    }
+
+    /// The lines a chunk is fitted with when nothing sets its size: [`Budget::fit`], at most
+    /// [`CHUNK_LINES`].
+    pub fn lines(self) -> usize {
+        self.fit().min(CHUNK_LINES)
+    }
+
+    /// The most tokens a call's reply may take: the reply's room, at least 1, since a cap of 0
+    /// leaves no room for any reply. A server whose calls share one cache, as llama-server's slots
+    /// do, fails every call in flight once one reply outgrows its room, and a model that loops
+    /// would run on until the context is full; capped, such a reply is cut off at its room
+    /// ([`TooBig::Reply`]), and only its own chunk is the worse for it.
+    pub fn cap(self) -> u64 {
+        self.reply.max(1)
+    }
+}
+
+/// How many of `jobs` calls at once share `server`'s context: all of them, unless its entry's
+/// `shared_context` is `false`.
+fn sharing(server: &Server, jobs: usize) -> u64 {
+    if server.entry.shared_context {
+        jobs.max(1) as u64
+    } else {
+        1
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Backend {
@@ -45,7 +141,10 @@ pub struct Backend {
     /// or `:`.
     pub label: String,
     pub via: Via,
-    pub chunk_lines: usize,
+    /// Lines per chunk as the LLM's entry sets them, at most as many as fit
+    /// ([`Backend::lines_per_chunk`]); `None` for the presets, `--llm-cmd` and an entry that does
+    /// not say.
+    pub chunk_lines: Option<usize>,
     pub jobs: usize,
 }
 
@@ -65,8 +164,8 @@ pub enum Via {
 /// How a backend prints its reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Output {
-    /// The reply alone: ollama, any `--llm-cmd`, and a settings entry with `output = "text"` or
-    /// no `output`.
+    /// The reply alone: any `--llm-cmd`, and a settings entry with `output = "text"` or no
+    /// `output`.
     Text,
     /// `claude -p --output-format json`: one object, the reply in `result`, with the call's tokens
     /// and its price.
@@ -81,6 +180,9 @@ pub enum Output {
 
 /// The system prompt for presets that take one; the instructions themselves go on stdin.
 const SYSTEM: &str = "You are a careful English proofreader. Follow the reply format exactly.";
+
+/// Why a reply cut off at the server's length limit fails, whichever API it came through.
+const CUT_OFF: &str = "the reply was cut off at the server's length limit";
 
 impl Backend {
     /// `claude`, `gpt` or `ollama:<model>`.
@@ -131,18 +233,8 @@ impl Backend {
                         "unknown --llm {name:?}: use claude, gpt, ollama:<model>, or --llm-cmd"
                     ));
                 };
-                // Thinking off: gemma4 spent its whole budget thinking and replied with nothing.
-                // No word wrap: it would break reply lines at the terminal width.
-                let argv = ["ollama", "run", "--think=false", "--nowordwrap", model];
-                return Ok(Backend {
-                    label: name.to_string(),
-                    via: Via::Command {
-                        argv: argv.iter().map(ToString::to_string).collect(),
-                        output: Output::Text,
-                    },
-                    chunk_lines: CHUNK_LINES_OLLAMA,
-                    jobs: JOBS,
-                });
+                let host = std::env::var("OLLAMA_HOST").ok();
+                return Ok(Backend::ollama(model, &server::ollama_url(host.as_deref())));
             }
         };
         Ok(Backend {
@@ -151,9 +243,20 @@ impl Backend {
                 argv: argv.iter().map(ToString::to_string).collect(),
                 output,
             },
-            chunk_lines: CHUNK_LINES,
+            chunk_lines: None,
             jobs: JOBS,
         })
+    }
+
+    /// `ollama:<model>`: Ollama's server, its OpenAI API at `url` ([`server::ollama_url`]).
+    fn ollama(model: &str, url: &str) -> Backend {
+        let server = Server::ollama(model, url);
+        Backend {
+            label: server.label(),
+            via: Via::Server(server),
+            chunk_lines: None,
+            jobs: JOBS,
+        }
     }
 
     /// Any command, run through `sh -c`.
@@ -164,7 +267,7 @@ impl Backend {
                 argv: vec!["sh".into(), "-c".into(), command.into()],
                 output: Output::Text,
             },
-            chunk_lines: CHUNK_LINES,
+            chunk_lines: None,
             jobs: JOBS,
         }
     }
@@ -191,7 +294,7 @@ impl Backend {
         Backend {
             label,
             via,
-            chunk_lines: entry.chunk_lines.unwrap_or(CHUNK_LINES),
+            chunk_lines: entry.chunk_lines,
             jobs: entry.jobs.unwrap_or(JOBS),
         }
     }
@@ -246,7 +349,7 @@ impl Backend {
                 Err(format!("{label}, which {path} now has as a server"))
             }
             (EntryKind::Server(server), Some(model)) => match &server.model {
-                Some(asked) if asked != model => Err(format!(
+                Some(asked) if !same_model(asked, model) => Err(format!(
                     "{label}, but {path} now has {name} ask for {asked:?}"
                 )),
                 _ => Ok(Backend {
@@ -259,16 +362,20 @@ impl Backend {
     }
 
     /// The backend made ready for calls: for a server, its key fetched, `GET <url>/models` asked,
-    /// the model settled (the one the entry or the run names, which the server must serve, else
-    /// the only one it serves) and the label with it, `<name>@<model>`, as the run records it; with
-    /// the warnings to show. A command, or an LLM that cannot be built again, comes back as it is,
-    /// asking nothing. Every error starts with the label as it was.
+    /// the model settled (the one the entry or the run names, which the server must serve, a name
+    /// without a tag as its `:latest`, else the only one it serves) and the label with it,
+    /// `<name>@<model>` (`ollama:<model>` keeps its own), as the run records it, and
+    /// its [`context`](Backend::context) read, from the list, else, for `ollama:<model>` and for an
+    /// entry whose url is plain `http://` and ends `/v1`, from Ollama's
+    /// `GET <url without /v1>/api/ps`; with the warnings to show. A command, or an LLM
+    /// that cannot be built again, comes back as it is, asking nothing. Every error starts with the
+    /// label as it was.
     ///
     /// A new scan runs it before it reads any file, since the label it records waits on the
     /// model; a resumed run only once a file needs the LLM, so a resume with nothing for the LLM
     /// to do needs no server up; a recheck on its job's thread, so a server or a key command that
     /// hangs freezes neither the screen nor the window. It sends only `GET`s, so it never makes a
-    /// server load a model.
+    /// server load a model; [`Backend::sized`] does.
     pub fn ready(self) -> Result<(Backend, Vec<String>), String> {
         match self.via {
             Via::Server(server) => {
@@ -286,24 +393,150 @@ impl Backend {
         }
     }
 
+    /// How many tokens a server's context holds, as far as it says; `None` for a backend that is
+    /// no server.
+    pub fn context(&self) -> Option<Context> {
+        match &self.via {
+            Via::Server(server) => Some(server.context()),
+            _ => None,
+        }
+    }
+
+    /// What each of `jobs` calls at once may take of a server's context ([`Budget`]), when the
+    /// server says how many tokens it holds; `None` for any other context, and for a backend that
+    /// is no server. The context is divided between the calls unless the entry's `shared_context`
+    /// is `false`, as `ollama:<model>`'s is: a server whose calls share one cache, as
+    /// llama-server's slots do, fails calls that together outgrow it.
+    pub fn budget(&self, jobs: usize) -> Option<Budget> {
+        let Via::Server(server) = &self.via else {
+            return None;
+        };
+        match server.context() {
+            Context::Tokens(tokens) => Some(Budget::new(
+                tokens / sharing(server, jobs),
+                server.own_cap().map(|(_, cap)| cap),
+            )),
+            Context::NotLoaded | Context::Unknown => None,
+        }
+    }
+
+    /// Lines per chunk with `jobs` calls at once: `forced` (`--chunk-lines`), else the entry's
+    /// `chunk_lines`, at most as many as fit each call's budget ([`Backend::budget`],
+    /// [`Budget::fit`]) when the server says its size, and as set when it does not; with neither
+    /// set, as many as fit, at most [`CHUNK_LINES`] ([`Budget::lines`]), else [`CHUNK_LINES`].
+    pub fn lines_per_chunk(&self, jobs: usize, forced: Option<usize>) -> usize {
+        // Cut when the chunks are made, not when they are sent, so the parts of a size set too
+        // big go to the workers side by side.
+        match (forced.or(self.chunk_lines), self.budget(jobs)) {
+            (Some(lines), Some(budget)) => lines.min(budget.fit()),
+            (Some(lines), None) => lines,
+            (None, Some(budget)) => budget.lines(),
+            (None, None) => CHUNK_LINES,
+        }
+    }
+
+    /// The warning for a server that did not say its context size and whose entry sets no
+    /// `chunk_lines`: its chunks are [`CHUNK_LINES`] lines, more than a small context holds, so it
+    /// names the smallest context that holds one beside its reply's room ([`Budget::new`]) for each
+    /// of `jobs` calls at once (for one call, with `shared_context = false` and for
+    /// `ollama:<model>`), in k, rounded up, and what sets the size: the entry's `chunk_lines`, or
+    /// `--chunk-lines` for `ollama:<model>`, which has no entry. `None` for any other backend: a
+    /// model Ollama has not loaded yet gets its size when a scan loads it ([`Backend::sized`]).
+    pub fn size_warning(&self, jobs: usize) -> Option<String> {
+        let Via::Server(server) = &self.via else {
+            return None;
+        };
+        if server.context() != Context::Unknown || self.chunk_lines.is_some() {
+            return None;
+        }
+        let own_cap = server.own_cap().map(|(_, cap)| cap);
+        let k = (full_chunk_context(own_cap) * sharing(server, jobs)).div_ceil(1024);
+        Some(format!(
+            "{} did not say its context size; set {} if it holds under {k}k tokens",
+            server.name,
+            server.size_setting()
+        ))
+    }
+
+    /// The warning for an entry whose own cap on its replies ([`Budget::new`]) leaves a call's
+    /// prompt no room for one line's [`estimate`]: every chunk is a single line ([`Budget::fit`]),
+    /// a call to each line, whatever sets the chunks' size. It names the cap and the call's share,
+    /// and, while the calls share the context, what gives each call more of it. `None` for any
+    /// other backend, and while the context is not known.
+    pub fn room_warning(&self, jobs: usize) -> Option<String> {
+        let Via::Server(server) = &self.via else {
+            return None;
+        };
+        let (field, cap) = server.own_cap()?;
+        let budget = self.budget(jobs)?;
+        if budget.prompt() >= estimate(1) {
+            return None;
+        }
+        let fix = if sharing(server, jobs) > 1 {
+            "lower it, or set shared_context = false or fewer jobs"
+        } else {
+            "lower it"
+        };
+        Some(format!(
+            "{}'s request.{field} ({cap}) leaves no room for lines in a call's {} tokens, so each \
+             line is sent alone; {fix}",
+            server.name,
+            budget.share()
+        ))
+    }
+
+    /// The backend with its context known where a load tells it: a server whose context is
+    /// [`Context::NotLoaded`] has Ollama load its model (`POST <url without /v1>/api/generate`,
+    /// waiting up to [`TIMEOUT`]), then `/api/ps` is asked again: [`Context::Tokens`], else
+    /// [`Context::Unknown`]. Anything else comes back as it is, asking nothing. A load takes the
+    /// model's memory on the server, which is why [`Backend::ready`] never makes one. Every error
+    /// starts with the label.
+    pub fn sized(self) -> Result<Backend, String> {
+        match self.via {
+            Via::Server(server) => {
+                let server = server
+                    .sized()
+                    .map_err(|why| format!("{}: {why}", self.label))?;
+                Ok(Backend {
+                    via: Via::Server(server),
+                    ..self
+                })
+            }
+            via => Ok(Backend { via, ..self }),
+        }
+    }
+
+    /// The line to show before [`Backend::sized`] has Ollama load a model, which can take a while
+    /// with nothing else said; `None` when sizing loads nothing.
+    pub fn loading(&self) -> Option<String> {
+        match &self.via {
+            Via::Server(server) => server.loading(),
+            _ => None,
+        }
+    }
+
     /// What a run's header records as the backend's command: its argv, or the URL a server's calls
     /// go to; nothing for an LLM that cannot be built again.
     pub fn command_line(&self) -> Vec<String> {
         match &self.via {
             Via::Command { argv, .. } => argv.clone(),
-            Via::Server(server) => vec![format!("{}/chat/completions", server.entry.url)],
+            Via::Server(server) => vec![server.chat_url()],
             Via::Unknown(_) => Vec::new(),
         }
     }
 
-    /// One call: the prompt in, the reply out, read as the backend gives it.
-    pub fn call(&self, prompt: &str, timeout: Duration) -> Answer {
+    /// One call: the prompt in, the reply out, read as the backend gives it. A server's call takes
+    /// `budget` of its context when that is `Some` ([`Backend::budget`]): its reply is capped at
+    /// [`Budget::cap`], and a prompt that came to 95% of [`Budget::share`] or more, and over
+    /// [`Budget::prompt`], is [`TooBig::Prompt`]. A command has neither.
+    pub fn call(&self, prompt: &str, timeout: Duration, budget: Option<Budget>) -> Answer {
         match &self.via {
             Via::Command { argv, output } => call_command(argv, *output, prompt, timeout),
-            Via::Server(server) => server.call(prompt, timeout),
+            Via::Server(server) => server.call(prompt, timeout, budget),
             Via::Unknown(why) => Answer {
                 reply: Err(why.clone()),
                 used: Used::Untracked,
+                too_big: None,
             },
         }
     }
@@ -332,6 +565,7 @@ fn call_command(argv: &[String], output: Output, prompt: &str, timeout: Duration
     Answer {
         reply: Err(reply),
         used,
+        too_big: None,
     }
 }
 
@@ -365,12 +599,26 @@ pub enum Used {
     Untracked,
 }
 
+/// How a call's chunk was too big for it: a smaller one may get a whole reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TooBig {
+    /// The prompt did not fit the server's context: the server refused it, or its
+    /// `prompt_tokens` came to 95% or more of the call's share of the context ([`Budget::share`])
+    /// and over the room the budget left the prompt ([`Budget::prompt`]), or to 95% or more of
+    /// the whole context for a call with no budget, where the server may have cut it.
+    Prompt,
+    /// The reply was cut off at the length limit.
+    Reply,
+}
+
 /// A call's reply, read from what the backend printed.
 #[derive(Debug, PartialEq)]
 pub struct Answer {
     /// The reply for [`parse`], or why there is none.
     pub reply: Result<String, String>,
     pub used: Used,
+    /// `Some` only with a `reply` that is an error saying why.
+    pub too_big: Option<TooBig>,
 }
 
 /// What a backend's JSON says of a call.
@@ -380,6 +628,7 @@ struct Said {
     /// Why it failed, in its own words, when it says.
     reason: Option<String>,
     usage: Option<Usage>,
+    too_big: Option<TooBig>,
 }
 
 #[derive(Deserialize)]
@@ -471,6 +720,7 @@ impl Output {
                 return Answer {
                     reply: Ok(stdout.to_string()),
                     used: Used::Untracked,
+                    too_big: None,
                 };
             }
             Output::Claude => "claude's JSON",
@@ -483,11 +733,13 @@ impl Output {
                 Answer {
                     reply: Err(format!("reply is not {what}: {first:.80}")),
                     used: Used::Unreported,
+                    too_big: None,
                 }
             },
             |said| Answer {
                 reply: said.reply,
                 used: said.usage.map_or(Used::Unreported, Used::Reported),
+                too_big: said.too_big,
             },
         )
     }
@@ -609,6 +861,7 @@ fn read_claude(stdout: &str) -> Option<Said> {
         reply,
         reason,
         usage,
+        too_big: None,
     })
 }
 
@@ -622,40 +875,58 @@ fn read_openai(stdout: &str) -> Option<Said> {
         cache_write_tokens: None,
         cost_usd: None,
     });
-    let said = r
+    let reason = r
         .error
         .and_then(OpenAiError::message)
         .filter(|m| !m.trim().is_empty());
-    let choice = r.choices.into_iter().next();
-    let stopped = choice.as_ref().and_then(|c| c.finish_reason.clone());
-    let (reply, reason) = if let Some(why) = said {
-        (Err(format!("the reply is an error: {why:.200}")), Some(why))
-    } else if stopped.as_deref() == Some("length") {
-        (
-            Err("the reply was cut off at the server's length limit".into()),
-            None,
-        )
-    } else if let Some(early) = stopped.filter(|s| s == "content_filter") {
-        // A reply the server cut short is no whole reply: taken as one, its chunk would be
-        // recorded as checked with nothing found in lines it never reached. Servers word a normal
-        // end many ways (`eos_token`, `stop_sequence`, `STOP`, an empty string), so only the
-        // reasons known to cut a reply fail.
-        (Err(format!("the reply stopped early: {early:.200}")), None)
-    } else {
-        // As claude's reader ends its reply.
-        let content = choice.and_then(|c| c.message).and_then(|m| m.content);
-        (
-            content
-                .map(|c| format!("{c}\n"))
-                .ok_or_else(|| "the reply has no content".into()),
-            None,
-        )
+    let (stopped, content) = match r.choices.into_iter().next() {
+        Some(c) => (c.finish_reason, c.message.and_then(|m| m.content)),
+        None => (None, None),
     };
+    // A reply the server cut short is no whole reply: taken as one, its chunk would be recorded as
+    // checked with nothing found in lines it never reached. Servers word a normal end many ways
+    // (`eos_token`, `stop_sequence`, `STOP`, an empty string), so only the reasons known to cut a
+    // reply fail.
+    let (reply, too_big) = classify(
+        reason.clone(),
+        stopped.as_deref(),
+        &["content_filter"],
+        content,
+    );
     Some(Said {
         reply,
         reason,
         usage,
+        too_big,
     })
+}
+
+/// What a chat reply comes to, from what the server said of it: its `error`, when that has any
+/// text; else a reply cut off at the length limit, when it `stopped` for `length`
+/// ([`TooBig::Reply`]); else one cut short, when it stopped for a reason in `early`; else its
+/// `content` with a newline after it, as claude's reader ends its reply. An OpenAI chat completion
+/// and Ollama's own chat reply are both read with it, so the two read a reply alike.
+fn classify(
+    error: Option<String>,
+    stopped: Option<&str>,
+    early: &[&str],
+    content: Option<String>,
+) -> (Result<String, String>, Option<TooBig>) {
+    if let Some(why) = error.filter(|e| !e.trim().is_empty()) {
+        return (Err(format!("the reply is an error: {why:.200}")), None);
+    }
+    match stopped {
+        Some("length") => (Err(CUT_OFF.into()), Some(TooBig::Reply)),
+        Some(reason) if early.contains(&reason) => {
+            (Err(format!("the reply stopped early: {reason:.200}")), None)
+        }
+        _ => (
+            content
+                .map(|c| format!("{c}\n"))
+                .ok_or_else(|| "the reply has no content".into()),
+            None,
+        ),
+    }
 }
 
 /// `None` when no line is an event.
@@ -702,6 +973,7 @@ fn read_codex(stdout: &str) -> Option<Said> {
         reply,
         reason,
         usage,
+        too_big: None,
     })
 }
 
@@ -786,7 +1058,7 @@ impl Spent {
     }
 
     /// `LLM: ` and the [parts](Spent::parts) joined by `sep`; `None` when no call was recorded (a
-    /// run from before calls were, or a backend that reports nothing: ollama, `--llm-cmd`).
+    /// run from before calls were, or a backend that reports nothing: `--llm-cmd`).
     pub fn line(&self, sep: &str) -> Option<String> {
         let parts = self.parts();
         (!parts.is_empty()).then(|| format!("LLM: {}", parts.join(sep)))
@@ -1247,18 +1519,19 @@ mod tests {
         assert_eq!(&g[g.len() - 2..], ["--json", "-"]);
         assert_eq!(output, Output::Codex);
         let o = Backend::preset("ollama:gemma4:12b-it-qat").unwrap();
-        assert_eq!(command(&o).1, Output::Text);
+        let Via::Server(s) = &o.via else {
+            panic!("{o:?}")
+        };
+        let url = server::ollama_url(std::env::var("OLLAMA_HOST").ok().as_deref());
         assert_eq!(
-            command(&o).0,
-            [
-                "ollama",
-                "run",
-                "--think=false",
-                "--nowordwrap",
-                "gemma4:12b-it-qat"
-            ]
+            (o.label.as_str(), s.entry.url.as_str(), s.model.as_deref()),
+            (
+                "ollama:gemma4:12b-it-qat",
+                url.as_str(),
+                Some("gemma4:12b-it-qat")
+            )
         );
-        assert_eq!(o.chunk_lines, CHUNK_LINES_OLLAMA);
+        assert_eq!((o.chunk_lines, o.jobs), (None, JOBS));
         assert!(Backend::preset("ollama:").is_err());
         assert!(Backend::preset("gemini").is_err());
         assert_eq!(
@@ -1389,7 +1662,7 @@ mod tests {
                 cost_usd: None,
             })
         );
-        let a = shell_as(Output::OpenAi, "cat").call(OPENAI, TIMEOUT);
+        let a = shell_as(Output::OpenAi, "cat").call(OPENAI, TIMEOUT, None);
         assert_eq!(a.reply.as_deref(), Ok("NONE\n"));
     }
 
@@ -1438,6 +1711,32 @@ mod tests {
                 Ok("NONE\n"),
                 "{whole}"
             );
+        }
+    }
+
+    #[test]
+    fn a_reply_cut_off_at_the_length_limit_is_too_big_for_the_reply() {
+        let cut = OPENAI.replace(r#""finish_reason":"stop""#, r#""finish_reason":"length""#);
+        let cut_off = (
+            Some(TooBig::Reply),
+            Err("the reply was cut off at the server's length limit".to_string()),
+        );
+        let a = Output::OpenAi.read(&cut);
+        assert_eq!((a.too_big, a.reply), cut_off);
+        let a = shell_as(Output::OpenAi, "cat").call(&cut, TIMEOUT, None);
+        assert_eq!((a.too_big, a.reply), cut_off);
+        let stopped = OPENAI.replace(
+            r#""finish_reason":"stop""#,
+            r#""finish_reason":"content_filter""#,
+        );
+        assert_eq!(Output::OpenAi.read(&stopped).too_big, None);
+        for (output, stdout) in [
+            (Output::OpenAi, OPENAI),
+            (Output::Claude, CLAUDE),
+            (Output::Codex, CODEX),
+            (Output::Text, "NONE\n"),
+        ] {
+            assert_eq!(output.read(stdout).too_big, None, "{output:?}");
         }
     }
 
@@ -1492,7 +1791,7 @@ mod tests {
             format!("echo '{stderr}' >&2; ")
         };
         let cmd = format!("cat '{}'; {say}exit 1", out.display());
-        shell_as(output, &cmd).call("", TIMEOUT)
+        shell_as(output, &cmd).call("", TIMEOUT, None)
     }
 
     #[test]
@@ -1591,7 +1890,7 @@ mod tests {
         );
         assert_eq!(reported(&a.used).map(|u| u.output_tokens), Some(5));
         // Text on stdout is never taken for a reason.
-        let a = Backend::shell("echo NONE; exit 1").call("", TIMEOUT);
+        let a = Backend::shell("echo NONE; exit 1").call("", TIMEOUT, None);
         assert_eq!(a.reply, Err("sh exited with exit status: 1".into()));
     }
 
@@ -1602,17 +1901,18 @@ mod tests {
             a,
             Answer {
                 reply: Ok("L1\tfixed\twhy\n".into()),
-                used: Used::Untracked
+                used: Used::Untracked,
+                too_big: None
             }
         );
     }
 
     #[test]
     fn a_call_reads_its_reply_as_the_backend_prints_it() {
-        let a = shell_as(Output::Claude, "cat").call(CLAUDE, TIMEOUT);
+        let a = shell_as(Output::Claude, "cat").call(CLAUDE, TIMEOUT, None);
         assert_eq!(a.reply.as_deref(), Ok("NONE\n"));
         assert!(reported(&a.used).is_some());
-        let a = Backend::shell("exit 3").call("", TIMEOUT);
+        let a = Backend::shell("exit 3").call("", TIMEOUT, None);
         assert!(a.reply.unwrap_err().contains("exit status: 3"));
         assert_eq!(a.used, Used::Untracked);
     }
@@ -1621,7 +1921,7 @@ mod tests {
     fn every_call_a_json_backend_started_is_counted_with_numbers_or_without() {
         let claude = |cmd: &str| shell_as(Output::Claude, cmd);
         // Killed at the timeout.
-        let a = claude("sleep 5; echo late").call("", Duration::from_millis(200));
+        let a = claude("sleep 5; echo late").call("", Duration::from_millis(200), None);
         assert!(a.reply.unwrap_err().contains("timed out"));
         assert_eq!(a.used, Used::Unreported);
         // Not its JSON, exiting 0 or not; nothing on stdout; its JSON with no usage in it.
@@ -1632,7 +1932,7 @@ mod tests {
             r#"echo '{"type":"result","is_error":true,"result":"no"}'; exit 1"#,
         ] {
             assert_eq!(
-                claude(cmd).call("", TIMEOUT).used,
+                claude(cmd).call("", TIMEOUT, None).used,
                 Used::Unreported,
                 "{cmd}"
             );
@@ -1641,7 +1941,7 @@ mod tests {
             Output::Codex,
             r#"echo '{"type":"thread.started","thread_id":"t"}'; exit 1"#,
         );
-        assert_eq!(codex.call("", TIMEOUT).used, Used::Unreported);
+        assert_eq!(codex.call("", TIMEOUT, None).used, Used::Unreported);
         // It never started: nothing to count.
         let gone = Backend {
             via: Via::Command {
@@ -1650,7 +1950,7 @@ mod tests {
             },
             ..claude("")
         };
-        let a = gone.call("", TIMEOUT);
+        let a = gone.call("", TIMEOUT, None);
         assert!(a.reply.unwrap_err().contains("cannot run"));
         assert_eq!(a.used, Used::Untracked);
         // A backend that never reports: nothing to count, whatever happened.
@@ -1659,7 +1959,7 @@ mod tests {
             ("exit 1", TIMEOUT),
         ] {
             assert_eq!(
-                Backend::shell(cmd).call("", timeout).used,
+                Backend::shell(cmd).call("", timeout, None).used,
                 Used::Untracked,
                 "{cmd}"
             );
@@ -1823,14 +2123,19 @@ mod tests {
                     argv: vec!["sh".into(), "-c".into(), "my-llm --fast".into()],
                     output: Output::Claude,
                 },
-                chunk_lines: 200,
+                chunk_lines: Some(200),
                 jobs: 4,
             })
         );
         let p = Backend::named("plain", &s).unwrap();
         assert_eq!(
-            (p.chunk_lines, p.jobs, command(&p).1),
-            (CHUNK_LINES, JOBS, Output::Text)
+            (
+                p.chunk_lines,
+                p.lines_per_chunk(2, None),
+                p.jobs,
+                command(&p).1
+            ),
+            (None, CHUNK_LINES, JOBS, Output::Text)
         );
         for preset in ["claude", "gpt", "ollama:gemma4"] {
             assert_eq!(
@@ -1883,7 +2188,7 @@ mod tests {
         let b = Backend::named("srv", &s).unwrap();
         assert_eq!(
             (b.label.as_str(), b.jobs, b.chunk_lines),
-            ("srv@gemma4", 3, CHUNK_LINES)
+            ("srv@gemma4", 3, None)
         );
         assert!(
             matches!(&b.via, Via::Server(s) if s.name == "srv" && s.model.as_deref() == Some("gemma4"))
@@ -1893,6 +2198,81 @@ mod tests {
         assert_eq!(any.label, "any");
         assert!(matches!(&any.via, Via::Server(s) if s.model.is_none()));
         assert_eq!(Backend::shell("x y").command_line(), ["sh", "-c", "x y"]);
+    }
+
+    #[test]
+    fn a_budgets_fit_is_the_most_lines_its_prompt_holds_and_its_lines_are_that_up_to_400() {
+        for share in [
+            0,
+            600,
+            1024,
+            2048,
+            4096,
+            8192,
+            16384,
+            32768,
+            131_072,
+            1 << 20,
+        ] {
+            let b = Budget::new(share, None);
+            let n = b.fit();
+            assert!(n >= 1, "{share}");
+            if n > 1 {
+                assert!(estimate(n) <= b.prompt(), "{share}: {n} lines do not fit");
+            }
+            assert!(
+                estimate(n + 1) > b.prompt(),
+                "{share}: room for more than {n}"
+            );
+            assert_eq!(b.lines(), n.min(CHUNK_LINES), "{share}");
+        }
+        let fit = |share| Budget::new(share, None).fit();
+        assert_eq!(
+            (fit(0), fit(2048), fit(8192), fit(131_072)),
+            (1, 30, 155, 3420)
+        );
+        let lines = |share| Budget::new(share, None).lines();
+        assert_eq!((lines(0), lines(131_072)), (1, CHUNK_LINES));
+        assert_eq!(estimate(10), PROMPT_TOKENS + 10 * TOKENS_PER_LINE);
+    }
+
+    #[test]
+    fn the_full_chunk_context_is_the_smallest_that_fits_a_full_chunk() {
+        for max_tokens in [None, Some(0), Some(8192)] {
+            let full = full_chunk_context(max_tokens);
+            assert_eq!(
+                (
+                    Budget::new(full - 1, max_tokens).lines(),
+                    Budget::new(full, max_tokens).lines()
+                ),
+                (CHUNK_LINES - 1, CHUNK_LINES),
+                "{max_tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_budgets_reply_room_is_the_entrys_cap_up_to_the_share_else_its_quarter_up_to_4096() {
+        for (share, max_tokens, prompt, cap) in [
+            (16384, None, 12288, 4096),
+            // A quarter over 4096 is bounded there, however large the share.
+            (16388, None, 16388 - 4096, 4096),
+            (523_788, None, 523_788 - 4096, 4096),
+            (1 << 20, None, (1 << 20) - 4096, 4096),
+            // An entry's own cap is the room at any size.
+            (1 << 20, Some(8192), (1 << 20) - 8192, 8192),
+            (16384, Some(8192), 8192, 8192),
+            (16384, Some(20000), 0, 16384),
+            (16384, Some(0), 16384, 1),
+            (3, None, 3, 1),
+        ] {
+            let b = Budget::new(share, max_tokens);
+            assert_eq!(
+                (b.prompt(), b.cap()),
+                (prompt, cap),
+                "{share} {max_tokens:?}"
+            );
+        }
     }
 
     #[test]
@@ -1928,16 +2308,26 @@ mod tests {
     }
 
     #[test]
+    fn a_command_takes_no_cap() {
+        let b = shell_as(Output::OpenAi, "cat");
+        assert_eq!(
+            b.call(OPENAI, TIMEOUT, Some(Budget::new(4, None))),
+            b.call(OPENAI, TIMEOUT, None)
+        );
+    }
+
+    #[test]
     fn an_unknown_llm_answers_why_and_counts_nothing() {
         let b = Backend {
             via: Via::Unknown("gone, which …".into()),
             ..Backend::shell("x")
         };
         assert_eq!(
-            b.call("P", TIMEOUT),
+            b.call("P", TIMEOUT, None),
             Answer {
                 reply: Err("gone, which …".into()),
-                used: Used::Untracked
+                used: Used::Untracked,
+                too_big: None
             }
         );
     }

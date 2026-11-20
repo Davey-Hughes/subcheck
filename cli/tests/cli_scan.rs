@@ -8,9 +8,9 @@ use std::cell::Cell;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-use common::fixture;
+use common::{fitting_lines, fixture};
 use subcheck_core::list::shell_quote;
-use subcheck_core::llm::Usage;
+use subcheck_core::llm::{Usage, estimate};
 use subcheck_core::store::{self, Check, LlmCall, Selector, State, Store};
 
 struct Env {
@@ -1359,11 +1359,12 @@ fn a_server_entry_scans_through_the_server_and_says_its_tokens() {
     server_entry(&env, &fake.url, "");
     let out = env.scan_preset("srv", &[&env.typos()], &[]);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert!(
-        stderr(&out).contains("LLM: 1 call, 1.50k in / 40 out tokens"),
-        "{}",
-        stderr(&out)
+    // The fake counts a prompt as subcheck estimates it.
+    let said = format!(
+        "LLM: 1 call, {} in / 40 out tokens",
+        estimate(common::TYPOS_LINES)
     );
+    assert!(stderr(&out).contains(&said), "{}", stderr(&out));
     assert_eq!(newest(&env).header.backend, "srv@fake-model");
     assert_eq!(
         newest(&env).header.command,
@@ -1375,7 +1376,10 @@ fn a_server_entry_scans_through_the_server_and_says_its_tokens() {
         .iter()
         .map(|r| format!("{} {}", r.method, r.path))
         .collect();
-    assert_eq!(asked, ["GET /v1/models", "POST /v1/chat/completions"]);
+    assert_eq!(
+        asked,
+        ["GET /v1/models", "GET /api/ps", "POST /v1/chat/completions"]
+    );
 }
 
 #[test]
@@ -1516,5 +1520,361 @@ fn a_server_on_this_machine_is_never_called_through_a_proxy() {
         .iter()
         .map(|r| format!("{} {}", r.method, r.path))
         .collect();
-    assert_eq!(asked, ["GET /v1/models", "POST /v1/chat/completions"]);
+    assert_eq!(
+        asked,
+        ["GET /v1/models", "GET /api/ps", "POST /v1/chat/completions"]
+    );
+}
+
+/// How many subtitle lines each chat completion sent to `fake` held, in the order they came.
+fn sent_lines(fake: &common::FakeServer) -> Vec<usize> {
+    fake.completions()
+        .iter()
+        .map(common::prompt_lines)
+        .collect()
+}
+
+#[test]
+fn a_scan_through_a_server_fits_its_chunks_to_the_context() {
+    // 1024 tokens shared by the default 2 jobs.
+    let per_call = fitting_lines(1024 / 2);
+    assert!(per_call < common::TYPOS_LINES);
+    let env = Env::new();
+    let fake = common::FakeServer::llm_sized(&["m"], 1024);
+    server_entry(&env, &fake.url, "");
+    let out = env.scan_preset("srv", &[&env.typos()], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let sent = sent_lines(&fake);
+    assert!(
+        sent.len() > 1 && sent.iter().all(|&n| n <= per_call),
+        "{sent:?}"
+    );
+    // Each reply capped at the last quarter of a call's share.
+    let caps: Vec<Option<u64>> = fake
+        .completions()
+        .iter()
+        .map(|r| r.json()["max_tokens"].as_u64())
+        .collect();
+    assert!(caps.iter().all(|&c| c == Some(1024 / 2 / 4)), "{caps:?}");
+    assert_eq!(env.newest_run().findings.len(), 2);
+}
+
+#[test]
+fn a_size_forced_over_what_fits_is_cut_to_it_and_each_call_capped() {
+    // 1400 tokens shared by the default 2 jobs: 700 a call, whose prompt holds fewer than all of
+    // typos.mkv's lines, which --chunk-lines asks for.
+    let fits = fitting_lines(1400 / 2);
+    let rest = common::TYPOS_LINES - fits;
+    assert!(fits < common::TYPOS_LINES);
+    let env = Env::new();
+    let fake = common::FakeServer::llm_sized(&["m"], 1400);
+    server_entry(&env, &fake.url, "");
+    let lines = common::TYPOS_LINES.to_string();
+    let file = env.typos();
+    let dry = env.scan_preset("srv", &["--dry-run", "--chunk-lines", &lines, &file], &[]);
+    assert!(dry.status.success(), "{}", stderr(&dry));
+    let printed: Vec<String> = String::from_utf8_lossy(&dry.stdout)
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("== ")?
+                .rsplit_once(" (")
+                .map(|(_, h)| h.to_string())
+        })
+        .collect();
+    assert_eq!(
+        printed,
+        [
+            format!("chunk 0, {fits} lines)"),
+            format!("chunk 1, {rest} lines)")
+        ]
+    );
+    let out = env.scan_preset("srv", &["--chunk-lines", &lines, &file], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let mut sent = sent_lines(&fake);
+    sent.sort_unstable();
+    assert_eq!(sent, [rest, fits]);
+    // Each reply capped at the last quarter of a call's share.
+    let caps: Vec<Option<u64>> = fake
+        .completions()
+        .iter()
+        .map(|r| r.json()["max_tokens"].as_u64())
+        .collect();
+    assert_eq!(caps, [Some(1400 / 2 / 4); 2]);
+    assert_eq!(env.newest_run().findings.len(), 2);
+}
+
+/// What llama-server answers `r` with for a model that repeats itself until something stops it:
+/// a reply cut off at the request's `max_tokens`, or, with none, the 500 it gives once the replies
+/// in flight have filled the cache they share.
+fn looping(r: &common::Request) -> common::Reply {
+    let Some(cap) = r.json()["max_tokens"].as_u64() else {
+        let full = std::fs::read_to_string(fixture("llm/llama-server-shared-cache.json")).unwrap();
+        return common::Reply::status(500, full);
+    };
+    let cut = serde_json::json!({
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "L1\tWe should leave before before before"},
+            "finish_reason": "length",
+        }],
+        "usage": {"prompt_tokens": 600, "completion_tokens": cap, "total_tokens": 600 + cap},
+    });
+    common::Reply::ok(cut.to_string())
+}
+
+#[test]
+fn a_model_that_runs_to_its_cap_every_time_fails_its_chunk_in_three_calls() {
+    // 4096 tokens shared by the default 2 jobs: 2048 a call, which holds all of typos.mkv's lines,
+    // and a reply capped at 512.
+    assert!(fitting_lines(4096 / 2) >= common::TYPOS_LINES);
+    let listed = serde_json::json!({
+        "object": "list",
+        "data": [{"id": "m", "object": "model", "meta": {"n_ctx": 4096}}],
+    })
+    .to_string();
+    let fake = common::FakeServer::start(move |r| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", "/v1/models") => common::Reply::ok(listed.clone()),
+        ("POST", "/v1/chat/completions") => looping(r),
+        _ => common::Reply::status(404, "{}"),
+    });
+    let env = Env::new();
+    server_entry(&env, &fake.url, "");
+    let out = env.scan_preset("srv", &[&env.typos()], &[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains(
+            "FAILED: LLM: the reply was cut off at subcheck's cap of 512 tokens; the entry's \
+             request.max_tokens sets another"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    // Cut off whole, then halved once, the first half cut off again and retried; the second half
+    // is not sent.
+    let half = common::TYPOS_LINES / 2;
+    assert_eq!(sent_lines(&fake), [common::TYPOS_LINES, half, half]);
+    let used: Vec<(usize, Option<u64>)> = env
+        .recorded_calls()
+        .iter()
+        .map(|c| (c.lines, c.usage.as_ref().map(|u| u.output_tokens)))
+        .collect();
+    let capped = Some(4096 / 2 / 4);
+    assert_eq!(
+        used,
+        [
+            (common::TYPOS_LINES, capped),
+            (half, capped),
+            (half, capped)
+        ]
+    );
+}
+
+#[test]
+fn the_flag_and_the_entry_beat_the_servers_context() {
+    // 4096 tokens shared by the default 2 jobs: fitted to them, one chunk holds all the lines
+    // typos.mkv sends, and the flag or the entry makes it two.
+    assert!(fitting_lines(4096 / 2) >= common::TYPOS_LINES);
+    let all = common::TYPOS_LINES;
+    let half = all / 2;
+    let lines = half.to_string();
+    let entry = format!("chunk_lines = {lines}\n");
+    for (extra, flag, sent) in [
+        ("", &[][..], vec![all]),
+        ("", &["--chunk-lines", &lines][..], vec![half, half]),
+        (&entry, &[][..], vec![half, half]),
+    ] {
+        let env = Env::new();
+        let fake = common::FakeServer::llm_sized(&["m"], 4096);
+        server_entry(&env, &fake.url, extra);
+        let file = env.typos();
+        let mut args = flag.to_vec();
+        args.push(&file);
+        let out = env.scan_preset("srv", &args, &[]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(sent_lines(&fake), sent, "{extra:?} {flag:?}");
+    }
+}
+
+#[test]
+fn a_server_that_does_not_say_its_size_warns_once_and_sends_400_lines() {
+    let env = Env::new();
+    let fake = common::FakeServer::llm(&["m"]);
+    server_entry(&env, &fake.url, "");
+    let out = env.scan_preset("srv", &[&env.typos()], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let warning =
+        "warning: srv did not say its context size; set chunk_lines if it holds under 38k tokens\n";
+    assert_eq!(stderr(&out).matches(warning).count(), 1, "{}", stderr(&out));
+    // A chunk of up to 400 lines takes all typos.mkv sends.
+    assert_eq!(sent_lines(&fake), [common::TYPOS_LINES]);
+}
+
+#[test]
+fn an_entrys_cap_that_leaves_no_room_for_a_line_warns_once_and_sends_each_line_alone() {
+    // 16384 tokens shared by the default 2 jobs: 8192 a call, all of it the reply's.
+    let env = Env::new();
+    let fake = common::FakeServer::llm_sized(&["m"], 16384);
+    server_entry(&env, &fake.url, "[llm.srv.request]\nmax_tokens = 8192\n");
+    let out = env.scan_preset("srv", &[&env.typos()], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let warning = "warning: srv's request.max_tokens (8192) leaves no room for lines in a call's \
+                   8192 tokens, so each line is sent alone; lower it, or set shared_context = \
+                   false or fewer jobs\n";
+    assert_eq!(stderr(&out).matches(warning).count(), 1, "{}", stderr(&out));
+    assert_eq!(sent_lines(&fake), [1; common::TYPOS_LINES]);
+    assert_eq!(env.newest_run().findings.len(), 2);
+}
+
+#[test]
+fn an_overflowing_chunk_is_split_and_every_finding_lands() {
+    let overflow = std::fs::read_to_string(fixture("llm/llama-server-overflow.json")).unwrap();
+    let fake = common::FakeServer::start(move |r| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", "/v1/models") => common::models_reply(&["m"]),
+        ("POST", "/v1/chat/completions") if common::prompt_lines(r) > 1 => {
+            common::Reply::status(400, overflow.clone())
+        }
+        ("POST", "/v1/chat/completions") => common::answered(r),
+        _ => common::Reply::status(404, "{}"),
+    });
+    let env = Env::new();
+    server_entry(&env, &fake.url, "");
+    let out = env.scan_preset("srv", &["-j", "2", &env.typos()], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let mut sent = sent_lines(&fake);
+    sent.sort_unstable();
+    assert_eq!(sent, [1, 1, 1, 1, 2, 2, 4]);
+    let mut recorded: Vec<usize> = env.recorded_calls().iter().map(|c| c.lines).collect();
+    recorded.sort_unstable();
+    assert_eq!(recorded, sent, "each call recorded with the lines it sent");
+    // As many as a scan whose chunk fits finds.
+    assert_eq!(env.newest_run().findings.len(), 2);
+}
+
+#[test]
+fn only_a_scan_that_needs_the_llm_loads_the_model() {
+    let loads = |fake: &common::FakeServer| {
+        fake.requests()
+            .iter()
+            .filter(|r| r.method == "POST" && r.path == "/api/generate")
+            .count()
+    };
+    let only_gets = |fake: &common::FakeServer| fake.requests().iter().all(|r| r.method == "GET");
+    let env = Env::new();
+    let file = env.typos();
+    let fake = common::FakeServer::ollama("m", 4096);
+    server_entry(&env, &fake.url, "");
+    let out = env.scan_preset("srv", &["--dry-run", &file], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(only_gets(&fake), "{:?}", fake.requests());
+    let out = env.scan_preset("srv", &[&file], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(loads(&fake), 1, "{:?}", fake.requests());
+    assert_eq!(fake.completions().len(), 1);
+    let run = newest(&env).name;
+    // The same scan through a server whose model is not loaded: nothing to check, so no load.
+    let unloaded = common::FakeServer::ollama("m", 4096);
+    server_entry(&env, &unloaded.url, "");
+    let out = env.scan_preset("srv", &[&file], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(only_gets(&unloaded), "{:?}", unloaded.requests());
+    assert_eq!(loads(&fake), 1);
+    // Adding to the run, which readies only once a file needs the LLM, then sizes.
+    let out = env.scan_plain(&["--run", &run, "--force", &file], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(loads(&unloaded), 1, "{:?}", unloaded.requests());
+}
+
+/// `OLLAMA_HOST` for a scan through `ollama:<model>`: `fake`'s address, as Ollama's is written.
+fn ollama_host(fake: &common::FakeServer) -> &str {
+    fake.url.strip_suffix("/v1").unwrap()
+}
+
+#[test]
+fn a_scan_says_so_while_ollama_loads_its_model() {
+    let env = Env::new();
+    let fake = common::FakeServer::ollama("gemma4:latest", 4096);
+    let host = [("OLLAMA_HOST", ollama_host(&fake))];
+    let loading = format!(
+        "loading gemma4:latest into Ollama at {}\n",
+        ollama_host(&fake)
+    );
+    let file = env.typos();
+    let out = env.scan_preset("ollama:gemma4", &[&file], &host);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out).matches(&loading).count(),
+        1,
+        "{}",
+        stderr(&out)
+    );
+    // Loaded by that scan, so the next one loads nothing and says nothing of it.
+    let out = env.scan_preset("ollama:gemma4", &["--force", &file], &host);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("into Ollama"), "{}", stderr(&out));
+}
+
+#[test]
+fn ollama_is_called_through_its_api_with_tokens_and_fitted_chunks() {
+    // 700 tokens, each of the default 2 jobs' whole: a chunk fitted to them holds fewer lines than
+    // typos.mkv sends, and more than one fitted to half of them.
+    let per_call = fitting_lines(700);
+    assert!(per_call < common::TYPOS_LINES && per_call > fitting_lines(700 / 2));
+    let env = Env::new();
+    let fake = common::FakeServer::ollama("gemma4:latest", 700);
+    let host = [("OLLAMA_HOST", ollama_host(&fake))];
+    let out = env.scan_preset("ollama:gemma4", &[&env.typos()], &host);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        // The fake counts each prompt as subcheck estimates it.
+        stderr(&out).contains(&format!(
+            "LLM: 2 calls, {} in / 80 out tokens",
+            estimate(per_call) + estimate(common::TYPOS_LINES - per_call)
+        )),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(newest(&env).header.backend, "ollama:gemma4");
+    let loads = fake
+        .requests()
+        .iter()
+        .filter(|r| r.method == "POST" && r.path == "/api/generate")
+        .count();
+    assert_eq!(loads, 1, "{:?}", fake.requests());
+    let chats = fake.chats();
+    let mut sent: Vec<usize> = chats.iter().map(common::prompt_lines).collect();
+    sent.sort_unstable();
+    assert_eq!(
+        sent,
+        [common::TYPOS_LINES - per_call, per_call],
+        "{chats:?}"
+    );
+    // Each reply capped at the last quarter of the context, in Ollama's words.
+    let caps: Vec<Option<u64>> = chats
+        .iter()
+        .map(|c| c.json()["options"]["num_predict"].as_u64())
+        .collect();
+    assert!(caps.iter().all(|&c| c == Some(700 / 4)), "{caps:?}");
+    assert!(fake.completions().is_empty(), "{:?}", fake.requests());
+    assert_eq!(env.newest_run().findings.len(), 2);
+}
+
+#[test]
+fn a_run_made_through_ollama_takes_more_files_through_its_api() {
+    let env = Env::new();
+    let fake = common::FakeServer::ollama("gemma4:latest", 2048);
+    let host = [("OLLAMA_HOST", ollama_host(&fake))];
+    let out = env.scan_preset("ollama:gemma4", &[&env.typos()], &host);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let run = newest(&env).name;
+    let chats = fake.chats().len();
+    let out = env.scan_plain(&["--run", &run, &env.typos()], &host);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let scan = newest(&env);
+    assert_eq!(
+        (scan.name, scan.header.backend.as_str()),
+        (run, "ollama:gemma4")
+    );
+    assert!(fake.chats().len() > chats, "{:?}", fake.requests());
+    assert!(fake.completions().is_empty(), "{:?}", fake.requests());
 }
