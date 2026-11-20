@@ -1,0 +1,306 @@
+# The answer key to script.ass: each planted typo and each trap, named by its line's text.
+# A typo's `fixed` lists every correction of the whole line that counts as right.
+# A trap is a line with nothing to fix that a proofreader might fix all the same.
+
+[[typo]]
+kind = "misspelling"
+line = "Put the bear buns on a seperate tray, please."
+fixed = ["Put the bear buns on a separate tray, please."]
+
+[[trap]]
+kind = "interjection"
+line = "Ehh?! Me? On the stage?"
+
+[[trap]]
+kind = "honorific"
+line = "Onee-chan is going to be the star!"
+
+[[trap]]
+kind = "lyric"
+line = "Down to the harbor the paper boats go"
+
+[[typo]]
+kind = "real word"
+line = "Sailing trough the gold of early light"
+fixed = ["Sailing through the gold of early light"]
+
+[[typo]]
+kind = "merged words"
+line = "I haven't seen it for awhile. Sayo's the one who rings the bell, right?"
+fixed = ["I haven't seen it for a while. Sayo's the one who rings the bell, right?"]
+
+[[trap]]
+kind = "emphasis"
+line = "And it was SO moving."
+
+[[trap]]
+kind = "honorific"
+line = "Wonderful! Sudo-kun, you're coming too."
+
+[[typo]]
+kind = "merged words"
+line = "Ihave no idea what half these words mean."
+fixed = ["I have no idea what half these words mean."]
+
+[[typo]]
+kind = "apostrophe"
+line = "Thats not helping, Kei."
+fixed = [
+    "That's not helping, Kei.",
+    "That is not helping, Kei.",
+]
+
+[[trap]]
+kind = "name"
+line = "Kozue knows what she's doing. Trust her."
+
+[[typo]]
+kind = "ocr"
+line = "Iet's start from the top of the storm scene."
+fixed = ["Let's start from the top of the storm scene."]
+
+[[typo]]
+kind = "misspelling"
+line = "The real one will be ready befor Saturday."
+fixed = ["The real one will be ready before Saturday."]
+
+[[trap]]
+kind = "stutter"
+line = "S-Sorry! I knew that one this morning!"
+
+[[trap]]
+kind = "honorific"
+line = "Kozue-senpai, I can't do this!"
+
+[[trap]]
+kind = "malapropism"
+line = "Well, every cloud has a silver spoon."
+
+[[typo]]
+kind = "doubled word"
+line = "Hand me the the hammer, would you?"
+fixed = ["Hand me the hammer, would you?"]
+
+[[trap]]
+kind = "japanese"
+line = "Otsukaresama, everyone!"
+
+[[typo]]
+kind = "apostrophe"
+line = "Whose locking up the storeroom tonight?"
+fixed = [
+    "Who's locking up the storeroom tonight?",
+    "Who is locking up the storeroom tonight?",
+]
+
+[[trap]]
+kind = "name"
+line = "Kei has the only key to the storeroom."
+
+[[typo]]
+kind = "in-world name"
+line = "We'll all be there! I'm bringing melon bread from Kurumya for the whole cast."
+fixed = ["We'll all be there! I'm bringing melon bread from Kurumiya for the whole cast."]
+
+[[trap]]
+kind = "in-world name"
+line = "Tingel is sponsoring the festival again this year."
+
+[[typo]]
+kind = "merged words"
+line = "Thanks alot, Kei. Really."
+fixed = ["Thanks a lot, Kei. Really."]
+
+[[trap]]
+kind = "pun"
+line = "Don't worry about Saturday. It's a shore thing."
+
+[[trap]]
+kind = "slang"
+line = "Y'all better have that bell done by Friday night!"
+
+[[typo]]
+kind = "apostrophe"
+line = "Come on, were almost at your place."
+fixed = [
+    "Come on, we're almost at your place.",
+    "Come on, we are almost at your place.",
+]
+
+[[typo]]
+kind = "real word"
+line = "The kids next door left there paper boats on our bench again."
+fixed = ["The kids next door left their paper boats on our bench again."]
+
+[[typo]]
+kind = "misspelling"
+line = "I made you an omlette. I know you skipped lunch."
+fixed = [
+    "I made you an omelette. I know you skipped lunch.",
+    "I made you an omelet. I know you skipped lunch.",
+]
+
+[[trap]]
+kind = "japanese"
+line = "Itadakimasu!"
+
+[[trap]]
+kind = "child speech"
+line = "Look! I builded a boat all by myself!"
+
+[[typo]]
+kind = "real word"
+line = "Be quite, both of you, or you'll wake the neighbors' baby."
+fixed = ["Be quiet, both of you, or you'll wake the neighbors' baby."]
+
+[[typo]]
+kind = "apostrophe"
+line = "Please dont tell anyone I almost quit today."
+fixed = [
+    "Please don't tell anyone I almost quit today.",
+    "Please do not tell anyone I almost quit today.",
+]
+
+[[trap]]
+kind = "interjection"
+line = "Hmph. Fine. I'll go after school."
+
+[[typo]]
+kind = "sign"
+line = "Sorabashi Public Libary"
+fixed = ["Sorabashi Public Library"]
+
+[[trap]]
+kind = "interjection"
+line = "Whaaat?! That's the bell?"
+
+[[typo]]
+kind = "real word"
+line = "The real bell was much bigger then the one I'm making."
+fixed = ["The real bell was much bigger than the one I'm making."]
+
+[[typo]]
+kind = "misspelling"
+line = "You'll recieve a reminder when it's due. Please actually return it."
+fixed = ["You'll receive a reminder when it's due. Please actually return it."]
+
+[[typo]]
+kind = "merged words"
+line = "And we walked past this door everyday for years."
+fixed = ["And we walked past this door every day for years."]
+
+[[typo]]
+kind = "misspelling"
+line = "Sudo-kun, can your father build a stand for it by tommorow?"
+fixed = ["Sudo-kun, can your father build a stand for it by tomorrow?"]
+
+[[trap]]
+kind = "slang"
+line = "Dunno. Ask Grandma."
+
+[[trap]]
+kind = "british spelling"
+line = "Which colour should the stage lanterns be?"
+
+[[trap]]
+kind = "name"
+line = "Gonda wants every boat lined up on the bank by six."
+
+[[trap]]
+kind = "japanese"
+line = "Three taiyaki with red bean paste, please."
+
+[[trap]]
+kind = "quoted misspelling"
+line = 'Look at that stall. The banner says "Grilled Squib." They misspelled squid.'
+
+[[typo]]
+kind = "missing word"
+line = "Kei and I got hungry, so went to the noodle stand first."
+fixed = ["Kei and I got hungry, so we went to the noodle stand first."]
+
+[[typo]]
+kind = "apostrophe"
+line = "Don't worry, ill be backstage in ten minutes."
+fixed = [
+    "Don't worry, I'll be backstage in ten minutes.",
+    "Don't worry, I will be backstage in ten minutes.",
+]
+
+[[trap]]
+kind = "lyric"
+line = "La la la, la la lo, where the gentle waters go"
+
+[[typo]]
+kind = "real word"
+line = "Sudo-kun, whatever happens, don't loose this cue sheet."
+fixed = ["Sudo-kun, whatever happens, don't lose this cue sheet."]
+
+[[trap]]
+kind = "slang"
+line = "Lemme fix your collar. Hold still."
+
+[[typo]]
+kind = "real word"
+line = "Just breath slowly and look at me."
+fixed = ["Just breathe slowly and look at me."]
+
+[[trap]]
+kind = "honorific"
+line = "Sensei, are you nervous too?"
+
+[[trap]]
+kind = "stutter"
+line = "Kei, don't pull that ro—"
+
+[[typo]]
+kind = "misspelling"
+line = "This is definately not how we rehearsed it."
+fixed = ["This is definitely not how we rehearsed it."]
+
+[[trap]]
+kind = "archaic"
+line = "Dost thou hear it, Father? The bell yet calleth thee home!"
+
+[[trap]]
+kind = "interjection"
+line = "Nooooo! I ran out of water!"
+
+[[trap]]
+kind = "emphasis"
+line = "Sooo... still scared?"
+
+[[typo]]
+kind = "apostrophe"
+line = "Look, its starting to rain for real."
+fixed = [
+    "Look, it's starting to rain for real.",
+    "Look, it is starting to rain for real.",
+]
+
+[[typo]]
+kind = "misspelling"
+line = "I said yes becuase nobody else would. But I'm glad I did."
+fixed = ["I said yes because nobody else would. But I'm glad I did."]
+
+[[typo]]
+kind = "ocr"
+line = "l'm still the girl who's scared of saying goodbye"
+fixed = ["I'm still the girl who's scared of saying goodbye"]
+
+[[trap]]
+kind = "lyric"
+line = "'Neath a sky of paper moons, we walk"
+
+[[trap]]
+kind = "name"
+line = "Mina was the best Sayo this town has ever seen."
+
+[[trap]]
+kind = "slang"
+line = "That girl ain't one for cameras."
+
+[[typo]]
+kind = "misspelling"
+line = "Kenta, let your sister sleep untill lunch. She earned it."
+fixed = ["Kenta, let your sister sleep until lunch. She earned it."]

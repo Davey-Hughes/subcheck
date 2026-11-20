@@ -1,0 +1,413 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+Style: Song,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+Style: Sign,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,5,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.50,0:00:04.00,Sign,,0,0,0,,Kurumiya Bakery — Fresh Bread Every Morning
+Dialogue: 0,0:00:05.10,0:00:08.60,Default,,0,0,0,,Mina, the first tray is ready. Can you carry it out front?
+Dialogue: 0,0:00:09.10,0:00:11.72,Default,,0,0,0,,Coming! Oh, these smell amazing.
+Dialogue: 0,0:00:12.30,0:00:15.31,Default,,0,0,0,,Don't eat any. Those are for the customers.
+Dialogue: 0,0:00:16.10,0:00:18.50,Default,,0,0,0,,I wasn't going to eat any.
+Dialogue: 0,0:00:18.70,0:00:21.50,Default,,0,0,0,,Then why is there sugar on your chin?
+Dialogue: 0,0:00:22.70,0:00:25.78,Default,,0,0,0,,Put the bear buns on a seperate tray, please.
+Dialogue: 0,0:00:26.10,0:00:29.11,Default,,0,0,0,,Grandma! I want the bun with the bear face!
+Dialogue: 0,0:00:30.00,0:00:33.22,Default,,0,0,0,,Kenta, you're up early. Did you brush your teeth?
+Dialogue: 0,0:00:33.50,0:00:36.09,Default,,0,0,0,,I brushed them two whole times!
+Dialogue: 0,0:00:37.10,0:00:39.34,Default,,0,0,0,,He brushed them once.
+Dialogue: 0,0:00:41.10,0:00:44.10,Default,,0,0,0,,Sit at the counter, both of you. Breakfast comes first.
+Dialogue: 0,0:00:44.30,0:00:47.80,Default,,0,0,0,,Good morning, Okuda-san! Two of the usual loaves, please.
+Dialogue: 0,0:00:48.10,0:00:50.50,Default,,0,0,0,,Good morning. They just came out of the oven.
+Dialogue: 0,0:00:50.70,0:00:54.20,Default,,0,0,0,,Is that Mina at the register? Look how tall she's gotten.
+Dialogue: 0,0:00:54.70,0:00:57.90,Default,,0,0,0,,Sixteen this year. Taller than her grandmother, too.
+Dialogue: 0,0:00:58.10,0:01:01.21,Default,,0,0,0,,Grandma, Gonda-san is running down the street.
+Dialogue: 0,0:01:02.00,0:01:04.83,Default,,0,0,0,,At his age? Something must be on fire.
+Dialogue: 0,0:01:05.50,0:01:08.26,Default,,0,0,0,,Okuda-san! Mina! We have a disaster!
+Dialogue: 0,0:01:09.10,0:01:11.83,Default,,0,0,0,,Good morning to you too, Gonda-san.
+Dialogue: 0,0:01:13.10,0:01:16.10,Default,,0,0,0,,Fumika-chan slipped on the steps outside her flower shop last night.
+Dialogue: 0,0:01:16.30,0:01:18.64,Default,,0,0,0,,Oh no. Is she all right?
+Dialogue: 0,0:01:20.10,0:01:22.50,Default,,0,0,0,,She sprained her ankle. The doctor says no standing for two weeks.
+Dialogue: 0,0:01:22.70,0:01:25.39,Default,,0,0,0,,But the festival is this Saturday.
+Dialogue: 0,0:01:26.70,0:01:29.90,Default,,0,0,0,,Exactly! Without Fumika-chan there's no Sayo,\Nand without Sayo there's no play!
+Dialogue: 0,0:01:30.10,0:01:33.60,Default,,0,0,0,,Mina, you've watched that play every summer since you were Kenta's age.
+Dialogue: 0,0:01:34.00,0:01:37.30,Default,,0,0,0,,You know every scene by heart. Please, take the part!
+Dialogue: 0,0:01:37.50,0:01:39.81,Default,,0,0,0,,Ehh?! Me? On the stage?
+Dialogue: 0,0:01:41.10,0:01:43.79,Default,,0,0,0,,Onee-chan is going to be the star!
+Dialogue: 0,0:01:45.10,0:01:47.27,Default,,0,0,0,,I haven't said yes!
+Dialogue: 0,0:01:48.30,0:01:51.59,Default,,0,0,0,,Think it over! The whole street is counting on you!
+Dialogue: 0,0:01:52.10,0:01:54.50,Default,,0,0,0,,He's gone. He didn't even buy anything.
+Dialogue: 0,0:01:54.70,0:01:58.20,Song,,0,0,0,,The morning tide is calling out my name
+Dialogue: 0,0:01:58.70,0:02:02.20,Song,,0,0,0,,I fold a wish and set it on the stream
+Dialogue: 0,0:02:02.70,0:02:06.20,Song,,0,0,0,,Down to the harbor the paper boats go
+Dialogue: 0,0:02:06.70,0:02:10.20,Song,,0,0,0,,Carrying the words I never said
+Dialogue: 0,0:02:10.70,0:02:14.20,Song,,0,0,0,,Sailing trough the gold of early light
+Dialogue: 0,0:02:14.70,0:02:18.20,Song,,0,0,0,,Every street I know is shining new
+Dialogue: 0,0:02:18.70,0:02:22.20,Song,,0,0,0,,Run with me before the summer ends
+Dialogue: 0,0:02:22.70,0:02:26.20,Song,,0,0,0,,The bells along the water ring for you
+Dialogue: 0,0:02:26.70,0:02:30.20,Song,,0,0,0,,And if I lose my way, I'll find the shore
+Dialogue: 0,0:02:30.70,0:02:34.20,Song,,0,0,0,,A hundred lanterns guide the way back home
+Dialogue: 0,0:02:34.70,0:02:38.20,Song,,0,0,0,,So hold on tight, the wind is turning now
+Dialogue: 0,0:02:38.70,0:02:42.20,Song,,0,0,0,,Tomorrow we will sail out, you and I
+Dialogue: 0,0:02:42.70,0:02:45.20,Sign,,0,0,0,,Episode 6: The Bell That Called Them Home
+Dialogue: 0,0:02:46.70,0:02:48.90,Default,,0,0,0,,So? Did you say yes?
+Dialogue: 0,0:02:50.10,0:02:53.25,Default,,0,0,0,,I didn't say anything. I just ran out the door.
+Dialogue: 0,0:02:54.00,0:02:56.27,Default,,0,0,0,,That sounds like a no.
+Dialogue: 0,0:02:57.50,0:03:00.61,Default,,0,0,0,,It's not a no! It's a "let me think about it."
+Dialogue: 0,0:03:01.10,0:03:04.21,Default,,0,0,0,,You've been thinking about it since breakfast.
+Dialogue: 0,0:03:05.10,0:03:08.10,Default,,0,0,0,,Kei, you've seen the play. Sayo has so many lines.
+Dialogue: 0,0:03:08.30,0:03:11.80,Default,,0,0,0,,I haven't seen it for awhile. Sayo's the one who rings the bell, right?
+Dialogue: 0,0:03:12.10,0:03:14.50,Default,,0,0,0,,Right. Her father's fishing boat is lost at sea.
+Dialogue: 0,0:03:14.70,0:03:18.20,Default,,0,0,0,,So she climbs the tower and rings the salt bell all night.
+Dialogue: 0,0:03:18.70,0:03:21.90,Default,,0,0,0,,And at dawn, every boat follows the sound back to the harbor.
+Dialogue: 0,0:03:22.10,0:03:25.60,Default,,0,0,0,,Fumika-san makes it look easy, but she's done it for six summers.
+Dialogue: 0,0:03:26.00,0:03:29.30,Default,,0,0,0,,My grandpa says the bell was real. It hung above the old fish market.
+Dialogue: 0,0:03:29.50,0:03:31.56,Default,,0,0,0,,Where is it now?
+Dialogue: 0,0:03:33.10,0:03:36.18,Default,,0,0,0,,Nobody knows. It disappeared a long time ago.
+Dialogue: 0,0:03:37.10,0:03:39.51,Default,,0,0,0,,There you are! Mina Okuda!
+Dialogue: 0,0:03:40.30,0:03:43.80,Default,,0,0,0,,Kozue-senpai? What are you doing in a second-year classroom?
+Dialogue: 0,0:03:44.10,0:03:46.50,Default,,0,0,0,,Gonda-san told me everything. You're our new Sayo!
+Dialogue: 0,0:03:46.70,0:03:49.36,Default,,0,0,0,,I haven't agreed to anything yet!
+Dialogue: 0,0:03:50.70,0:03:53.67,Default,,0,0,0,,She's been planning this play since April.
+Dialogue: 0,0:03:54.10,0:03:57.00,Default,,0,0,0,,Since March, actually. I keep notebooks.
+Dialogue: 0,0:03:58.00,0:04:01.30,Default,,0,0,0,,Listen. I heard you read at the spring assembly. Your voice carries.
+Dialogue: 0,0:04:01.50,0:04:04.05,Default,,0,0,0,,That was a speech about squid.
+Dialogue: 0,0:04:05.10,0:04:07.34,Default,,0,0,0,,And it was SO moving.
+Dialogue: 0,0:04:09.10,0:04:10.85,Default,,0,0,0,,Was it?
+Dialogue: 0,0:04:12.30,0:04:14.19,Default,,0,0,0,,Not really.
+Dialogue: 0,0:04:16.10,0:04:17.74,Default,,0,0,0,,Kei!
+Dialogue: 0,0:04:18.70,0:04:22.20,Default,,0,0,0,,Just come to one rehearsal. The community hall, right after school.
+Dialogue: 0,0:04:22.70,0:04:25.90,Default,,0,0,0,,If you hate it, I'll find someone else. I promise.
+Dialogue: 0,0:04:26.10,0:04:28.44,Default,,0,0,0,,One rehearsal. Only one.
+Dialogue: 0,0:04:30.00,0:04:32.87,Default,,0,0,0,,Wonderful! Sudo-kun, you're coming too.
+Dialogue: 0,0:04:33.50,0:04:35.28,Default,,0,0,0,,Me? Why?
+Dialogue: 0,0:04:37.10,0:04:40.60,Default,,0,0,0,,Somebody has to build the bell,\Nand your father has the biggest workshop on the street.
+Dialogue: 0,0:04:41.10,0:04:43.62,Default,,0,0,0,,That's actually a fair point.
+Dialogue: 0,0:04:44.30,0:04:47.80,Default,,0,0,0,,Igarashi-san, this is my homeroom. Back to your own class, please.
+Dialogue: 0,0:04:48.10,0:04:50.50,Default,,0,0,0,,Yes, Sensei! Four o'clock, my stars!
+Dialogue: 0,0:04:50.70,0:04:53.29,Default,,0,0,0,,Did she just call us her stars?
+Dialogue: 0,0:04:54.70,0:04:57.04,Default,,0,0,0,,She calls everyone that.
+Dialogue: 0,0:04:58.10,0:05:01.49,Default,,0,0,0,,All right, everyone. Textbooks open to page forty-two.
+Dialogue: 0,0:05:02.00,0:05:05.30,Default,,0,0,0,,You've been staring at that script all through lunch.
+Dialogue: 0,0:05:05.50,0:05:08.90,Default,,0,0,0,,Kozue-senpai left it on my desk. It's forty pages long.
+Dialogue: 0,0:05:09.10,0:05:12.04,Default,,0,0,0,,Ihave no idea what half these words mean.
+Dialogue: 0,0:05:13.10,0:05:14.99,Default,,0,0,0,,Let me see.
+Dialogue: 0,0:05:16.30,0:05:19.80,Default,,0,0,0,,{\i1}Fear not, Father. The salt bell shall sing until the sea grows still.{\i0}
+Dialogue: 0,0:05:20.10,0:05:22.30,Default,,0,0,0,,Who talks like that?
+Dialogue: 0,0:05:22.70,0:05:25.22,Default,,0,0,0,,People in old plays, I guess.
+Dialogue: 0,0:05:26.70,0:05:29.90,Default,,0,0,0,,And I have to say it while ringing a bell in the rain.
+Dialogue: 0,0:05:30.10,0:05:31.95,Default,,0,0,0,,Real rain?
+Dialogue: 0,0:05:34.00,0:05:37.30,Default,,0,0,0,,Gonda-san stands beside the stage with a watering can.
+Dialogue: 0,0:05:37.50,0:05:40.82,Default,,0,0,0,,Kenta thinks that's the best part of the whole show.
+Dialogue: 0,0:05:41.10,0:05:43.41,Default,,0,0,0,,Thats not helping, Kei.
+Dialogue: 0,0:05:45.10,0:05:48.10,Default,,0,0,0,,Sorry. Eat your rice ball. You'll need your strength.
+Dialogue: 0,0:05:48.30,0:05:50.80,Sign,,0,0,0,,Rehearsal Today, 4 PM — Sorabashi Community Hall
+Dialogue: 0,0:05:52.10,0:05:54.50,Default,,0,0,0,,Everyone, this is Mina. She'll be playing Sayo!
+Dialogue: 0,0:05:54.70,0:05:57.53,Default,,0,0,0,,Nice to meet you all. I'll do my best.
+Dialogue: 0,0:05:58.70,0:06:01.90,Default,,0,0,0,,Good to have you, Okuda. Don't worry about the lines yet.
+Dialogue: 0,0:06:02.10,0:06:04.90,Default,,0,0,0,,Hamaguchi-sensei? You're in the play?
+Dialogue: 0,0:06:06.00,0:06:09.30,Default,,0,0,0,,I've played Sayo's father for eight years. I'm practically a fisherman.
+Dialogue: 0,0:06:09.50,0:06:12.02,Default,,0,0,0,,He gets seasick on the ferry.
+Dialogue: 0,0:06:13.10,0:06:15.69,Default,,0,0,0,,That is a private matter, Sudo.
+Dialogue: 0,0:06:17.10,0:06:19.30,Default,,0,0,0,,Mina-chan! You came!
+Dialogue: 0,0:06:20.30,0:06:23.24,Default,,0,0,0,,Fumika-san! Should you be walking around?
+Dialogue: 0,0:06:24.10,0:06:26.50,Default,,0,0,0,,I'm hopping, not walking. I wanted to meet my Sayo.
+Dialogue: 0,0:06:26.70,0:06:29.71,Default,,0,0,0,,I'm so sorry. I'll never be as good as you.
+Dialogue: 0,0:06:30.70,0:06:33.90,Default,,0,0,0,,Nonsense. Sayo isn't brave at the start. She's scared, just like you.
+Dialogue: 0,0:06:34.10,0:06:36.79,Default,,0,0,0,,That's what makes the ending work.
+Dialogue: 0,0:06:38.00,0:06:40.90,Default,,0,0,0,,Kozue knows what she's doing. Trust her.
+Dialogue: 0,0:06:41.50,0:06:44.54,Default,,0,0,0,,Iet's start from the top of the storm scene.
+Dialogue: 0,0:06:45.10,0:06:48.60,Default,,0,0,0,,Places, everyone! Sudo-kun, how is the bell coming along?
+Dialogue: 0,0:06:49.10,0:06:51.93,Default,,0,0,0,,It's a bucket with a handle right now.
+Dialogue: 0,0:06:52.30,0:06:54.12,Default,,0,0,0,,A bucket?
+Dialogue: 0,0:06:56.10,0:06:58.50,Default,,0,0,0,,The real one will be ready befor Saturday.
+Dialogue: 0,0:06:58.70,0:07:01.60,Default,,0,0,0,,Then we'll use our imaginations. Action!
+Dialogue: 0,0:07:02.70,0:07:05.85,Default,,0,0,0,,Father! Father, can you hear me over the waves?
+Dialogue: 0,0:07:06.10,0:07:09.53,Default,,0,0,0,,A little louder, Mina. The back row is a long way away.
+Dialogue: 0,0:07:10.00,0:07:12.34,Default,,0,0,0,,Father! Can you hear me?
+Dialogue: 0,0:07:13.50,0:07:16.09,Default,,0,0,0,,Much better! Now ring the bell!
+Dialogue: 0,0:07:17.10,0:07:19.06,Default,,0,0,0,,Clang. Clang.
+Dialogue: 0,0:07:21.10,0:07:24.10,Default,,0,0,0,,Sudo-kun, please don't do the sound effects with your mouth.
+Dialogue: 0,0:07:24.30,0:07:26.68,Default,,0,0,0,,Then give me a real bell.
+Dialogue: 0,0:07:28.10,0:07:30.50,Default,,0,0,0,,The salt bell shall sing until... until the... um...
+Dialogue: 0,0:07:30.70,0:07:33.18,Default,,0,0,0,,"Until the sea grows still."
+Dialogue: 0,0:07:34.70,0:07:37.53,Default,,0,0,0,,S-Sorry! I knew that one this morning!
+Dialogue: 0,0:07:38.10,0:07:41.39,Default,,0,0,0,,It's fine. Everyone forgets lines on the first day.
+Dialogue: 0,0:07:42.00,0:07:44.55,Default,,0,0,0,,Kozue-senpai, I can't do this!
+Dialogue: 0,0:07:45.50,0:07:48.90,Default,,0,0,0,,Of course you can. Stop reading the words and start feeling them.
+Dialogue: 0,0:07:49.10,0:07:51.06,Default,,0,0,0,,Feeling what?
+Dialogue: 0,0:07:53.10,0:07:56.10,Default,,0,0,0,,The storm! The cold! Your father lost somewhere out in the dark!
+Dialogue: 0,0:07:56.30,0:07:58.68,Default,,0,0,0,,That's a lot of feelings.
+Dialogue: 0,0:08:00.10,0:08:02.44,Default,,0,0,0,,Gonda-san, you're early.
+Dialogue: 0,0:08:02.70,0:08:06.16,Default,,0,0,0,,I brought rice crackers for the cast. And some bad news.
+Dialogue: 0,0:08:06.70,0:08:09.90,Default,,0,0,0,,The fireworks company backed out. No fireworks this year.
+Dialogue: 0,0:08:10.10,0:08:12.97,Default,,0,0,0,,No fireworks? But that's the best part!
+Dialogue: 0,0:08:14.00,0:08:16.80,Default,,0,0,0,,Well, every cloud has a silver spoon.
+Dialogue: 0,0:08:17.50,0:08:19.95,Default,,0,0,0,,A silver lining, Gonda-san.
+Dialogue: 0,0:08:21.10,0:08:22.92,Default,,0,0,0,,That too.
+Dialogue: 0,0:08:25.10,0:08:28.10,Default,,0,0,0,,We still have the boats, and the boats are the heart of the festival.
+Dialogue: 0,0:08:28.30,0:08:31.59,Default,,0,0,0,,Mina, you're going to be great. Just trust the words.
+Dialogue: 0,0:08:32.10,0:08:34.50,Default,,0,0,0,,Okay. From my entrance, then.
+Dialogue: 0,0:08:34.70,0:08:37.11,Default,,0,0,0,,{\i1}The bell! I hear the bell!{\i0}
+Dialogue: 0,0:08:38.70,0:08:41.90,Default,,0,0,0,,Sensei, you're supposed to wait until she rings it.
+Dialogue: 0,0:08:42.10,0:08:44.34,Default,,0,0,0,,Sorry. I got excited.
+Dialogue: 0,0:08:46.00,0:08:49.30,Default,,0,0,0,,Let's take ten minutes. Sudo-kun, can you help me with the curtain?
+Dialogue: 0,0:08:49.50,0:08:52.19,Default,,0,0,0,,Hand me the the hammer, would you?
+Dialogue: 0,0:08:53.10,0:08:55.55,Default,,0,0,0,,Which one? There are three.
+Dialogue: 0,0:08:57.10,0:09:00.10,Default,,0,0,0,,The small one, with the tape on the handle.
+Dialogue: 0,0:09:00.30,0:09:03.17,Default,,0,0,0,,Kei, how do you always know what to do?
+Dialogue: 0,0:09:04.10,0:09:06.50,Default,,0,0,0,,I don't. I just look like I do.
+Dialogue: 0,0:09:06.70,0:09:09.15,Default,,0,0,0,,That's not very comforting.
+Dialogue: 0,0:09:10.70,0:09:13.90,Default,,0,0,0,,It's not supposed to be. It's supposed to be honest.
+Dialogue: 0,0:09:14.10,0:09:16.90,Default,,0,0,0,,Okay, everyone! That's all for today!
+Dialogue: 0,0:09:18.00,0:09:20.31,Default,,0,0,0,,Otsukaresama, everyone!
+Dialogue: 0,0:09:21.50,0:09:24.19,Default,,0,0,0,,Same time tomorrow. Don't be late!
+Dialogue: 0,0:09:25.10,0:09:27.58,Default,,0,0,0,,Whose locking up the storeroom tonight?
+Dialogue: 0,0:09:29.10,0:09:31.93,Default,,0,0,0,,Kei has the only key to the storeroom.
+Dialogue: 0,0:09:32.30,0:09:34.75,Default,,0,0,0,,I'll lock it on my way out.
+Dialogue: 0,0:09:36.10,0:09:38.50,Sign,,0,0,0,,Kaigara Street Shopping Arcade
+Dialogue: 0,0:09:38.70,0:09:41.67,Default,,0,0,0,,The whole street looks different at night.
+Dialogue: 0,0:09:42.70,0:09:45.64,Default,,0,0,0,,Everyone's hanging lanterns for Saturday.
+Dialogue: 0,0:09:46.10,0:09:49.60,Default,,0,0,0,,Look, even the Kurumiya sign has a lantern. Grandma must have done it.
+Dialogue: 0,0:09:50.00,0:09:53.29,Default,,0,0,0,,Hey, it's the Kurumiya girl! Good luck on Saturday!
+Dialogue: 0,0:09:53.50,0:09:56.09,Default,,0,0,0,,How does everyone know already?
+Dialogue: 0,0:09:57.10,0:10:00.53,Default,,0,0,0,,Gonda-san told the whole street at the morning meeting.
+Dialogue: 0,0:10:01.10,0:10:03.48,Default,,0,0,0,,He has a very loud voice.
+Dialogue: 0,0:10:04.30,0:10:07.80,Default,,0,0,0,,We'll all be there! I'm bringing melon bread from Kurumya for the whole cast.
+Dialogue: 0,0:10:08.10,0:10:10.50,Default,,0,0,0,,Thank you! I mean, you don't have to!
+Dialogue: 0,0:10:10.70,0:10:13.20,Sign,,0,0,0,,Fumika's Flowers — Closed This Week
+Dialogue: 0,0:10:14.70,0:10:17.81,Default,,0,0,0,,Fumika-san's shop looks so lonely without her.
+Dialogue: 0,0:10:18.10,0:10:20.60,Sign,,0,0,0,,Tingel Soda — Ice Cold Here
+Dialogue: 0,0:10:22.00,0:10:25.30,Default,,0,0,0,,Want a Tingel? The shops are giving them to festival helpers.
+Dialogue: 0,0:10:25.50,0:10:28.79,Default,,0,0,0,,Tingel is sponsoring the festival again this year.
+Dialogue: 0,0:10:29.10,0:10:31.62,Default,,0,0,0,,The melon one is my favorite.
+Dialogue: 0,0:10:33.10,0:10:35.48,Default,,0,0,0,,Thanks alot, Kei. Really.
+Dialogue: 0,0:10:36.30,0:10:38.26,Default,,0,0,0,,For the soda?
+Dialogue: 0,0:10:40.10,0:10:42.50,Default,,0,0,0,,For coming to rehearsal with me. I would have run away without you.
+Dialogue: 0,0:10:42.70,0:10:45.29,Default,,0,0,0,,You did try to run away. Twice.
+Dialogue: 0,0:10:46.70,0:10:49.85,Default,,0,0,0,,Don't worry about Saturday. It's a shore thing.
+Dialogue: 0,0:10:50.10,0:10:52.55,Default,,0,0,0,,Kei, that pun was terrible.
+Dialogue: 0,0:10:54.00,0:10:56.83,Default,,0,0,0,,The sea gives me all my best material.
+Dialogue: 0,0:10:57.50,0:11:00.00,Sign,,0,0,0,,Sudo Fish Market
+Dialogue: 0,0:11:01.10,0:11:04.32,Default,,0,0,0,,Y'all better have that bell done by Friday night!
+Dialogue: 0,0:11:05.10,0:11:06.92,Default,,0,0,0,,Yes, Dad!
+Dialogue: 0,0:11:08.30,0:11:10.43,Default,,0,0,0,,Evening, Sudo-san.
+Dialogue: 0,0:11:12.10,0:11:14.50,Default,,0,0,0,,Evening, Mina. I hear you're the new Sayo. Good for you.
+Dialogue: 0,0:11:14.70,0:11:17.43,Default,,0,0,0,,Come on, were almost at your place.
+Dialogue: 0,0:11:18.70,0:11:21.90,Default,,0,0,0,,The kids next door left there paper boats on our bench again.
+Dialogue: 0,0:11:22.10,0:11:24.83,Default,,0,0,0,,I'll drop them off on the way home.
+Dialogue: 0,0:11:26.00,0:11:28.31,Default,,0,0,0,,See you tomorrow, Mina.
+Dialogue: 0,0:11:29.50,0:11:31.56,Default,,0,0,0,,Good night, Kei.
+Dialogue: 0,0:11:33.10,0:11:35.60,Sign,,0,0,0,,Kurumiya Bakery — Closed for Today
+Dialogue: 0,0:11:37.10,0:11:38.92,Default,,0,0,0,,I'm home!
+Dialogue: 0,0:11:40.30,0:11:43.66,Default,,0,0,0,,Welcome back. Wash your hands. Dinner's almost ready.
+Dialogue: 0,0:11:44.10,0:11:46.50,Default,,0,0,0,,I made you an omlette. I know you skipped lunch.
+Dialogue: 0,0:11:46.70,0:11:48.80,Default,,0,0,0,,How did you know?
+Dialogue: 0,0:11:50.70,0:11:53.90,Default,,0,0,0,,You never eat when you're nervous. Your mother was the same.
+Dialogue: 0,0:11:54.10,0:11:56.02,Default,,0,0,0,,Itadakimasu!
+Dialogue: 0,0:11:58.00,0:12:00.80,Default,,0,0,0,,Look! I builded a boat all by myself!
+Dialogue: 0,0:12:01.50,0:12:04.75,Default,,0,0,0,,You built it all by yourself? It's amazing, Kenta.
+Dialogue: 0,0:12:05.10,0:12:07.83,Default,,0,0,0,,It has a flag. The flag says Kenta.
+Dialogue: 0,0:12:09.10,0:12:12.10,Default,,0,0,0,,Grandma, did you know about the bell? The real one?
+Dialogue: 0,0:12:12.30,0:12:15.80,Default,,0,0,0,,The salt bell? My father said he heard it ring once, when he was a boy.
+Dialogue: 0,0:12:16.10,0:12:17.99,Default,,0,0,0,,In a storm?
+Dialogue: 0,0:12:18.70,0:12:22.16,Default,,0,0,0,,No. On a perfectly calm night, with nobody in the tower.
+Dialogue: 0,0:12:22.70,0:12:24.69,Default,,0,0,0,,That's creepy.
+Dialogue: 0,0:12:26.10,0:12:29.60,Default,,0,0,0,,That's a story. And stories are what the festival is for.
+Dialogue: 0,0:12:30.00,0:12:32.55,Default,,0,0,0,,Mina, eat your vegetables too.
+Dialogue: 0,0:12:33.50,0:12:35.56,Default,,0,0,0,,I'm eating them.
+Dialogue: 0,0:12:37.10,0:12:39.65,Default,,0,0,0,,Onee-chan gave me her carrots.
+Dialogue: 0,0:12:41.10,0:12:42.81,Default,,0,0,0,,Kenta!
+Dialogue: 0,0:12:44.30,0:12:47.80,Default,,0,0,0,,Be quite, both of you, or you'll wake the neighbors' baby.
+Dialogue: 0,0:12:48.10,0:12:50.50,Default,,0,0,0,,Please dont tell anyone I almost quit today.
+Dialogue: 0,0:12:50.70,0:12:54.20,Default,,0,0,0,,I won't. But I think you should visit the library tomorrow.
+Dialogue: 0,0:12:54.70,0:12:56.62,Default,,0,0,0,,The library?
+Dialogue: 0,0:12:58.10,0:13:01.60,Default,,0,0,0,,There's a whole shelf about this town. Maybe the bell is in there.
+Dialogue: 0,0:13:02.00,0:13:04.66,Default,,0,0,0,,Hmph. Fine. I'll go after school.
+Dialogue: 0,0:13:05.50,0:13:08.58,Default,,0,0,0,,Can I come? I want to see the dinosaur books!
+Dialogue: 0,0:13:09.10,0:13:12.21,Default,,0,0,0,,You have kindergarten until three, Kenta-chan.
+Dialogue: 0,0:13:13.10,0:13:15.72,Default,,0,0,0,,But I want to see the dinosaurs!
+Dialogue: 0,0:13:16.30,0:13:19.38,Default,,0,0,0,,{\i1}Father, if you can hear me, follow the sound.{\i0}
+Dialogue: 0,0:13:20.10,0:13:22.50,Default,,0,0,0,,Follow the sound, and come home.
+Dialogue: 0,0:13:22.70,0:13:24.69,Default,,0,0,0,,I can do this.
+Dialogue: 0,0:13:26.70,0:13:28.52,Default,,0,0,0,,Probably.
+Dialogue: 0,0:13:30.10,0:13:32.60,Sign,,0,0,0,,Sorabashi Public Libary
+Dialogue: 0,0:13:34.00,0:13:36.66,Default,,0,0,0,,I haven't been in here for years.
+Dialogue: 0,0:13:37.50,0:13:39.39,Default,,0,0,0,,Since when?
+Dialogue: 0,0:13:41.10,0:13:44.60,Default,,0,0,0,,Elementary school. I borrowed a book about whales and never brought it back.
+Dialogue: 0,0:13:45.10,0:13:48.10,Default,,0,0,0,,Mina Okuda? You still owe us a book about whales.
+Dialogue: 0,0:13:48.30,0:13:51.27,Default,,0,0,0,,I'm so sorry! It's somewhere in my closet!
+Dialogue: 0,0:13:52.10,0:13:54.50,Default,,0,0,0,,I'll take that as a promise. What are you looking for today?
+Dialogue: 0,0:13:54.70,0:13:58.20,Default,,0,0,0,,Anything about the salt bell. The one from the old fish market.
+Dialogue: 0,0:13:58.70,0:14:01.20,Sign,,0,0,0,,Local History — Second Floor
+Dialogue: 0,0:14:02.10,0:14:05.60,Default,,0,0,0,,Local history is upstairs, by the window. Watch the third step.
+Dialogue: 0,0:14:06.00,0:14:09.25,Default,,0,0,0,,Here. "A History of Sorabashi Harbor," volume two.
+Dialogue: 0,0:14:09.50,0:14:12.05,Default,,0,0,0,,There's a photo! Look at this!
+Dialogue: 0,0:14:13.10,0:14:15.48,Default,,0,0,0,,Whaaat?! That's the bell?
+Dialogue: 0,0:14:17.10,0:14:20.10,Default,,0,0,0,,The real bell was much bigger then the one I'm making.
+Dialogue: 0,0:14:20.30,0:14:23.80,Default,,0,0,0,,"In 1931, the bell was taken down for repairs and stored at the town hall."
+Dialogue: 0,0:14:24.10,0:14:26.50,Default,,0,0,0,,"After that, there is no record of it."
+Dialogue: 0,0:14:26.70,0:14:30.20,Default,,0,0,0,,Wait. The community hall used to be the town hall, didn't it?
+Dialogue: 0,0:14:30.70,0:14:33.36,Default,,0,0,0,,So the bell might still be there?
+Dialogue: 0,0:14:34.10,0:14:37.39,Default,,0,0,0,,In the storeroom. The one only you have the key to.
+Dialogue: 0,0:14:38.00,0:14:40.31,Default,,0,0,0,,Can I borrow this book?
+Dialogue: 0,0:14:41.50,0:14:44.90,Default,,0,0,0,,You'll recieve a reminder when it's due. Please actually return it.
+Dialogue: 0,0:14:45.10,0:14:47.23,Default,,0,0,0,,I will! I promise!
+Dialogue: 0,0:14:49.10,0:14:51.97,Default,,0,0,0,,She said that about the whale book too.
+Dialogue: 0,0:14:52.30,0:14:54.80,Sign,,0,0,0,,Storeroom — Staff Only
+Dialogue: 0,0:14:56.10,0:14:58.37,Default,,0,0,0,,It's so dusty in here.
+Dialogue: 0,0:14:58.70,0:15:01.85,Default,,0,0,0,,Careful. Those boxes are older than both of us.
+Dialogue: 0,0:15:02.70,0:15:05.67,Default,,0,0,0,,Costumes, paper lanterns, a broken drum...
+Dialogue: 0,0:15:06.10,0:15:08.44,Default,,0,0,0,,What's under that sheet?
+Dialogue: 0,0:15:10.00,0:15:12.59,Default,,0,0,0,,It won't move. Help me pull it.
+Dialogue: 0,0:15:13.50,0:15:15.91,Default,,0,0,0,,On three. One, two, three!
+Dialogue: 0,0:15:17.10,0:15:19.86,Default,,0,0,0,,It's the bell. It's really the bell.
+Dialogue: 0,0:15:21.10,0:15:23.65,Default,,0,0,0,,It's been here the whole time.
+Dialogue: 0,0:15:24.30,0:15:27.48,Default,,0,0,0,,And we walked past this door everyday for years.
+Dialogue: 0,0:15:28.10,0:15:30.50,Default,,0,0,0,,We have to tell Kozue-senpai.
+Dialogue: 0,0:15:30.70,0:15:33.08,Default,,0,0,0,,We have to tell everyone.
+Dialogue: 0,0:15:34.70,0:15:37.64,Default,,0,0,0,,What's all the shouting about? Oh. Oh my.
+Dialogue: 0,0:15:38.10,0:15:41.60,Default,,0,0,0,,This changes everything. We're ringing the real bell on Saturday!
+Dialogue: 0,0:15:42.00,0:15:45.30,Default,,0,0,0,,Can it even ring? It's been sitting here for ninety years.
+Dialogue: 0,0:15:45.50,0:15:48.75,Default,,0,0,0,,There's only one way to find out. Mina, you do it.
+Dialogue: 0,0:15:49.10,0:15:50.71,Default,,0,0,0,,Me?
+Dialogue: 0,0:15:53.10,0:15:55.65,Default,,0,0,0,,You're Sayo. It should be you.
+Dialogue: 0,0:15:56.30,0:15:58.36,Default,,0,0,0,,Okay. Here goes.
+Dialogue: 0,0:16:00.10,0:16:02.06,Default,,0,0,0,,That sound...
+Dialogue: 0,0:16:02.70,0:16:04.73,Default,,0,0,0,,It's beautiful.
+Dialogue: 0,0:16:06.70,0:16:09.90,Default,,0,0,0,,Grandpa was right. You can hear it all the way down to the water.
+Dialogue: 0,0:16:10.10,0:16:13.60,Default,,0,0,0,,Sudo-kun, can your father build a stand for it by tommorow?
+Dialogue: 0,0:16:14.00,0:16:16.62,Default,,0,0,0,,He'll complain, but he'll do it.
+Dialogue: 0,0:16:17.50,0:16:20.00,Sign,,0,0,0,,Kozue: Final rehearsal at 5 tonight. Bring the bell!
+Dialogue: 0,0:16:21.10,0:16:24.11,Default,,0,0,0,,Mina, pack the cream buns in their own box.
+Dialogue: 0,0:16:25.10,0:16:27.97,Default,,0,0,0,,Got it. How many boxes are we bringing?
+Dialogue: 0,0:16:28.30,0:16:31.69,Default,,0,0,0,,Twelve. Gonda-san ordered four of them all by himself.
+Dialogue: 0,0:16:32.10,0:16:34.50,Default,,0,0,0,,He says the cast needs energy.
+Dialogue: 0,0:16:34.70,0:16:37.99,Default,,0,0,0,,He says that every year, and then he eats them all.
+Dialogue: 0,0:16:38.70,0:16:41.88,Default,,0,0,0,,So don't let him near the boxes before the show.
+Dialogue: 0,0:16:42.10,0:16:44.76,Default,,0,0,0,,Onee-chan, I folded twenty boats!
+Dialogue: 0,0:16:46.00,0:16:48.59,Default,,0,0,0,,Twenty? That's a lot of wishes.
+Dialogue: 0,0:16:49.50,0:16:51.84,Default,,0,0,0,,Can I float all of them?
+Dialogue: 0,0:16:53.10,0:16:55.27,Default,,0,0,0,,Dunno. Ask Grandma.
+Dialogue: 0,0:16:57.10,0:17:00.10,Default,,0,0,0,,This one is for you. It says "Don't be scared."
+Dialogue: 0,0:17:00.30,0:17:03.34,Default,,0,0,0,,Thank you, Kenta. I'll keep it in my pocket.
+Dialogue: 0,0:17:04.10,0:17:06.50,Sign,,0,0,0,,Paper Boat Festival — Saturday, 6 PM, Sagi Riverbank
+Dialogue: 0,0:17:06.70,0:17:09.67,Default,,0,0,0,,Which colour should the stage lanterns be?
+Dialogue: 0,0:17:10.70,0:17:13.53,Default,,0,0,0,,White, like the ones in the old photo.
+Dialogue: 0,0:17:14.10,0:17:17.00,Default,,0,0,0,,White it is! Write that down, Gonda-san.
+Dialogue: 0,0:17:18.00,0:17:21.29,Default,,0,0,0,,Gonda wants every boat lined up on the bank by six.
+Dialogue: 0,0:17:21.50,0:17:24.90,Default,,0,0,0,,The real bell needs a new stand. The old frame can't hold it.
+Dialogue: 0,0:17:25.10,0:17:28.18,Default,,0,0,0,,Dad welded one last night. It's in the truck.
+Dialogue: 0,0:17:29.10,0:17:32.10,Default,,0,0,0,,Kurumiya's stall is right next to the stage, so the cast can grab a snack.
+Dialogue: 0,0:17:32.30,0:17:34.80,Sign,,0,0,0,,Lost Child Center — Ask Here
+Dialogue: 0,0:17:36.10,0:17:38.50,Default,,0,0,0,,Wow, the whole riverbank is full.
+Dialogue: 0,0:17:38.70,0:17:41.32,Default,,0,0,0,,Stay close, Kenta. Hold my hand.
+Dialogue: 0,0:17:42.70,0:17:44.97,Default,,0,0,0,,Onee-chan, I'm hungry!
+Dialogue: 0,0:17:46.10,0:17:49.07,Default,,0,0,0,,Three taiyaki with red bean paste, please.
+Dialogue: 0,0:17:50.00,0:17:52.55,Default,,0,0,0,,This one has the biggest tail!
+Dialogue: 0,0:17:53.50,0:17:56.90,Default,,0,0,0,,Look at that stall. The banner says "Grilled Squib." They misspelled squid.
+Dialogue: 0,0:17:57.10,0:17:59.30,Default,,0,0,0,,Should we tell them?
+Dialogue: 0,0:18:01.10,0:18:04.10,Default,,0,0,0,,It's been like that for three years. It's a tradition now.
+Dialogue: 0,0:18:04.30,0:18:07.17,Default,,0,0,0,,There you two are! We start in an hour!
+Dialogue: 0,0:18:08.10,0:18:10.50,Default,,0,0,0,,Kei and I got hungry, so went to the noodle stand first.
+Dialogue: 0,0:18:10.70,0:18:13.81,Default,,0,0,0,,Mina, you need to be in costume by six thirty!
+Dialogue: 0,0:18:14.70,0:18:17.78,Default,,0,0,0,,Don't worry, ill be backstage in ten minutes.
+Dialogue: 0,0:18:18.10,0:18:21.39,Default,,0,0,0,,Mina, look! They're putting the boats in the water!
+Dialogue: 0,0:18:22.00,0:18:25.50,Song,,0,0,0,,Little boat of folded white
+Dialogue: 0,0:18:26.00,0:18:29.50,Song,,0,0,0,,Carry one small wish tonight
+Dialogue: 0,0:18:30.00,0:18:33.50,Song,,0,0,0,,Past the bridge and past the pier
+Dialogue: 0,0:18:34.00,0:18:37.50,Song,,0,0,0,,Tell the sea that I am here
+Dialogue: 0,0:18:38.00,0:18:41.50,Song,,0,0,0,,La la la, la la lo, where the gentle waters go
+Dialogue: 0,0:18:42.00,0:18:45.50,Song,,0,0,0,,Every lantern is a name
+Dialogue: 0,0:18:46.00,0:18:49.50,Song,,0,0,0,,Every name becomes a flame
+Dialogue: 0,0:18:50.00,0:18:53.50,Song,,0,0,0,,Float with me until the morning comes
+Dialogue: 0,0:18:54.00,0:18:56.03,Default,,0,0,0,,It's so pretty.
+Dialogue: 0,0:18:57.50,0:18:59.88,Default,,0,0,0,,Did you put your boat in?
+Dialogue: 0,0:19:01.10,0:19:03.65,Default,,0,0,0,,Kenta wanted to do it himself.
+Dialogue: 0,0:19:05.10,0:19:07.65,Default,,0,0,0,,Bye-bye, boat! Don't get lost!
+Dialogue: 0,0:19:08.30,0:19:11.73,Default,,0,0,0,,Sudo-kun, whatever happens, don't loose this cue sheet.
+Dialogue: 0,0:19:12.10,0:19:14.50,Sign,,0,0,0,,Tonight at 7 PM: "The Salt Bell" — Festival Stage
+Dialogue: 0,0:19:14.70,0:19:17.39,Default,,0,0,0,,Lemme fix your collar. Hold still.
+Dialogue: 0,0:19:18.70,0:19:21.36,Default,,0,0,0,,Fumika-san, thank you for coming.
+Dialogue: 0,0:19:22.10,0:19:25.14,Default,,0,0,0,,I wouldn't miss it. You look just like Sayo.
+Dialogue: 0,0:19:26.00,0:19:28.48,Default,,0,0,0,,My hands won't stop shaking.
+Dialogue: 0,0:19:29.50,0:19:32.19,Default,,0,0,0,,Just breath slowly and look at me.
+Dialogue: 0,0:19:33.10,0:19:35.41,Default,,0,0,0,,In and out. In and out.
+Dialogue: 0,0:19:37.10,0:19:39.58,Default,,0,0,0,,Sensei, are you nervous too?
+Dialogue: 0,0:19:40.30,0:19:42.92,Default,,0,0,0,,Terribly. I get sick every year.
+Dialogue: 0,0:19:44.10,0:19:46.50,Default,,0,0,0,,That's not making me feel better!
+Dialogue: 0,0:19:46.70,0:19:49.29,Default,,0,0,0,,Five minutes, everyone! Places!
+Dialogue: 0,0:19:50.70,0:19:52.59,Default,,0,0,0,,Mina. Here.
+Dialogue: 0,0:19:54.10,0:19:57.18,Default,,0,0,0,,The rope from the bell? There's a knot in it.
+Dialogue: 0,0:19:58.00,0:20:00.94,Default,,0,0,0,,So you know where to hold it in the dark.
+Dialogue: 0,0:20:01.50,0:20:03.42,Default,,0,0,0,,Thanks, Kei.
+Dialogue: 0,0:20:05.10,0:20:08.28,Default,,0,0,0,,Ring it like you mean it. It's the real one now.
+Dialogue: 0,0:20:09.10,0:20:12.10,Default,,0,0,0,,{\i1}The storm has come, and still the boats are out.{\i0}
+Dialogue: 0,0:20:12.30,0:20:14.85,Default,,0,0,0,,Father! Father, where are you?
+Dialogue: 0,0:20:16.10,0:20:18.50,Default,,0,0,0,,{\i1}Sayo! Stay inside! The waves are too high!{\i0}
+Dialogue: 0,0:20:18.70,0:20:21.88,Default,,0,0,0,,I won't stay inside! Not while you're out there!
+Dialogue: 0,0:20:22.70,0:20:25.04,Default,,0,0,0,,Kei, don't pull that ro—
+Dialogue: 0,0:20:26.10,0:20:27.92,Default,,0,0,0,,Too late.
+Dialogue: 0,0:20:30.00,0:20:33.30,Default,,0,0,0,,Gonda-san! Did you tie a bucket of water to that rope?
+Dialogue: 0,0:20:33.50,0:20:35.60,Default,,0,0,0,,It's a big storm!
+Dialogue: 0,0:20:37.10,0:20:40.11,Default,,0,0,0,,This is definately not how we rehearsed it.
+Dialogue: 0,0:20:41.10,0:20:43.62,Default,,0,0,0,,Keep going, Mina. Keep going.
+Dialogue: 0,0:20:44.30,0:20:47.80,Default,,0,0,0,,Dost thou hear it, Father? The bell yet calleth thee home!
+Dialogue: 0,0:20:48.10,0:20:50.30,Default,,0,0,0,,Is that a real bell?
+Dialogue: 0,0:20:50.70,0:20:53.57,Default,,0,0,0,,It's the salt bell. I can't believe it.
+Dialogue: 0,0:20:54.70,0:20:57.90,Default,,0,0,0,,I heard that sound when I was a boy. I swear I did.
+Dialogue: 0,0:20:58.10,0:21:00.76,Default,,0,0,0,,{\i1}I hear it! Sayo, I hear the bell!{\i0}
+Dialogue: 0,0:21:02.00,0:21:04.94,Default,,0,0,0,,Follow the sound, Father! Follow it home!
+Dialogue: 0,0:21:05.50,0:21:07.95,Default,,0,0,0,,Nooooo! I ran out of water!
+Dialogue: 0,0:21:09.10,0:21:12.28,Default,,0,0,0,,Gonda-san, the storm is supposed to be over now.
+Dialogue: 0,0:21:13.10,0:21:14.92,Default,,0,0,0,,Oh. Good.
+Dialogue: 0,0:21:16.30,0:21:19.31,Default,,0,0,0,,The boats are coming in. Every one of them.
+Dialogue: 0,0:21:20.10,0:21:22.48,Default,,0,0,0,,Thank you all for coming!
+Dialogue: 0,0:21:22.70,0:21:25.08,Default,,0,0,0,,Mina! You were wonderful!
+Dialogue: 0,0:21:26.70,0:21:29.85,Default,,0,0,0,,Good work, Okuda. You were a real Sayo tonight.
+Dialogue: 0,0:21:30.10,0:21:32.34,Default,,0,0,0,,Sooo... still scared?
+Dialogue: 0,0:21:34.00,0:21:36.59,Default,,0,0,0,,Terrified. But it was worth it.
+Dialogue: 0,0:21:37.50,0:21:40.26,Default,,0,0,0,,Look, its starting to rain for real.
+Dialogue: 0,0:21:41.10,0:21:44.49,Default,,0,0,0,,Gonda-san, put the watering can down. This one's real.
+Dialogue: 0,0:21:45.10,0:21:48.10,Default,,0,0,0,,I said yes becuase nobody else would. But I'm glad I did.
+Dialogue: 0,0:21:48.30,0:21:50.05,Default,,0,0,0,,Me too.
+Dialogue: 0,0:21:52.10,0:21:54.50,Default,,0,0,0,,The boats all made it to the harbor.
+Dialogue: 0,0:21:54.70,0:21:57.01,Default,,0,0,0,,Just like in the story.
+Dialogue: 0,0:21:58.70,0:22:01.64,Default,,0,0,0,,Kei. Thanks for finding the bell with me.
+Dialogue: 0,0:22:02.10,0:22:05.04,Default,,0,0,0,,You found it. I just held the flashlight.
+Dialogue: 0,0:22:06.00,0:22:08.06,Default,,0,0,0,,That's not true.
+Dialogue: 0,0:22:09.50,0:22:11.67,Default,,0,0,0,,It's a little true.
+Dialogue: 0,0:22:13.10,0:22:16.60,Song,,0,0,0,,The streetlights blink awake one by one
+Dialogue: 0,0:22:17.10,0:22:20.60,Song,,0,0,0,,I count my steps along the river wall
+Dialogue: 0,0:22:21.10,0:22:24.60,Song,,0,0,0,,l'm still the girl who's scared of saying goodbye
+Dialogue: 0,0:22:25.10,0:22:28.60,Song,,0,0,0,,But you laughed and pulled me through the rain
+Dialogue: 0,0:22:29.10,0:22:32.60,Song,,0,0,0,,'Neath a sky of paper moons, we walk
+Dialogue: 0,0:22:33.10,0:22:36.60,Song,,0,0,0,,The summer smells of salt and evening bread
+Dialogue: 0,0:22:37.10,0:22:40.60,Song,,0,0,0,,Don't let go, the evening's almost done
+Dialogue: 0,0:22:41.10,0:22:44.60,Song,,0,0,0,,I'll remember how the lanterns glowed
+Dialogue: 0,0:22:45.10,0:22:48.60,Song,,0,0,0,,Even when the boats have sailed away
+Dialogue: 0,0:22:49.10,0:22:52.60,Song,,0,0,0,,There's a song still ringing in my chest
+Dialogue: 0,0:22:53.10,0:22:56.60,Song,,0,0,0,,Tomorrow I will find a braver me
+Dialogue: 0,0:22:57.10,0:23:00.60,Song,,0,0,0,,Stay with me until the streetlights fade
+Dialogue: 0,0:23:01.10,0:23:03.60,Sign,,0,0,0,,Lost Salt Bell Rings Again After 90 Years
+Dialogue: 0,0:23:05.10,0:23:08.10,Default,,0,0,0,,Good morning! I'll take two melon breads, please!
+Dialogue: 0,0:23:08.30,0:23:10.96,Default,,0,0,0,,Gonda-san, you're in a good mood.
+Dialogue: 0,0:23:12.10,0:23:14.50,Default,,0,0,0,,Have you seen the paper? We're on the front page!
+Dialogue: 0,0:23:14.70,0:23:18.20,Default,,0,0,0,,The festival was a triumph! Next year will be bigger and better!
+Dialogue: 0,0:23:18.70,0:23:21.88,Default,,0,0,0,,Next year, Fumika-chan will be back on her feet.
+Dialogue: 0,0:23:22.10,0:23:25.53,Default,,0,0,0,,She already told me. She wants Mina to play Sayo again.
+Dialogue: 0,0:23:26.00,0:23:29.15,Default,,0,0,0,,Mina was the best Sayo this town has ever seen.
+Dialogue: 0,0:23:29.50,0:23:32.75,Default,,0,0,0,,I left a letter from the newspaper on the counter.
+Dialogue: 0,0:23:33.10,0:23:36.25,Default,,0,0,0,,They want a photo of the bell. And one of Mina.
+Dialogue: 0,0:23:37.10,0:23:39.72,Default,,0,0,0,,That girl ain't one for cameras.
+Dialogue: 0,0:23:40.30,0:23:42.99,Default,,0,0,0,,Morning, Sudo-san. The usual fish?
+Dialogue: 0,0:23:44.10,0:23:46.50,Default,,0,0,0,,The usual. And tell Mina the whole harbor heard that bell.
+Dialogue: 0,0:23:46.70,0:23:49.74,Default,,0,0,0,,Onee-chan! Wake up! You're in the newspaper!
+Dialogue: 0,0:23:50.70,0:23:52.90,Default,,0,0,0,,Five more minutes...
+Dialogue: 0,0:23:54.10,0:23:57.14,Default,,0,0,0,,Kenta, let your sister sleep untill lunch. She earned it.

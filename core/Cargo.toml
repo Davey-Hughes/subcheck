@@ -34,5 +34,12 @@ tempfile.workspace = true
 # `group`'s tests point a child's stderr elsewhere.
 rustix = { workspace = true, features = ["stdio"] }
 
+# `test = true` makes `cargo test` (and so CI and the coverage run) run the bench's own tests, which
+# tie its answer key to its script.
+[[example]]
+name = "bench"
+path = "examples/bench/main.rs"
+test = true
+
 [lints]
 workspace = true

@@ -360,6 +360,10 @@ ffmpeg -nostdin -loglevel error -y -i "$src/audio-short.flac" -ar 48000 -c:a ac3
 mux -o "$out/audio-ac3.mkv" --language 0:eng --track-name '0:FLAC' "$src/audio-short.flac" \
   --language 0:eng --track-name '0:AC-3 by ffmpeg' --default-track-flag 0:no "$src/audio-short.ac3"
 
+# The invented episode the benchmark (core/examples/bench) scans, muxed from its source there, where
+# its answer key sits beside it.
+mux -o "$out/bench.mkv" --language 0:eng --track-name '0:English Full' core/examples/bench/script.ass
+
 # The oracle: mkvextract's output for every text subtitle track, named the way `subcheck extract`
 # names its default output (<stem>.track<ID>.<ext>).
 for mkv in "$out"/*.mkv; do

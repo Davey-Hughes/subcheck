@@ -208,6 +208,21 @@ pub fn answered(r: &Request) -> Reply {
     Reply::ok(completion(r).to_string())
 }
 
+/// A finished chat completion whose reply is `content`, with 1000 prompt and 50 reply tokens: what
+/// a test's own route answers a call with.
+pub fn chat_reply(content: &str) -> Reply {
+    let completion = serde_json::json!({
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 1000, "completion_tokens": 50, "total_tokens": 1050},
+    });
+    Reply::ok(completion.to_string())
+}
+
 /// fake-llm.sh's chat completion for `r`'s last message, with the prompt counted as subcheck
 /// estimates it ([`llm::estimate`]) and none of it cached: fake-llm.sh gives every prompt the same
 /// count, too many for a call's share of the small contexts tests fit chunks to, where a count that

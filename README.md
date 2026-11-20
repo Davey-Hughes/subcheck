@@ -271,15 +271,20 @@ The settings file defines LLMs of your own for `--llm` to pick by name. It is
 `~/Library/Application Support/subcheck/` on macOS), or the absolute path in `SUBCHECK_CONFIG`. No
 file is the same as an empty one.
 
-```toml
-default = "local"
+How many typos an LLM finds, and how much of what it flags is a real mistake, depends on the
+model. subcheck's prompt was written with claude, and a small local model finds fewer typos and
+flags more lines that need no fix. [Measuring a model](#measuring-a-model) compares LLMs on an
+invented episode.
 
-[llm.local]
+```toml
+default = "home"
+
+[llm.home]
 url = "http://127.0.0.1:8000/v1"
 jobs = 4
 shared_context = false
 
-[llm.local.request]
+[llm.home.request]
 temperature = 1.0
 top_k = 64
 top_p = 0.95
@@ -432,6 +437,209 @@ Keychain or an unlocked agent works.
 
 A key sent over plain `http://` to another machine warns. A server on this machine is never
 called through a proxy.
+
+### Servers, by example
+
+Each command below starts a server on this machine with a context of 16384 tokens, and the entry
+after it is the one for that server. A larger context sends more lines in each call, up to 400
+([Fitting the context](#fitting-the-context)).
+
+llama-server's default port differs between builds, so the command names one:
+
+```sh
+llama-server -m <model>.gguf --alias local -c 16384 --parallel 2 --port 8080
+```
+
+```toml
+[llm.local]
+url = "http://127.0.0.1:8080/v1"
+jobs = 2
+
+[llm.local.request]
+temperature = 1.0
+top_k = 64
+top_p = 0.95
+```
+
+`--alias local` has `/models` list `local` in place of the file's path, so a run records
+`local@local`. `--parallel` sets the server's slots, and `jobs` is at most that many: a call
+beyond them waits for a slot. The slots share the context, so `shared_context` stays `true`, which
+fits each call to half of it here. The `request` table sets the sampling of every call in place of
+the server's defaults, with the values the model's card gives.
+
+vLLM:
+
+```sh
+vllm serve <org>/<model> --max-model-len 16384 --port 8000
+```
+
+```toml
+[llm.vllm]
+url = "http://127.0.0.1:8000/v1"
+shared_context = false
+jobs = 4
+```
+
+vLLM gives each call in flight all of `--max-model-len`, hence `shared_context = false`, and runs
+the calls in flight as one batch, so four at once finish a scan sooner than two.
+
+`ollama:<model>` needs no entry. The context is `OLLAMA_CONTEXT_LENGTH`
+([Fitting the context](#fitting-the-context)), set where the server starts, or in its service's
+environment where Ollama runs as one:
+
+```sh
+OLLAMA_CONTEXT_LENGTH=16384 ollama serve
+subcheck scan --llm ollama:<model> <path>
+```
+
+An entry whose `url` is Ollama's `/v1` goes through Ollama's OpenAI API instead, for a `request`
+table of your own. Ollama lists every model pulled, so the entry names one, and
+`shared_context = false` gives each call the whole context, as `ollama:<model>` does:
+
+```toml
+[llm.ollama-v1]
+url = "http://127.0.0.1:11434/v1"
+model = "<model>"
+shared_context = false
+
+[llm.ollama-v1.request]
+temperature = 0.5
+```
+
+A hosted API needs only its entry. `api_key_env` names the variable that holds its key; the
+`openrouter` entry above gets its key from a command instead, with `api_key_cmd` ([Keys](#keys)).
+`thinking = "server"` is for an API that refuses the switches that turn thinking off:
+
+```toml
+[llm.hosted]
+url = "https://openrouter.ai/api/v1"
+model = "<org>/<model>"
+api_key_env = "OPENROUTER_API_KEY"
+thinking = "server"
+```
+
+A command entry reads the prompt on stdin and prints the reply, and `output` says how to read what
+it prints, one entry here for each:
+
+```toml
+[llm.ask]
+command = "llm -m <model>"
+
+[llm.post]
+command = "post-chat <model>"
+output = "openai"
+
+[llm.claude-cmd]
+command = "claude -p --output-format json --model <model>"
+output = "claude"
+
+[llm.codex-cmd]
+command = "codex exec --json --skip-git-repo-check --model <model>"
+output = "codex"
+```
+
+`ask` keeps the default `output`, `"text"`, for a command that prints the reply alone, as
+[llm](https://llm.datasette.io) does. `post-chat` stands for a script of your own that posts the
+prompt to a chat API and prints the JSON the API returns. `claude-cmd` and `codex-cmd` run claude
+and Codex with flags of your own, here `--model`. A command entry runs its command as written,
+without the other flags the `claude` and `gpt` presets pass, such as those that keep each call from
+loading your hooks or saving a session. Codex refuses to run outside a git repository without
+`--skip-git-repo-check`, and the command runs in the directory subcheck was started in.
+
+### Measuring a model
+
+From a checkout, the bench scans an invented episode with each LLM named and scores its findings
+against the episode's answer key:
+
+```sh
+cargo run -p subcheck-core --example bench -- [-v] <llm>...
+```
+
+Each `<llm>` is a name `--llm` takes, a preset or an entry in the settings file `scan` reads
+(`SUBCHECK_CONFIG` names another). The episode is `core/examples/bench/script.ass`: dialogue, an
+opening, an insert song, an ending and signs, with typos planted in it. Its key, `answers.toml`
+beside it, lists each planted typo, with the fixes that count as right, and each trap: a line with
+nothing to fix that looks as if it needs one, such as a name, an honorific, slang, a stutter or a
+lyric. Each LLM scans it into a store of its own in a scratch directory, which the bench deletes
+when it ends. A bench stopped with Ctrl-C leaves the directory behind, a `.tmp…` one in `$TMPDIR`
+or `/tmp`. Your store is never touched, and an LLM named twice is scanned twice, not skipped as
+checked.
+
+The first line it prints counts what the key holds, `bench.mkv: <n> planted typos, <n> traps`,
+and a table follows, with a row for each LLM, such as this one for a llama-server entry:
+
+```
+llm          jobs  lines/call  right  other fix  missed  false alarms  other   time  calls                tokens
+local@local     2         155     27          0       3             3      0  21.8s      3  12.9k in / 1.12k out
+```
+
+The columns:
+
+- `llm` is the LLM as its run records it, `<entry>@<model>` for a server or `ollama:<model>` as
+  named, or as named when it failed before that.
+- `jobs` is the calls in flight, and `lines/call` the lines sent in each, as fitted to the context.
+- `right` is the typos whose corrected line is one the key lists.
+- `other fix` is the typos found but corrected some other way. A curly apostrophe where the key has
+  a straight one counts here, as `apply` would write it.
+- `missed` is the typos with no finding.
+- `false alarms` is the traps flagged, one for each line however many findings it has.
+- `other` is the findings on lines the key does not name. Those lines have nothing to fix, so these
+  are false alarms too, on plain lines; a name or honorific flagged in a line that is not a trap
+  counts here.
+- `time` is how long the scan took from start to end. It leaves out the server check and the load
+  subcheck has Ollama make (`loading <model> into Ollama at <address>`). A server that loads its
+  model on the first call counts that load in the first row of its LLM.
+- `calls` and `tokens` are the calls made and the tokens in and out, as [LLM costs](#llm-costs)
+  counts them, with `-` for an LLM that reports no tokens.
+
+A row whose LLM failed ends after `lines/call` with `failed: <why>`, and has 0 for a column it
+failed before learning. The other LLMs still run, and the bench exits with 1.
+
+Two of the planted typos, `befor` and `trough`, are the examples the scan's prompt gives, so every
+model is shown those two. Four are a missing apostrophe alone (`Thats`, `dont`, `its`, `were`),
+which a model that takes the prompt's rule against reporting punctuation literally may skip, and
+a model that obeys its rule against reporting names may skip `Kurumya`, the bakery `Kurumiya`
+misspelt. A model samples at random, so its rows differ from one run to the next; name an LLM
+several times (`local local local`) to see by how much. An LLM's first row may run with the
+server's cache cold, where later rows find the same prompts cached, and may hold the load of a
+server that loads its model on the first call. So compare first rows only between servers that load
+the same way, or name the LLM once more and leave its first row out, which works when that LLM's
+rows run back to back.
+
+Warnings, such as the one for a server that says no context size, go to stderr, as does the
+line saying Ollama is loading a model. `-v` also shows on stderr what the scans say of each file
+as they run, and after the table, under each row's number and LLM, a line for each typo it missed
+or fixed another way, each trap it flagged and each other finding:
+
+```
+1. <llm>
+  missed [<kind>] <line>
+  other fix [<kind>] <line> -> <fix> (<reason>)
+  false alarm [<kind>] <line> -> <fix> (<reason>)
+  other <line> -> <fix> (<reason>)
+```
+
+`<kind>` is the key's, such as `misspelling`, `apostrophe` or `honorific`; `<fix>` and
+`<reason>` are the LLM's. A line break in a failed row's reason, or in an LLM's label, line, fix or
+reason, shows as `; `, so each row and each of these lines stays one line.
+
+When a real scan finds a kind of typo the episode lacks, or a model flags a line it should not, an
+invented line of the same pattern joins `script.ass`, never the real line: no line of the episode
+comes from a real show. Its entry in `answers.toml` is a `[[typo]]`, with its `kind`, its `line`
+and each `fixed` line that counts as right, or a `[[trap]]`, with its `kind` and `line`.
+`dev/make-fixtures.sh` builds `bench.mkv` from the script, and every other fixture with it, which
+another version of mkvmerge or ffmpeg can make differently from the committed ones. So build them
+into a scratch directory, `<dir>` here, and copy back only the bench's two files, from the
+checkout's root:
+
+```sh
+dev/make-fixtures.sh <dir>
+cp <dir>/bench.mkv core/tests/fixtures/
+cp <dir>/expected/bench.track0.ass core/tests/fixtures/expected/
+```
+
+The tests check that each answer is the text of exactly one line, with no markup in it, that no two
+lines read the same, and that the fixture holds the script as it is.
 
 ## LLM costs
 
