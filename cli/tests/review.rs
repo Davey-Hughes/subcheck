@@ -2,6 +2,8 @@
 //! run's view and by `list`. The screen itself is not drawn here; `tui::view` has its own tests.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use crossterm::event::KeyCode;
 use subcheck_cli::mpv::Player;
@@ -71,23 +73,40 @@ fn checked(store: &mut Store, scan: &ScanRow, path: &str, findings: Vec<Finding>
         .unwrap();
 }
 
-/// The event loop's inner part: a message, then every effect it leads to, run for real.
-fn send(m: &mut Review, s: &mut Screen, msg: Msg, runner: &mut Runner<Msg>, player: &mut Player) {
+/// What the event loop runs effects with: the runner, and the channel its check lanes answer on.
+struct Looped {
+    runner: Runner<Msg>,
+    rx: mpsc::Receiver<Msg>,
+}
+
+/// The event loop's inner part: a message, then every effect it leads to, run for real; then,
+/// while review waits for `o`'s file check or a view switch, the next message on the loop's
+/// channel, which brings each check's answer from its lane, and what it leads to in turn.
+fn send(m: &mut Review, s: &mut Screen, msg: Msg, runner: &mut Looped, player: &mut Player) {
     let now = jiff::Timestamp::now();
-    let mut queue: VecDeque<_> = screen::update(m, s, msg, now).into();
-    while let Some(effect) = queue.pop_front() {
-        let input = run_effect(effect, runner, player);
-        queue.extend(screen::update(m, s, input.into(), now));
+    let mut next = Some(msg);
+    while let Some(msg) = next.take() {
+        let mut queue: VecDeque<_> = screen::update(m, s, msg, now).into();
+        while let Some(effect) = queue.pop_front() {
+            if let Some(input) = run_effect(effect, &mut runner.runner, player) {
+                queue.extend(screen::update(m, s, input.into(), now));
+            }
+        }
+        if m.stamping.is_some() || m.switching.is_some() {
+            let msg = runner.rx.recv_timeout(Duration::from_secs(30));
+            next = Some(msg.expect("a check's lane answers"));
+        }
     }
 }
 
 /// A runner writing through a connection of its own to `store`'s database, which each test reads
 /// back through `store`.
-fn runner_on(store: &Store) -> Runner<Msg> {
-    // No test here starts a scan, so the runner's jobs send nothing and the receiver can go.
-    let (tx, _) = std::sync::mpsc::channel();
+fn runner_on(store: &Store) -> Looped {
+    // No test here starts a scan, so only the check lanes send to the channel.
+    let (tx, rx) = mpsc::channel();
     // Where apply would write its tracks: no test here starts apply, so nothing goes there.
-    Runner::new(store.reopen().unwrap(), "/no-state".into(), tx)
+    let runner = Runner::new(store.reopen().unwrap(), "/no-state".into(), tx);
+    Looped { runner, rx }
 }
 
 #[test]
@@ -163,8 +182,8 @@ fn decisions_made_in_review_are_in_the_store() {
     assert_eq!(run.state_of(3), State::Pending);
     assert_eq!(run.state_of(1), State::Accepted);
 
-    // The file not on disk, `o` reads its stamp through the loop's runner and says so in the
-    // status line, asking nothing of mpv.
+    // The file not on disk, `o` reads its stamp on the runner's lane and says so in the status
+    // line, asking nothing of mpv.
     model.filter = Filter::All;
     send(&mut model, &mut screen, key('o'), &mut runner, &mut player);
     assert_eq!(

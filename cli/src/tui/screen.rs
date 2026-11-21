@@ -35,7 +35,8 @@ pub enum Msg {
     Resize(u16, u16),
     /// A mouse action at a column and row of the screen.
     Mouse(Mouse, u16, u16),
-    /// No message came for a quarter of a second while a job runs: the spinner turns.
+    /// No message came for a quarter of a second while a job runs, or `o`'s file check waits: the
+    /// spinner turns.
     Tick,
 }
 
@@ -90,7 +91,7 @@ pub struct Screen {
     pub show_cost: bool,
     /// The editor, while the review edits an entry: its text and cursor are the screen's.
     pub editor: Option<Editor>,
-    /// The loop's ticks while a job runs (`Msg::Tick`): the spinner's step.
+    /// The loop's ticks while a job runs or a check waits (`Msg::Tick`): the spinner's step.
     pub ticks: usize,
 }
 
@@ -156,19 +157,28 @@ impl Screen {
         layout::right_shown(status, items, left).then_some(items)
     }
 
-    /// The spinner's step, beside what a job is doing.
+    /// The spinner's step, beside what a job is doing or after what the status line says while a
+    /// check waits.
     pub fn spinner(&self) -> char {
         SPINNER[self.ticks % SPINNER.len()]
     }
 
     /// What the status line `line` says: review's ([`status`]); else what the run's LLM calls
-    /// cost while [`Screen::show_cost`] holds, as much of it as fits beside `? help`.
+    /// cost while [`Screen::show_cost`] holds, as much of it as fits beside `? help`. While `o`'s
+    /// file check waits ([`Review::stamping`]), the spinner after it, or alone with nothing said:
+    /// on a share that does not answer the wait has no end in sight, and a line that never moves
+    /// would read as a screen that hung.
     pub fn status_text(&self, m: &Review, line: Rect) -> Option<String> {
-        status(m).or_else(|| {
+        let text = status(m).or_else(|| {
             self.show_cost
                 .then(|| cost_status(&m.run.spent, line))
                 .flatten()
-        })
+        });
+        if m.stamping.is_none() {
+            return text;
+        }
+        let spinner = self.spinner();
+        Some(text.map_or_else(|| spinner.to_string(), |text| format!("{text} {spinner}")))
     }
 }
 
@@ -326,9 +336,10 @@ pub fn update(m: &mut Review, s: &mut Screen, msg: Msg, now: Timestamp) -> Vec<E
 /// A job's step or an effect's result, taken by `update::update`; then the screen follows what it
 /// did to the list.
 fn follow(m: &mut Review, s: &mut Screen, input: Input, now: Timestamp) -> Vec<Effect> {
-    let switched = matches!(input, Input::Switched(Ok(_)));
+    // Another view is taken only on the newest switch's answer: an older one's changes nothing.
+    let view = m.view_number;
     let effects = update::update(m, input, now);
-    if switched {
+    if m.view_number != view {
         // Another view: its lists and its detail start at the top, no click came in it yet, and
         // the spinner starts over.
         s.scroll = 0;

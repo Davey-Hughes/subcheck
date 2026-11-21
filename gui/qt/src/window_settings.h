@@ -99,7 +99,8 @@ public:
     // maximized last time comes back to its own size when it is restored.
     void show(QQuickWindow *window);
 
-    // Keeps what the window last said, if it has said anything since this last ran.
+    // Keeps what the window last said, if it has said anything since this last ran, and writes
+    // everything kept to the store at once.
     void keep();
 
     int sidebarWidth() const;

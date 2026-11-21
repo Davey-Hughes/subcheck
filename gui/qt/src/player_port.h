@@ -67,6 +67,12 @@ public:
     void run(const subcheck_ffi::PlayerCommand &command);
     // Review has ended: what waits is dropped, playback stops, and nothing more is reported.
     void release();
+    // After release: `then(true)` once mpv has ended the file it had, or `then(false)` once
+    // `within` has passed without, as when its open waits on a share that does not answer. mpv's
+    // path, read once, says whether it has one: with none, or with no mpv, or one not ready, which
+    // has loaded nothing, `then(true)` at once; with one, at that file's end. Not mpv's idle flag,
+    // which says idle from the stop on, while mpv still waits on the file's open.
+    void whenFileEnds(std::chrono::milliseconds within, std::function<void(bool ended)> then);
 
     // What mpv says: that it can show video; a request's answer, with mpv's error text or none;
     // that playback has started again after a load or a seek; that the position has changed; and
@@ -124,6 +130,7 @@ private:
     void where();
     void noAnswer();
     void notReady();
+    void saidEnded(bool ended);
     void fail(const subcheck_ffi::PlayerError &why);
     void finish(const subcheck_ffi::PlayerReport &report);
 
@@ -159,4 +166,10 @@ private:
     std::optional<std::string> late;
     // What openingChanged last said.
     bool saidOpening = false;
+    // whenFileEnds's: its read of the path, until mpv answers it; whether mpv then had a file, or
+    // may have, whose end the wait is for; the wait's whole time; and what it calls.
+    std::uint64_t pathAsked = 0;
+    bool fileHeld = false;
+    QTimer endLimit;
+    std::function<void(bool ended)> onEnd;
 };

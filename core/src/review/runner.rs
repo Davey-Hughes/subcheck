@@ -1,21 +1,24 @@
-//! What review's tasks do ([`Runner`]): the store's reads and writes, and the jobs that check files
-//! again and apply fixes, each on a thread of its own ([`super::jobs`]). Nothing here knows the
-//! UI: the jobs send their inputs to the channel the runner was given, the one `update`'s
-//! inputs come in on, the terminal's loop's or a session's.
+//! What review's tasks do ([`Runner`]): the store's reads and writes; the disk checks, each kind
+//! on a lane of its own ([`super::checks`]); and the jobs that check files again and apply fixes,
+//! each on a thread of its own ([`super::jobs`]). Nothing here knows the UI: the lanes and the jobs
+//! send their inputs to the channel the runner was given, the one `update`'s inputs come in on,
+//! the terminal's loop's or a session's.
 
-use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use anyhow::Context;
 
+use super::checks::{self, Checks, SLOW_AFTER, Stat, ViewOf};
 use super::jobs;
-use super::model::{self, FileNote};
+use super::model;
 use super::progress;
 use super::update::{Input, Job, Switch, Task};
 use crate::llm::Via;
-use crate::scan::{self, file_stamp};
+use crate::scan;
 use crate::settings::Settings;
 use crate::store::{Run, ScanRow, Selector, ShowFolder, Store};
 
@@ -30,16 +33,83 @@ pub struct Runner<T> {
     tx: Sender<T>,
     /// The settings file a recheck reads; `None` for this process's ([`Settings::load`]).
     settings: Option<PathBuf>,
+    /// Review's disk checks, off this thread, which a file on a dead share would hold for good.
+    checks: Checks<T>,
+    /// What `checks` was built with, so that a test's seam replaces one part and keeps the others.
+    #[cfg(any(test, feature = "test-support"))]
+    built: (Stat, ViewOf, Duration),
 }
 
 impl<T: From<Input> + Send + 'static> Runner<T> {
+    /// The checks read files' stamps as a scan does, and views through a connection of the
+    /// switch lane's own ([`store_view`]), and call `Play`'s check slow after [`SLOW_AFTER`].
     pub fn new(store: Store, state: PathBuf, tx: Sender<T>) -> Runner<T> {
+        let view_of = store_view(store.path().to_path_buf(), store.reopen().ok());
+        Runner::checking(store, state, tx, checks::disk_stat(), view_of, SLOW_AFTER)
+    }
+
+    /// A runner whose checks are made of `stat`, `view_of` and `slow_after` ([`Checks::new`]).
+    fn checking(
+        store: Store,
+        state: PathBuf,
+        tx: Sender<T>,
+        stat: Stat,
+        view_of: ViewOf,
+        slow_after: Duration,
+    ) -> Runner<T> {
+        #[cfg(any(test, feature = "test-support"))]
+        let built = (Arc::clone(&stat), Arc::clone(&view_of), slow_after);
         Runner {
+            checks: Checks::new(stat, view_of, slow_after, tx.clone()),
+            #[cfg(any(test, feature = "test-support"))]
+            built,
             store,
             state,
             tx,
             settings: None,
         }
+    }
+
+    /// This runner, its checks made again with `stat`, `view_of` and `slow_after`.
+    #[cfg(any(test, feature = "test-support"))]
+    fn rebuilt(self, stat: Stat, view_of: ViewOf, slow_after: Duration) -> Runner<T> {
+        let Runner {
+            store,
+            state,
+            tx,
+            settings,
+            ..
+        } = self;
+        Runner {
+            settings,
+            ..Runner::checking(store, state, tx, stat, view_of, slow_after)
+        }
+    }
+
+    /// This runner, its checks reading each file's size and mtime with `stat`: a test's, which
+    /// blocks the paths it chooses as a dead share would.
+    #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_stat(self, stat: Stat) -> Runner<T> {
+        let (_, view_of, slow_after) = self.built.clone();
+        self.rebuilt(stat, view_of, slow_after)
+    }
+
+    /// This runner, its view switches read with `view_of`: a test's, which can block until told.
+    #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_view_of(self, view_of: ViewOf) -> Runner<T> {
+        let (stat, _, slow_after) = self.built.clone();
+        self.rebuilt(stat, view_of, slow_after)
+    }
+
+    /// This runner, `Play`'s check called slow after `slow_after`: a test's, short so as not to
+    /// wait the real one, or long so that no word comes while it reads other events.
+    #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_slow_after(self, slow_after: Duration) -> Runner<T> {
+        let (stat, view_of, _) = self.built.clone();
+        self.rebuilt(stat, view_of, slow_after)
     }
 
     /// This runner, its rechecks reading the settings file at `path` rather than this process's.
@@ -60,16 +130,19 @@ impl<T: From<Input> + Send + 'static> Runner<T> {
         self.store.show_folders()
     }
 
-    /// Run `task` and say how it went. A job it starts (`Recheck`, `StartApply`) runs on a
-    /// thread of its own, which sends the rest to the channel.
-    pub fn run(&mut self, task: Task) -> Input {
+    /// Run `task` and say how it went, or hand a disk check to its lane and say nothing yet: its
+    /// answer comes on the channel, as a job's do ([`Checks::take`]). A job it starts (`Recheck`,
+    /// `StartApply`) runs on a thread of its own, which sends the rest to the channel.
+    pub fn run(&mut self, task: Task) -> Option<Input> {
+        let task = self.checks.take(task)?;
         let Runner {
             store,
             state,
             tx,
             settings,
+            ..
         } = self;
-        match task {
+        Some(match task {
             Task::Write { purpose, decisions } => {
                 let result = store.decide(&decisions).map_err(|e| e.to_string());
                 Input::Written {
@@ -122,41 +195,30 @@ impl<T: From<Input> + Send + 'static> Runner<T> {
                         .map_err(|e| e.to_string())
                 },
             )),
-            Task::Stamp(moment) => Input::Stamped {
-                stamp: file_stamp(Path::new(&moment.file)).ok(),
-                moment,
-            },
-            Task::Switch(to) => Input::Switched(
-                other_view(store, &to)
-                    .map(|run| {
-                        let notes = file_notes(&run);
-                        (run, notes)
-                    })
-                    .map_err(|e| format!("{e:#}")),
-            ),
-        }
+            Task::Stamp(_) | Task::Note { .. } | Task::Switch { .. } => {
+                unreachable!("the check lanes take every disk check")
+            }
+        })
     }
 }
 
-/// How each of the run's files with findings differs from when it was scanned, by path; files as
-/// they were are left out.
-pub fn file_notes(run: &Run) -> HashMap<String, FileNote> {
-    // Only files with findings ever show a note, and on a network share each check is a round trip.
-    let shown: HashSet<&str> = run.findings.iter().map(|f| f.file.as_str()).collect();
-    let mut notes = HashMap::new();
-    // The newest record of each file wins: a file a run checked twice keeps its last stamp.
-    for f in run.files.iter().filter(|f| shown.contains(f.path.as_str())) {
-        let note = match file_stamp(Path::new(&f.path)) {
-            Ok((size, mtime)) if size == f.size && mtime == f.mtime => None,
-            Ok(_) => Some(FileNote::Changed),
-            Err(_) => Some(FileNote::Missing),
+/// The [`ViewOf`] outside tests: [`other_view`] on a connection of the switch lane's own, as a
+/// job has one, so that review's writes never wait behind a read stuck on a dead share. `reading`
+/// is that connection, opened with the runner; when it could not be, a switch opens one at `path`,
+/// and when that fails too, the switch fails, saying why.
+fn store_view(path: PathBuf, reading: Option<Store>) -> ViewOf {
+    let reading = Mutex::new(reading);
+    Arc::new(move |to| {
+        // Only the switch lane reads through it, one switch at a time.
+        let mut reading = reading.lock().unwrap_or_else(PoisonError::into_inner);
+        let store = match &mut *reading {
+            Some(store) => store,
+            none => none.insert(
+                Store::open_at(&path).with_context(|| format!("opening {}", path.display()))?,
+            ),
         };
-        match note {
-            Some(n) => notes.insert(f.path.clone(), n),
-            None => notes.remove(&f.path),
-        };
-    }
-    notes
+        other_view(store, to)
+    })
 }
 
 /// The view [`Task::Switch`] asks for, read from the store: a run's folders, the newest run that
@@ -344,8 +406,8 @@ mod tests {
         let Task::Recheck { run, .. } = task.clone() else {
             unreachable!()
         };
-        let started = |input: Input| match input {
-            Input::Started { job, .. } => job.map(|j| j.run),
+        let started = |input: Option<Input>| match input {
+            Some(Input::Started { job, .. }) => job.map(|j| j.run),
             other => panic!("{other:?}"),
         };
         let none = dir.path().join("none.toml");
@@ -395,7 +457,7 @@ mod tests {
         let settings = format!("[llm.srv]\nurl = \"{}\"\nchunk_lines = 1\n", server.url);
         let (_dir, mut runner, rx, recheck_task) = rechecking("srv@m", &settings);
         let started = Instant::now();
-        let Input::Started { job, .. } = runner.run(recheck_task) else {
+        let Some(Input::Started { job, .. }) = runner.run(recheck_task) else {
             panic!()
         };
         assert!(
@@ -440,7 +502,7 @@ mod tests {
         let server = FakeServer::llm_sized(&["m"], 1024);
         let settings = format!("[llm.srv]\nurl = \"{}\"\n", server.url);
         let (_dir, mut runner, rx, recheck_task) = rechecking("srv@m", &settings);
-        let Input::Started { job, .. } = runner.run(recheck_task) else {
+        let Some(Input::Started { job, .. }) = runner.run(recheck_task) else {
             panic!()
         };
         assert!(job.is_ok(), "{job:?}");
@@ -468,7 +530,7 @@ mod tests {
             server.url
         );
         let (_dir, mut runner, rx, recheck_task) = rechecking("srv@m", &settings);
-        let Input::Started { job, .. } = runner.run(recheck_task) else {
+        let Some(Input::Started { job, .. }) = runner.run(recheck_task) else {
             panic!()
         };
         assert!(job.is_ok(), "{job:?}");
@@ -511,7 +573,7 @@ mod tests {
     /// `Input::Warned` before the scan's first step, and ends well.
     fn recheck_warns(settings: &str, warning: &str) {
         let (_dir, mut runner, rx, recheck_task) = rechecking("srv@m", settings);
-        let Input::Started { job, .. } = runner.run(recheck_task) else {
+        let Some(Input::Started { job, .. }) = runner.run(recheck_task) else {
             panic!()
         };
         assert!(job.is_ok(), "{job:?}");
@@ -542,7 +604,7 @@ mod tests {
         let server = FakeServer::llm(&["m"]);
         let settings = format!("[llm.srv]\nurl = \"{}\"\n", server.url);
         let (_dir, mut runner, rx, recheck_task) = rechecking("srv@m", &settings);
-        let Input::Started { job, .. } = runner.run(recheck_task) else {
+        let Some(Input::Started { job, .. }) = runner.run(recheck_task) else {
             panic!()
         };
         assert!(job.is_ok(), "{job:?}");
@@ -567,7 +629,7 @@ mod tests {
         let closed = closed_port_url();
         let settings = format!("[llm.srv]\nurl = \"{closed}\"\n");
         let (_dir, mut runner, rx, recheck_task) = rechecking("srv@m", &settings);
-        let Input::Started { job, .. } = runner.run(recheck_task) else {
+        let Some(Input::Started { job, .. }) = runner.run(recheck_task) else {
             panic!()
         };
         assert!(job.is_ok());
@@ -586,54 +648,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn files_that_changed_or_went_missing_are_noted() {
-        let dir = tempfile::tempdir().unwrap();
-        let same = dir.path().join("same.mkv");
-        let changed = dir.path().join("changed.mkv");
-        std::fs::write(&same, b"1234").unwrap();
-        std::fs::write(&changed, b"1234").unwrap();
-        let record = |p: &Path| {
-            let (size, mtime) = file_stamp(p).unwrap();
-            crate::store::FileRecord {
-                path: p.to_string_lossy().into_owned(),
-                size,
-                mtime,
-                error: None,
-                tracks: vec![],
-                lines: 0,
-                truncated: None,
-                checks: vec![crate::store::Check::Llm],
+    /// The view `to` asks for, as the switch lane answers it on `rx`: its name and how many
+    /// findings it has, or why it could not be read. The runner answers nothing at once.
+    fn switched(
+        runner: &mut Runner<Input>,
+        rx: &mpsc::Receiver<Input>,
+        to: Switch,
+    ) -> Result<(String, usize), String> {
+        assert_eq!(runner.run(Task::Switch { asked: 1, to }), None);
+        match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+            Input::Switched { result, .. } => {
+                result.map(|run| (run.shown_name(), run.findings.len()))
             }
-        };
-        let gone = |name: &str| crate::store::FileRecord {
-            path: dir.path().join(name).to_string_lossy().into_owned(),
-            ..record(&same)
-        };
-        let files = vec![
-            record(&same),
-            record(&changed),
-            gone("gone.mkv"),
-            gone("clean-and-gone.mkv"),
-        ];
-        // Findings in the first three; the fourth had none, so it is never checked.
-        let findings = files[..3]
-            .iter()
-            .map(|f| crate::store::Finding {
-                file: f.path.clone(),
-                ..model::tests_support::finding(1, 1, "a", "b", 0)
-            })
-            .collect();
-        let run = Run {
-            files,
-            findings,
-            ..Run::default()
-        };
-        std::fs::write(&changed, b"12345").unwrap();
-        let notes = file_notes(&run);
-        assert_eq!(notes.len(), 2, "{notes:?}");
-        assert_eq!(notes[&run.files[1].path], FileNote::Changed);
-        assert_eq!(notes[&run.files[2].path], FileNote::Missing);
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // When the runner could not open the switch lane's own connection, the first switch opens it;
+    // when that fails too, the switch fails, saying why.
+    #[test]
+    fn a_switch_opens_its_own_connection_when_the_runner_could_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("subcheck.db");
+        let mut store = Store::open_at(&db).unwrap();
+        let header = scan_row("claude", &["eng"]).header;
+        let name = store.begin_scan(&header, &[]).unwrap().name;
+        let view_of = store_view(db, None);
+        let run = view_of(&Switch::Selector(vec![name.clone()])).unwrap();
+        assert_eq!(run.shown_name(), format!("run {name}"));
+        let nowhere = dir.path().join("no-such-dir").join("subcheck.db");
+        let view_of = store_view(nowhere.clone(), None);
+        let said = format!("{:#}", view_of(&Switch::Selector(vec![name])).unwrap_err());
+        assert!(
+            said.starts_with(&format!("opening {}: ", nowhere.display())),
+            "{said}"
+        );
     }
 
     // As `Session::open` reads its selector: a run by its name; a path on disk as a path, with
@@ -680,13 +729,9 @@ mod tests {
             }],
         };
         store.save(&attempt, vec![made]).unwrap();
-        let (tx, _rx) = mpsc::channel::<Input>();
+        let (tx, rx) = mpsc::channel::<Input>();
         let mut runner = Runner::new(store, dir.path().join("state"), tx);
-        let mut open = |words: Vec<String>| match runner.run(Task::Switch(Switch::Selector(words)))
-        {
-            Input::Switched(view) => view.map(|(run, _)| (run.shown_name(), run.findings.len())),
-            other => panic!("{other:?}"),
-        };
+        let mut open = |words: Vec<String>| switched(&mut runner, &rx, Switch::Selector(words));
         assert_eq!(open(vec![name.clone()]), Ok((format!("run {name}"), 0)));
         assert_eq!(open(vec![path]), Ok(("E01.mkv".to_string(), 1)));
         let folder = dir.path().join("empty");
@@ -731,14 +776,11 @@ mod tests {
             findings: vec![model::tests_support::finding(0, 1, "a", "b", 0)],
         };
         store.save(&attempt, vec![made]).unwrap();
-        let (tx, _rx) = mpsc::channel::<Input>();
+        let (tx, rx) = mpsc::channel::<Input>();
         let mut runner = Runner::new(store, dir.path().join("state"), tx);
         let folder = "/m/K-On!".to_string();
         assert!(!Path::new(&folder).exists());
-        let mut open = |to: Switch| match runner.run(Task::Switch(to)) {
-            Input::Switched(view) => view.map(|(run, _)| (run.shown_name(), run.findings.len())),
-            other => panic!("{other:?}"),
-        };
+        let mut open = |to: Switch| switched(&mut runner, &rx, to);
         assert_eq!(
             open(Switch::Folder(folder.clone())),
             Ok(("K-On!".to_string(), 1))
@@ -763,7 +805,7 @@ mod tests {
             dry_run: true,
             karaoke: false,
         };
-        assert_eq!(runner.run(task), Input::ApplyStarted(Ok(())));
+        assert_eq!(runner.run(task), Some(Input::ApplyStarted(Ok(()))));
         // Apply's thread then holds the channel's last sender, so a lost send fails here at once.
         drop(runner);
         // Nothing accepted: the apply ends at once, and says so from its thread.

@@ -109,21 +109,36 @@ Right (← and → on macOS) seek 5 s, `,` and `.` 1 s, and `[` and `]` step a f
 Ctrl+W and Ctrl+Q quit (⌘Z, ⌘W and ⌘Q on macOS). No menu shows the others: J and K (or Down and Up)
 move, Enter expands a row into its members or collapses it, F steps through the filters, U undoes
 and Q quits. No key in the window does what the terminal's `e`, `c`, `A`, `D`, `g`, `G`, Home, End,
-PgUp, PgDn, Tab or `?` does. While Show in Video (O) waits for a file that is slow to open, a busy
-animation shows over the video once the wait has lasted 150 ms; it goes once the video shows, or
-once Close Video (Shift+O) has closed the video. While a video plays, a drag of a column or of the
-window's edge stays smooth. A column drag stretches the video's frame until the drag ends, when mpv
-draws it again at its new size. The window keeps its size, its place on X11 and macOS (Wayland lets
-no window place itself), its columns' widths, the episodes' order and its settings for the next run,
-in `$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf` on Linux and macOS when `XDG_CONFIG_HOME` is an
-absolute path; otherwise in `~/.config/subcheck/subcheck-qt.conf` on Linux and in the app's
-preferences on macOS. At the end it prints the counts as the terminal does, but names a view of
-paths as its window's title does: by the first path's last part, and `+N` for the others. It exits
-with 1 after an error, or when review has not ended 10 s after quitting, and with 0 otherwise. The
-10 s gives one decision's write time to wait out another process's lock on the store, which the
-store waits up to 5 s for. It is not enough for several writes queued behind a lock held longer, or
-for an open that waits on the lock more than once: the window then closes review, which can lose a
-decision not yet written.
+PgUp, PgDn, Tab or `?` does. A view shows its rows at once: the details panel's word on an episode's
+file (`This episode's file is missing`, or `This episode changed since it was checked`) comes once
+that file's check answers, so a share that is slow or does not answer holds up no row. Another view,
+by V or a review in the sidebar, takes the place of the one shown once it has been read
+(`Opening the view…`), and until then the view shown stays and works. Show in Video (O) checks its
+file each time, so a file that has come back opens, and the word on it comes up to date. From the
+press, while Show in Video waits for that check and then for mpv to open the file, a busy animation
+shows over the video once the wait has lasted 500 ms; it goes once the video shows, or once Close
+Video (Shift+O) has closed the video. A check that has not answered in 3 s says so on the status
+line (`E05: the share isn't answering, still waiting`), and the wait and the animation go on; Close
+Video ends them (`Stopped waiting for E05`, or `Video closed` when a video was open or opening), and
+nothing opens when the check answers, as nothing does for any press but the newest. While a video
+plays, a drag of a column or of the window's edge stays smooth. A column drag stretches the video's
+frame until the drag ends, when mpv draws it again at its new size. The window keeps its size, its
+place on X11 and macOS (Wayland lets no window place itself), its columns' widths, the episodes'
+order and its settings for the next run, in `$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf` on Linux
+and macOS when `XDG_CONFIG_HOME` is an absolute path; otherwise in
+`~/.config/subcheck/subcheck-qt.conf` on Linux and in the app's preferences on macOS. At the end it
+prints the counts as the terminal does, but names a view of paths as its window's title does: by the
+first path's last part, and `+N` for the others. It exits with 1 after an error, or when review has
+not ended 10 s after quitting, and with 0 otherwise. The 10 s gives one decision's write time to
+wait out another process's lock on the store, which the store waits up to 5 s for. It is not enough
+for several writes queued behind a lock held longer, or for an open that waits on the lock more than
+once: the window then closes review, which can lose a decision not yet written. Quitting waits on no
+file's check: the window closes and prints the counts at once, even while a check, or mpv's open of
+a file, waits on a share that does not answer. While mpv's open waits on such a share, the process
+ends about 2 s after the quit without waiting for mpv, with the window's settings kept as any quit
+keeps them. On a FUSE share (sshfs, rclone) the process ends only once the share answers, whatever
+waits on it, as no program can end a request a FUSE share has taken; the window is gone all the
+same.
 
 The video pane is mpv, inside the window through MpvQt. It reads its options from
 `$XDG_CONFIG_HOME/mpvqt/mpvqt.conf` on Linux (by default `~/.config/mpvqt/mpvqt.conf`) and
@@ -254,7 +269,7 @@ filter, to the next row).
 | `A` | apply the accepted fixes of the view (asks first; not while a scan runs) |
 | `D` | dry run: what apply would do, writing nothing |
 | `o` | open the finding in mpv with its subtitle track: a line on its first frame, a timing finding on the frame that shows the error, or with none, its first moved line's first frame; paused if mpv is paused or has no file open, playing on if it plays, as the status line then says; again on the same row goes back there |
-| `O` | close mpv and stay in review; the next `o` opens it again |
+| `O` | close mpv and end any wait of `o`'s for its file's check, and stay in review; the next `o` opens it again |
 | Space | pause or resume mpv |
 | ← → | mpv back or forward 5 s |
 | `,` `.` | mpv back or forward 1 s |
@@ -280,9 +295,20 @@ start, `sub-visibility=yes` and, when the finding names one, its subtitle track,
 of its own: `hr-seek=yes`, so that it lands on the frame and not on the keyframe before it, which
 makes mpv's own relative seeks in that file exact too; `rebase-start-time=no`, so that mpv's clock
 is the file's own, which subcheck's times are on, even for a file whose first cluster is not at 0;
-and `pause`, as mpv is to end up, which `reset-on-next-file=pause` would otherwise undo. `o` on a
-file that is not there (whose size and time cannot be read) says `file missing`, and asks nothing
-of mpv.
+and `pause`, as mpv is to end up, which `reset-on-next-file=pause` would otherwise undo. `o` checks
+its file each time, so a file that has come back opens, and its mark in the detail pane
+(`file changed since scan` or `file missing`) comes up to date; a file that is not there (whose size
+and time cannot be read) is not opened, and nothing is asked of mpv: the terminal says
+`file missing: <path>`, and the window `The file is missing: <path>`. A view's rows show at once,
+and its files' marks once their checks answer, so a share that is slow or does not answer holds up
+no row. A recheck asks whether each of its files exists as it starts (after `c`, then `y`, or, for
+one that waited for a scan, once that scan ends), and until such a share answers, the terminal takes
+no key, `q` and Ctrl+C included. `v`'s view takes the place of the one shown once it has been read
+(`opening the view…`). While `o`'s check waits, a spinner turns at the end of the status line; a
+check that has not answered in 3 s says so (`E05: the share isn't answering, still waiting`), and
+the wait goes on until the check answers, when only the newest `o` opens, or until `O` ends it
+(`stopped waiting for E05`, or `closed mpv` when mpv was running too). A check that waits does not
+make `q` ask first.
 
 ## LLM settings
 

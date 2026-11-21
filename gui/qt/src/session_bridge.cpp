@@ -62,7 +62,7 @@ SessionBridge::SessionBridge(std::vector<std::string> selector, PlayerPort &play
     : QObject(parent), selector(std::move(selector)), port(player), out(out), err(err) {
     connect(&port, &PlayerPort::reported, this, &SessionBridge::report);
     // The end's release ends any Open, and with it the animation.
-    connect(&port, &PlayerPort::openingChanged, this, [this] { loading.set(port.opening()); });
+    connect(&port, &PlayerPort::openingChanged, this, [this] { loading.set(waitingForVideo()); });
     connect(&loading, &LoadingFlag::shownChanged, this, &SessionBridge::videoLoadingChanged);
     // Queued: each event the pump reads is applied on this object's thread, in the pump's order.
     connect(this, &SessionBridge::eventArrived, this, &SessionBridge::apply, Qt::QueuedConnection);
@@ -357,7 +357,7 @@ void SessionBridge::apply(const Event &event) {
     std::visit(Overloaded{
                    [this](const Event::kChanged &change) { changed(change); },
                    [this](const Event::kAnswered &answer) { answered(answer.answered); },
-                   [this](const Event::kPlayer &player) { port.run(player.v1); },
+                   [this](const Event::kPlayer &player) { handOver(player.v1); },
                    [this](const Event::kEnded &end) { ended(end); },
                },
                event.get_variant());
@@ -384,6 +384,8 @@ void SessionBridge::changed(const Event::kChanged &change) {
     // Whether review was asking as it took the action this change answers: the change before says.
     const bool asking = summary.question.has_value();
     summary = change.summary;
+    openFollows = summary.open_follows;
+    loading.set(waitingForVideo());
     shows.show(summary);
     opened = true;
     const std::optional<EntryKey> entry =
@@ -500,6 +502,20 @@ void SessionBridge::leaveQuietEpisode() {
     beforeClick.reset();
 }
 
+void SessionBridge::handOver(const PlayerCommand &command) {
+    // An Open is what the change's open_follows told of, so the port's own count of it takes over
+    // from here; no other command is.
+    if (std::holds_alternative<PlayerCommand::kOpen>(command.get_variant())) {
+        openFollows = false;
+    }
+    port.run(command);
+    loading.set(waitingForVideo());
+}
+
+bool SessionBridge::waitingForVideo() const {
+    return (session && (summary.stamping || openFollows)) || port.opening();
+}
+
 void SessionBridge::ended(const Event::kEnded &end) {
     letGo();
     // As the terminal: what is left to say of the jobs on stderr; then the error, on stderr, or
@@ -584,6 +600,9 @@ std::optional<Event::kEnded> SessionBridge::letGo() {
         static_cast<void>(pump.release());
     }
     session.reset();
+    // No check of review's is answered once review is let go, so the arc ends with it, even under
+    // the fatal end's dialog.
+    loading.set(waitingForVideo());
     return end;
 }
 

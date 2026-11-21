@@ -275,6 +275,7 @@ pub struct Splice {
 
 /// What a UI shows beside the list ([`session::Summary`]), sent whole with any change to it.
 #[derive(uniffi::Record, Debug, Clone, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // as core's, each says a thing of its own
 pub struct Summary {
     /// What the view is called.
     pub title: String,
@@ -289,6 +290,14 @@ pub struct Summary {
     pub rejected: u64,
     /// Whether a job runs.
     pub busy: bool,
+    /// `Play` waits for its file's check, before the player is asked anything: a UI shows the
+    /// video loading from the press.
+    pub stamping: bool,
+    /// The player is asked to open a file right after this change: a UI shows the video loading
+    /// from it, as from `stamping`, so that `Play`'s wait is one from the press to the open. A
+    /// player Open event uses it up: read it as false from that event on, until a change says true
+    /// again, which is sent even when the last change sent also said true.
+    pub open_follows: bool,
     pub filter: Filter,
     pub pane: Pane,
     /// The edit under way; none once it ends, or when what it edits has gone.
@@ -354,8 +363,17 @@ pub enum Status {
     QueuedAgain { label: String },
     /// A check again left out file `label`, the first of those no longer on disk.
     NoSuchFile { label: String },
+    /// A view switch (`SwitchView`, `OpenView`, `OpenFolder`) is reading the view it opens. The
+    /// view shown stays, and works, until it comes.
+    OpeningView,
     /// `Play` asks the player to open file `label` at `at_ms`.
     Opening { label: String, at_ms: i64 },
+    /// The check of file `label`, which `Play` waits for, has not answered in a while: its share
+    /// is slow or down. The wait goes on.
+    NotAnswering { label: String },
+    /// `ClosePlayer` ended `Play`'s wait for the check of file `label`: nothing opens when it
+    /// answers.
+    StoppedWaiting { label: String },
     /// The player opened it, and left mpv paused or playing.
     Opened { paused: bool },
     /// Where playback is after a `Playback`.
@@ -1378,6 +1396,8 @@ impl From<session::Summary> for Summary {
             accepted,
             rejected,
             busy,
+            stamping,
+            open_follows,
             filter,
             pane,
             edit,
@@ -1396,6 +1416,8 @@ impl From<session::Summary> for Summary {
             accepted: wide(accepted),
             rejected: wide(rejected),
             busy,
+            stamping,
+            open_follows,
             filter: filter.into(),
             pane: pane.into(),
             edit: edit.map(Editing::from),
@@ -1454,7 +1476,10 @@ impl From<status::Status> for Status {
             status::Status::Refused(why) => Status::Refused { why: why.into() },
             status::Status::QueuedAgain { label } => Status::QueuedAgain { label },
             status::Status::NoSuchFile { label } => Status::NoSuchFile { label },
+            status::Status::OpeningView => Status::OpeningView,
             status::Status::Opening { label, at_ms } => Status::Opening { label, at_ms },
+            status::Status::NotAnswering { label } => Status::NotAnswering { label },
+            status::Status::StoppedWaiting { label } => Status::StoppedWaiting { label },
             status::Status::Opened { paused } => Status::Opened { paused },
             status::Status::Played(state) => Status::Played {
                 state: state.into(),
@@ -2344,6 +2369,8 @@ mod tests {
                 accepted: 2,
                 rejected: 3,
                 busy: true,
+                stamping: true,
+                open_follows: true,
                 filter: list::Filter::Only(store::State::Accepted),
                 pane: model::Pane::Files,
                 edit: Some(session::Editing {
@@ -2429,6 +2456,8 @@ mod tests {
                 accepted: 2,
                 rejected: 3,
                 busy: true,
+                stamping: true,
+                open_follows: true,
                 filter: Filter::Accepted,
                 pane: Pane::Files,
                 edit: Some(Editing {
@@ -3067,6 +3096,8 @@ mod tests {
             accepted: 0,
             rejected: 0,
             busy: false,
+            stamping: false,
+            open_follows: false,
             filter: list::Filter::All,
             pane: model::Pane::Findings,
             edit: None,
@@ -3559,6 +3590,7 @@ mod tests {
                     label: label("E07"),
                 },
             ),
+            (status::Status::OpeningView, Status::OpeningView),
             (
                 status::Status::Opening {
                     label: label("E08"),
@@ -3567,6 +3599,22 @@ mod tests {
                 Status::Opening {
                     label: label("E08"),
                     at_ms: 165_060,
+                },
+            ),
+            (
+                status::Status::NotAnswering {
+                    label: label("E10"),
+                },
+                Status::NotAnswering {
+                    label: label("E10"),
+                },
+            ),
+            (
+                status::Status::StoppedWaiting {
+                    label: label("E11"),
+                },
+                Status::StoppedWaiting {
+                    label: label("E11"),
                 },
             ),
             (
@@ -3972,7 +4020,10 @@ mod tests {
         assert_eq!(ui.summary().title, format!("run {name}"));
         assert!(!ui.summary().of_paths);
         assert_eq!((ui.summary().selected, ui.summary().pending), (Some(1), 4));
-        // The FIFO is on disk, but not as it was scanned; the sample's files are not.
+        // The rows come before their files are checked, the notes once they are: the FIFO is on
+        // disk, but not as it was scanned; the sample's files are not.
+        assert_eq!((ui.rows[0].note, ui.rows[1].note), (None, None));
+        ui.until(&s, "the notes", |ui| ui.rows[1].note.is_some());
         assert_eq!(ui.rows[0].note, Some(FileNote::Changed));
         assert_eq!(ui.rows[1].note, Some(FileNote::Missing));
         // The files in the order the run named them, the first selected; the selected row's

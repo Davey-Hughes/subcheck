@@ -35,6 +35,19 @@ std::string clean() { return qEnvironmentVariable("SUBCHECK_TEST_CLEAN").toStdSt
 
 const QString counts = "4 to review · 0 accepted · 0 rejected";
 
+// The window's moments for the arc over the video, as the bridge's flag has them: shown once a wait
+// has lasted the first, gone once it has been over for the second. What a busy machine may add to
+// either before a test sees the change. A wait past the hide moment, in which the arc is to stay,
+// short of the player's limit for an answer from mpv, past which an Open unanswered fails. When a
+// test's check of the file answers: halfway through the first moment, so that the check not yet
+// having answered when the arc shows and the arc's showing timed from the press (not from the
+// answer) each get the same room.
+constexpr int arcShows = 500;
+constexpr int arcGoes = 100;
+constexpr int slack = 1000;
+constexpr int pastHiding = 300;
+constexpr int checkAnswers = arcShows / 2;
+
 // Where the row at `row` is, and whether a row of several, as its first line says them.
 QString place(SessionBridge &bridge, int row) {
     FindingsModel *list = bridge.findings();
@@ -175,6 +188,22 @@ struct StandIn {
     // the window shows.
     void answerAlone(uint64_t answered) {
         emit bridge.eventArrived(Event(Event::kAnswered{answered}));
+    }
+
+    // Review's change as it last sent it, but for whether Show in Video waits for its file's check,
+    // and whether the player's Open follows the change.
+    void stamping(bool waiting, bool openFollows = false) {
+        Summary summary = last->summary;
+        summary.stamping = waiting;
+        summary.open_follows = openFollows;
+        emit bridge.eventArrived(Event(Event::kChanged{std::nullopt, summary, std::nullopt,
+                                                       std::nullopt, std::nullopt, std::nullopt}));
+    }
+
+    // Review's Open of a made-up moment, which the player runs on the test's mpv.
+    void open() {
+        emit bridge.eventArrived(Event(Event::kPlayer{PlayerCommand(
+            PlayerCommand::kOpen{Moment{"/m/a.mkv", 0, std::nullopt}, How::kLoad, {}})}));
     }
 };
 
@@ -600,6 +629,186 @@ private slots:
         QCOMPARE(mpv.last(), "stop");
         emit o.player.reported(PlayerReport(PlayerReport::kClosed{std::nullopt}));
         QCOMPARE(o.err.str(), "");
+    }
+
+    // While review waits for Show in Video's check of its file, before the player has heard of an
+    // Open, the video shows that it loads: once the wait has lasted the window's moment, and not
+    // before; and it stops a moment after review's change that ends the wait, with no Open under
+    // way. The clock starts before each change, so that the time it gives is never short of the
+    // flag's own. Review is held back, and its changes stood in for, once it has gone quiet.
+    void theArcShowsWhileReviewWaitsForTheFileCheck() {
+        // Declared before the stand-in, whose bridge the handler below writes them from, so that
+        // they outlive it.
+        QElapsedTimer clock;
+        qint64 changedAt = -1;
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.holdOnceQuiet();
+        QSignalSpy changed(&s.bridge, &SessionBridge::videoLoadingChanged);
+        connect(&s.bridge, &SessionBridge::videoLoadingChanged, this,
+                [&] { changedAt = clock.elapsed(); });
+
+        clock.start();
+        s.stamping(true);
+        QTRY_VERIFY_WITH_TIMEOUT(s.bridge.videoLoading(), arcShows + slack);
+        QVERIFY2(changedAt >= arcShows, qPrintable(QString::number(changedAt)));
+        QVERIFY(!s.player.opening());
+        clock.start();
+        s.stamping(false);
+        QTRY_VERIFY_WITH_TIMEOUT(!s.bridge.videoLoading(), arcGoes + slack);
+        QVERIFY2(changedAt >= arcGoes, qPrintable(QString::number(changedAt)));
+        QCOMPARE(changed.count(), 2);
+    }
+
+    // Review's end ends the arc, though its last change had a check of the file waiting: nothing is
+    // left to answer the check, and no arc spins under the fatal end's dialog. The end is made up,
+    // with review held back once it has gone quiet.
+    void theArcEndsWithReview() {
+        StandIn s;
+        QSignalSpy fatal(&s.bridge, &SessionBridge::fatalChanged);
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.holdOnceQuiet();
+        s.stamping(true);
+        QTRY_VERIFY(s.bridge.videoLoading());
+        emit s.bridge.eventArrived(Event(Event::kEnded{std::string("the store went away"), {}}));
+        QTRY_COMPARE(fatal.count(), 1);
+        QVERIFY(!s.player.opening());
+        QTRY_VERIFY_WITH_TIMEOUT(!s.bridge.videoLoading(), arcGoes + slack);
+    }
+
+    // From review's check of the file into the player's Open, the arc shows as one, never gone
+    // between. The change that ends the check's wait says that the Open follows; and once an Open
+    // runs, a change with no check waiting and none to follow leaves the arc up, so the change
+    // heard after the Open does too. Review is held back, and its changes stood in for, once it has
+    // gone quiet.
+    void theArcStaysUpFromTheCheckIntoTheLoad() {
+        for (const bool openFirst : {false, true}) {
+            const char *order =
+                openFirst ? "the Open, then the change" : "the change, then the Open";
+            // Before the stand-in, whose bridge stops it as it goes.
+            FakeMpv mpv;
+            StandIn s;
+            s.player.attach(&mpv);
+            s.player.ready();
+            s.bridge.start();
+            QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+            s.holdOnceQuiet();
+            QSignalSpy changed(&s.bridge, &SessionBridge::videoLoadingChanged);
+            s.stamping(true);
+            QTRY_VERIFY2(s.bridge.videoLoading(), order);
+            if (openFirst) {
+                s.open();
+                s.stamping(false);
+            } else {
+                s.stamping(false, true);
+                s.open();
+            }
+            QTRY_COMPARE(mpv.last(), "get path");
+            QTest::qWait(pastHiding);
+            QVERIFY2(s.player.opening(), order);
+            QVERIFY2(s.bridge.videoLoading(), order);
+            QVERIFY2(changed.count() == 1, order);
+        }
+    }
+
+    // Review's check of the file answers before the arc has shown, with the change that says the
+    // Open follows, and the Open stays under way: the arc shows a moment after the press, as for
+    // one wait, not a moment after the Open. The clock starts before the press, and the answer's
+    // time is taken before its change is sent, so that neither time is short. Review is held back,
+    // and its changes stood in for, once it has gone quiet.
+    void theArcShowsAMomentAfterThePressThoughTheCheckAnswersFirst() {
+        // Declared before the stand-in, whose bridge the handler below writes them from, so that
+        // they outlive it; the mpv before the stand-in too, whose bridge stops it as it goes.
+        QElapsedTimer clock;
+        qint64 shownAt = -1;
+        FakeMpv mpv;
+        StandIn s;
+        s.player.attach(&mpv);
+        s.player.ready();
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.holdOnceQuiet();
+        QSignalSpy changed(&s.bridge, &SessionBridge::videoLoadingChanged);
+        connect(&s.bridge, &SessionBridge::videoLoadingChanged, this,
+                [&] { shownAt = clock.elapsed(); });
+
+        clock.start();
+        s.stamping(true);
+        QTest::qWait(checkAnswers);
+        const qint64 answeredAt = clock.elapsed();
+        QVERIFY2(!s.bridge.videoLoading(), qPrintable(QString("loading at %1 ms").arg(answeredAt)));
+        s.stamping(false, true);
+        s.open();
+        QTRY_VERIFY_WITH_TIMEOUT(s.bridge.videoLoading(), arcShows + slack);
+        QVERIFY(s.player.opening());
+        QVERIFY2(shownAt >= arcShows, qPrintable(QString::number(shownAt)));
+        QVERIFY2(shownAt - answeredAt < arcShows,
+                 qPrintable(QString("shown %1 ms, answered %2 ms").arg(shownAt).arg(answeredAt)));
+        QCOMPARE(changed.count(), 1);
+    }
+
+    // The same, but the change that ends the check's wait does not say that an Open follows: the
+    // wait ends there, and the Open after it waits a moment of its own, the arc shown a moment
+    // after the Open and not after the press. Review's word that the Open follows is what carries
+    // the press's wait into it. The answer's time is taken before its change is sent, so that the
+    // time from it is never short of the flag's own.
+    void anOpenNotSaidToFollowWaitsAMomentOfItsOwn() {
+        // Declared before the stand-in, as above.
+        QElapsedTimer clock;
+        qint64 shownAt = -1;
+        FakeMpv mpv;
+        StandIn s;
+        s.player.attach(&mpv);
+        s.player.ready();
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.holdOnceQuiet();
+        QSignalSpy changed(&s.bridge, &SessionBridge::videoLoadingChanged);
+        connect(&s.bridge, &SessionBridge::videoLoadingChanged, this,
+                [&] { shownAt = clock.elapsed(); });
+
+        clock.start();
+        s.stamping(true);
+        QTest::qWait(checkAnswers);
+        const qint64 answeredAt = clock.elapsed();
+        QVERIFY2(!s.bridge.videoLoading(), qPrintable(QString("loading at %1 ms").arg(answeredAt)));
+        s.stamping(false);
+        s.open();
+        QTRY_VERIFY_WITH_TIMEOUT(s.bridge.videoLoading(), arcShows + slack);
+        QVERIFY(s.player.opening());
+        QVERIFY2(shownAt - answeredAt >= arcShows,
+                 qPrintable(QString("shown %1 ms, answered %2 ms").arg(shownAt).arg(answeredAt)));
+        QCOMPARE(changed.count(), 1);
+    }
+
+    // The change that said an Open follows is used up by the Open: once the player has it and
+    // finishes it, with no change of review's after, the arc goes, though the change's flag is
+    // still the last the bridge heard. Review is held back, and its changes stood in for, once it
+    // has gone quiet.
+    void theArcGoesWhenTheOpenItWasToldOfFinishes() {
+        FakeMpv mpv;
+        StandIn s;
+        s.player.attach(&mpv);
+        s.player.ready();
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.holdOnceQuiet();
+        s.stamping(true);
+        QTRY_VERIFY_WITH_TIMEOUT(s.bridge.videoLoading(), arcShows + slack);
+        // The player's report would make real review answer with a change of its own, which ends
+        // the flag's use; the case is that none comes.
+        QObject::disconnect(&s.player, &PlayerPort::reported, &s.bridge, nullptr);
+        s.stamping(false, true);
+        s.open();
+        QTRY_COMPARE(mpv.last(), "get path");
+        QVERIFY(s.bridge.videoLoading());
+        mpv.answer(s.player, {}, "property unavailable");
+        mpv.answer(s.player);
+        s.player.restarted();
+        QTRY_VERIFY(!s.player.opening());
+        QTRY_VERIFY_WITH_TIMEOUT(!s.bridge.videoLoading(), arcGoes + slack);
     }
 
     // A quit under a question, here `Recheck`'s: review ends at once, as no job runs, where a

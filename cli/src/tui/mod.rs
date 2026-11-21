@@ -11,7 +11,7 @@ pub mod screen;
 pub mod status;
 pub mod view;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -125,10 +125,12 @@ fn input(tx: Sender<Msg>) -> io::Result<()> {
     Ok(())
 }
 
-/// Run one effect and say how it went: a task through `runner`, a player command on mpv.
-pub fn run_effect(effect: Effect, runner: &mut Runner<Msg>, player: &mut Player) -> Input {
-    match effect {
-        Effect::Task(task) => runner.run(task),
+/// Run one effect and say how it went: a task through `runner`, a player command on mpv. A disk
+/// check says nothing here: the runner hands it to a lane of its own, whose answer comes later
+/// through the loop's channel, as a job's do.
+pub fn run_effect(effect: Effect, runner: &mut Runner<Msg>, player: &mut Player) -> Option<Input> {
+    Some(match effect {
+        Effect::Task(task) => return runner.run(task),
         Effect::Player(PlayerCommand::Open {
             moment,
             how,
@@ -136,7 +138,7 @@ pub fn run_effect(effect: Effect, runner: &mut Runner<Msg>, player: &mut Player)
         }) => Input::Opened(player.open(&moment, how, &options)),
         Effect::Player(PlayerCommand::Playback(p)) => Input::Played(player.playback(p)),
         Effect::Player(PlayerCommand::Close) => Input::Closed(player.close()),
-    }
+    })
 }
 
 /// Restores the terminal on every exit path: normal return, `?`, or panic.
@@ -233,8 +235,21 @@ fn opening_status(warnings: &[String]) -> Option<Status> {
     })
 }
 
-/// How long the loop waits for a message while a job runs before the spinner turns.
+/// How long the loop waits for a message while a job runs, or `o`'s file check waits, before the
+/// spinner turns.
 const TICK: Duration = Duration::from_millis(250);
+
+/// The review the screen opens on: `run`, with no file notes yet, and what review asks for first
+/// ([`update::first_effects`]): the notes, which a lane checks while the screen is up, so that a
+/// share that does not answer holds neither the screen shut nor a key. `karaoke`: apply re-spaces
+/// per-letter karaoke; `warnings`, what planning a scan warned of ([`opening_status`]).
+fn opening_review(run: Run, karaoke: bool, warnings: &[String]) -> (Review, Vec<Effect>) {
+    let mut model = Review::new(run, HashMap::new());
+    model.karaoke = karaoke;
+    model.status = opening_status(warnings);
+    let first = update::first_effects(&mut model);
+    (model, first)
+}
 
 /// Open the screen on `open`, writing decisions through `store`. `state` is the state directory,
 /// where mpv's socket goes when there is no runtime directory, and apply writes the fixed tracks.
@@ -258,11 +273,8 @@ pub fn run(open: Open, store: Store, state: &Path, karaoke: bool) -> anyhow::Res
         println!("No findings in {}.", run.called());
         return Ok(ExitCode::SUCCESS);
     }
-    let notes = runner::file_notes(&run);
     let mut player = Player::new("mpv", mpv::socket_path(state));
-    let mut model = Review::new(run, notes);
-    model.karaoke = karaoke;
-    model.status = opening_status(&warnings);
+    let (mut model, first) = opening_review(run, karaoke, &warnings);
 
     // The terminal is restored should the screen's own thread panic. A job's panic comes to the
     // loop as `Input::Fatal`, which ends the screen in order.
@@ -304,6 +316,7 @@ pub fn run(open: Open, store: Store, state: &Path, karaoke: bool) -> anyhow::Res
                 &mut terminal,
                 &mut model,
                 &mut screen,
+                first,
                 &rx,
                 &mut runner,
                 &mut player,
@@ -366,46 +379,71 @@ fn outcome(
     })
 }
 
-/// Draw, take the next message (the terminal's, a job's, or a tick while one runs), update, and
-/// run the effects, until the model quits.
+/// Run review's `first` effects, then draw, take the next message (the terminal's, a job's or a
+/// check's, or a tick while one runs or waits), update, and run the effects, until the model
+/// quits.
 fn screen_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     model: &mut Review,
     screen: &mut Screen,
+    first: Vec<Effect>,
     rx: &mpsc::Receiver<Msg>,
     runner: &mut Runner<Msg>,
     player: &mut Player,
 ) -> anyhow::Result<()> {
+    run_effects(first, model, screen, runner, player);
     while !model.should_quit {
         terminal.draw(|f| view::view(model, screen, f))?;
-        let msg = receive(rx, model.progress.busy());
+        let msg = receive(rx, ticking(model));
         let effects = screen::update(model, screen, msg, jiff::Timestamp::now());
         // Show what is about to happen (`opening E02 at …`) before an effect holds the loop:
         // starting mpv can take seconds.
         if !effects.is_empty() {
             terminal.draw(|f| view::view(model, screen, f))?;
         }
-        let mut queue: VecDeque<Effect> = effects.into();
-        while let Some(effect) = queue.pop_front() {
-            let input = run_effect(effect, runner, player);
-            queue.extend(screen::update(
-                model,
-                screen,
-                input.into(),
-                jiff::Timestamp::now(),
-            ));
-        }
+        run_effects(effects, model, screen, runner, player);
     }
     Ok(())
 }
 
-/// The loop's next message: the terminal's or a job's, or while a job runs a tick should none come
-/// for [`TICK`]. The runner holds a `Sender` of its own (for the jobs `c`, `A` and `D` start), so
-/// the channel cannot close while the screen runs; a disconnect is fatal, a backstop: each job
-/// (the input thread, each scan and apply) reports why it ends before it does (`Input::Fatal`,
-/// `Input::ScanEnded`, `Input::ApplyEnded`), and with the input thread gone no key can quit.
-fn receive(rx: &mpsc::Receiver<Msg>, busy: bool) -> Msg {
-    let got = if busy {
+/// Run `effects` in order, and the effects each one's input leads to after them. A disk check
+/// gives no input here: its answer comes later, through the loop's channel.
+fn run_effects(
+    effects: Vec<Effect>,
+    model: &mut Review,
+    screen: &mut Screen,
+    runner: &mut Runner<Msg>,
+    player: &mut Player,
+) {
+    let mut queue: VecDeque<Effect> = effects.into();
+    while let Some(effect) = queue.pop_front() {
+        let Some(input) = run_effect(effect, runner, player) else {
+            continue;
+        };
+        queue.extend(screen::update(
+            model,
+            screen,
+            input.into(),
+            jiff::Timestamp::now(),
+        ));
+    }
+}
+
+/// Whether the loop ticks, so that the spinner turns: while a job runs, and while `o`'s file check
+/// waits, which on a share that does not answer goes on until it does. Only a job makes `q` ask
+/// first (`Progress::busy`): quitting leaves a check to end on its own, and loses nothing.
+fn ticking(model: &Review) -> bool {
+    model.progress.busy() || model.stamping.is_some()
+}
+
+/// The loop's next message: the terminal's, a job's or a check's, or, with `tick` ([`ticking`]),
+/// a tick should none come for [`TICK`]. The runner holds a `Sender` of its own (for the jobs `c`,
+/// `A` and `D` start), so the channel cannot close while the screen runs; a disconnect is fatal,
+/// a backstop: each job (the input thread, each scan and apply) reports why it ends before it does
+/// (`Input::Fatal`, `Input::ScanEnded`, `Input::ApplyEnded`), and with the input thread gone no
+/// key can quit.
+fn receive(rx: &mpsc::Receiver<Msg>, tick: bool) -> Msg {
+    let got = if tick {
         match rx.recv_timeout(TICK) {
             Err(mpsc::RecvTimeoutError::Timeout) => return Msg::Tick,
             got => got.ok(),
@@ -419,9 +457,15 @@ fn receive(rx: &mpsc::Receiver<Msg>, busy: bool) -> Msg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::Instant;
+
     use crossterm::event::{KeyEvent, MouseEvent};
+    use model::FileNote;
     use subcheck_core::apply;
     use subcheck_core::player::{How, PlayerError};
+    use subcheck_core::review::checks::Stat;
+    use update::Task;
 
     #[test]
     fn keys_map_to_msgs_and_chords_do_not_leak() {
@@ -570,6 +614,118 @@ mod tests {
         assert_eq!(receive(&rx, true), Msg::Tick);
     }
 
+    /// A disk check that blocks, as one on a share that does not answer does, until the sender it
+    /// comes with is dropped (a failing test drops it as it unwinds); then it finds nothing.
+    fn stuck() -> (mpsc::Sender<()>, Stat) {
+        let (release, held) = mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let stat: Stat = Arc::new(move |_: &Path| {
+            let _ = held.lock().unwrap_or_else(PoisonError::into_inner).recv();
+            None
+        });
+        (release, stat)
+    }
+
+    /// A runner on a store in `dir` whose disk checks read with `stat`, the channel its lanes
+    /// answer on, and a player with no mpv to start.
+    fn checking(dir: &Path, stat: Stat) -> (Runner<Msg>, mpsc::Receiver<Msg>, Player) {
+        let store = Store::open_at(&dir.join("subcheck.db")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let runner = Runner::new(store, dir.into(), tx).with_stat(stat);
+        let player = Player::new(dir.join("no-mpv"), dir.join("mpv.sock"));
+        (runner, rx, player)
+    }
+
+    // The files' check stuck, as on a share that does not answer: made before the screen opened,
+    // it would hold it shut. Asked for on a lane, it leaves the screen to open at once, with no
+    // notes until it answers.
+    #[test]
+    fn the_screen_opens_before_its_files_are_checked() {
+        let warnings = ["warning: /m/locked: skipped: Permission denied (os error 13)".to_string()];
+        let (mut m, first) = opening_review(model::tests_support::run(), true, &warnings);
+        assert!(m.notes.is_empty(), "{:?}", m.notes);
+        assert!(m.karaoke);
+        assert_eq!(m.status, opening_status(&warnings));
+        let paths: Vec<String> = (1..=3).map(model::tests_support::path).collect();
+        let asked = Task::Note {
+            view: 0,
+            paths: paths.clone(),
+        };
+        assert_eq!(first, [Effect::Task(asked)]);
+        let dir = tempfile::tempdir().unwrap();
+        let (release, stat) = stuck();
+        let (mut runner, rx, mut player) = checking(dir.path(), stat);
+        let mut s = Screen::default();
+        let started = Instant::now();
+        run_effects(first, &mut m, &mut s, &mut runner, &mut player);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(m.notes.is_empty(), "{:?}", m.notes);
+        drop(release);
+        let answer = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        screen::update(&mut m, &mut s, answer, jiff::Timestamp::now());
+        let missing = paths.into_iter().map(|p| (p, FileNote::Missing)).collect();
+        assert_eq!(m.notes, missing);
+    }
+
+    // `q` while `o`'s file check is stuck: the check held no key, `q` asks nothing since no job
+    // runs, and the runner lets go of its lanes without waiting for the check, so the screen ends
+    // at once.
+    #[test]
+    fn quitting_while_a_check_waits_does_not_wait_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (release, stat) = stuck();
+        let (mut runner, _rx, mut player) = checking(dir.path(), stat);
+        let mut m = model::tests_support::sample();
+        let mut s = Screen::default();
+        let now = jiff::Timestamp::now();
+        let effects = screen::update(&mut m, &mut s, Msg::Key(KeyCode::Char('o')), now);
+        assert!(
+            matches!(effects[..], [Effect::Task(Task::Stamp(_))]),
+            "{effects:?}"
+        );
+        let started = Instant::now();
+        for effect in effects {
+            assert_eq!(run_effect(effect, &mut runner, &mut player), None);
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(m.stamping.is_some());
+        let effects = screen::update(&mut m, &mut s, Msg::Key(KeyCode::Char('q')), now);
+        assert_eq!(effects, []);
+        assert!(m.should_quit);
+        assert_eq!(m.confirm, None);
+        drop(player);
+        drop(runner);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(release);
+    }
+
+    // The loop ticks while `o`'s file check waits, as it does while a job runs, so that the
+    // spinner turns; `q` still asks first only while a job runs.
+    #[test]
+    fn the_terminal_ticks_while_a_check_waits() {
+        let mut m = model::tests_support::sample();
+        let mut s = Screen::default();
+        let now = jiff::Timestamp::now();
+        assert!(!ticking(&m));
+        screen::update(&mut m, &mut s, Msg::Key(KeyCode::Char('o')), now);
+        assert!(ticking(&m));
+        assert!(!m.progress.busy());
+        let (_tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        assert_eq!(receive(&rx, ticking(&m)), Msg::Tick);
+        assert!(started.elapsed() >= TICK);
+        let moment = m.stamping.clone().unwrap();
+        let answered = Input::Stamped {
+            moment,
+            stamp: None,
+        };
+        screen::update(&mut m, &mut s, answered.into(), now);
+        assert!(!ticking(&m));
+        m.progress
+            .start("r", "subcheck scan --run r /m".into(), false);
+        assert!(ticking(&m));
+    }
+
     #[test]
     fn each_player_command_runs_on_mpv_and_comes_back_as_its_input() {
         let dir = tempfile::tempdir().unwrap();
@@ -579,7 +735,7 @@ mod tests {
         let mut runner = Runner::new(store, dir.path().into(), tx);
         let mut ran = |command| {
             let effect = Effect::Player(command);
-            run_effect(effect, &mut runner, &mut player)
+            run_effect(effect, &mut runner, &mut player).expect("a player command says how it went")
         };
         let moment = subcheck_core::player::Moment {
             file: "/m/E01.mkv".into(),

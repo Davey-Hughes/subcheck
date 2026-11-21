@@ -158,8 +158,16 @@ QString statusWords(const Status &status) {
                 return QStringLiteral("%1 is not on disk, so it was not checked again")
                     .arg(text(n.label));
             },
+            [](const Status::kOpeningView &) { return QStringLiteral("Opening the view…"); },
             [](const Status::kOpening &o) {
                 return QStringLiteral("Opening %1 at %2").arg(text(o.label), exactClock(o.at_ms));
+            },
+            [](const Status::kNotAnswering &n) {
+                return QStringLiteral("%1: the share isn't answering, still waiting")
+                    .arg(text(n.label));
+            },
+            [](const Status::kStoppedWaiting &s) {
+                return QStringLiteral("Stopped waiting for %1").arg(text(s.label));
             },
             [](const Status::kOpened &o) {
                 return o.paused ? QStringLiteral("Showing it, paused")

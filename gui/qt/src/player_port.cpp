@@ -49,9 +49,11 @@ PlayerPort::PlayerPort(std::chrono::milliseconds settle, std::chrono::millisecon
                        std::chrono::milliseconds ready, QObject *parent)
     : QObject(parent) {
     // Each precise: a coarse timer may end up to 5% early. A move mpv says nothing of is given its
-    // whole settle time, and its end reports the move as landed.
-    for (auto [timer, after] : {std::pair{&this->settle, settle}, std::pair{&unanswered, answer},
-                                std::pair{&notShown, ready}}) {
+    // whole settle time, and its end reports the move as landed. whenFileEnds gives endLimit its
+    // time.
+    for (auto [timer, after] :
+         {std::pair{&this->settle, settle}, std::pair{&unanswered, answer},
+          std::pair{&notShown, ready}, std::pair{&endLimit, std::chrono::milliseconds::zero()}}) {
         timer->setSingleShot(true);
         timer->setInterval(after);
         timer->setTimerType(Qt::PreciseTimer);
@@ -66,6 +68,7 @@ PlayerPort::PlayerPort(std::chrono::milliseconds settle, std::chrono::millisecon
     });
     connect(&unanswered, &QTimer::timeout, this, &PlayerPort::noAnswer);
     connect(&notShown, &QTimer::timeout, this, &PlayerPort::notReady);
+    connect(&endLimit, &QTimer::timeout, this, [this] { saidEnded(false); });
 }
 
 // The mpv gone will answer nothing more and land nothing, and a new one has shown nothing and is
@@ -146,6 +149,23 @@ void PlayerPort::release() {
     noteOpening();
 }
 
+// The read follows release's stop, which mpv runs first, as it runs requests in the order they are
+// sent: from the stop on, mpv starts no file, and one it has started names its path before it
+// touches the disk. So a path means a file mpv has yet to end, and the next end mpv says, which it
+// says after this read's answer, is that file's; an end it says before the answer is an earlier
+// file's. An mpv gone, or one that never could show video, has loaded nothing.
+void PlayerPort::whenFileEnds(std::chrono::milliseconds within,
+                              std::function<void(bool ended)> then) {
+    onEnd = std::move(then);
+    if (!mpv || !isReady) {
+        saidEnded(true);
+        return;
+    }
+    endLimit.start(within);
+    pathAsked = nextId++;
+    mpv->get(pathAsked, QStringLiteral("path"));
+}
+
 void PlayerPort::ready() {
     isReady = true;
     notShown.stop();
@@ -156,6 +176,17 @@ void PlayerPort::ready() {
 }
 
 void PlayerPort::answered(std::uint64_t id, const QString &error, const QVariant &data) {
+    // whenFileEnds's read: mpv's word for a property with no value, no file, ends the wait; a path,
+    // or any other error, which leaves it unknown, leaves the wait to the file's end or the limit.
+    if (id != 0 && id == pathAsked) {
+        pathAsked = 0;
+        if (error == unavailable) {
+            saidEnded(true);
+        } else {
+            fileHeld = true;
+        }
+        return;
+    }
     // An answer to a request of a command that has since ended, or of the release's stop.
     if (id == 0 || id != asked) {
         return;
@@ -188,6 +219,10 @@ void PlayerPort::moved() {
 }
 
 void PlayerPort::ended(End end) {
+    // The file whenFileEnds waits on has ended, however it did.
+    if (fileHeld) {
+        saidEnded(true);
+    }
     // A stop is the end of a file a load replaced, which can come after the load's own reads, and
     // those can outlast the settle time on a stalled mount: it leaves the load waited for. Any
     // other end is the loading file's own, as the load replaced whatever played before, and counts
@@ -232,6 +267,17 @@ void PlayerPort::noteOpening() {
     if (opening() != saidOpening) {
         saidOpening = !saidOpening;
         emit openingChanged();
+    }
+}
+
+// Said once: the read under way, should mpv answer it after the wait's time, is no one's, and so is
+// an end mpv says after it.
+void PlayerPort::saidEnded(bool ended) {
+    endLimit.stop();
+    pathAsked = 0;
+    fileHeld = false;
+    if (onEnd) {
+        std::exchange(onEnd, nullptr)(ended);
     }
 }
 

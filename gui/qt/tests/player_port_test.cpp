@@ -11,6 +11,7 @@
 #include <QTest>
 
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -74,6 +75,13 @@ QStringList answerOpening(FakeMpv &mpv, PlayerPort &player, const QString &path 
     asked << mpv.last();
     mpv.answer(player);
     return asked;
+}
+
+// What whenFileEnds says, each time, as a word in `said`.
+std::function<void(bool)> saidInto(QStringList &said) {
+    return [&said](bool ended) {
+        said << (ended ? QStringLiteral("ended") : QStringLiteral("not ended"));
+    };
 }
 
 // The player, its fake mpv, and what it has reported, each as one line. Its limits are far longer
@@ -845,6 +853,147 @@ private slots:
         QTest::qWait(100);
         QCOMPARE(r.mpv.last(), "stop");
         QCOMPARE(r.reports, QStringList());
+    }
+
+    // Once review has let go: mpv's path read once, behind release's stop. With no file, which
+    // mpv's word for a property with no value says, ended at once, with nothing more asked.
+    void whenFileEndsAtOnceWithNoFile() {
+        Rig r;
+        r.player.ready();
+        r.player.release();
+        QStringList said;
+        r.player.whenFileEnds(std::chrono::seconds(10), saidInto(said));
+        QCOMPARE(r.mpv.last(), "get path");
+        r.mpv.serve(r.player);
+        QCOMPARE(said, QStringList{"ended"});
+        QTest::qWait(100);
+        QCOMPARE(said, QStringList{"ended"});
+        QCOMPARE(r.mpv.requests.size(), 2u);
+    }
+
+    // A file mpv has loaded, whose path the read gives: ended at that file's end, which mpv says
+    // after the read's answer. An end mpv says before the answer is an earlier file's, and once the
+    // wait has said so, a later end says nothing more.
+    void whenFileEndsAtTheEndOfTheFileMpvHas() {
+        Rig r;
+        r.mpv.holds = FakeMpv::Holds::Loaded;
+        r.player.ready();
+        r.player.release();
+        QStringList said;
+        r.player.whenFileEnds(std::chrono::seconds(10), saidInto(said));
+        r.mpv.serve(r.player);
+        QCOMPARE(said, QStringList{"ended"});
+
+        Rig h;
+        h.player.ready();
+        h.player.release();
+        QStringList heard;
+        h.player.whenFileEnds(std::chrono::seconds(10), saidInto(heard));
+        h.player.ended(End::Stopped);
+        h.mpv.answer(h.player, QStringLiteral("/m/a.mkv"));
+        QCOMPARE(heard, QStringList());
+        h.player.ended(End::Stopped);
+        QCOMPARE(heard, QStringList{"ended"});
+        h.player.ended(End::Failed);
+        QCOMPARE(heard, QStringList{"ended"});
+        QCOMPARE(h.reports, QStringList());
+    }
+
+    // A file whose open waits on a share that does not answer, which mpv ends only once the share
+    // answers, though its idle flag says idle from the stop on: not ended once the wait's time from
+    // the call has passed, said once, with nothing more asked, and the file's end then heard by no
+    // wait dropped. A wait after it reads the path again, so the file's end counts there, whether
+    // mpv says it during that wait or said it between the two, when the path reads no file.
+    void whenFileEndsGivesUpOnAStuckFileAndAWaitAfterReadsAgain() {
+        Rig r;
+        r.mpv.holds = FakeMpv::Holds::Stuck;
+        r.player.ready();
+        r.player.release();
+        QStringList said;
+        QElapsedTimer waited;
+        waited.start();
+        r.player.whenFileEnds(std::chrono::milliseconds(300), saidInto(said));
+        QVERIFY(r.mpv.serveUntil(
+            r.player, [&said] { return !said.isEmpty(); }, std::chrono::seconds(2)));
+        QVERIFY2(waited.elapsed() >= 300, qPrintable(QString::number(waited.elapsed())));
+        QCOMPARE(said, QStringList{"not ended"});
+        QCOMPARE(r.mpv.requests.size(), 2u);
+        r.player.whenFileEnds(std::chrono::seconds(10), saidInto(said));
+        QCOMPARE(r.mpv.last(), "get path");
+        r.mpv.serve(r.player);
+        QCOMPARE(said, QStringList{"not ended"});
+        r.mpv.shareAnswers(r.player);
+        QCOMPARE(said, (QStringList{"not ended", "ended"}));
+        QCOMPARE(r.reports, QStringList());
+
+        Rig between;
+        between.mpv.holds = FakeMpv::Holds::Stuck;
+        between.player.ready();
+        between.player.release();
+        QStringList heard;
+        between.player.whenFileEnds(std::chrono::milliseconds(300), saidInto(heard));
+        QVERIFY(between.mpv.serveUntil(
+            between.player, [&heard] { return !heard.isEmpty(); }, std::chrono::seconds(2)));
+        between.mpv.shareAnswers(between.player);
+        QCOMPARE(heard, QStringList{"not ended"});
+        between.player.whenFileEnds(std::chrono::seconds(10), saidInto(heard));
+        between.mpv.serve(between.player);
+        QCOMPARE(heard, (QStringList{"not ended", "ended"}));
+    }
+
+    // A read mpv fails with any other error says nothing of a file, so the wait goes on: to an end
+    // mpv says, or to its time.
+    void whenFileEndsWaitsOnAReadThatSaysNothing() {
+        const QString failed = QStringLiteral("error accessing property");
+        Rig r;
+        r.player.ready();
+        r.player.release();
+        QStringList said;
+        r.player.whenFileEnds(std::chrono::seconds(10), saidInto(said));
+        r.mpv.answer(r.player, {}, failed);
+        QCOMPARE(said, QStringList());
+        r.player.ended(End::Stopped);
+        QCOMPARE(said, QStringList{"ended"});
+
+        Rig quiet;
+        quiet.player.ready();
+        quiet.player.release();
+        QStringList heard;
+        QElapsedTimer waited;
+        waited.start();
+        quiet.player.whenFileEnds(std::chrono::milliseconds(300), saidInto(heard));
+        quiet.mpv.answer(quiet.player, {}, failed);
+        QTRY_COMPARE_WITH_TIMEOUT(heard, QStringList{"not ended"}, 2000);
+        QVERIFY2(waited.elapsed() >= 300, qPrintable(QString::number(waited.elapsed())));
+    }
+
+    // A read mpv answers only once the wait's time has passed is no one's: the wait has said its
+    // word.
+    void whenFileEndsDropsAReadAnsweredAfterItsTime() {
+        Rig r;
+        r.player.ready();
+        r.player.release();
+        QStringList said;
+        r.player.whenFileEnds(std::chrono::milliseconds(300), saidInto(said));
+        QTRY_COMPARE_WITH_TIMEOUT(said, QStringList{"not ended"}, 2000);
+        r.mpv.answer(r.player, {}, unavailable);
+        QCOMPARE(said, QStringList{"not ended"});
+        QCOMPARE(r.mpv.requests.size(), 2u);
+    }
+
+    // With no mpv, or one not ready, which has loaded nothing, there is nothing to wait for: ended
+    // at once, with nothing asked.
+    void whenFileEndsWithNoMpvEndsAtOnce() {
+        PlayerPort alone(std::chrono::seconds(10));
+        QStringList said;
+        alone.whenFileEnds(std::chrono::seconds(10), saidInto(said));
+        QCOMPARE(said, QStringList{"ended"});
+
+        Rig r;
+        r.player.release();
+        r.player.whenFileEnds(std::chrono::seconds(10), saidInto(said));
+        QCOMPARE(said, (QStringList{"ended", "ended"}));
+        QCOMPARE(r.mpv.requests.size(), 0u);
     }
 
     // Without its mpv (the window that showed it has gone), the player can show nothing, and

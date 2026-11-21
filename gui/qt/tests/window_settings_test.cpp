@@ -446,6 +446,27 @@ private slots:
         QTRY_COMPARE(in(dir)->value("window/size").toSize(), QSize(700, 500));
     }
 
+    // What keep keeps is in the file as it returns, with no event run after it, with the other
+    // choices the run made: the window's hard end (main.cpp) ends the process straight after it,
+    // and the store neither writes at the event loop's next pass nor is destroyed. The settle
+    // time outlasts the test, so that only the test's keep runs. The file is read as text, as
+    // another QSettings on it in this process would read the store's unwritten values.
+    void keepWritesTheFileAtOnce() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        WindowSettings settings(in(dir), "offscreen", std::chrono::hours(1));
+        QQuickWindow window;
+        settings.show(&window);
+        QVERIFY(move(window, QSize(700, 500), QPoint(40, 30)));
+        settings.keepColumns(180, 410);
+        settings.keep();
+        QFile file(dir.filePath("subcheck-qt.conf"));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const QByteArray text = file.readAll();
+        QVERIFY2(text.contains("size=@Size(700 500)"), text.constData());
+        QVERIFY2(text.contains("sidebar=180"), text.constData());
+    }
+
     // A window manager can report the frame's margins after the window's last move, and a change of
     // margins says nothing. The offscreen platform's margins do not change alone, so a move the
     // settings cannot hear stands in for them: the window reports a new place and says nothing.

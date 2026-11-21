@@ -2268,7 +2268,7 @@ private slots:
     }
 
     // While Show in Video waits, a busy animation is centred on the video, once the wait has lasted
-    // 150 ms, so that a quick open shows none; on a backing of the window's colour, which the
+    // 500 ms, so that a quick open shows none; on a backing of the window's colour, which the
     // style's own ink reads on in any palette, as the black of the pane does not in a light one.
     // Neither takes a click, and a screen reader names the animation. Close Video ends both, and
     // so does review's end, each once the 100 ms are up that keep a load which ends as the next
@@ -2306,7 +2306,7 @@ private slots:
         QTRY_VERIFY(atOnce.has_value());
         QVERIFY(!*atOnce);
         QTRY_VERIFY(loading->property("running").toBool());
-        QVERIFY2(shownAt >= 150, qPrintable(QString::number(shownAt)));
+        QVERIFY2(shownAt >= 500, qPrintable(QString::number(shownAt)));
         QVERIFY(loading->isVisible());
         QVERIFY(backing->isVisible());
         // Each within the half pixel that centring rounds to, so that it draws sharp.

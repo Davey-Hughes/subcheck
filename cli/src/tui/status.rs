@@ -59,7 +59,12 @@ pub fn words(status: &Status) -> String {
             format!("{label} will be checked again when the scan is done")
         }
         Status::NoSuchFile { label } => format!("{label}: no such file"),
+        Status::OpeningView => "opening the view…".into(),
         Status::Opening { label, at_ms } => format!("opening {label} at {}", timestamp_ms(*at_ms)),
+        Status::NotAnswering { label } => {
+            format!("{label}: the share isn't answering, still waiting")
+        }
+        Status::StoppedWaiting { label } => format!("stopped waiting for {label}"),
         Status::Opened { paused: true } => "opened in mpv, paused".into(),
         Status::Opened { paused: false } => "opened in mpv, playing".into(),
         Status::Played(p) => format!(
@@ -310,6 +315,7 @@ mod tests {
                 },
                 "E13: no such file",
             ),
+            (Status::OpeningView, "opening the view…"),
             (
                 Status::Opening {
                     label: label("E14"),
@@ -323,6 +329,18 @@ mod tests {
                     at_ms: -1_500,
                 },
                 "opening E17 at 0:00:00.000",
+            ),
+            (
+                Status::NotAnswering {
+                    label: label("E18"),
+                },
+                "E18: the share isn't answering, still waiting",
+            ),
+            (
+                Status::StoppedWaiting {
+                    label: label("E19"),
+                },
+                "stopped waiting for E19",
             ),
             (Status::Opened { paused: true }, "opened in mpv, paused"),
             (Status::Opened { paused: false }, "opened in mpv, playing"),

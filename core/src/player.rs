@@ -27,6 +27,16 @@ pub fn line_start_us(start_ms: i64) -> i64 {
     start_ms.saturating_mul(1000).saturating_add(PAST_A_LINE_US)
 }
 
+/// The time, in ms, that a moment's `start_us` was made from: a line's carries the
+/// `PAST_A_LINE_US` and a frame's, always whole milliseconds, does not.
+pub fn start_ms(start_us: i64) -> i64 {
+    if start_us % 1000 == 0 {
+        start_us / 1000
+    } else {
+        (start_us - PAST_A_LINE_US) / 1000
+    }
+}
+
 /// What a `Playback` action asks of mpv.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Playback {

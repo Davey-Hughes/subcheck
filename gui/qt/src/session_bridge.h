@@ -69,7 +69,8 @@ class SessionBridge : public QObject {
     Q_PROPERTY(bool showingEpisode READ showingEpisode NOTIFY summaryChanged)
     Q_PROPERTY(QString fatal READ fatal NOTIFY fatalChanged)
     // The player, which the video pane is the mpv of; and whether the video shows that it
-    // loads: once the player's Open has lasted a moment, until a moment after it ends.
+    // loads: once Show in Video's wait, on review's check of its file and then on the player's
+    // Open, has lasted a moment, until a moment after it ends.
     Q_PROPERTY(PlayerPort *player READ player CONSTANT)
     Q_PROPERTY(bool videoLoading READ videoLoading NOTIFY videoLoadingChanged)
 
@@ -256,6 +257,16 @@ private:
     // click still to be answered, which the ask came after. Whatever the bridge last heard of a
     // question: under one, review only lets it go and keeps the finding selected, which then shows.
     void leaveQuietEpisode();
+    // Whether Show in Video waits: on review's check of its file, or on the player's Open from
+    // review's change that says it follows, as the change that ends the check does, until the
+    // player is handed that Open, both while review is held; and on the player's Open from when the
+    // player has it.
+    // The flag takes these as one wait from the press, so that the arc ends neither at the
+    // hand-over from the check to the Open nor at a change review sends while the Open runs, whose
+    // summary has no check waiting and no Open to follow.
+    bool waitingForVideo() const;
+    // The player's command from review, handed to the port; an Open uses up `openFollows`.
+    void handOver(const subcheck_ffi::PlayerCommand &command);
     void ended(const subcheck_ffi::Event::kEnded &end);
     template <typename Call> void guarded(Call call);
     void report(subcheck_ffi::PlayerReport report);
@@ -283,10 +294,15 @@ private:
     std::shared_ptr<Relay> relay;
     std::unique_ptr<QThread> pump;
     QTimer quitWait;
-    // An Open quicker than the first moment shows no animation; two back to back, the next started
-    // before the hide moment after the first is up, show as one.
-    LoadingFlag loading{std::chrono::milliseconds(150), std::chrono::milliseconds(100)};
+    // A wait quicker than the first moment shows no animation; once one shows, two back to back,
+    // the next started before the hide moment after the first is up, show as one, as an Open and
+    // the next do. Review's check of a file and the Open it sends as the check ends come to it as
+    // one wait (waitingForVideo).
+    LoadingFlag loading{std::chrono::milliseconds(500), std::chrono::milliseconds(100)};
     subcheck_ffi::Summary summary{};
+    // Whether an Open is still to come that review's last change said follows: the change sets it
+    // and the Open clears it, as review's next change is not to be waited on to say it has come.
+    bool openFollows = false;
     std::optional<subcheck_ffi::EntryKey> selectedEntry;
     // The greyed episode's view that shows, until it ends, as showingEpisode says.
     std::optional<QuietView> quiet;

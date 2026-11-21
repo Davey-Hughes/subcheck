@@ -4,6 +4,7 @@
 // first path's last part and `+N` for the others, where the terminal names every path. The exit
 // status is 1 after an error, or when review has not ended within the wait below after a quit,
 // and 0 otherwise.
+#include "ending.h"
 #include "player_port.h"
 #include "session_bridge.h"
 #include "window_settings.h"
@@ -12,9 +13,11 @@
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQuickWindow>
+#include <QWindow>
 #include <QtQml/QQmlExtensionPlugin>
 
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -27,6 +30,31 @@ using namespace std::chrono_literals;
 Q_IMPORT_QML_PLUGIN(SubcheckPlugin)
 
 namespace {
+
+// As the terminal's main, once the window and its session are gone: while a signal is ending the
+// process, its cleanup ends it, rather than this status before a job's groups are ended. The first
+// call into the library when the window failed before opening a session, so a contract mismatch
+// throws here, which the bridge would have caught at open. The process's status.
+int finishing(int status) {
+    try {
+        subcheck_ffi::finish();
+    } catch (const std::exception &e) {
+        std::cerr << "subcheck-qt: " << e.what() << '\n';
+        return 1;
+    }
+    return status;
+}
+
+// Ends the process at once, as main would end it but with no object destroyed: the video pane's
+// teardown, MpvQt's, waits for mpv's load stuck on a share that does not answer, and so does its
+// renderer's, on the render thread, which the window's teardown waits on. The kernel ends mpv's
+// threads with the process. What main does once the window has gone is done here, as main will
+// not run: the output written out, then finishing.
+[[noreturn]] void exitHard(int status) {
+    std::cout.flush();
+    std::cerr.flush();
+    std::_Exit(finishing(status));
+}
 
 // The window, from its start to its end: its status.
 int run(int argc, char **argv) {
@@ -58,8 +86,6 @@ int run(int argc, char **argv) {
     // closing review, which can drop a decision still queued, and exits with 1. A session stalled
     // for good, on a hung mount say, still ends the window.
     SessionBridge bridge(std::move(selector), player, std::cout, std::cerr, 10s);
-    QObject::connect(&bridge, &SessionBridge::finished, &app,
-                     [](int status) { QCoreApplication::exit(status); });
     WindowSettings settings(WindowSettings::appStore(), QGuiApplication::platformName());
     QQmlApplicationEngine engine;
     engine.setInitialProperties({{QStringLiteral("bridge"), QVariant::fromValue(&bridge)},
@@ -70,23 +96,33 @@ int run(int argc, char **argv) {
         return 1;
     }
     settings.show(window);
+    // The settings kept now, as no teardown will keep them, and the window heard no more: hidden
+    // next, it can say it is no longer maximized, which the settings would keep once it settled.
+    const auto keepSettings = [&settings, window] {
+        settings.keep();
+        QObject::disconnect(window, nullptr, &settings, nullptr);
+    };
+    const auto hideWindows = [] {
+        const QWindowList windows = QGuiApplication::topLevelWindows();
+        for (QWindow *each : windows) {
+            each->hide();
+        }
+    };
+    // Once review has ended, which stopped mpv: mpv has 2 s to end the file it had, and the window
+    // then ends as any does. The windows go after a moment, should mpv not have ended it by then,
+    // as it does with one loaded or none: a moment long past what that takes, and short enough that
+    // the window still goes at once to the eye. Past the 2 s the process ends without the window's
+    // teardown, from here, before the event loop returns and anything is destroyed.
+    QObject::connect(&bridge, &SessionBridge::finished, &app,
+                     [&player, keepSettings, hideWindows](int status) {
+                         endWindow(
+                             player, 200ms, 2s, status, keepSettings, hideWindows,
+                             [](int code) { QCoreApplication::exit(code); }, exitHard);
+                     });
     bridge.start();
     return QGuiApplication::exec();
 }
 
 } // namespace
 
-int main(int argc, char **argv) {
-    const int status = run(argc, argv);
-    // As the terminal's main, once the window and its session are gone: while a signal is ending
-    // the process, its cleanup ends it, rather than this status before a job's groups are ended.
-    // The first call into the library when the window failed before opening a session, so a
-    // contract mismatch throws here, which the bridge would have caught at open.
-    try {
-        subcheck_ffi::finish();
-    } catch (const std::exception &e) {
-        std::cerr << "subcheck-qt: " << e.what() << '\n';
-        return 1;
-    }
-    return status;
-}
+int main(int argc, char **argv) { return finishing(run(argc, argv)); }

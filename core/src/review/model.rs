@@ -11,6 +11,7 @@ use super::status::Status;
 use crate::apply::patch::Outcome;
 use crate::list::{self, Filter};
 use crate::mkv;
+use crate::player::Moment;
 use crate::store::{Decision, Finding, Run, State, TrackRecord};
 use crate::timing::frame_count;
 
@@ -56,6 +57,18 @@ impl Entry {
 pub enum FileNote {
     Changed,
     Missing,
+}
+
+/// How the file at `path` differs from `run`'s record of it, by its size and mtime now
+/// (`stamp`), none when they could not be read: missing, changed since it was scanned, or as it
+/// was (`None`). A file the run checked twice is compared with its last record, the newest; one
+/// the run has no record of is as it was, having nothing to differ from.
+pub fn note_for(run: &Run, path: &str, stamp: Option<(u64, Timestamp)>) -> Option<FileNote> {
+    let Some((size, mtime)) = stamp else {
+        return Some(FileNote::Missing);
+    };
+    let record = run.files.iter().rev().find(|f| f.path == path)?;
+    (record.size != size || record.mtime != mtime).then_some(FileNote::Changed)
 }
 
 /// Which list the left pane shows.
@@ -319,6 +332,48 @@ pub struct Review {
     /// opens: the same file, unchanged since, is sought, not loaded again (slow for a big file
     /// over NFS). A remux in place keeps the path, and after a fix of one letter even the size.
     pub loaded: Option<(String, (u64, Timestamp))>,
+    /// The moment of the newest `Play` still waiting for its file's check, until the check
+    /// answers ([`Input::Stamped`]) or `ClosePlayer` ends the wait. Only this moment's answer
+    /// opens: on a slow share an older press's check can answer after the user has pressed again,
+    /// or given up, and opening it then would show a moment they have moved past. Moving the
+    /// selection or switching the view keeps it: the press asked for that moment.
+    ///
+    /// [`Input::Stamped`]: crate::review::update::Input::Stamped
+    pub stamping: Option<Moment>,
+    /// Whether the newest `ClosePlayer` ended a `Play`'s wait ([`Review::stamping`]). The player's
+    /// "nothing open" for a close that did is kept off the status line, even when other news came
+    /// first: it would read as if the press had done nothing. Each press sets it and no answer
+    /// clears it, as the player answers closes in order: an older press's answer that comes after
+    /// a newer press ended a wait is kept off too.
+    pub close_ended_wait: bool,
+    /// Which view review shows: 0 as it opens, one more at each view switch (`switch`). A view's
+    /// file notes come after its rows ([`Input::Noted`]), and a switch can come in between: notes
+    /// asked for another view than this one are of another view's files.
+    ///
+    /// [`Input::Noted`]: crate::review::update::Input::Noted
+    pub view_number: u64,
+    /// The number of the newest view switch asked for ([`Review::ask_switch`]), until it answers
+    /// ([`Input::Switched`]) or a job starts. Only its answer is taken: on a slow share an older
+    /// switch's read can answer after the user has asked for another view. Once a job starts, none
+    /// is: the job's progress belongs to the view it started in, as a switch asked while it runs is
+    /// refused.
+    ///
+    /// [`Input::Switched`]: crate::review::update::Input::Switched
+    pub switching: Option<u64>,
+    /// How many view switches have been asked for: each takes the next number, so that an answer
+    /// names the request it answers.
+    switches: u64,
+    /// The files whose note review has set or cleared since it asked for the view's notes: by
+    /// `Play`'s check of the file, a read-back (`refresh`) or apply's remux in place. Each is a
+    /// newer look at the file than the view's check, which may have read it before: the check's
+    /// answer ([`Input::Noted`]) leaves their notes as they are.
+    ///
+    /// [`Input::Noted`]: crate::review::update::Input::Noted
+    pub fresh: HashSet<String>,
+    /// The decisions written while a view switch is under way, by finding ID. The switch reads the
+    /// store on its own, and may read it before they are written: the view it brings takes these
+    /// over its own ([`Review::switch`]).
+    decided_meanwhile: HashMap<u64, Decision>,
 }
 
 impl Review {
@@ -372,6 +427,13 @@ impl Review {
             kept_from: None,
             replaced_by: HashMap::new(),
             loaded: None,
+            stamping: None,
+            close_ended_wait: false,
+            view_number: 0,
+            switching: None,
+            switches: 0,
+            fresh: HashSet::new(),
+            decided_meanwhile: HashMap::new(),
         };
         m.selected = m
             .entries()
@@ -453,8 +515,10 @@ impl Review {
                 None => self.run.files.push(record),
             }
         }
-        // The store has just read it as it is on disk.
+        // The store has just read it as it is on disk: newer than the view's check, should that
+        // answer later.
         self.notes.remove(path);
+        self.fresh.insert(path.to_string());
         let (rows, tracks) = group(&self.run);
         self.rows = rows;
         self.tracks = tracks;
@@ -531,13 +595,16 @@ impl Review {
     }
 
     /// Take `view`, another view of the findings (`SwitchView`'s other one, `OpenView`'s or
-    /// `OpenFolder`'s), with its files' `notes`. What pointed at a finding carries over by its ID,
+    /// `OpenFolder`'s). Its files' notes come later, once checked: the notes of the view left go,
+    /// and the view's number moves on, so that a late answer for the view left is dropped. The
+    /// decisions written while the switch was under way are laid over the view's own, which the
+    /// store may have been read before them. What pointed at a finding carries over by its ID,
     /// where the view has it: the selection, else the first row with a pending finding, as on
     /// opening; the expanded rows; and the undo steps, less the findings this view does not show
     /// (a step left empty goes). The filter, the pane, the marks and the file the player last
     /// loaded stay. The files view shows the new view's files, the selected file kept where it is
     /// one of them.
-    pub fn switch(&mut self, view: Run, notes: HashMap<String, FileNote>) {
+    pub fn switch(&mut self, view: Run) {
         let selected = self.selected_key();
         let expanded: Vec<EntryKey> = self
             .expanded
@@ -555,7 +622,9 @@ impl Review {
         self.labels = labels(&view);
         self.progress.show(&view);
         self.run = view;
-        self.notes = notes;
+        self.notes.clear();
+        self.fresh.clear();
+        self.view_number += 1;
         self.editing = None;
 
         let index: HashMap<u64, usize> = self
@@ -565,6 +634,11 @@ impl Review {
             .enumerate()
             .map(|(i, f)| (f.id, i))
             .collect();
+        for (id, d) in std::mem::take(&mut self.decided_meanwhile) {
+            if index.contains_key(&id) {
+                self.run.decisions.insert(id, d);
+            }
+        }
         let at = |id: u64| index.get(&id).copied();
         self.expanded = expanded
             .iter()
@@ -589,6 +663,25 @@ impl Review {
         self.file_selected = file
             .and_then(|p| self.progress.files.iter().position(|f| f.path == p))
             .unwrap_or(0);
+    }
+
+    /// Number a new view switch: the newest asked, whose answer alone is taken (`switching`).
+    /// The decisions written before it are in the store its read finds; those written from here on
+    /// are kept for the view it brings (`take_decision`).
+    pub fn ask_switch(&mut self) -> u64 {
+        self.switches += 1;
+        self.switching = Some(self.switches);
+        self.decided_meanwhile.clear();
+        self.switches
+    }
+
+    /// Decision `d`, written to the store: the view shows it, and while a view switch is under way
+    /// so will the view the switch brings, whenever its read was ([`Review::switch`]).
+    pub fn take_decision(&mut self, d: &Decision) {
+        self.run.decisions.insert(d.finding, d.clone());
+        if self.switching.is_some() {
+            self.decided_meanwhile.insert(d.finding, d.clone());
+        }
     }
 
     /// Entry `e`'s key ([`EntryKey`]). `e` is an entry of the current rows, as `entries()` gives
@@ -1502,6 +1595,38 @@ mod tests {
     }
 
     #[test]
+    fn note_for_reads_the_last_record_of_a_path() {
+        let mut run = tests_support::run();
+        let p = tests_support::path(1);
+        let FileRecord { size, mtime, .. } = run.files[0].clone();
+        let later = mtime + jiff::SignedDuration::from_secs(1);
+        assert_eq!(note_for(&run, &p, Some((size, mtime))), None);
+        assert_eq!(
+            note_for(&run, &p, Some((size + 1, mtime))),
+            Some(FileNote::Changed)
+        );
+        assert_eq!(
+            note_for(&run, &p, Some((size, later))),
+            Some(FileNote::Changed)
+        );
+        assert_eq!(note_for(&run, &p, None), Some(FileNote::Missing));
+        assert_eq!(
+            note_for(&run, "/m/unrecorded.mkv", Some((size, mtime))),
+            None
+        );
+        // Checked twice, the file is compared with what the second check saw.
+        run.files.push(FileRecord {
+            size: size + 1,
+            ..run.files[0].clone()
+        });
+        assert_eq!(note_for(&run, &p, Some((size + 1, mtime))), None);
+        assert_eq!(
+            note_for(&run, &p, Some((size, mtime))),
+            Some(FileNote::Changed)
+        );
+    }
+
+    #[test]
     fn changed_words_are_set_apart_from_the_shared_ends() {
         assert_eq!(
             label(
@@ -1992,7 +2117,7 @@ mod tests {
             .unwrap();
         m.undo = vec![vec![(3, None), (4, None)], vec![(2, None)]];
         let other = without_e02(&m);
-        m.switch(other, HashMap::new());
+        m.switch(other);
         assert!(m.run.of_paths);
         // Findings 1 and 4, still one row, still expanded; the selection on finding 4.
         assert_eq!(
@@ -2015,7 +2140,7 @@ mod tests {
             .position(|&e| e == Entry::Row(1))
             .unwrap();
         let other = without_e02(&m);
-        m.switch(other, HashMap::new());
+        m.switch(other);
         assert_eq!(m.selected, 0);
     }
 }

@@ -1118,6 +1118,53 @@ mod tests {
         assert!(lines[19].ends_with(" ? help"), "{screen}");
     }
 
+    // While `o`'s file check waits, the status line's words carry the spinner after them, turned a
+    // step by each tick as the one after a job's count on the border is; with no words, the spinner
+    // alone. Once the check answers, it goes.
+    #[test]
+    fn the_status_line_shows_a_spinner_while_a_check_waits() {
+        let mut m = sample();
+        let mut s = Screen::default();
+        send(&mut m, &mut s, Msg::Resize(160, 20), now());
+        let status_line = |m: &Review, s: &Screen| {
+            let screen = render_on(m, s, 160, 20);
+            screen.lines().nth(19).unwrap().to_string()
+        };
+        send(&mut m, &mut s, Msg::Key(KeyCode::Char('o')), now());
+        let moment = m.stamping.clone().expect("o waits for its file's check");
+        let words = screen::status(&m).unwrap();
+        assert!(words.starts_with("opening E01 at "), "{words}");
+        let line = status_line(&m, &s);
+        assert!(line.starts_with(&format!("{words} ⠋ ")), "{line}");
+        assert!(line.ends_with(" ? help"), "{line}");
+        send(&mut m, &mut s, Msg::Tick, now());
+        let line = status_line(&m, &s);
+        assert!(line.starts_with(&format!("{words} ⠙ ")), "{line}");
+        let slow = Input::StillChecking {
+            moment: moment.clone(),
+        };
+        send(&mut m, &mut s, slow, now());
+        let line = status_line(&m, &s);
+        assert!(
+            line.starts_with("E01: the share isn't answering, still waiting ⠙ "),
+            "{line}"
+        );
+        // A key ends the message; the wait goes on, and so does the spinner.
+        send(&mut m, &mut s, Msg::Key(KeyCode::Char('j')), now());
+        assert_eq!(screen::status(&m), None);
+        let line = status_line(&m, &s);
+        assert!(line.starts_with("⠙ "), "{line}");
+        let answered = Input::Stamped {
+            moment,
+            stamp: None,
+        };
+        send(&mut m, &mut s, answered, now());
+        let words = screen::status(&m).unwrap();
+        let line = status_line(&m, &s);
+        assert!(line.starts_with(&format!("{words}  ")), "{line}");
+        assert!(!line.contains(s.spinner()), "{line}");
+    }
+
     #[test]
     fn the_detail_pane_scrolls() {
         let m = sample();

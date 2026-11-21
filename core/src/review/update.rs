@@ -4,11 +4,11 @@
 //! each UI maps its own to the same rules: the terminal's are in `subcheck_cli::tui`, its `keymap`
 //! and `screen`.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use jiff::Timestamp;
 
-use super::model::{Confirm, Edit, Entry, EntryKey, FileNote, Mark, Pane, Review, UndoStep};
+use super::model::{Confirm, Edit, Entry, EntryKey, Mark, Pane, Review, UndoStep, note_for};
 use super::progress::{Scan, Stage};
 use super::status::{Asked, Failure, Kept, Refusal, Status};
 use crate::apply;
@@ -47,14 +47,27 @@ pub enum Input {
         missing: Vec<String>,
         paths: Vec<String>,
     },
-    /// A [`Task::Switch`] finished: the view and its files' notes, or why it could not be read.
-    Switched(Result<(Run, HashMap<String, FileNote>), String>),
+    /// A [`Task::Note`] finished: the size and mtime of each file it asked for, none where they
+    /// could not be read, for view number `view` ([`Review::view_number`]).
+    Noted {
+        view: u64,
+        stamps: Vec<(String, Option<(u64, Timestamp)>)>,
+    },
+    /// A [`Task::Switch`] finished: the view switch number `asked` asked for, or why it could not
+    /// be read.
+    Switched {
+        asked: u64,
+        result: Result<Run, String>,
+    },
     /// A [`Task::Stamp`] finished: the moment `Play` opens, and its file's size and mtime now, or
     /// none when they could not be read.
     Stamped {
         moment: Moment,
         stamp: Option<(u64, Timestamp)>,
     },
+    /// The check a [`Task::Stamp`] asked for of `moment`'s file has not answered, a while after it
+    /// was asked: its share is slow or down.
+    StillChecking { moment: Moment },
     /// A [`PlayerCommand::Open`] finished: where mpv was left, or why it did not open.
     Opened(Result<Opened, PlayerError>),
     /// A [`PlayerCommand::Playback`] finished: where mpv is now.
@@ -215,14 +228,24 @@ pub enum Task {
     /// Check `paths` again into `run`, as `subcheck scan --run <run> --force <paths>`
     /// does ([`Input::Started`]).
     Recheck { run: String, paths: Vec<String> },
+    /// Read the size and mtime of each of `paths`, the files with findings of view number `view`,
+    /// for their notes ([`Input::Noted`]). The view shows its rows without waiting for them: on a
+    /// slow or dead share the check takes long, or never ends, so it runs on a lane of its own
+    /// ([`super::checks::Checks`]).
+    Note { view: u64, paths: Vec<String> },
     /// Open another view of the findings, the other one (`SwitchView`), one a selector names
-    /// (`OpenView`) or a folder's (`OpenFolder`), read from the store with its files' notes
-    /// ([`Input::Switched`] says how it went).
-    Switch(Switch),
-    /// Read the size and mtime of the file `Play` opens, for review to say seek or load
-    /// ([`Input::Stamped`]): a stat, which can hang on a stalled mount, so a task. A session runs
-    /// it on its own thread, not the window's; the terminal runs every task in its loop, which a
-    /// stall holds.
+    /// (`OpenView`) or a folder's (`OpenFolder`), read from the store ([`Input::Switched`] says
+    /// how it went). `asked` numbers the request ([`Review::switching`]): the read touches the
+    /// disk, a word of `OpenView`'s and a path view's folders, so it runs on a lane of its own, and
+    /// on a slow share an older one can answer after a newer one was asked.
+    Switch { asked: u64, to: Switch },
+    /// Read the size and mtime of the file `Play` opens ([`Input::Stamped`]), for review to say
+    /// seek or load and to bring the file's note up to date. Asked at every `Play`, of a file
+    /// marked missing too: a share that was down comes back, and only a fresh look can tell. Only
+    /// the newest press's answer opens ([`Review::stamping`]). A stat can hang on a stalled mount,
+    /// so it runs on a lane of its own ([`super::checks::Checks`]), off the thread that runs
+    /// `update`: review takes the actions after it while it waits, its answer comes later as an
+    /// input, and closing never waits for it.
     Stamp(Moment),
     /// Apply `run`'s accepted fixes on a thread of their own (with `dry_run`, say what would change
     /// and write nothing); `karaoke` as `apply --karaoke` ([`Input::ApplyStarted`], then
@@ -251,8 +274,22 @@ pub fn update(m: &mut Review, input: Input, now: Timestamp) -> Vec<Effect> {
             missing,
             paths: p,
         } => started(m, job, &missing, &p),
-        Input::Switched(result) => switched(m, result),
+        Input::Noted { view, stamps } => {
+            noted(m, view, stamps);
+            Vec::new()
+        }
+        Input::Switched { asked, result } => switched(m, asked, result),
         Input::Stamped { moment, stamp } => stamped(m, moment, stamp),
+        // Said of the press review waits for alone: an older one's check opens nothing whenever
+        // it answers.
+        Input::StillChecking { moment } => {
+            if m.stamping.as_ref() == Some(&moment) {
+                m.status = Some(Status::NotAnswering {
+                    label: m.label(&moment.file),
+                });
+            }
+            Vec::new()
+        }
         Input::Opened(result) => {
             m.status = Some(match result {
                 Ok(Opened { paused }) => Status::Opened { paused },
@@ -273,10 +310,13 @@ pub fn update(m: &mut Review, input: Input, now: Timestamp) -> Vec<Effect> {
         // Whatever it says, mpv may no longer have the file review loaded.
         Input::Closed(result) => {
             m.loaded = None;
-            m.status = Some(match result {
-                Ok(()) => Status::Closed,
-                Err(e) => player_status(m, Asked::Close, e),
-            });
+            match result {
+                Ok(()) => m.status = Some(Status::Closed),
+                // A close that ended a wait has said so: mpv's "nothing open" would read as if the
+                // press had done nothing.
+                Err(PlayerError::NotOpen) if m.close_ended_wait => {}
+                Err(e) => m.status = Some(player_status(m, Asked::Close, e)),
+            }
             Vec::new()
         }
         Input::PlayerFailed(e) => {
@@ -312,6 +352,51 @@ pub fn update(m: &mut Review, input: Input, now: Timestamp) -> Vec<Effect> {
             m.should_quit = true;
             Vec::new()
         }
+    }
+}
+
+/// What review asks for as a view opens, and again after each view switch: the view's file notes
+/// ([`Task::Note`]), which come when the check answers. Only files with findings ever show a note,
+/// and on a network share each check is a round trip: each is asked for once, a file the run
+/// recorded twice included.
+pub fn first_effects(m: &mut Review) -> Vec<Effect> {
+    // Whatever review set before this ask, the check's answer is newer.
+    m.fresh.clear();
+    let shown: HashSet<&str> = m.run.findings.iter().map(|f| f.file.as_str()).collect();
+    let mut asked = HashSet::new();
+    let paths: Vec<String> = m
+        .run
+        .files
+        .iter()
+        .map(|f| f.path.as_str())
+        .filter(|path| shown.contains(path) && asked.insert(*path))
+        .map(str::to_string)
+        .collect();
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    vec![Effect::Task(Task::Note {
+        view: m.view_number,
+        paths,
+    })]
+}
+
+/// The check of view number `view`'s files answered: each file's note, by the rule `Play`'s check
+/// follows ([`note_for`]), against the records review holds now. An answer for a view left is of
+/// another view's files, and is dropped. A file review has looked at since it asked
+/// ([`Review::fresh`]) keeps what that newer look said.
+fn noted(m: &mut Review, view: u64, stamps: Vec<(String, Option<(u64, Timestamp)>)>) {
+    if view != m.view_number {
+        return;
+    }
+    for (path, stamp) in stamps {
+        if m.fresh.contains(&path) {
+            continue;
+        }
+        match note_for(&m.run, &path, stamp) {
+            Some(note) => m.notes.insert(path, note),
+            None => m.notes.remove(&path),
+        };
     }
 }
 
@@ -382,7 +467,7 @@ fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
         Action::OpenFolder(folder) => return open_folder(m, folder),
         Action::Apply { dry_run } => return apply_key(m, dry_run),
         Action::Play => return open(m),
-        Action::ClosePlayer => return vec![Effect::Player(PlayerCommand::Close)],
+        Action::ClosePlayer => return close_player(m),
         Action::Playback(p) => return vec![Effect::Player(PlayerCommand::Playback(p))],
         Action::Answer(yes) => return answer(m, yes),
         Action::SelectFile(path) => select_file(m, &path),
@@ -469,6 +554,8 @@ fn open_editor(m: &mut Review) {
         entry: m.entry_key(entry),
         findings: targets.iter().map(|&i| m.finding(i).id).collect(),
     });
+    // A switch's view ends the edit, and the text typed for it with it.
+    drop_switch(m);
 }
 
 /// The edit's end: its findings accepted with `text`, or plainly when that is the suggestion,
@@ -605,7 +692,7 @@ fn written(
     let old = m.selected;
     let shown = m.entries();
     for d in decisions {
-        m.run.decisions.insert(d.finding, d.clone());
+        m.take_decision(d);
         // A dry run's mark said what apply would do with the decision as it was.
         if m.marks.get(&d.finding).is_some_and(Mark::dry_run) {
             m.marks.remove(&d.finding);
@@ -841,15 +928,12 @@ fn previous_file(m: &mut Review) {
 }
 
 fn open(m: &mut Review) -> Vec<Effect> {
+    // The newest press wins even when it opens nothing: the user has moved past the older one.
+    m.stamping = None;
     let Some(i) = m.focus() else {
         return Vec::new();
     };
     let f = m.finding(i);
-    if m.notes.get(&f.file) == Some(&FileNote::Missing) {
-        let path = f.file.clone();
-        m.status = Some(Status::Refused(Refusal::FileMissing { path }));
-        return Vec::new();
-    }
     // Whether mpv plays once there is the player's to keep, from mpv's own state, a pause made in
     // mpv's window among it, so the moment carries none. A timing finding with a frame that shows
     // its error opens on that frame, sought at the frame's own time: worked out from the frame rate
@@ -880,17 +964,37 @@ fn open(m: &mut Review) -> Vec<Effect> {
         label: m.label(&moment.file),
         at_ms,
     });
+    m.stamping = Some(moment.clone());
     vec![Effect::Task(Task::Stamp(moment))]
 }
 
-/// `Play`'s file stat, and review's word to the player: a seek when review last had it load this
+/// `Play`'s file check, and review's word to the player: a seek when review last had it load this
 /// file, unchanged on disk since, else a load. The player checks the seek against what its mpv
-/// has open, so a load forgotten too soon costs a reload, never a wrong frame. A file that is not
-/// there (whose size and mtime cannot be read) is not opened, as one whose note says it is missing
-/// is not: mpv could not read it either, and the terminal's player, which does not wait for a load
-/// to land, would say it opened. Its note is left as it is, so that the next `Play` stats the file
-/// again: a mount back, it opens.
+/// has open, so a load forgotten too soon costs a reload, never a wrong frame. Only the answer for
+/// the press review waits for acts ([`Review::stamping`]): an older press's, or one `ClosePlayer`
+/// let go, would open a moment the user has left. The answer brings the file's note up to date,
+/// whatever the view's check said when it opened: it is the newest look at the file. A file that
+/// is not there (whose size and mtime cannot be read) is not opened: mpv could not read it either,
+/// and the terminal's player, which does not wait for a load to land, would say it opened. The
+/// next `Play` checks it again, so that a file on a share that came back opens.
 fn stamped(m: &mut Review, moment: Moment, stamp: Option<(u64, Timestamp)>) -> Vec<Effect> {
+    if m.stamping.as_ref() != Some(&moment) {
+        return Vec::new();
+    }
+    m.stamping = None;
+    // The share has answered for this press, so its words that it has not would otherwise stay
+    // through mpv's whole load; any other status was set since and is newer.
+    if matches!(m.status, Some(Status::NotAnswering { .. })) {
+        m.status = Some(Status::Opening {
+            label: m.label(&moment.file),
+            at_ms: player::start_ms(moment.start_us),
+        });
+    }
+    match note_for(&m.run, &moment.file, stamp) {
+        Some(note) => m.notes.insert(moment.file.clone(), note),
+        None => m.notes.remove(&moment.file),
+    };
+    m.fresh.insert(moment.file.clone());
     let Some(stamp) = stamp else {
         m.loaded = None;
         m.status = Some(Status::Refused(Refusal::FileMissing { path: moment.file }));
@@ -908,6 +1012,19 @@ fn stamped(m: &mut Review, moment: Moment, stamp: Option<(u64, Timestamp)>) -> V
         how,
         options: player::load_options(),
     })]
+}
+
+/// `ClosePlayer`: the player closes what it has open, and a `Play` still waiting for its file's
+/// check stops waiting, so that the check's answer, however late, opens nothing.
+fn close_player(m: &mut Review) -> Vec<Effect> {
+    let waited = m.stamping.take();
+    m.close_ended_wait = waited.is_some();
+    if let Some(moment) = waited {
+        m.status = Some(Status::StoppedWaiting {
+            label: m.label(&moment.file),
+        });
+    }
+    vec![Effect::Player(PlayerCommand::Close)]
 }
 
 /// What went wrong with player command `asked`, as review's message: a file by the list's name for
@@ -963,6 +1080,8 @@ fn apply_key(m: &mut Review, dry_run: bool) -> Vec<Effect> {
     if dry_run {
         return start_apply(m, true);
     }
+    // Its counts are the view's shown, and a yes applies that view.
+    drop_switch(m);
     m.confirm = Some(Confirm::Apply);
     Vec::new()
 }
@@ -979,6 +1098,7 @@ fn start_apply(m: &mut Review, dry_run: bool) -> Vec<Effect> {
         resume.push_str(" --karaoke");
     }
     m.progress.start_apply(dry_run, resume);
+    drop_switch(m);
     vec![Effect::Task(Task::StartApply {
         run: m.run.clone(),
         dry_run,
@@ -1014,12 +1134,16 @@ fn applied(m: &mut Review, event: apply::Event) -> Vec<Effect> {
             }
             m.run.applied.extend(marked);
             // Every model record for the path takes the new stamp, even if only one check kind
-            // moved: only `file_notes` reads it, and another view re-reads the store.
+            // moved: only `note_for` reads it, and another view re-reads the store.
             if let Some((size, mtime)) = restamped {
                 for r in m.run.files.iter_mut().filter(|r| r.path == path) {
                     r.size = size;
                     r.mtime = mtime;
                 }
+                // The file is as its records now say. A check of the view's files asked before the
+                // remux would compare the size and mtime it had with them.
+                m.notes.remove(&path);
+                m.fresh.insert(path);
             }
         }
         apply::Event::Failed {
@@ -1041,21 +1165,38 @@ fn applied(m: &mut Review, event: apply::Event) -> Vec<Effect> {
 }
 
 /// The view `SwitchView`, `OpenView` or `OpenFolder` asked for has been read, or could not be:
-/// take it, or say why the screen is as it was.
-fn switched(
-    m: &mut Review,
-    result: Result<(Run, HashMap<String, FileNote>), String>,
-) -> Vec<Effect> {
+/// take it and ask for its files' notes, or say why the screen is as it was. Only the newest
+/// switch's answer acts ([`Review::switching`]): an older one's would replace the view the user
+/// asked for after it, or say that a view they no longer wait for failed.
+fn switched(m: &mut Review, asked: u64, result: Result<Run, String>) -> Vec<Effect> {
+    if m.switching != Some(asked) {
+        return Vec::new();
+    }
+    m.switching = None;
     match result {
-        Ok((run, notes)) => m.switch(run, notes),
+        Ok(run) => {
+            m.switch(run);
+            if m.status == Some(Status::OpeningView) {
+                m.status = None;
+            }
+            first_effects(m)
+        }
         Err(error) => {
             m.status = Some(Status::Failed {
                 what: Failure::Switch,
                 error,
             });
+            Vec::new()
         }
     }
-    Vec::new()
+}
+
+/// Ask for view `to` as the newest switch, and say the view is opening: the one shown stays, and
+/// works, until it comes.
+fn ask_for_view(m: &mut Review, to: Switch) -> Vec<Effect> {
+    let asked = m.ask_switch();
+    m.status = Some(Status::OpeningView);
+    vec![Effect::Task(Task::Switch { asked, to })]
 }
 
 /// `SwitchView`: the other view of the screen's findings. From a run's view, the run's folders;
@@ -1067,9 +1208,8 @@ fn switch_view(m: &mut Review) -> Vec<Effect> {
         return Vec::new();
     }
     if !m.run.of_paths {
-        return vec![Effect::Task(Task::Switch(Switch::FoldersOf(
-            m.run.name.clone(),
-        )))];
+        let name = m.run.name.clone();
+        return ask_for_view(m, Switch::FoldersOf(name));
     }
     let in_list = match m.pane {
         Pane::Findings => m.selected_entry().map(|e| {
@@ -1081,16 +1221,16 @@ fn switch_view(m: &mut Review) -> Vec<Effect> {
         }),
         Pane::Files => None,
     };
-    in_list
-        .or_else(|| {
-            m.progress
-                .files
-                .get(m.file_selected)
-                .map(|f| f.path.clone())
-        })
-        .map(|p| Effect::Task(Task::Switch(Switch::RunNaming(p))))
-        .into_iter()
-        .collect()
+    let file = in_list.or_else(|| {
+        m.progress
+            .files
+            .get(m.file_selected)
+            .map(|f| f.path.clone())
+    });
+    match file {
+        Some(p) => ask_for_view(m, Switch::RunNaming(p)),
+        None => Vec::new(),
+    }
 }
 
 /// The view `words` select, in place of the one shown; not while a job runs, as for `SwitchView`.
@@ -1098,7 +1238,7 @@ fn open_view(m: &mut Review, words: Vec<String>) -> Vec<Effect> {
     if refused_while_a_job_runs(m) {
         return Vec::new();
     }
-    vec![Effect::Task(Task::Switch(Switch::Selector(words)))]
+    ask_for_view(m, Switch::Selector(words))
 }
 
 /// The view of `folder`, in place of the one shown; not while a job runs, as for `SwitchView`.
@@ -1106,7 +1246,18 @@ fn open_folder(m: &mut Review, folder: String) -> Vec<Effect> {
     if refused_while_a_job_runs(m) {
         return Vec::new();
     }
-    vec![Effect::Task(Task::Switch(Switch::Folder(folder)))]
+    ask_for_view(m, Switch::Folder(folder))
+}
+
+/// A job's question has opened, the job has started, or an edit has opened: what a yes does, the
+/// job's progress and the edit's text belong to the view shown. A switch under way is dropped, and
+/// its late answer with it, as one asked while a job runs is refused; the status no longer says the
+/// view is opening.
+fn drop_switch(m: &mut Review) {
+    m.switching = None;
+    if m.status == Some(Status::OpeningView) {
+        m.status = None;
+    }
 }
 
 /// Whether a new view is refused, for a scan or apply that runs: its progress belongs to the view
@@ -1167,7 +1318,11 @@ fn again(m: &mut Review, path: String, run: String) -> Vec<Effect> {
 /// The run `Recheck` checks a file again into, and its LLM, for the question; or why there is none.
 fn run_found(m: &mut Review, path: String, found: Result<(String, String), String>) -> Vec<Effect> {
     match found {
-        Ok((run, backend)) => m.confirm = Some(Confirm::Recheck { path, run, backend }),
+        Ok((run, backend)) => {
+            // A yes checks the file of the files view shown, into the run it names.
+            drop_switch(m);
+            m.confirm = Some(Confirm::Recheck { path, run, backend });
+        }
         Err(error) => {
             m.status = Some(Status::Failed {
                 what: Failure::Recheck,
@@ -1200,6 +1355,7 @@ fn started(
     let effects = match job {
         Ok(job) => {
             m.progress.start(&job.run, job.resume, true);
+            drop_switch(m);
             Vec::new()
         }
         Err(e) => {
@@ -1436,10 +1592,11 @@ pub mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use crate::apply::patch::Outcome;
-    use crate::review::model::{Mark, Question};
+    use crate::review::model::{FileNote, Mark, Question};
     use crate::review::progress::{ApplyAt, Stopping};
 
     use super::tests_support::{
@@ -1786,7 +1943,10 @@ mod tests {
                 path: path(2),
                 view: Err("database is locked".into()),
             },
-            Input::Switched(Err("disk I/O error".into())),
+            Input::Switched {
+                asked: 1,
+                result: Err("disk I/O error".into()),
+            },
             Input::Opened(Ok(Opened { paused: true })),
             Input::Played(Ok(PlayState {
                 paused: true,
@@ -1798,6 +1958,8 @@ mod tests {
         ];
         for input in inputs {
             for mut m in asking() {
+                // As if a view switch had been asked before the question, so that its answer acts.
+                m.switching = Some(1);
                 let asked = m.confirm.clone();
                 let what = format!("{input:?} under {asked:?}");
                 update(&mut m, input.clone(), now());
@@ -2507,6 +2669,20 @@ mod tests {
         update(m, Input::Stamped { moment, stamp }, now())
     }
 
+    /// The moment whose file check `effects`, `Play`'s, asks for.
+    fn asked(effects: Vec<Effect>) -> Moment {
+        let [Effect::Task(Task::Stamp(moment))] = <[Effect; 1]>::try_from(effects).unwrap() else {
+            panic!("expected the stat of the file to open");
+        };
+        moment
+    }
+
+    /// What review does once the check of `moment`'s file reads `stamp`.
+    fn checked(m: &mut Review, moment: &Moment, stamp: Option<(u64, Timestamp)>) -> Vec<Effect> {
+        let moment = moment.clone();
+        update(m, Input::Stamped { moment, stamp }, now())
+    }
+
     /// The stamp of a file `size` bytes long.
     fn stamp(size: u64) -> (u64, Timestamp) {
         (size, now())
@@ -2641,21 +2817,6 @@ mod tests {
         }
     }
 
-    // As a file whose note says it is missing is not opened: mpv could not read it either.
-    #[test]
-    fn a_file_that_cannot_be_read_now_is_not_opened() {
-        let mut m = sample();
-        let effects = act(&mut m, Action::Play);
-        stat(&mut m, effects, Some(stamp(1)));
-        let effects = act(&mut m, Action::Play);
-        assert_eq!(stat(&mut m, effects, None), []);
-        assert_eq!(
-            m.status,
-            Some(Status::Refused(Refusal::FileMissing { path: path(1) }))
-        );
-        assert_eq!(m.loaded, None);
-    }
-
     // Each report's message, with what was asked and the file by the list's name; an error with
     // text keeps its words.
     #[test]
@@ -2743,10 +2904,317 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_file_is_not_opened() {
+    fn a_play_waits_for_its_check_and_opens_when_it_comes() {
+        let mut m = sample();
+        let moment = Moment {
+            file: path(1),
+            start_us: 165_064_500,
+            sid: Some(1),
+        };
+        assert_eq!(
+            act(&mut m, Action::Play),
+            [Effect::Task(Task::Stamp(moment.clone()))]
+        );
+        assert_eq!(m.stamping, Some(moment.clone()));
+        assert_eq!(
+            checked(&mut m, &moment, Some(stamp(1))),
+            open(moment, How::Load)
+        );
+        assert_eq!(m.stamping, None);
+    }
+
+    // A check that answers after a newer press opens nothing and changes nothing: the user has
+    // moved on to another moment.
+    #[test]
+    fn only_the_newest_plays_check_opens() {
+        let mut m = sample();
+        let recorded = (m.run.files[0].size, m.run.files[0].mtime);
+        let effects = act(&mut m, Action::Play);
+        stat(&mut m, effects, Some(recorded));
+        let loaded = m.loaded.clone();
+        assert!(loaded.is_some());
+        let e01 = asked(act(&mut m, Action::Play));
+        act(&mut m, Action::Move(1));
+        let e02 = asked(act(&mut m, Action::Play));
+        assert_eq!(e02.file, path(2));
+        let said = m.status.clone();
+        assert_eq!(checked(&mut m, &e01, None), []);
+        assert_eq!(m.stamping, Some(e02.clone()));
+        assert_eq!(m.loaded, loaded);
+        assert_eq!(m.status, said);
+        assert_eq!(m.notes, HashMap::new());
+        assert_eq!(checked(&mut m, &e02, Some(stamp(1))), open(e02, How::Load));
+    }
+
+    #[test]
+    fn the_same_press_twice_opens_once() {
+        let mut m = sample();
+        let first = asked(act(&mut m, Action::Play));
+        let second = asked(act(&mut m, Action::Play));
+        assert_eq!(first, second);
+        assert_eq!(
+            checked(&mut m, &first, Some(stamp(1))),
+            open(first.clone(), How::Load)
+        );
+        assert_eq!(checked(&mut m, &second, Some(stamp(1))), []);
+    }
+
+    #[test]
+    fn close_video_ends_the_wait_and_says_so() {
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        assert_eq!(
+            act(&mut m, Action::ClosePlayer),
+            [Effect::Player(PlayerCommand::Close)]
+        );
+        assert_eq!(m.stamping, None);
+        let stopped = Some(Status::StoppedWaiting {
+            label: "E01".into(),
+        });
+        assert_eq!(m.status, stopped);
+        // With no video open, the player's "nothing open" would read as if the press did nothing.
+        update(&mut m, Input::Closed(Err(PlayerError::NotOpen)), now());
+        assert_eq!(m.status, stopped);
+        assert_eq!(checked(&mut m, &moment, Some(stamp(1))), []);
+        assert_eq!(m.status, stopped);
+        assert_eq!(m.loaded, None);
+    }
+
+    #[test]
+    fn close_video_with_no_wait_says_what_the_player_says() {
+        let mut m = sample();
+        assert_eq!(
+            act(&mut m, Action::ClosePlayer),
+            [Effect::Player(PlayerCommand::Close)]
+        );
+        assert_eq!(m.status, None);
+        update(&mut m, Input::Closed(Err(PlayerError::NotOpen)), now());
+        assert_eq!(
+            m.status,
+            Some(Status::NotOpen {
+                asked: Asked::Close
+            })
+        );
+        // A wait that has ended is no wait.
+        let effects = act(&mut m, Action::Play);
+        stat(&mut m, effects, Some(stamp(1)));
+        act(&mut m, Action::ClosePlayer);
+        assert_eq!(m.status, None);
+    }
+
+    #[test]
+    fn only_a_close_video_that_ended_a_wait_keeps_nothing_open_off_the_line() {
+        let mut m = sample();
+        // An open under way, `o` again with its check stuck, then Close Video: the player answers
+        // the open before the close, as it takes its commands in order.
+        let effects = act(&mut m, Action::Play);
+        stat(&mut m, effects, Some(stamp(1)));
+        asked(act(&mut m, Action::Play));
+        act(&mut m, Action::ClosePlayer);
+        let gone = Some(Status::CouldNotOpen {
+            label: "E01".into(),
+        });
+        update(
+            &mut m,
+            Input::Opened(Err(PlayerError::CouldNotOpen { file: path(1) })),
+            now(),
+        );
+        update(&mut m, Input::Closed(Err(PlayerError::NotOpen)), now());
+        assert_eq!(m.status, gone);
+        // Close Video again, with no wait left to end.
+        act(&mut m, Action::ClosePlayer);
+        update(&mut m, Input::Closed(Err(PlayerError::NotOpen)), now());
+        assert_eq!(
+            m.status,
+            Some(Status::NotOpen {
+                asked: Asked::Close
+            })
+        );
+        // A press that ends a wait while an older press's answer is still to come: neither answer
+        // takes its word away.
+        act(&mut m, Action::ClosePlayer);
+        asked(act(&mut m, Action::Play));
+        act(&mut m, Action::ClosePlayer);
+        update(&mut m, Input::Closed(Err(PlayerError::NotOpen)), now());
+        update(&mut m, Input::Closed(Err(PlayerError::NotOpen)), now());
+        assert_eq!(
+            m.status,
+            Some(Status::StoppedWaiting {
+                label: "E01".into()
+            })
+        );
+    }
+
+    #[test]
+    fn moving_the_selection_keeps_the_waiting_play() {
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        assert_eq!(moment.file, path(1));
+        act(&mut m, Action::Move(1));
+        assert_eq!(
+            checked(&mut m, &moment, Some(stamp(1))),
+            open(moment, How::Load)
+        );
+    }
+
+    #[test]
+    fn a_play_that_opens_nothing_ends_an_older_wait() {
+        let mut m = crate::review::model::tests_support::with_timing();
+        for f in &mut m.run.findings {
+            if let Some(t) = &mut f.timing {
+                for s in &mut t.stretches {
+                    (s.first, s.last, s.frame_ms) = (None, None, None);
+                }
+            }
+        }
+        m.selected = 0;
+        let moment = asked(act(&mut m, Action::Play));
+        m.selected = 1;
+        assert_eq!(act(&mut m, Action::Play), []);
+        assert_eq!(m.status, Some(Status::Refused(Refusal::NothingToOpen)));
+        assert_eq!(m.stamping, None);
+        assert_eq!(checked(&mut m, &moment, Some(stamp(1))), []);
+    }
+
+    // A share that was down comes back, and only a fresh look can tell.
+    #[test]
+    fn a_file_marked_missing_is_checked_again() {
         let mut m = sample();
         m.notes.insert(path(1), FileNote::Missing);
-        assert_eq!(act(&mut m, Action::Play), []);
+        assert!(matches!(
+            act(&mut m, Action::Play)[..],
+            [Effect::Task(Task::Stamp(_))]
+        ));
+        assert_eq!(m.status, Some(opening("E01", 165_060)));
+    }
+
+    #[test]
+    fn a_file_back_opens_and_loses_its_missing_mark() {
+        let mut m = sample();
+        m.notes.insert(path(1), FileNote::Missing);
+        let recorded = (m.run.files[0].size, m.run.files[0].mtime);
+        let moment = asked(act(&mut m, Action::Play));
+        assert_eq!(
+            checked(&mut m, &moment, Some(recorded)),
+            open(moment, How::Load)
+        );
+        assert_eq!(m.notes.get(&path(1)), None);
+    }
+
+    #[test]
+    fn a_file_found_changed_is_marked_changed() {
+        let mut m = sample();
+        let other = (m.run.files[0].size + 1, m.run.files[0].mtime);
+        let moment = asked(act(&mut m, Action::Play));
+        assert_eq!(
+            checked(&mut m, &moment, Some(other)),
+            open(moment, How::Load)
+        );
+        assert_eq!(m.notes.get(&path(1)), Some(&FileNote::Changed));
+    }
+
+    // Not opened: mpv could not read it either, and the terminal's player, which does not wait for
+    // a load to land, would say it opened.
+    #[test]
+    fn a_missing_file_ends_the_wait() {
+        let mut m = sample();
+        let recorded = (m.run.files[0].size, m.run.files[0].mtime);
+        let effects = act(&mut m, Action::Play);
+        stat(&mut m, effects, Some(recorded));
+        let moment = asked(act(&mut m, Action::Play));
+        let elsewhere = Moment {
+            file: path(2),
+            ..moment.clone()
+        };
+        assert_eq!(checked(&mut m, &elsewhere, None), []);
+        assert_eq!(m.stamping, Some(moment.clone()));
+        assert!(m.loaded.is_some());
+        assert_eq!(m.status, Some(opening("E01", 165_060)));
+        assert_eq!(m.notes, HashMap::new());
+        assert_eq!(checked(&mut m, &moment, None), []);
+        assert_eq!(m.stamping, None);
+        assert_eq!(m.loaded, None);
+        assert_eq!(
+            m.status,
+            Some(Status::Refused(Refusal::FileMissing { path: path(1) }))
+        );
+        assert_eq!(m.notes.get(&path(1)), Some(&FileNote::Missing));
+    }
+
+    #[test]
+    fn still_checking_says_the_share_is_not_answering() {
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        let elsewhere = Moment {
+            file: path(2),
+            ..moment.clone()
+        };
+        update(&mut m, Input::StillChecking { moment: elsewhere }, now());
+        assert_eq!(m.status, Some(opening("E01", 165_060)));
+        let waiting = Input::StillChecking {
+            moment: moment.clone(),
+        };
+        update(&mut m, waiting.clone(), now());
+        let not_answering = Some(Status::NotAnswering {
+            label: "E01".into(),
+        });
+        assert_eq!(m.status, not_answering);
+        // Once the check has answered, the word comes too late to say anything.
+        checked(&mut m, &moment, Some(stamp(1)));
+        m.status = None;
+        update(&mut m, waiting, now());
+        assert_eq!(m.status, None);
+    }
+
+    fn word(m: &mut Review, moment: &Moment) {
+        update(
+            m,
+            Input::StillChecking {
+                moment: moment.clone(),
+            },
+            now(),
+        );
+    }
+
+    #[test]
+    fn the_answer_after_the_word_puts_the_presss_status_back() {
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        word(&mut m, &moment);
+        let sent = checked(&mut m, &moment, Some(stamp(1)));
+        assert_eq!(m.status, Some(opening("E01", 165_060)));
+        assert_eq!(sent, open(moment, How::Load));
+    }
+
+    #[test]
+    fn the_answer_after_a_cleared_status_and_the_word_puts_the_presss_status_back() {
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        act(&mut m, Action::Move(1));
+        assert_eq!(m.status, None);
+        word(&mut m, &moment);
+        let sent = checked(&mut m, &moment, Some(stamp(1)));
+        assert_eq!(m.status, Some(opening("E01", 165_060)));
+        assert_eq!(sent, open(moment, How::Load));
+    }
+
+    #[test]
+    fn a_status_set_after_the_word_is_not_replaced_by_the_answer() {
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        word(&mut m, &moment);
+        let other = Some(Status::Opened { paused: true });
+        m.status = other.clone();
+        checked(&mut m, &moment, Some(stamp(1)));
+        assert_eq!(m.status, other);
+    }
+
+    #[test]
+    fn a_missing_file_after_the_word_shows_the_refusal_not_opening() {
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        word(&mut m, &moment);
+        assert_eq!(checked(&mut m, &moment, None), []);
         assert_eq!(
             m.status,
             Some(Status::Refused(Refusal::FileMissing { path: path(1) }))
@@ -3319,23 +3787,30 @@ mod tests {
         let mut m = sample();
         assert_eq!(
             act(&mut m, Action::SwitchView),
-            [Effect::Task(Task::Switch(Switch::FoldersOf(
-                m.run.name.clone()
-            )))]
+            [Effect::Task(Task::Switch {
+                asked: 1,
+                to: Switch::FoldersOf(m.run.name.clone()),
+            })]
         );
         // In a paths view, the selected row's first member's file.
         m.run.of_paths = true;
         m.selected = 0;
         assert_eq!(
             act(&mut m, Action::SwitchView),
-            [Effect::Task(Task::Switch(Switch::RunNaming(path(1))))]
+            [Effect::Task(Task::Switch {
+                asked: 2,
+                to: Switch::RunNaming(path(1)),
+            })]
         );
         // In the files view, the selected file.
         act(&mut m, Action::ShowPane(Pane::Files));
         m.file_selected = 2;
         assert_eq!(
             act(&mut m, Action::SwitchView),
-            [Effect::Task(Task::Switch(Switch::RunNaming(path(3))))]
+            [Effect::Task(Task::Switch {
+                asked: 3,
+                to: Switch::RunNaming(path(3)),
+            })]
         );
     }
 
@@ -3349,7 +3824,10 @@ mod tests {
         assert_eq!(m.selected_entry(), None);
         assert_eq!(
             act(&mut m, Action::SwitchView),
-            [Effect::Task(Task::Switch(Switch::RunNaming(path(2))))]
+            [Effect::Task(Task::Switch {
+                asked: 1,
+                to: Switch::RunNaming(path(2)),
+            })]
         );
     }
 
@@ -3366,7 +3844,10 @@ mod tests {
         let mut m = sample();
         assert_eq!(
             act(&mut m, Action::OpenView(words.clone())),
-            [Effect::Task(Task::Switch(Switch::Selector(words.clone())))]
+            [Effect::Task(Task::Switch {
+                asked: 1,
+                to: Switch::Selector(words.clone()),
+            })]
         );
         let mut m = scanning();
         assert_eq!(act(&mut m, Action::OpenView(words.clone())), []);
@@ -3387,9 +3868,10 @@ mod tests {
         let mut m = sample();
         assert_eq!(
             act(&mut m, Action::OpenFolder("/m/K-On!".into())),
-            [Effect::Task(Task::Switch(Switch::Folder(
-                "/m/K-On!".into()
-            )))]
+            [Effect::Task(Task::Switch {
+                asked: 1,
+                to: Switch::Folder("/m/K-On!".into()),
+            })]
         );
         let mut m = scanning();
         assert_eq!(act(&mut m, Action::OpenFolder("/m/K-On!".into())), []);
@@ -3410,7 +3892,12 @@ mod tests {
         let mut m = sample();
         m.loaded = Some((path(1), (1, now())));
         let view = tests_support::run();
-        update(&mut m, Input::Switched(Ok((view, HashMap::new()))), now());
+        act(&mut m, Action::SwitchView);
+        let switched = Input::Switched {
+            asked: 1,
+            result: Ok(view),
+        };
+        update(&mut m, switched, now());
         assert_eq!(m.loaded, Some((path(1), (1, now()))));
     }
 
@@ -3418,7 +3905,12 @@ mod tests {
     fn a_view_that_cannot_be_read_leaves_the_screen_as_it_was() {
         let mut m = sample();
         let before = m.run.clone();
-        update(&mut m, Input::Switched(Err("disk I/O error".into())), now());
+        act(&mut m, Action::SwitchView);
+        let failed = Input::Switched {
+            asked: 1,
+            result: Err("disk I/O error".into()),
+        };
+        update(&mut m, failed, now());
         assert_eq!(m.run, before);
         assert_eq!(
             m.status,
@@ -3426,6 +3918,386 @@ mod tests {
                 what: Failure::Switch,
                 error: "disk I/O error".into(),
             })
+        );
+    }
+
+    /// The notes `first_effects` asks for, those of view `view`: each of its files with findings,
+    /// once.
+    fn notes_of(view: u64) -> Vec<Effect> {
+        vec![Effect::Task(Task::Note {
+            view,
+            paths: vec![path(1), path(2), path(3)],
+        })]
+    }
+
+    /// What the check of the view's files read: each file's size and mtime, or none.
+    fn noted(view: u64, stamps: &[(u32, Option<(u64, Timestamp)>)]) -> Input {
+        Input::Noted {
+            view,
+            stamps: stamps.iter().map(|&(ep, s)| (path(ep), s)).collect(),
+        }
+    }
+
+    /// The size and mtime the view recorded for episode `ep`.
+    fn recorded(m: &Review, ep: u32) -> (u64, Timestamp) {
+        let f = m.run.files.iter().find(|f| f.path == path(ep)).unwrap();
+        (f.size, f.mtime)
+    }
+
+    /// The sample as another view shows it, a paths view, read from the store as it is now.
+    fn other_view(m: &Review) -> Run {
+        Run {
+            of_paths: true,
+            paths: vec!["/m/K-On!".into()],
+            ..m.run.clone()
+        }
+    }
+
+    #[test]
+    fn the_first_effects_ask_for_the_views_notes() {
+        let mut m = sample();
+        // A file checked twice is asked for once, and one with no findings never.
+        m.run.files.push(tests_support::file(2));
+        m.run.files.push(tests_support::file(9));
+        assert_eq!(first_effects(&mut m), notes_of(0));
+        let mut none = Review::new(Run::default(), HashMap::new());
+        assert_eq!(first_effects(&mut none), []);
+    }
+
+    #[test]
+    fn notes_for_the_view_shown_are_taken() {
+        let mut m = sample();
+        m.notes.insert(path(1), FileNote::Missing);
+        first_effects(&mut m);
+        let changed = (recorded(&m, 2).0 + 1, recorded(&m, 2).1);
+        let notes = noted(
+            0,
+            &[(1, Some(recorded(&m, 1))), (2, Some(changed)), (3, None)],
+        );
+        assert_eq!(update(&mut m, notes, now()), []);
+        assert_eq!(
+            m.notes,
+            HashMap::from([(path(2), FileNote::Changed), (path(3), FileNote::Missing)])
+        );
+    }
+
+    #[test]
+    fn notes_for_a_view_left_are_dropped() {
+        let mut m = sample();
+        first_effects(&mut m);
+        act(&mut m, Action::SwitchView);
+        let view = other_view(&m);
+        let switched = Input::Switched {
+            asked: 1,
+            result: Ok(view),
+        };
+        assert_eq!(update(&mut m, switched, now()), notes_of(1));
+        update(&mut m, noted(1, &[(2, None)]), now());
+        let notes = m.notes.clone();
+        let late = noted(0, &[(2, Some(recorded(&m, 2))), (3, None)]);
+        update(&mut m, late, now());
+        assert_eq!(m.notes, notes);
+    }
+
+    // A file `o` found back keeps its word: the view's check, asked before the press, may have read
+    // the file while it was still gone. A newer ask's answer is newer than the press, and counts.
+    #[test]
+    fn a_late_note_never_overwrites_a_newer_fact() {
+        let mut m = sample();
+        m.notes.insert(path(1), FileNote::Missing);
+        first_effects(&mut m);
+        let moment = asked(act(&mut m, Action::Play));
+        let back = recorded(&m, 1);
+        assert_eq!(
+            checked(&mut m, &moment, Some(back)),
+            open(moment, How::Load)
+        );
+        assert_eq!(m.notes.get(&path(1)), None);
+        update(&mut m, noted(0, &[(1, None), (2, None)]), now());
+        assert_eq!(m.notes, HashMap::from([(path(2), FileNote::Missing)]));
+        first_effects(&mut m);
+        update(&mut m, noted(0, &[(1, None)]), now());
+        assert_eq!(m.notes.get(&path(1)), Some(&FileNote::Missing));
+    }
+
+    #[test]
+    fn a_late_note_keeps_a_read_backs_word() {
+        let mut m = sample();
+        m.notes.insert(path(1), FileNote::Missing);
+        first_effects(&mut m);
+        let msg = saved(&m, 1, vec![]);
+        update(&mut m, msg, now());
+        assert_eq!(m.notes.get(&path(1)), None);
+        update(&mut m, noted(0, &[(1, None)]), now());
+        assert_eq!(m.notes.get(&path(1)), None);
+    }
+
+    // Read before the remux, the old size and mtime differ from the record the remux moved on.
+    #[test]
+    fn a_late_note_keeps_an_applys_restamp() {
+        for read in [Some((100, Timestamp::UNIX_EPOCH)), None] {
+            let mut m = accepted();
+            first_effects(&mut m);
+            act(&mut m, Action::Apply { dry_run: false });
+            act(&mut m, Action::Answer(true));
+            let stamp: (u64, Timestamp) = (123, "2026-10-30T09:00:00Z".parse().unwrap());
+            update(
+                &mut m,
+                file_done(path(1), vec![(1, Outcome::Patched)], vec![1], Some(stamp)),
+                now(),
+            );
+            update(&mut m, noted(0, &[(1, read)]), now());
+            assert_eq!(m.notes.get(&path(1)), None, "{read:?}");
+        }
+    }
+
+    #[test]
+    fn a_switch_is_asked_with_a_number_and_says_the_view_is_opening() {
+        let mut m = sample();
+        assert_eq!(
+            act(&mut m, Action::SwitchView),
+            [Effect::Task(Task::Switch {
+                asked: 1,
+                to: Switch::FoldersOf(m.run.name.clone()),
+            })]
+        );
+        assert_eq!(m.switching, Some(1));
+        assert_eq!(m.status, Some(Status::OpeningView));
+    }
+
+    // An older switch can answer after a newer one was asked: the user has moved past it.
+    #[test]
+    fn only_the_newest_switch_is_taken() {
+        let mut m = sample();
+        act(&mut m, Action::SwitchView);
+        assert!(matches!(
+            act(&mut m, Action::SwitchView)[..],
+            [Effect::Task(Task::Switch { asked: 2, .. })]
+        ));
+        let before = m.run.clone();
+        let view = other_view(&m);
+        let older = Input::Switched {
+            asked: 1,
+            result: Ok(view.clone()),
+        };
+        assert_eq!(update(&mut m, older, now()), []);
+        assert_eq!(m.run, before);
+        assert_eq!(m.view_number, 0);
+        assert_eq!(m.status, Some(Status::OpeningView));
+        let newest = Input::Switched {
+            asked: 2,
+            result: Ok(view.clone()),
+        };
+        assert_eq!(update(&mut m, newest.clone(), now()), notes_of(1));
+        assert_eq!(m.run, view);
+        assert_eq!(m.view_number, 1);
+        assert_eq!(m.switching, None);
+        assert_eq!(m.status, None);
+        // Taken once: the same answer again is no switch.
+        assert_eq!(update(&mut m, newest, now()), []);
+        assert_eq!(m.view_number, 1);
+    }
+
+    #[test]
+    fn an_older_switchs_error_is_dropped() {
+        let mut m = sample();
+        act(&mut m, Action::SwitchView);
+        act(&mut m, Action::SwitchView);
+        let failed = |asked: u64, error: &str| Input::Switched {
+            asked,
+            result: Err(error.into()),
+        };
+        assert_eq!(update(&mut m, failed(1, "disk I/O error"), now()), []);
+        assert_eq!(m.status, Some(Status::OpeningView));
+        assert_eq!(m.switching, Some(2));
+        assert_eq!(update(&mut m, failed(2, "no run named r"), now()), []);
+        assert_eq!(
+            m.status,
+            Some(Status::Failed {
+                what: Failure::Switch,
+                error: "no run named r".into(),
+            })
+        );
+        assert_eq!(m.switching, None);
+    }
+
+    #[test]
+    fn actions_work_on_the_view_shown_while_a_switch_is_under_way() {
+        let mut m = sample();
+        act(&mut m, Action::SwitchView);
+        act(&mut m, Action::Move(1));
+        assert_eq!(m.selected, 1);
+        let effects = act(&mut m, Action::Accept);
+        assert_eq!(decided(&effects), [(3, State::Accepted, None)]);
+        assert_eq!(m.switching, Some(1));
+    }
+
+    // The switch's read can come before the write of a decision taken while it was under way, and
+    // bring the finding as it was.
+    #[test]
+    fn a_decision_taken_during_a_switch_shows_in_the_new_view() {
+        let mut m = sample();
+        let view = other_view(&m);
+        act(&mut m, Action::SwitchView);
+        let effects = act(&mut m, Action::Accept);
+        assert_eq!(decided(&effects)[0], (1, State::Accepted, None));
+        written(&mut m, effects);
+        update(
+            &mut m,
+            Input::Switched {
+                asked: 1,
+                result: Ok(view),
+            },
+            now(),
+        );
+        assert!(m.run.of_paths);
+        for id in [1, 2, 4] {
+            assert_eq!(m.run.decisions[&id].state, State::Accepted, "{id}");
+        }
+        assert_eq!(m.run.state_of(3), State::Pending);
+    }
+
+    #[test]
+    fn an_undo_during_a_switch_shows_in_the_new_view() {
+        let mut m = sample();
+        let effects = act(&mut m, Action::Accept);
+        written(&mut m, effects);
+        let view = other_view(&m);
+        assert_eq!(view.state_of(1), State::Accepted);
+        act(&mut m, Action::SwitchView);
+        let effects = act(&mut m, Action::Undo);
+        written(&mut m, effects);
+        update(
+            &mut m,
+            Input::Switched {
+                asked: 1,
+                result: Ok(view),
+            },
+            now(),
+        );
+        assert!(m.run.of_paths);
+        for id in [1, 2, 4] {
+            assert_eq!(m.run.state_of(id), State::Pending, "{id}");
+        }
+    }
+
+    // A job's progress belongs to the view it started in, as a switch while it runs is refused.
+    #[test]
+    fn a_job_started_during_a_switch_keeps_the_view_it_started_in() {
+        let mut m = accepted();
+        act(&mut m, Action::SwitchView);
+        // A dry run starts at once, with no question.
+        act(&mut m, Action::Apply { dry_run: true });
+        assert!(m.progress.applying());
+        assert_eq!(m.switching, None);
+        let before = m.run.clone();
+        let switched = Input::Switched {
+            asked: 1,
+            result: Ok(other_view(&m)),
+        };
+        assert_eq!(update(&mut m, switched, now()), []);
+        assert_eq!(m.run, before);
+        // A check again's scan, as it starts.
+        let mut m = sample();
+        act(&mut m, Action::SwitchView);
+        let job = Job {
+            run: m.run.name.clone(),
+            resume: "subcheck scan --run r --force /m".into(),
+        };
+        update(
+            &mut m,
+            Input::Started {
+                job: Ok(job),
+                missing: vec![],
+                paths: vec![path(1)],
+            },
+            now(),
+        );
+        assert!(m.progress.running());
+        assert_eq!(m.switching, None);
+    }
+
+    // A yes acts on the view it was asked from: the question's words are that view's.
+    #[test]
+    fn a_job_question_during_a_switch_drops_the_switch() {
+        let mut m = accepted();
+        act(&mut m, Action::SwitchView);
+        act(&mut m, Action::Apply { dry_run: false });
+        assert_eq!(m.confirm, Some(Confirm::Apply));
+        assert_eq!(m.switching, None);
+        let before = m.run.clone();
+        let view = Run {
+            name: "2026-10-18T09-00-00".into(),
+            ..other_view(&m)
+        };
+        let switched = Input::Switched {
+            asked: 1,
+            result: Ok(view),
+        };
+        assert_eq!(update(&mut m, switched.clone(), now()), []);
+        assert_eq!(m.run, before);
+        let effects = act(&mut m, Action::Answer(true));
+        let [Effect::Task(Task::StartApply { run, .. })] = &effects[..] else {
+            panic!("expected apply to start: {effects:?}");
+        };
+        assert_eq!(run.name, before.name);
+        assert_eq!(run, &before);
+        // `Recheck` asks once its run is found.
+        let mut m = sample();
+        act(&mut m, Action::ShowPane(Pane::Files));
+        m.file_selected = 0;
+        act(&mut m, Action::SwitchView);
+        assert!(matches!(
+            act(&mut m, Action::Recheck)[..],
+            [Effect::Task(Task::FindRun { .. })]
+        ));
+        // Not yet: the run may not be found, and then nothing asks.
+        assert_eq!(m.switching, Some(1));
+        let name = m.run.name.clone();
+        let found = Input::RunFound {
+            path: path(1),
+            found: Ok((name.clone(), "claude".into())),
+        };
+        update(&mut m, found, now());
+        assert!(matches!(m.confirm, Some(Confirm::Recheck { .. })));
+        assert_eq!(m.switching, None);
+        let before = m.run.clone();
+        assert_eq!(update(&mut m, switched, now()), []);
+        assert_eq!(m.run, before);
+        assert_eq!(
+            act(&mut m, Action::Answer(true)),
+            [Effect::Task(Task::Recheck {
+                run: name,
+                paths: vec![path(1)],
+            })]
+        );
+    }
+
+    // The view a switch brings ends an edit, and the text typed for it would be lost.
+    #[test]
+    fn an_edit_started_during_a_switch_drops_the_switch() {
+        let mut m = sample();
+        act(&mut m, Action::SwitchView);
+        act(&mut m, Action::Edit);
+        assert!(m.editing.is_some());
+        assert_eq!(m.switching, None);
+        let before = m.run.clone();
+        let switched = Input::Switched {
+            asked: 1,
+            result: Ok(other_view(&m)),
+        };
+        assert_eq!(update(&mut m, switched, now()), []);
+        assert_eq!(m.run, before);
+        assert!(m.editing.is_some());
+        let mine = "The beat gets through to our minds";
+        let effects = act(&mut m, Action::Reword(mine.into()));
+        assert_eq!(
+            decided(&effects),
+            [
+                (1, State::Accepted, Some(mine)),
+                (2, State::Accepted, Some(mine)),
+                (4, State::Accepted, Some(mine)),
+            ]
         );
     }
 

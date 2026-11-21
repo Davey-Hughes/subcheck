@@ -30,8 +30,9 @@ fn send(m: &mut Review, s: &mut Screen, msg: Msg, runner: &mut Runner<Msg>, play
     let now = jiff::Timestamp::now();
     let mut queue: VecDeque<_> = screen::update(m, s, msg, now).into();
     while let Some(effect) = queue.pop_front() {
-        let input = run_effect(effect, runner, player);
-        queue.extend(screen::update(m, s, input.into(), now));
+        if let Some(input) = run_effect(effect, runner, player) {
+            queue.extend(screen::update(m, s, input.into(), now));
+        }
     }
 }
 

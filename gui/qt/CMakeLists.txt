@@ -114,7 +114,8 @@ qt_add_qml_module(subcheck_window
             src/player_port.cpp src/mpv_item.h src/mpv_item.cpp src/overloaded.h src/spliced.h
             src/words.h src/words.cpp src/sidebar_models.h src/sidebar_models.cpp
             src/detail_view.h src/detail_view.cpp src/window_settings.h src/window_settings.cpp
-            src/menu_keys.h src/menu_keys.cpp src/loading_flag.h src/loading_flag.cpp)
+            src/menu_keys.h src/menu_keys.cpp src/loading_flag.h src/loading_flag.cpp
+            src/ending.h src/ending.cpp)
 target_include_directories(subcheck_window PUBLIC src)
 target_link_libraries(subcheck_window PUBLIC subcheck_bindings Qt6::Quick MpvQt::MpvQt)
 subcheck_warnings(subcheck_window)
@@ -187,9 +188,10 @@ set_tests_properties(findings_model_test PROPERTIES
 
 # The window's code that needs no session, each test on its own: the status bar's words for each
 # message, the window's other words and colours, the sidebar's lists, the details panel's words,
-# what the window remembers, and when the busy animation over the video shows.
+# what the window remembers, when the busy animation over the video shows, and how the window ends
+# once review has.
 foreach(name IN ITEMS status_words_test words_test sidebar_models_test detail_view_test
-                      window_settings_test loading_flag_test)
+                      window_settings_test loading_flag_test ending_test)
     qt_add_executable(${name} tests/${name}.cpp)
     target_link_libraries(${name} PRIVATE subcheck_window Qt6::Test)
     subcheck_warnings(${name})

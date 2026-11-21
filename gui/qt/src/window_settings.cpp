@@ -183,17 +183,19 @@ void WindowSettings::show(QQuickWindow *window) {
 }
 
 void WindowSettings::keep() {
-    if (!said) {
-        return;
-    }
-    store->setValue(maximizedKey, said->maximized);
-    if (!said->whole) {
-        store->setValue(sizeKey, said->size);
-        if (placed) {
-            store->setValue(placeKey, said->place);
+    if (said) {
+        store->setValue(maximizedKey, said->maximized);
+        if (!said->whole) {
+            store->setValue(sizeKey, said->size);
+            if (placed) {
+                store->setValue(placeKey, said->place);
+            }
         }
+        said.reset();
     }
-    said.reset();
+    // Now, not as the store would, at the event loop's next pass or as it is destroyed: the
+    // window's hard end (main.cpp) ends the process straight after this, which runs neither.
+    store->sync();
 }
 
 int WindowSettings::sidebarWidth() const {

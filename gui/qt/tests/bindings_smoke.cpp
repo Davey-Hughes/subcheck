@@ -153,14 +153,17 @@ void a_run_opens_and_each_part_of_a_change_crosses(const std::string &folder) {
         check(row.at_ms == 1000, "at 0:00:01");
         check(row.original == "We should leave befor it rains.", "its line");
         check(row.wording == "We should leave before it rains.", "its fix");
-        check(row.note == FileNote::kChanged && ui.rows[1].note == FileNote::kChanged,
-              "E01's note, on both rows E01 is the first member of");
+        check(!row.note && !ui.rows[1].note, "the rows come before their files are checked");
         check(!row.checking && !row.mixed, "nothing checked again, and one decision");
         check(row.check == Check::kLlm && row.original_changed.start == 16u &&
                   row.original_changed.end == 21u && row.wording_changed.start == 16u &&
                   row.wording_changed.end == 22u,
               "the LLM's finding, befor and before marked on its row");
     }
+    // The notes, once the files are checked: E01's on both rows E01 is the first member of.
+    ui.until("the notes", [](const Ui &ui) { return ui.rows.size() == 2 && ui.rows[0].note; });
+    check(ui.rows[0].note == FileNote::kChanged && ui.rows[1].note == FileNote::kChanged,
+          "E01's note, on both rows E01 is the first member of");
     // The store's one show folder, the seeded run's, which the view is of.
     check(ui.folders.size() == 1, "one show folder");
     if (ui.folders.size() == 1) {
@@ -371,7 +374,8 @@ void a_run_opens_and_each_part_of_a_change_crosses(const std::string &folder) {
           "on the first file, the file before is refused, and why");
 
     s->send(Action(Action::kOpenView{{"no-such-run"}}));
-    check(!ui.next("opening a view").status, "a view asked for clears the status line");
+    check(message<Status::kOpeningView>(ui.next("opening a view")),
+          "a view asked for says it is opening, in place of the message before");
     const Status::kFailed *notThere = message<Status::kFailed>(ui.next("a view not there"));
     check(notThere && std::holds_alternative<Failure::kSwitch>(notThere->what.get_variant()) &&
               notThere->error == "no run named no-such-run",

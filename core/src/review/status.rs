@@ -47,8 +47,17 @@ pub enum Status {
     QueuedAgain { label: String },
     /// A check again left out file `label`, the first of those no longer on disk.
     NoSuchFile { label: String },
+    /// A view switch (`SwitchView`, `OpenView`, `OpenFolder`) is reading the view it opens. The
+    /// view shown stays, and works, until it comes.
+    OpeningView,
     /// `Play` asks the player to open file `label` at `at_ms`.
     Opening { label: String, at_ms: i64 },
+    /// The check of file `label`, which `Play` waits for, has not answered in a while: its share
+    /// is slow or down. The wait goes on.
+    NotAnswering { label: String },
+    /// `ClosePlayer` ended `Play`'s wait for the check of file `label`: nothing opens when it
+    /// answers.
+    StoppedWaiting { label: String },
     /// The player opened it, and left mpv paused or playing.
     Opened { paused: bool },
     /// Where playback is after a `Playback`.

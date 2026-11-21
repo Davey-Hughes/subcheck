@@ -7,7 +7,7 @@
 //! one it was cut from corrupts the rows. The rows are compared, not reported: `update` would have
 //! to name every row it touches, and one it missed would leave the UI silently out of step.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ use super::detail::Detail;
 use super::jobs::panic_text;
 use super::model::{Entry, EntryKey, FileNote, Fix, ListTrack, MarkKind, Pane, Question, Review};
 use super::progress::{ApplyStage, FileProgress, Job, Stage};
-use super::runner::{self, Runner};
+use super::runner::Runner;
 use super::status::Status;
 use super::update::{self, Action, Effect, Input, Task};
 use crate::group;
@@ -86,6 +86,7 @@ impl<T> Default for Splice<T> {
 
 /// What a UI shows beside the list. Sent whole, with any change to it.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // each says a thing of its own that a UI shows
 pub struct Summary {
     /// What the view is called ([`crate::store::Run::shown_name`]).
     pub title: String,
@@ -101,6 +102,17 @@ pub struct Summary {
     pub rejected: usize,
     /// Whether a job runs ([`crate::review::progress::Progress::busy`]).
     pub busy: bool,
+    /// `Play` waits for its file's check ([`Review::stamping`]), which on a slow share takes long,
+    /// before the player is asked anything: a UI shows the video loading from the press.
+    pub stamping: bool,
+    /// The player is asked to open a file right after this change: a [`PlayerCommand::Open`] is
+    /// among the effects still to run as it is published. A UI shows the video loading from it, as
+    /// from `stamping`, so that `Play`'s wait is one from the press to the open, though the change
+    /// that ends the wait for the file's check, which the Open follows, has `stamping` off. Off in
+    /// every other change. A UI takes the Open for using this up: it reads `Event::Player(Open)` as
+    /// clearing it, and a later change that says true is published even when nothing else in it
+    /// differs from the last.
+    pub open_follows: bool,
     /// The findings the list shows.
     pub filter: Filter,
     /// Which list the UI shows.
@@ -315,8 +327,8 @@ fn file_logs(m: &Review) -> Option<FileLogs> {
 }
 
 /// What `m` shows beside a list of `rows` rows and `files` files, once review has taken `answered`
-/// of the UI's actions.
-fn summary(m: &Review, rows: usize, files: usize, answered: u64) -> Summary {
+/// of the UI's actions, with an Open to follow or not.
+fn summary(m: &Review, rows: usize, files: usize, answered: u64, open_follows: bool) -> Summary {
     let (pending, accepted, rejected) = m.counts();
     Summary {
         title: m.run.shown_name(),
@@ -326,6 +338,8 @@ fn summary(m: &Review, rows: usize, files: usize, answered: u64) -> Summary {
         accepted,
         rejected,
         busy: m.progress.busy(),
+        stamping: m.stamping.is_some(),
+        open_follows,
         filter: m.filter,
         pane: m.pane,
         edit: m.editing.as_ref().and_then(|edit| {
@@ -377,6 +391,9 @@ struct Sent {
     shelf: Vec<ShowFolder>,
     /// The UI's actions taken so far, which each summary says.
     answered: u64,
+    /// Whether an Open is among the effects still to run, which the next summary says
+    /// ([`Summary::open_follows`]); each publish sets it.
+    open_follows: bool,
 }
 
 impl Sent {
@@ -387,7 +404,7 @@ impl Sent {
     fn change(&mut self, m: &Review) -> Option<Event> {
         let rows = entry_views(m);
         let files = file_views(m);
-        let summary = summary(m, rows.len(), files.len(), self.answered);
+        let summary = summary(m, rows.len(), files.len(), self.answered, self.open_follows);
         let detail = m.detail();
         let logs = file_logs(m);
         let folders: Vec<FolderView> = self
@@ -443,10 +460,33 @@ impl Sent {
         }
     }
 
-    /// Tell `emit` what [`Sent::change`] finds, if it finds anything.
-    fn publish(&mut self, m: &Review, emit: &mut dyn FnMut(Event)) {
+    /// Tell `emit` what [`Sent::change`] finds, if it finds anything, `next` being the effects
+    /// still to run after it: the summary says whether a player's Open is among them. A seek in the
+    /// open file or a close is no Open: it waits on no file to open. A change that differs from the
+    /// last in that alone is a change all the same, so the one after says that none follows. So is
+    /// a true after a player's Open went out (`emitted`), as a UI reads the Open as clearing it.
+    fn publish<'a>(
+        &mut self,
+        m: &Review,
+        next: impl IntoIterator<Item = &'a Effect>,
+        emit: &mut dyn FnMut(Event),
+    ) {
+        self.open_follows = next
+            .into_iter()
+            .any(|effect| matches!(effect, Effect::Player(PlayerCommand::Open { .. })));
         if let Some(event) = self.change(m) {
             emit(event);
+        }
+    }
+
+    /// Note that `command` went to the UI. The bridge counts a player's Open as using up
+    /// `open_follows`, so the summary last sent must say false too, or a later true, from any
+    /// step's Open, would be taken for no change and never reach it.
+    fn emitted(&mut self, command: &PlayerCommand) {
+        if matches!(command, PlayerCommand::Open { .. })
+            && let Some(last) = &mut self.summary
+        {
+            last.open_follows = false;
         }
     }
 }
@@ -541,8 +581,10 @@ struct Opened {
     review: Review,
 }
 
-/// `selector`'s view of `store` as a review ready to serve. The stat of every file with findings
-/// (`file_notes`) can be slow, on a network share.
+/// `selector`'s view of `store` as a review ready to serve, with no file notes yet: no file is
+/// checked here, as a check of a file on a dead share never answers. Review asks for the notes once
+/// it is served and its view shown ([`update::first_effects`]), and they come from a lane of their
+/// own.
 fn opened(
     store: Store,
     state: PathBuf,
@@ -550,8 +592,7 @@ fn opened(
     karaoke: bool,
 ) -> anyhow::Result<Opened> {
     let run = store.view(&Selector::parse(selector)?)?;
-    let notes = runner::file_notes(&run);
-    let mut review = Review::new(run, notes);
+    let mut review = Review::new(run, HashMap::new());
     review.karaoke = karaoke;
     Ok(Opened {
         store,
@@ -578,6 +619,15 @@ impl Session {
     /// environment and the state directory there, so this is the seam a test comes in by, with a
     /// store and a review of its own.
     fn start(open: impl FnOnce() -> anyhow::Result<Opened> + Send + 'static) -> Session {
+        Session::start_with(open, |runner| runner)
+    }
+
+    /// [`Session::start`], with `fit` done to the runner before review is served: the seam a
+    /// test's disk checks come in by.
+    fn start_with(
+        open: impl FnOnce() -> anyhow::Result<Opened> + Send + 'static,
+        fit: impl FnOnce(Runner<Msg>) -> Runner<Msg> + Send + 'static,
+    ) -> Session {
         let (inputs, queue) = mpsc::channel();
         let (events, items) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Shared::default()));
@@ -603,7 +653,7 @@ impl Session {
                 // panicking, say. The stream must end whatever happens here: for a UI that never
                 // calls `close`, nothing else ends it.
                 let last = panic::catch_unwind(AssertUnwindSafe(|| {
-                    core(open, &queue, inputs, &on_thread, &shared)
+                    core(open, fit, &queue, inputs, &on_thread, &shared)
                 }))
                 .unwrap_or_else(|panic| {
                     Some(Event::Ended {
@@ -711,11 +761,13 @@ fn panicked(panic: &(dyn std::any::Any + Send)) -> String {
     format!("review panicked: {}", panic_text(panic))
 }
 
-/// The core thread: open, serve, and end; returns the last event. None once `close` has run while
-/// review was served, as `close`'s own is then the stream's end; an open that fails returns its
-/// end all the same, which no one reads after a `close`.
+/// The core thread: open, serve with the runner as `fit` leaves it, and end; returns the last
+/// event. None once `close` has run while review was served, as `close`'s own is then the
+/// stream's end; an open that fails returns its end all the same, which no one reads after a
+/// `close`.
 fn core(
     open: impl FnOnce() -> anyhow::Result<Opened>,
+    fit: impl FnOnce(Runner<Msg>) -> Runner<Msg>,
     queue: &Receiver<Msg>,
     inputs: Sender<Msg>,
     events: &Sender<Item>,
@@ -734,7 +786,7 @@ fn core(
             });
         }
     };
-    let mut runner = Runner::new(store, state, inputs);
+    let mut runner = fit(Runner::new(store, state, inputs));
     let served = panic::catch_unwind(AssertUnwindSafe(|| {
         serve(&mut review, &mut runner, queue, events, shared);
     }));
@@ -766,7 +818,9 @@ fn core(
     Some(Event::Ended { fatal, outro })
 }
 
-/// Publish the opening state, then take each input until `update` quits or the UI stops it.
+/// Publish the opening state, then ask for what review asks as a view opens, its files' notes
+/// ([`update::first_effects`]), then take each input until `update` quits or the UI stops it. The
+/// view shows before its files are checked: on a dead share their check never answers.
 fn serve(
     review: &mut Review,
     runner: &mut Runner<Msg>,
@@ -780,7 +834,9 @@ fn serve(
     };
     // The record as it opens is `Shared::default()`'s: no job, and no outro yet.
     sent.read(runner.show_folders());
-    sent.publish(review, &mut emit);
+    sent.publish(review, &[], &mut emit);
+    let first = update::first_effects(review);
+    run_effects(review, runner, &mut sent, first, &mut emit, shared);
     while !review.should_quit {
         // The runner holds a sender, so `recv` cannot fail while this runs.
         let Ok(Msg::Input(input)) = queue.recv() else {
@@ -841,14 +897,13 @@ fn moves_folders(input: &Input) -> bool {
         Input::Written { result: Ok(_), .. }
             | Input::ScanEnded(_)
             | Input::ApplyEnded(_)
-            | Input::Switched(Ok(_))
+            | Input::Switched { result: Ok(_), .. }
     )
 }
 
 /// One input: through `update`, the change published before any effect runs, so that a UI shows
-/// what is about to happen before it does ("opening E02…" before the player command); then each
-/// effect. A task's result goes back through `update` and is published in turn; a player command
-/// goes to the UI, whose reply comes later as an input of its own.
+/// what is about to happen before it does ("opening E02…" while its file is checked); then each
+/// effect ([`run_effects`]).
 fn step(
     review: &mut Review,
     runner: &mut Runner<Msg>,
@@ -863,26 +918,48 @@ fn step(
         sent.answered += 1;
     }
     let moved = moves_folders(&input);
-    let mut effects: VecDeque<Effect> = update::update(review, input, Timestamp::now()).into();
+    let effects = update::update(review, input, Timestamp::now());
     if moved {
         sent.read(runner.show_folders());
     }
-    sent.publish(review, emit);
+    sent.publish(review, &effects, emit);
+    run_effects(review, runner, sent, effects, emit, shared);
+}
+
+/// `effects` in turn, and those each leads to; none once `close` has run. A task's result goes
+/// back through `update` and is published in turn. A disk check's comes later instead, on the
+/// queue as an input of its own, from the lane the runner hands it to: a check stuck on a dead
+/// share holds no action after it, and `close` never waits for a lane. A player command goes to
+/// the UI, whose reply comes later as an input of its own.
+fn run_effects(
+    review: &mut Review,
+    runner: &mut Runner<Msg>,
+    sent: &mut Sent,
+    effects: Vec<Effect>,
+    emit: &mut dyn FnMut(Event),
+    shared: &Mutex<Shared>,
+) {
+    let mut effects: VecDeque<Effect> = effects.into();
     while let Some(effect) = effects.pop_front() {
         if !may_run(&effect, shared) {
             return;
         }
         match effect {
             Effect::Task(task) => {
-                let result = runner.run(task);
+                let Some(result) = runner.run(task) else {
+                    continue;
+                };
                 let moved = moves_folders(&result);
                 effects.extend(update::update(review, result, Timestamp::now()));
                 if moved {
                     sent.read(runner.show_folders());
                 }
-                sent.publish(review, emit);
+                sent.publish(review, &effects, emit);
             }
-            Effect::Player(command) => emit(Event::Player(command)),
+            Effect::Player(command) => {
+                sent.emitted(&command);
+                emit(Event::Player(command));
+            }
         }
     }
 }
@@ -905,6 +982,7 @@ mod tests {
     use crate::apply;
     use crate::list::Filter;
     use crate::player::{How, Moment, Playback};
+    use crate::review::checks::{self, Stat, ViewOf};
     use crate::review::model::tests_support::{self, finding, many, sample, with_timing};
     use crate::review::model::{Mark, Row};
     use crate::review::progress::{ApplyAt, Counts, Scan};
@@ -978,6 +1056,8 @@ mod tests {
                 spent: Spent::default(),
                 of_paths: false,
                 answered: 0,
+                stamping: false,
+                open_follows: false,
             }
         );
     }
@@ -1186,8 +1266,20 @@ mod tests {
             (written(Err("locked".into())), false),
             (Input::ScanEnded(Err("no LLM".into())), true),
             (Input::ApplyEnded(Ok(apply::Summary::default())), true),
-            (Input::Switched(Ok((Run::default(), HashMap::new()))), true),
-            (Input::Switched(Err("disk I/O error".into())), false),
+            (
+                Input::Switched {
+                    asked: 1,
+                    result: Ok(Run::default()),
+                },
+                true,
+            ),
+            (
+                Input::Switched {
+                    asked: 1,
+                    result: Err("disk I/O error".into()),
+                },
+                false,
+            ),
             (
                 Input::ReadBack {
                     path: tests_support::path(1),
@@ -1688,18 +1780,32 @@ mod tests {
     /// and does not hang the run.
     const LIMIT: Duration = Duration::from_secs(30);
 
-    /// What `f` returns, which must come within [`LIMIT`].
-    fn within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    /// How long a test gives what must come though a check is stuck: it comes at once, or not at
+    /// all while the check waits.
+    const SOON: Duration = Duration::from_secs(2);
+
+    /// What `f` returns, which must come within `limit`.
+    fn within_for<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(f());
         });
-        rx.recv_timeout(LIMIT).expect("this should not wait")
+        rx.recv_timeout(limit).expect("this should not wait")
+    }
+
+    /// What `f` returns, which must come within [`LIMIT`].
+    fn within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        within_for(LIMIT, f)
+    }
+
+    /// The next event, which must come within `limit`.
+    fn next_within(s: &Arc<Session>, limit: Duration) -> Option<Event> {
+        let s = Arc::clone(s);
+        within_for(limit, move || s.next_event())
     }
 
     fn next(s: &Arc<Session>) -> Option<Event> {
-        let s = Arc::clone(s);
-        within(move || s.next_event())
+        next_within(s, LIMIT)
     }
 
     /// The events up to and including `Ended`, which must come.
@@ -1777,25 +1883,144 @@ mod tests {
         (store, scan.name)
     }
 
-    /// A session on `seeded`'s run, `change` done to its review as it opens. The sample's files are
-    /// not on disk, so their notes are cleared, or `Play` would refuse them.
-    fn session(dir: &Path, change: impl FnOnce(&mut Review) + Send + 'static) -> Arc<Session> {
+    /// A stat that finds each of the sample's files as its scan recorded it, as on a share that
+    /// answers, though none is on disk; and any other path on disk.
+    fn as_scanned() -> Stat {
+        let scanned: HashMap<String, (u64, Timestamp)> = tests_support::run()
+            .files
+            .into_iter()
+            .map(|f| (f.path, (f.size, f.mtime)))
+            .collect();
+        let disk = checks::disk_stat();
+        Arc::new(
+            move |path: &Path| match scanned.get(path.to_string_lossy().as_ref()) {
+                Some(&stamp) => Some(stamp),
+                None => disk(path),
+            },
+        )
+    }
+
+    /// `runner` as a session test has it unless it says otherwise: its checks find the sample's
+    /// files as scanned ([`as_scanned`]), so that no note comes, at a time of its own, to change
+    /// what a test reads, and `Play` opens them; and no check is said to be slow while a test
+    /// waits for something else.
+    fn answering(runner: Runner<Msg>) -> Runner<Msg> {
+        runner.with_stat(as_scanned()).with_slow_after(LIMIT)
+    }
+
+    /// A session on `seeded`'s run, `change` done to its review as it opens, and `fit` to its
+    /// runner, after [`answering`]: the test's own stat or view switch.
+    fn session_with(
+        dir: &Path,
+        change: impl FnOnce(&mut Review) + Send + 'static,
+        fit: impl FnOnce(Runner<Msg>) -> Runner<Msg> + Send + 'static,
+    ) -> Arc<Session> {
         let (store, name) = seeded(dir);
         let state = dir.join("state");
-        Arc::new(Session::start(move || {
+        let open = move || {
             let mut opened = opened(store, state, &[name], false)?;
-            opened.review.notes.clear();
             change(&mut opened.review);
             Ok(opened)
-        }))
+        };
+        Arc::new(Session::start_with(open, |runner| fit(answering(runner))))
+    }
+
+    /// A session on `seeded`'s run, `change` done to its review as it opens, its runner
+    /// [`answering`].
+    fn session(dir: &Path, change: impl FnOnce(&mut Review) + Send + 'static) -> Arc<Session> {
+        session_with(dir, change, |runner| runner)
+    }
+
+    /// The next event, a change, which must come within `limit`; what it says of the rows, and
+    /// the summary.
+    fn change_within(s: &Arc<Session>, limit: Duration) -> (Option<Splice>, Summary) {
+        match next_within(s, limit) {
+            Some(Event::Changed { rows, summary, .. }) => (rows, summary),
+            other => panic!("expected a change: {other:?}"),
+        }
     }
 
     /// The next event, a change; what it says of the rows, and the summary.
     fn next_change(s: &Arc<Session>) -> (Option<Splice>, Summary) {
-        match next(s) {
-            Some(Event::Changed { rows, summary, .. }) => (rows, summary),
-            other => panic!("expected a change: {other:?}"),
+        change_within(s, LIMIT)
+    }
+
+    /// What a [`Share`] saw a check of a path do.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Seen {
+        Started(String),
+        Ended(String),
+    }
+
+    /// A share for a session's checks to read, through the stat `Share::new` gives with it: each
+    /// path as `look` finds it, but that a check of a path the share holds waits until the share
+    /// lets go, of that path and every other (`let_go`, or the share dropped, so that a test that
+    /// fails leaves no lane stuck). Each check is told on `seen` as it starts and as it ends.
+    struct Share {
+        held: Arc<Mutex<HashSet<String>>>,
+        let_go: Option<Sender<()>>,
+        seen: Receiver<Seen>,
+    }
+
+    impl Share {
+        fn new(look: Stat) -> (Share, Stat) {
+            let held = Arc::new(Mutex::new(HashSet::new()));
+            let holding = Arc::clone(&held);
+            let (let_go, gone) = mpsc::channel::<()>();
+            let gone = Mutex::new(gone);
+            let (saw, seen) = mpsc::channel();
+            let stat: Stat = Arc::new(move |path: &Path| {
+                let name = path.to_string_lossy().into_owned();
+                let _ = saw.send(Seen::Started(name.clone()));
+                if holding.lock().unwrap().contains(&name) {
+                    // Nothing is sent: the sender's going is the word, and it lets every held
+                    // check through, this one and each after it.
+                    let _ = gone.lock().unwrap().recv_timeout(LIMIT);
+                }
+                let stamp = look(path);
+                let _ = saw.send(Seen::Ended(name));
+                stamp
+            });
+            let share = Share {
+                held,
+                let_go: Some(let_go),
+                seen,
+            };
+            (share, stat)
         }
+
+        /// Each check of `path` from here on waits for the share to let go.
+        fn hold(&self, path: &str) {
+            self.held.lock().unwrap().insert(path.into());
+        }
+
+        fn let_go(&mut self) {
+            self.let_go = None;
+        }
+
+        /// What a check did next, which must come within [`LIMIT`].
+        fn next(&self) -> Seen {
+            self.seen
+                .recv_timeout(LIMIT)
+                .expect("no check did anything")
+        }
+
+        /// What checks did since, that has come.
+        fn since(&self) -> Vec<Seen> {
+            self.seen.try_iter().collect()
+        }
+    }
+
+    /// A view switch's read that waits for a word on, or the going of, the returned sender, and
+    /// then reads `view`, whatever the switch asked for.
+    fn held_view(view: Run) -> (ViewOf, Sender<()>) {
+        let (let_go, gone) = mpsc::channel::<()>();
+        let gone = Mutex::new(gone);
+        let view_of: ViewOf = Arc::new(move |_: &update::Switch| -> anyhow::Result<Run> {
+            let _ = gone.lock().unwrap().recv_timeout(LIMIT);
+            Ok(view.clone())
+        });
+        (view_of, let_go)
     }
 
     #[test]
@@ -1805,7 +2030,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_reads_the_view_and_its_files_notes_and_takes_karaoke() {
+    fn opening_reads_the_view_but_not_its_files_and_takes_karaoke() {
         let dir = tempfile::tempdir().unwrap();
         let (store, name) = seeded(dir.path());
         let state = dir.path().join("state");
@@ -1813,8 +2038,8 @@ mod tests {
         assert_eq!(opened.state, state);
         assert_eq!(opened.review.rows.len(), 2);
         assert!(opened.review.karaoke);
-        // The sample's three files are not on disk.
-        assert_eq!(opened.review.notes.len(), 3);
+        // The sample's three files are not on disk, and no note says so yet.
+        assert!(opened.review.notes.is_empty());
     }
 
     #[test]
@@ -1854,12 +2079,14 @@ mod tests {
     #[test]
     fn a_change_is_published_before_its_effects_run_and_a_tasks_result_after_it() {
         let dir = tempfile::tempdir().unwrap();
-        // E01 on disk, under its own name, so that the stat `Play` makes finds it.
+        // E01 on disk, under its own name and as recorded, so that the check `Play` asks for finds
+        // it as it was scanned.
         let e01 = dir.path().join("K-On! - E01 - Episode.mkv");
         std::fs::write(&e01, "1").unwrap();
+        let (size, mtime) = crate::scan::file_stamp(&e01).unwrap();
         let file = e01.to_string_lossy().into_owned();
         let on_disk = file.clone();
-        let s = session(dir.path(), move |m| {
+        let change = move |m: &mut Review| {
             for f in &mut m.run.findings {
                 if f.file == tests_support::path(1) {
                     f.file.clone_from(&on_disk);
@@ -1868,17 +2095,27 @@ mod tests {
             for f in &mut m.run.files {
                 if f.path == tests_support::path(1) {
                     f.path.clone_from(&on_disk);
+                    (f.size, f.mtime) = (size, mtime);
                 }
             }
-        });
+        };
+        let s = session_with(dir.path(), change, |r| r.with_stat(checks::disk_stat()));
         next(&s);
-        // A player command: what is about to happen; then, once the core thread has read the
-        // file's stamp, which changes nothing shown, the command. The report comes back as an
-        // input of its own.
+        // The view's notes, once its files are checked: E02's and E03's are not on disk, and the
+        // second row's first finding is E02's.
+        let (rows, _) = next_change(&s);
+        let rows = rows.unwrap();
+        assert_eq!((rows.at, rows.inserted.len()), (1, 1));
+        assert_eq!(rows.inserted[0].note, Some(FileNote::Missing));
+        // A player command: what is about to happen, while the file's check is under way; then,
+        // once the check's lane has answered, which changes nothing else shown, the wait's end,
+        // and the command. The report comes back as an input of its own.
         s.send(Action::Play);
-        let (rows, summary) = next_change(&s);
-        assert_eq!(rows, None);
-        assert_eq!(summary.status, Some(opening_e01()));
+        for stamping in [true, false] {
+            let (rows, summary) = next_change(&s);
+            assert_eq!((rows, summary.status), (None, Some(opening_e01())));
+            assert_eq!(summary.stamping, stamping);
+        }
         assert_eq!(
             next(&s),
             Some(Event::Player(PlayerCommand::Open {
@@ -1937,11 +2174,12 @@ mod tests {
                 asked: Asked::Close
             })
         );
-        // The selection on E02 since the accept, a file that is not on disk: the stat says so,
-        // and nothing goes to the player.
+        // The selection on E02 since the accept, a file that is not on disk: the check says so,
+        // once it has answered, and nothing goes to the player.
         s.send(Action::Play);
-        next_change(&s);
+        assert!(next_change(&s).1.stamping);
         let (_, summary) = next_change(&s);
+        assert!(!summary.stamping);
         assert_eq!(
             summary.status,
             Some(Status::Refused(Refusal::FileMissing {
@@ -1966,18 +2204,30 @@ mod tests {
             vec![finding(0, 5, TYPO, FIXED, 1_000)],
         );
         let state = dir.path().join("state");
-        let s = Arc::new(Session::start(move || opened(store, state, &[a], false)));
+        let open = move || opened(store, state, &[a], false);
+        let s = Arc::new(Session::start_with(open, answering));
         assert_eq!(next_change(&s).0.unwrap().inserted.len(), 2);
         s.send(Action::OpenView(vec![b.name.clone()]));
-        // Its answer, before the view is read.
-        assert_eq!(next(&s), Some(Event::Answered { answered: 1 }));
+        // Its answer, before the view is read: the view is opening.
+        let (rows, summary) = next_change(&s);
+        assert_eq!(rows, None);
+        assert_eq!(summary.status, Some(Status::OpeningView));
+        assert_eq!(summary.answered, 1);
         let (rows, summary) = next_change(&s);
         let rows = rows.unwrap();
         assert_eq!((rows.at, rows.removed, rows.inserted.len()), (0, 2, 1));
+        assert_eq!(rows.inserted[0].note, None);
         assert_eq!(summary.title, format!("run {}", b.name));
+        assert_eq!(summary.status, None);
+        // Then its file's note, once the file is checked: E05 is not on disk.
+        let (rows, _) = next_change(&s);
+        assert_eq!(rows.unwrap().inserted[0].note, Some(FileNote::Missing));
         s.send(Action::OpenView(vec!["nope".into()]));
         // Its answer, then the failed read's.
-        assert_eq!(next(&s), Some(Event::Answered { answered: 2 }));
+        let (rows, summary) = next_change(&s);
+        assert_eq!(rows, None);
+        assert_eq!(summary.status, Some(Status::OpeningView));
+        assert_eq!(summary.answered, 2);
         let (rows, summary) = next_change(&s);
         assert_eq!(rows, None);
         assert_eq!(
@@ -2027,33 +2277,41 @@ mod tests {
                 at: Timestamp::UNIX_EPOCH,
             }])
             .unwrap();
-        // The accept's message let go, while the view is still to read: the folders as they were.
+        // The accept's message gives way to the view opening, while the view is still to read: the
+        // folders as they were.
         s.send(Action::OpenFolder("/m/K-On!".into()));
         let (summary, folders) = changed(&s);
-        assert_eq!((summary.status, folders), (None, None));
+        assert_eq!((summary.status, folders), (Some(Status::OpeningView), None));
         let (summary, folders) = changed(&s);
         assert_eq!(summary.title, "K-On!");
         assert_eq!(folders, Some(vec![k_on(0, true)]));
     }
 
-    // `close`'s locked part first, with the core thread between `Play`'s change and its stat:
-    // neither the stat nor the player's command it would lead to runs. No job runs, so no group
+    // `close`'s locked part first, with the core thread between `Play`'s change and its check:
+    // neither the check nor the player's command it would lead to runs. No job runs, so no group
     // ends in this process.
     #[test]
     fn nothing_the_core_thread_was_to_do_runs_after_close() {
         let dir = tempfile::tempdir().unwrap();
-        // E01 on disk, under its own name, so that the stat finds it and the open would go out.
+        // E01 on disk, under its own name, so that the check finds it and the open would go out.
         let e01 = dir.path().join("K-On! - E01 - Episode.mkv");
         std::fs::write(&e01, "1").unwrap();
         let on_disk = e01.to_string_lossy().into_owned();
-        let s = session(dir.path(), move |m| {
+        let change = move |m: &mut Review| {
             for f in &mut m.run.findings {
                 if f.file == tests_support::path(1) {
                     f.file.clone_from(&on_disk);
                 }
             }
-        });
+        };
+        // The view's check, of E02 and E03 (E01's findings are under the path on disk), held at
+        // its first: once it has started, the core thread has handed it to its lane, and takes
+        // the lock again only for a step, so the lock taken here holds `Play`'s.
+        let (share, stat) = Share::new(as_scanned());
+        share.hold(&tests_support::path(2));
+        let s = session_with(dir.path(), change, move |runner| runner.with_stat(stat));
         next(&s);
+        assert_eq!(share.next(), Seen::Started(tests_support::path(2)));
         let mut held = lock(&s.shared);
         s.send(Action::Play);
         assert_eq!(next_change(&s).1.status, Some(opening_e01()));
@@ -2077,6 +2335,7 @@ mod tests {
             })
             .collect();
         assert_eq!(after, []);
+        assert_eq!(share.since(), [], "a check ran after close");
     }
 
     // An action that changes nothing a UI shows is answered alone, with the count of actions taken,
@@ -2331,6 +2590,405 @@ mod tests {
         drop(let_go);
     }
 
+    // The rows show before any file is checked, as on a share that does not answer; the notes
+    // come once the check does.
+    #[test]
+    fn a_view_opens_before_its_files_are_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut share, stat) =
+            Share::new(Arc::new(|_: &Path| -> Option<(u64, Timestamp)> { None }));
+        for ep in 1..=3 {
+            share.hold(&tests_support::path(ep));
+        }
+        let s = session_with(dir.path(), |_| {}, move |runner| runner.with_stat(stat));
+        let (rows, _) = next_change(&s);
+        let rows = rows.unwrap().inserted;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.note.is_none()), "{rows:?}");
+        assert_eq!(share.next(), Seen::Started(tests_support::path(1)));
+        share.let_go();
+        let (rows, _) = next_change(&s);
+        let notes: Vec<Option<FileNote>> = rows.unwrap().inserted.iter().map(|v| v.note).collect();
+        assert_eq!(notes, [Some(FileNote::Missing); 2]);
+    }
+
+    // `Play`'s check, stuck, holds no action after it: the move is taken at once, and the press
+    // still waits.
+    #[test]
+    fn a_stalled_check_holds_no_later_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let (share, stat) = Share::new(as_scanned());
+        share.hold(&tests_support::path(1));
+        let s = session_with(dir.path(), |_| {}, move |runner| runner.with_stat(stat));
+        next(&s);
+        s.send(Action::Play);
+        let (_, summary) = next_change(&s);
+        assert_eq!(
+            (summary.status, summary.stamping),
+            (Some(opening_e01()), true)
+        );
+        // The view's check of E01 and `Play`'s, both stuck.
+        for _ in 0..2 {
+            assert_eq!(share.next(), Seen::Started(tests_support::path(1)));
+        }
+        s.send(Action::Move(1));
+        let (_, summary) = change_within(&s, SOON);
+        assert_eq!((summary.selected, summary.stamping), (Some(1), true));
+    }
+
+    // Three presses while the first's file does not answer: the second's check waits behind it,
+    // the third's in place of the second's. Once the first answers, the third's runs, alone, and
+    // alone opens.
+    #[test]
+    fn only_the_newest_press_waits_behind_a_check_and_alone_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut share, stat) = Share::new(as_scanned());
+        // The first row open, so that its members, one in each file, can each be pressed.
+        let s = session_with(
+            dir.path(),
+            |m| {
+                m.expanded.insert(0);
+            },
+            move |runner| runner.with_stat(stat),
+        );
+        next(&s);
+        // The view's check of its three files first, so that what the share sees from here is
+        // the presses'.
+        let mut ended = 0;
+        while ended < 3 {
+            if let Seen::Ended(_) = share.next() {
+                ended += 1;
+            }
+        }
+        share.hold(&tests_support::path(1));
+        s.send(Action::Play);
+        next_change(&s);
+        for member in [2, 4] {
+            s.send(Action::Select(EntryKey::Member(member)));
+            next_change(&s);
+            s.send(Action::Play);
+            next_change(&s);
+        }
+        // Answered once the core thread has handed the last press's check to its lane.
+        s.send(Action::Dismiss);
+        next(&s);
+        share.let_go();
+        let open = loop {
+            match next(&s) {
+                Some(Event::Player(command)) => break command,
+                Some(Event::Changed { .. }) => {}
+                other => panic!("{other:?}"),
+            }
+        };
+        let PlayerCommand::Open { moment, .. } = open else {
+            panic!("{open:?}")
+        };
+        assert_eq!(moment.file, tests_support::path(3));
+        // E01's answer came first, on the same lane, and opened nothing.
+        let (e01, e03) = (tests_support::path(1), tests_support::path(3));
+        let seen = [share.next(), share.next(), share.next(), share.next()];
+        assert_eq!(
+            seen,
+            [
+                Seen::Started(e01.clone()),
+                Seen::Ended(e01),
+                Seen::Started(e03.clone()),
+                Seen::Ended(e03)
+            ]
+        );
+        assert_eq!(share.since(), []);
+    }
+
+    // Close Video while `Play` waits: the wait ends, the player is told to close, and the check's
+    // late answer opens nothing.
+    #[test]
+    fn close_video_during_the_check_opens_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut share, stat) = Share::new(as_scanned());
+        share.hold(&tests_support::path(1));
+        let s = session_with(dir.path(), |_| {}, move |runner| runner.with_stat(stat));
+        next(&s);
+        s.send(Action::Play);
+        assert!(next_change(&s).1.stamping);
+        s.send(Action::ClosePlayer);
+        let (_, summary) = next_change(&s);
+        let stopped = Status::StoppedWaiting {
+            label: "E01".into(),
+        };
+        assert_eq!((summary.status, summary.stamping), (Some(stopped), false));
+        assert_eq!(next(&s), Some(Event::Player(PlayerCommand::Close)));
+        share.let_go();
+        // E02 pressed after: its check runs on the same lane, after E01's, so once E02's open has
+        // come, E01's late answer has been taken.
+        s.send(Action::Move(1));
+        next_change(&s);
+        s.send(Action::Play);
+        let mut events = Vec::new();
+        while !matches!(events.last(), Some(Event::Player(_))) {
+            events.push(next(&s).expect("the stream ended"));
+        }
+        let opened: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Player(PlayerCommand::Open { moment, .. }) => Some(moment.file.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, [tests_support::path(2)], "{events:?}");
+        let Some(Event::Changed { summary, .. }) = events.iter().rev().nth(1) else {
+            panic!("{events:?}")
+        };
+        assert!(!summary.stamping);
+    }
+
+    #[test]
+    fn the_slow_word_reaches_the_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let (share, stat) = Share::new(as_scanned());
+        share.hold(&tests_support::path(1));
+        let s = session_with(
+            dir.path(),
+            |_| {},
+            move |runner| {
+                runner
+                    .with_stat(stat)
+                    .with_slow_after(Duration::from_millis(50))
+            },
+        );
+        next(&s);
+        s.send(Action::Play);
+        assert_eq!(next_change(&s).1.status, Some(opening_e01()));
+        let (_, summary) = change_within(&s, SOON);
+        let slow = Status::NotAnswering {
+            label: "E01".into(),
+        };
+        assert_eq!((summary.status, summary.stamping), (Some(slow), true));
+    }
+
+    // A view switch whose read is stuck holds no action after it; the view comes once it answers.
+    #[test]
+    fn a_stalled_switch_holds_no_later_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, a) = seeded(dir.path());
+        let record = tests_support::file(5);
+        let b = begin(&mut store, &[PathBuf::from(&record.path)]);
+        save(
+            &mut store,
+            b.id,
+            &record,
+            vec![finding(0, 5, TYPO, FIXED, 1_000)],
+        );
+        let (view_of, let_go) = held_view(store.run_view(&b).unwrap());
+        let state = dir.path().join("state");
+        let open = move || opened(store, state, &[a], false);
+        let s = Arc::new(Session::start_with(open, move |runner| {
+            answering(runner).with_view_of(view_of)
+        }));
+        next(&s);
+        s.send(Action::SwitchView);
+        assert_eq!(next_change(&s).1.status, Some(Status::OpeningView));
+        s.send(Action::Move(1));
+        let (_, summary) = change_within(&s, SOON);
+        assert_eq!(summary.selected, Some(1));
+        drop(let_go);
+        let (rows, summary) = next_change(&s);
+        assert_eq!(summary.title, format!("run {}", b.name));
+        assert_eq!(rows.unwrap().inserted.len(), 1);
+    }
+
+    // `close` with `Play`'s check, a view's and a switch's read all stuck: it returns at once,
+    // and their late answers, once they come, go nowhere.
+    #[test]
+    fn closing_does_not_wait_for_a_stalled_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut share, stat) = Share::new(as_scanned());
+        for ep in 1..=3 {
+            share.hold(&tests_support::path(ep));
+        }
+        let (let_go, gone) = mpsc::channel::<()>();
+        let gone = Mutex::new(gone);
+        let (read, done) = mpsc::channel();
+        let view_of: ViewOf = Arc::new(move |_: &update::Switch| -> anyhow::Result<Run> {
+            let _ = gone.lock().unwrap().recv_timeout(LIMIT);
+            let _ = read.send(());
+            anyhow::bail!("let go")
+        });
+        let s = session_with(
+            dir.path(),
+            |_| {},
+            move |runner| runner.with_stat(stat).with_view_of(view_of),
+        );
+        next(&s);
+        s.send(Action::Play);
+        next_change(&s);
+        s.send(Action::SwitchView);
+        next_change(&s);
+        // Answered once the core thread has handed the switch to its lane.
+        s.send(Action::Dismiss);
+        next(&s);
+        let closing = Arc::clone(&s);
+        within_for(Duration::from_secs(1), move || closing.close());
+        let events = to_the_end(&s);
+        assert_eq!(end_of(&events), (None, &[][..]));
+        share.let_go();
+        drop(let_go);
+        // The view's three files and `Play`'s, and the switch's read: each answers, to no one.
+        let mut ended = 0;
+        while ended < 4 {
+            if let Seen::Ended(_) = share.next() {
+                ended += 1;
+            }
+        }
+        done.recv_timeout(LIMIT).unwrap();
+        assert_eq!(next(&s), None);
+    }
+
+    #[test]
+    fn the_summary_says_a_play_waits_for_its_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session(dir.path(), |_| {});
+        assert!(!next_change(&s).1.stamping);
+        s.send(Action::Play);
+        assert!(next_change(&s).1.stamping);
+        assert!(!next_change(&s).1.stamping);
+        assert!(
+            matches!(
+                next(&s),
+                Some(Event::Player(PlayerCommand::Open { how: How::Load, .. }))
+            ),
+            "the sample's E01, found as scanned, opens"
+        );
+    }
+
+    // The change that ends `Play`'s wait for its file's check says that the player's Open follows
+    // it; no other change does: not the view as it opens, the change as the check starts or the
+    // change after the player's answer, nor the answer to a seek in the open file or a close.
+    #[test]
+    fn only_the_change_an_open_follows_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session(dir.path(), |_| {});
+        let waits =
+            |(_, summary): (Option<Splice>, Summary)| (summary.stamping, summary.open_follows);
+        assert_eq!(waits(next_change(&s)), (false, false));
+        s.send(Action::Play);
+        assert_eq!(waits(next_change(&s)), (true, false));
+        assert_eq!(waits(next_change(&s)), (false, true));
+        assert!(matches!(
+            next(&s),
+            Some(Event::Player(PlayerCommand::Open { .. }))
+        ));
+        s.report(PlayerReport::Opened(Ok(player::Opened { paused: true })));
+        assert_eq!(waits(next_change(&s)), (false, false));
+        // Nothing else the UI shows changes: the action's answer alone.
+        s.send(Action::Playback(Playback::Seek(5)));
+        assert_eq!(next(&s), Some(Event::Answered { answered: 2 }));
+        assert_eq!(
+            next(&s),
+            Some(Event::Player(PlayerCommand::Playback(Playback::Seek(5))))
+        );
+        s.send(Action::ClosePlayer);
+        assert_eq!(waits(next_change(&s)), (false, false));
+        assert_eq!(next(&s), Some(Event::Player(PlayerCommand::Close)));
+    }
+
+    // Two presses on files whose checks answer, the second after the first's Open went out: the UI
+    // is told twice that an Open follows. A press publishes a change of its own between the two, so
+    // the reset itself is pinned by `an_open_follows_is_sent_again_after_an_open_went_out`, which
+    // publishes no other change between the two.
+    #[test]
+    fn two_presses_through_a_session_each_say_an_open_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session(dir.path(), |_| {});
+        next(&s);
+        let mut follows = Vec::new();
+        for press in 0..2 {
+            if press == 1 {
+                s.send(Action::Move(1));
+            }
+            s.send(Action::Play);
+            loop {
+                match next(&s).expect("the stream ended") {
+                    Event::Changed { summary, .. } if summary.open_follows => follows.push(press),
+                    Event::Player(PlayerCommand::Open { .. }) => break,
+                    _ => {}
+                }
+            }
+            s.report(PlayerReport::Opened(Ok(player::Opened { paused: true })));
+        }
+        assert_eq!(follows, [0, 1]);
+    }
+
+    // The same view published before an Open, then before none: the second is sent all the same,
+    // so that a UI does not go on reading that an Open follows. A seek or a close is no Open.
+    #[test]
+    fn a_change_in_whether_an_open_follows_alone_is_sent() {
+        let m = sample();
+        let mut sent = told(&m);
+        let open = Effect::Player(PlayerCommand::Open {
+            moment: Moment {
+                file: tests_support::path(1),
+                start_us: 0,
+                sid: None,
+            },
+            how: How::Seek,
+            options: vec![],
+        });
+        let others = [
+            Effect::Player(PlayerCommand::Playback(Playback::Seek(5))),
+            Effect::Player(PlayerCommand::Close),
+        ];
+        let mut events = Vec::new();
+        let mut emit = |event: Event| events.push(event);
+        sent.publish(&m, &others, &mut emit);
+        sent.publish(&m, [&others[0], &open], &mut emit);
+        sent.publish(&m, &others, &mut emit);
+        sent.publish(&m, &others, &mut emit);
+        let follows: Vec<bool> = events
+            .iter()
+            .map(|event| match event {
+                Event::Changed {
+                    rows: None,
+                    summary,
+                    ..
+                } => summary.open_follows,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(follows, [true, false]);
+    }
+
+    // Two Opens with no change between them: the bridge counts the first as using up
+    // `open_follows`, so the second's true is sent although the last summary sent said true too.
+    // The reset covers any later true, whichever step's Open it is.
+    #[test]
+    fn an_open_follows_is_sent_again_after_an_open_went_out() {
+        let m = sample();
+        let mut sent = told(&m);
+        let command = PlayerCommand::Open {
+            moment: Moment {
+                file: tests_support::path(1),
+                start_us: 0,
+                sid: None,
+            },
+            how: How::Seek,
+            options: vec![],
+        };
+        let open = Effect::Player(command.clone());
+        let mut events = Vec::new();
+        let mut emit = |event: Event| events.push(event);
+        sent.publish(&m, [&open], &mut emit);
+        sent.emitted(&command);
+        sent.publish(&m, [&open], &mut emit);
+        let follows: Vec<bool> = events
+            .iter()
+            .map(|event| match event {
+                Event::Changed { summary, .. } => summary.open_follows,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(follows, [true, true]);
+    }
+
     /// What a UI holds of a session: each list, each splice applied to it as it comes, and the
     /// detail and the logs as last sent.
     #[derive(Debug, Default, PartialEq)]
@@ -2394,29 +3052,40 @@ mod tests {
             state,
             mut review,
         } = opened(store, dir.path().join("state"), &[name], false).unwrap();
-        review.notes.clear();
-        let (tx, _rx) = mpsc::channel();
-        let mut runner = Runner::new(store, state, tx);
+        let (tx, rx) = mpsc::channel();
+        let mut runner = Runner::new(store, state, tx).with_slow_after(LIMIT);
         let mut sent = Sent::default();
         let open = Mutex::new(Shared::default());
         let mut held = Held::default();
         held.take(sent.change(&review).unwrap());
         assert_eq!(held, Held::of(&review));
+        // Each input, then what the check lanes send while review waits for a switch or `Play`'s
+        // check, in turn, as the core thread takes them from its queue. A view's notes come when
+        // they come, and are taken with the next answer waited for, if any.
         let mut go = |review: &mut Review, sent: &mut Sent, input: Input, held: &mut Held| {
-            let what = format!("{input:?}");
-            let mut heard = Vec::new();
-            step(
-                review,
-                &mut runner,
-                sent,
-                input,
-                &mut |e| heard.push(e),
-                &open,
-            );
-            for event in heard {
-                held.take(event);
+            let mut next = Some(input);
+            while let Some(input) = next.take() {
+                let what = format!("{input:?}");
+                let mut heard = Vec::new();
+                step(
+                    review,
+                    &mut runner,
+                    sent,
+                    input,
+                    &mut |e| heard.push(e),
+                    &open,
+                );
+                for event in heard {
+                    held.take(event);
+                }
+                assert_eq!(*held, Held::of(review), "after {what}");
+                if review.switching.is_some() || review.stamping.is_some() {
+                    let Ok(Msg::Input(input)) = rx.recv_timeout(LIMIT) else {
+                        panic!("no answer came from a check's lane, after {what}");
+                    };
+                    next = Some(input);
+                }
             }
-            assert_eq!(*held, Held::of(review), "after {what}");
         };
         let only = |state| Action::SetFilter(Filter::Only(state));
         for action in [
@@ -2775,8 +3444,15 @@ mod tests {
             "gate" => {
                 let (store, name) = stalled(dir);
                 let state = dir.join("state");
-                let s = Arc::new(Session::start(move || opened(store, state, &[name], false)));
+                // The view's check of the FIFO held: once it has started, the core thread has
+                // handed it to its lane, and takes the lock again only for a step.
+                let fifo = dir.join("stalled.mkv").to_string_lossy().into_owned();
+                let (share, stat) = Share::new(checks::disk_stat());
+                share.hold(&fifo);
+                let open = move || opened(store, state, &[name], false);
+                let s = Arc::new(Session::start_with(open, |runner| runner.with_stat(stat)));
                 next(&s);
+                assert_eq!(share.next(), Seen::Started(fifo));
                 // The dry run's start waits on the lock, after the change that says it runs.
                 let mut held = lock(&s.shared);
                 s.send(Action::Apply { dry_run: true });
