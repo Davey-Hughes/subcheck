@@ -40,27 +40,35 @@ pub fn view(m: &Review, s: &Screen, f: &mut Frame) {
     }
 }
 
-/// What `?` shows, a column to each group: each key and what it does.
+/// What `?` shows, a column to each group: each key and what it does. A group's widest row sets how
+/// many groups fit side by side, and so how tall the box is: a wider row in decide, move or mpv
+/// drops the next group under them on the narrowest screens where they share a band, and the box
+/// grows there by a band's rows, past a 24-row screen with the LLM costs under it at some of those
+/// widths. Hence decide's short words. The size tests check the groups side by side at the widths
+/// where they first share a band today, so that a row grown by a column fails them. `q` is decide's
+/// last row, as decide is shorter than move: where the two share a band, the row makes the box no
+/// taller.
 const KEY_GROUPS: [(&str, &[(&str, &str)]); 4] = [
     (
-        "decide",
+        "decide, quit",
         &[
             ("a", "accept"),
             ("r", "reject"),
-            ("x", "clear: back to pending"),
+            ("x", "clear: to pending"),
             ("e", "reword, then accept"),
             ("u", "undo"),
-            ("c", "check a file again (files)"),
+            ("c", "check again (files)"),
+            ("q", "quit; Ctrl+C, Ctrl+D"),
         ],
     ),
     (
         "move",
         &[
             ("j k ↑ ↓", "move"),
-            ("g G", "top, bottom"),
+            ("g G Home End", "top, bottom"),
             ("PgUp PgDn", "page"),
             ("n p", "next, previous file"),
-            ("⏎", "expand a group"),
+            ("⏎", "expand, to findings"),
             ("f", "filter"),
             ("Tab", "findings, files"),
             ("v", "a run, its folders"),
@@ -69,9 +77,9 @@ const KEY_GROUPS: [(&str, &[(&str, &str)]); 4] = [
     (
         "mpv",
         &[
-            ("o", "open the line"),
+            ("o", "open the finding"),
             ("O", "close mpv"),
-            ("␣", "pause"),
+            ("Space", "pause"),
             ("← →", "5 s back, forward"),
             (", .", "1 s back, forward"),
             ("[ ]", "a frame back, forward"),
@@ -1387,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn question_mark_shows_every_key_in_a_box_over_the_panes() {
+    fn question_mark_shows_the_keys_in_a_box_over_the_panes() {
         let m = sample();
         let s = Screen {
             help: true,
@@ -1398,13 +1406,18 @@ mod tests {
             "┌ keys ",
             "decide",
             "a  accept",
-            "x  clear: back to pending",
-            "c  check a file again (files)",
-            "PgUp PgDn  page",
-            "Tab        findings, files",
-            "␣    pause",
-            "[ ]  a frame back, forward",
-            "O    close mpv",
+            "x  clear: to pending",
+            "c  check again (files)",
+            "g G Home End  top, bottom",
+            "PgUp PgDn     page",
+            "⏎             expand, to findings",
+            "Tab           findings, files",
+            "o      open the finding",
+            "Space  pause",
+            "[ ]    a frame back, forward",
+            "O      close mpv",
+            "decide, quit",
+            "q  quit; Ctrl+C, Ctrl+D",
             "└ q quits · any other key closes this ",
         ] {
             assert!(screen.contains(text), "{text}\n{screen}");
@@ -1416,17 +1429,74 @@ mod tests {
                 .any(|l| l.contains("decide") && l.contains("move") && l.contains("mpv")),
             "{screen}"
         );
-        // On 70 the last two groups go under the first two.
+        // On 70 the last two groups go under the first two, and the whole box shows on 24 rows: its
+        // last row of keys, the blank row under it, then the way out.
         let screen = render_on(&m, &s, 70, 24);
         let heading = |name: &str| screen.lines().position(|l| l.contains(name)).unwrap();
         assert_eq!(heading("decide"), heading("move"), "{screen}");
         assert!(heading("mpv") > heading("decide"), "{screen}");
+        let lines: Vec<&str> = screen.lines().collect();
+        let last = lines
+            .iter()
+            .position(|l| l.contains("[ ]    a frame back, forward"))
+            .unwrap_or_else(|| panic!("{screen}"));
+        assert!(
+            lines.get(last + 2).is_some_and(|l| l.contains("└ q quits")),
+            "{screen}"
+        );
         // Too short for every key, it still says how to leave.
         let screen = render_on(&m, &s, 50, 20);
         assert!(
             screen.contains("q quits · any other key closes"),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn the_keys_box_shows_what_the_llm_calls_cost_on_24_rows_70_and_80_columns_wide() {
+        let m = with_cost();
+        let s = Screen {
+            help: true,
+            ..Screen::default()
+        };
+        // The box's own line, not the status line's, which says the cost too as review opens.
+        for width in [70, 80] {
+            let screen = render_on(&m, &s, width, 24);
+            assert!(
+                screen.contains("│ 1 call · 1.23M in / 31.2k out tokens · $3.21 at API prices"),
+                "{width}\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_keys_box_keeps_its_groups_side_by_side_at_64_96_and_131_columns() {
+        let m = with_cost();
+        let s = Screen {
+            help: true,
+            ..Screen::default()
+        };
+        // Where these groups first share the box's first band today, so that a row grown by a
+        // column puts a group under them and fails this; on a screen tall enough for the box there,
+        // the cost shows, inside the box.
+        let cases: [(u16, u16, &[&str]); 3] = [
+            (64, 40, &["decide", "move"]),
+            (96, 24, &["decide", "move", "mpv"]),
+            (131, 24, &["decide", "move", "mpv", "apply"]),
+        ];
+        for (width, height, together) in cases {
+            let screen = render_on(&m, &s, width, height);
+            assert!(
+                screen
+                    .lines()
+                    .any(|l| together.iter().all(|group| l.contains(group))),
+                "{width}x{height}\n{screen}"
+            );
+            assert!(
+                screen.contains("│ 1 call · 1.23M in / 31.2k out tokens · $3.21 at API prices"),
+                "{width}x{height}\n{screen}"
+            );
+        }
     }
 
     #[test]
@@ -1550,7 +1620,7 @@ mod tests {
         send(&mut m, &mut s, Msg::Key(KeyCode::Esc), now());
         assert!(!s.help);
         assert!(!s.show_cost);
-        // Ctrl-U, which comes as its own message.
+        // Ctrl+U, which comes as its own message.
         let mut m = with_cost();
         let mut s = Screen::default();
         send(&mut m, &mut s, Msg::KillLine, now());
@@ -1793,7 +1863,7 @@ mod tests {
         );
         m.selected = 1;
         send(&mut m, &mut s, Msg::Key(KeyCode::Char('e')), now());
-        // Ctrl-C mid-edit: the next key answers the question, so it shows, as it does outside
+        // Ctrl+C mid-edit: the next key answers the question, so it shows, as it does outside
         // the editor.
         send(&mut m, &mut s, Msg::Interrupt, now());
         let screen = render_on(&m, &s, 160, 20);

@@ -3577,7 +3577,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_or_ctrl_d_while_applying_asks_as_q_does_and_y_stops_it() {
-        // Ctrl-C and Ctrl-D are both `Action::Interrupt` (`subcheck_cli::tui`'s `map_event`, then
+        // Ctrl+C and Ctrl+D are both `Action::Interrupt` (`subcheck_cli::tui`'s `map_event`, then
         // its `screen::update`).
         let applying = || {
             let mut m = accepted();

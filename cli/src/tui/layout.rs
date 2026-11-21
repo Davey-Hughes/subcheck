@@ -16,7 +16,9 @@ const fn button(text: &'static str, key: KeyCode) -> Item {
     Item { text, key }
 }
 
-/// At the end of the status line: what `?` shows, every key.
+/// At the end of the status line: what `?` shows, review's keys. It leaves out a question's keys
+/// and the editor's: the status line shows ⏎, Esc and y/n while they apply, and the editor's other
+/// keys (← →, Home, End, Backspace, Delete, Ctrl+U) are in the README only.
 pub const HELP: &[Item] = &[button("? help", KeyCode::Char('?'))];
 
 /// At the end of the status line while the editor is open.

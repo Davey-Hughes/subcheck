@@ -298,7 +298,7 @@ fn install() {
                 if ending.spawn(move || end_by_signal(sig)).is_err() {
                     end_by_signal(sig);
                 }
-                // Should the cleanup wait on a stalled mount, a second SIGINT or SIGTERM (Ctrl-C
+                // Should the cleanup wait on a stalled mount, a second SIGINT or SIGTERM (Ctrl+C
                 // again) ends subcheck as if there were no handler, once the first has had
                 // [`PATIENCE`], leaving what it had yet to do. Not a second SIGHUP: a terminal that
                 // closes sends two, the kernel's and the shell's, and nobody is there to insist.
@@ -471,7 +471,7 @@ mod tests {
             // in it; in `dir-written` a thread goes on making files in it until it cannot, and in
             // `dir-dropped` its guard is dropped before the signal.
             "dir" | "dir-written" | "dir-dropped" => {
-                // Ctrl-C is the signal these tests send, and a test run in the background of a
+                // Ctrl+C is the signal these tests send, and a test run in the background of a
                 // script inherits it ignored, which the module would leave so.
                 // SAFETY: setting a disposition to SIG_DFL.
                 unsafe {

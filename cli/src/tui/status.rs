@@ -99,7 +99,7 @@ fn refused(why: &Refusal) -> String {
     match why {
         Refusal::SelectionStays => "that finding changed; the selection stays".into(),
         Refusal::NotInView { label } => format!("{label} is not in this view"),
-        Refusal::TimingFix => "a timing fix is accepted or rejected, not edited".into(),
+        Refusal::TimingFix => "a timing fix is accepted or rejected, not reworded".into(),
         Refusal::EmptyWording => "the wording cannot be empty (Esc cancels)".into(),
         Refusal::EditOutOfDate => "the edit is out of date; nothing was decided".into(),
         Refusal::Already { state } => format!("already {}", label(*state)),
@@ -246,7 +246,7 @@ mod tests {
             ),
             (
                 refused(Refusal::TimingFix),
-                "a timing fix is accepted or rejected, not edited",
+                "a timing fix is accepted or rejected, not reworded",
             ),
             (
                 refused(Refusal::EmptyWording),

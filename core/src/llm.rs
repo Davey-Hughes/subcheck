@@ -1313,7 +1313,7 @@ impl Failed {
 /// and a key command alike; [`group::spawn`] is what the tests of `run` itself pass, which need
 /// the group alone), so a timeout kills everything it started (a wrapper script's children, or
 /// what dash forks for `sh -c`), not just the direct child. That takes it out of the terminal's
-/// foreground group, where Ctrl-C would reach it, so when SIGINT, SIGTERM or SIGHUP ends
+/// foreground group, where Ctrl+C would reach it, so when SIGINT, SIGTERM or SIGHUP ends
 /// subcheck, [`group`] kills every group still running.
 fn run(
     argv: &[String],

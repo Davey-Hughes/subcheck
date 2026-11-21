@@ -13,9 +13,9 @@
 //! scans say of each file as they go.
 //!
 //! Each LLM's scan goes into a store of its own in a scratch directory, deleted when the bench
-//! ends, by Ctrl-C too. A second Ctrl-C can end the bench while it deletes, and leaves what
+//! ends, by Ctrl+C too. A second Ctrl+C can end the bench while it deletes, and leaves what
 //! remains in `$TMPDIR` or `/tmp`: a `.tmp…` directory, its name ending in `.removing-<pid>` when
-//! a Ctrl-C began the deletion. The bench never opens the store `subcheck` keeps, so it leaves no
+//! a Ctrl+C began the deletion. The bench never opens the store `subcheck` keeps, so it leaves no
 //! runs there.
 
 mod score;

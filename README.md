@@ -92,33 +92,38 @@ episode the check found nothing in is greyed in the sidebar and says `No finding
 shows what its check said, alone under the video; the finding you were on stays greyed in the list,
 as the episode has none to go to, and Accept, Reject, Back to Undecided, Show in Video and Enter
 wait until you move to a finding again, by a move, a click or Undo. View ▸ Episodes Without Findings
-Last lists those episodes after the rest, while `n` and `p` still go to the next and previous
-episode in review's order. File ▸ Settings… (Ctrl+, or ⌘, on macOS) opens a window of its own that
-chooses the window's colours, the default or a palette for deuteranomaly/deuteranopia,
-protanomaly/protanopia, tritanomaly/tritanopia, or little or no colour vision, with a sample, and
-the size of the text of the window, the findings list and the details panel, each the platform's
-until set; each choice applies at once, and while Settings is open no key of the main window's
-reaches review. The menus hold the rest, and the terminal's keys work too: `j` and `k` (or the up
-and down arrows) move, Enter expands a row into its members, `a`, `r`, `x` and `u` accept, reject,
-put back to undecided and undo, `f` steps through the filters, `n` and `p` go to the next and
-previous episode, `v` switches between a check and its folders, `o` opens the selected finding in
-the video pane as the terminal's `o` does in mpv, playing on if the pane plays and paused if not,
-and `O` stops playback, leaving the pane black and review open; Space plays and pauses, ← and → seek
-5 s, `,` and `.` 1 s, and `[` and `]` step a frame; `q` quits. While Show in Video (`o`) waits for a
-file that is slow to open, a busy animation shows over the video once the wait has lasted 150 ms; it
-goes once the video shows, or once Close Video (`O`) has closed the video. While a video plays, a
-drag of a column or of the window's edge stays smooth. A column drag stretches the video's frame
-until the drag ends, when mpv draws it again at its new size. The window keeps its size, its place
-on X11 and macOS (Wayland lets no window place itself), its columns' widths, the episodes' order and
-its settings for the next run, in `$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf` on Linux and macOS
-when `XDG_CONFIG_HOME` is an absolute path; otherwise in `~/.config/subcheck/subcheck-qt.conf` on
-Linux and in the app's preferences on macOS. At the end it prints the counts as the terminal does,
-but names a view of paths as its window's title does: by the first path's last part, and `+N` for
-the others. It exits with 1 after an error, or when review has not ended 10 s after quitting, and
-with 0 otherwise. The 10 s gives one decision's write time to wait out another process's lock on the
-store, which the store waits up to 5 s for. It is not enough for several writes queued behind a lock
-held longer, or for an open that waits on the lock more than once: the window then closes review,
-which can lose a decision not yet written.
+Last lists those episodes after the rest, while N and P still go to the next and previous episode in
+review's order. File ▸ Settings… (Ctrl+, or ⌘, on macOS) opens a window of its own that chooses the
+window's colours, the default or a palette for deuteranomaly/deuteranopia, protanomaly/protanopia,
+tritanomaly/tritanopia, or little or no colour vision, with a sample, and the size of the text of
+the window, the findings list and the details panel, each the platform's until set; each choice
+applies at once, Esc or Ctrl+W (⌘W on macOS) closes Settings, and while Settings is open no key of
+the main window's reaches review. The menus hold the rest and show their keys as this paragraph
+writes the window's: a letter alone is that key without Shift, and Shift is written out, so the
+menu's O is the terminal's `o`, and its Shift+O (⇧O on macOS) is the terminal's `O`. A, R and X
+accept, reject and put back to undecided, N and P go to the next and previous episode, V switches
+between a check and its folders, O (Show in Video) opens the selected finding in the video pane as
+the terminal's `o` does in mpv, playing on if the pane plays and paused if not, and Shift+O (Close
+Video) closes the video, leaving the pane black and review open; Space plays and pauses, Left and
+Right (← and → on macOS) seek 5 s, `,` and `.` 1 s, and `[` and `]` step a frame; Ctrl+Z undoes, and
+Ctrl+W and Ctrl+Q quit (⌘Z, ⌘W and ⌘Q on macOS). No menu shows the others: J and K (or Down and Up)
+move, Enter expands a row into its members or collapses it, F steps through the filters, U undoes
+and Q quits. No key in the window does what the terminal's `e`, `c`, `A`, `D`, `g`, `G`, Home, End,
+PgUp, PgDn, Tab or `?` does. While Show in Video (O) waits for a file that is slow to open, a busy
+animation shows over the video once the wait has lasted 150 ms; it goes once the video shows, or
+once Close Video (Shift+O) has closed the video. While a video plays, a drag of a column or of the
+window's edge stays smooth. A column drag stretches the video's frame until the drag ends, when mpv
+draws it again at its new size. The window keeps its size, its place on X11 and macOS (Wayland lets
+no window place itself), its columns' widths, the episodes' order and its settings for the next run,
+in `$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf` on Linux and macOS when `XDG_CONFIG_HOME` is an
+absolute path; otherwise in `~/.config/subcheck/subcheck-qt.conf` on Linux and in the app's
+preferences on macOS. At the end it prints the counts as the terminal does, but names a view of
+paths as its window's title does: by the first path's last part, and `+N` for the others. It exits
+with 1 after an error, or when review has not ended 10 s after quitting, and with 0 otherwise. The
+10 s gives one decision's write time to wait out another process's lock on the store, which the
+store waits up to 5 s for. It is not enough for several writes queued behind a lock held longer, or
+for an open that waits on the lock more than once: the window then closes review, which can lose a
+decision not yet written.
 
 The video pane is mpv, inside the window through MpvQt. It reads its options from
 `$XDG_CONFIG_HOME/mpvqt/mpvqt.conf` on Linux (by default `~/.config/mpvqt/mpvqt.conf`) and
@@ -235,8 +240,9 @@ filter, to the next row).
 
 | Key | Does |
 |---|---|
-| `j` `k` ↑ ↓ `g` `G` PgUp PgDn | move |
+| `j` `k` ↑ ↓ `g` `G` Home End PgUp PgDn | move |
 | `n` `p` | first row of the next or previous file |
+| `⏎` | expand a row of several episodes, or collapse it (from the row or one of them); in the files view: the file's first finding the filter shows |
 | `a` `r` | accept or reject (a row: the pending episodes the filter shows, or all it shows when none is pending; an episode decided on its own keeps its decision) |
 | `x` | clear: back to pending (a row: every episode the filter shows) |
 | `e` | reword, then accept |
@@ -253,19 +259,21 @@ filter, to the next row).
 | ← → | mpv back or forward 5 s |
 | `,` `.` | mpv back or forward 1 s |
 | `[` `]` | mpv back or forward one frame (it stays paused) |
-| `?` | show every key, and what the run's LLM calls cost, in a box over the list; `q` quits from it, any other key closes it |
-| `q` | quit, closing the mpv window review started; while a scan or apply runs, ask first, and stop it |
+| `?` | show review's keys, and what the run's LLM calls cost, in a box over the panes; `q` quits from it, any other key closes it |
+| `q` Ctrl+C Ctrl+D | quit, closing the mpv window review started; while a scan or apply runs, ask first, and stop it; Ctrl+C and Ctrl+D do so from the editor too, and from a question as below |
 
 The mouse works too. Click a row to select it, and double-click to open it in mpv. The wheel moves
 the selection over the list and scrolls the detail pane. `? help` at the end of the status line, and
-the editor's `⏎ accept · Esc cancel` there, are clickable. Since review takes the mouse, select text
-in the terminal with Shift+drag. A question on the status line (`… y/n`) takes the next key: `y`
-answers it; Ctrl-C or Ctrl-D quits, but while a scan or apply runs asks to quit in the question's
-place, unless it asks that already; Ctrl-U and the other Ctrl and Alt keys leave it open; and any
-other key only lets it go. So do a click on a row, a file or `? help`, and a turn of the wheel over
-the list; other clicks, and the wheel over the detail pane, leave it open. While the editor is open,
-the mouse lets it go only by a click on `? help`; while the box of keys is open, a click only closes
-the box.
+the editor's `⏎ accept · Esc cancel` there, are clickable. `e` opens the editor on the status line:
+← and → move the cursor, Home and End take it to the start and the end, Backspace takes out the
+character before it and Delete the one after, and Ctrl+U all of the wording before it. Since review
+takes the mouse, select text in the terminal with Shift+drag. A question on the status line
+(`… y/n`) takes the next key: `y` answers it; Ctrl+C or Ctrl+D quits, but while a scan or apply runs
+asks to quit in the question's place, unless it asks that already; Ctrl+U and the other Ctrl and Alt
+keys leave it open; and any other key only lets it go. So do a click on a row, a file or `? help`,
+and a turn of the wheel over the list; other clicks, and the wheel over the detail pane, leave it
+open. While the editor is open, the mouse lets it go only by a click on `? help`; while the box of
+keys is open, a click only closes the box.
 
 Whatever `mpv.conf` says (or, for the window, `mpvqt.conf`), a file `o` loads gets, beside its
 start, `sub-visibility=yes` and, when the finding names one, its subtitle track, three more options
@@ -595,9 +603,9 @@ opening, an insert song, an ending and signs, with typos planted in it. Its key,
 beside it, lists each planted typo, with the fixes that count as right, and each trap: a line with
 nothing to fix that looks as if it needs one, such as a name, an honorific, slang, a stutter or a
 lyric. Each LLM scans it into a store of its own in a scratch directory, which the bench deletes
-when it ends, by Ctrl-C too. A second Ctrl-C can end the bench while it deletes, and leaves what
+when it ends, by Ctrl+C too. A second Ctrl+C can end the bench while it deletes, and leaves what
 remains in `$TMPDIR` or `/tmp`: a `.tmp…` directory, its name ending in `.removing-<pid>` when a
-Ctrl-C began the deletion. Your store is never touched, and an LLM named twice is scanned twice,
+Ctrl+C began the deletion. Your store is never touched, and an LLM named twice is scanned twice,
 not skipped as checked.
 
 The first line it prints counts what the key holds, `bench.mkv: <n> planted typos, <n> traps`,

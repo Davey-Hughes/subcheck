@@ -27,9 +27,9 @@ pub enum Msg {
     /// asks for it, which the screen's own state follows (a double-click, the cost line).
     Input(Input),
     Key(KeyCode),
-    /// Ctrl-U: in the editor, delete back to the start.
+    /// Ctrl+U: in the editor, delete back to the start.
     KillLine,
-    /// Ctrl-C or Ctrl-D.
+    /// Ctrl+C or Ctrl+D.
     Interrupt,
     /// The terminal's new size.
     Resize(u16, u16),
@@ -305,7 +305,7 @@ pub fn update(m: &mut Review, s: &mut Screen, msg: Msg, now: Timestamp) -> Vec<E
         (false, true) => s.editor = None,
         _ => {}
     }
-    // The cost line review opened with ends at the first key (Ctrl-U, Ctrl-C and Ctrl-D too),
+    // The cost line review opened with ends at the first key (Ctrl+U, Ctrl+C and Ctrl+D too),
     // click or turn of the wheel, the box of keys open or not: once the message is handled, so a
     // click lands on the status line as it was drawn.
     if by_user {
@@ -375,7 +375,7 @@ fn key_press(m: &mut Review, s: &mut Screen, key: KeyCode, now: Timestamp) -> Ve
     }
 }
 
-/// Ctrl-U: in the editor, delete back to the start.
+/// Ctrl+U: in the editor, delete back to the start.
 fn kill_line(s: &mut Screen) {
     if let Some(ed) = &mut s.editor {
         ed.text = ed.text.chars().skip(ed.cursor).collect();

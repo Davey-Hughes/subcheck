@@ -45,7 +45,7 @@ use subcheck_core::scan;
 use subcheck_core::store::{Run, Store};
 use update::{Effect, Input};
 
-/// A terminal event as a `Msg`. Ctrl and Alt chords never reach the plain-key handlers, so Ctrl-C
+/// A terminal event as a `Msg`. Ctrl and Alt chords never reach the plain-key handlers, so Ctrl+C
 /// quits instead of reading as `c`; with the mouse they are ignored.
 pub fn map_event(ev: &Event) -> Option<Msg> {
     let k = match ev {
@@ -96,7 +96,7 @@ fn next_msg(mut read: impl FnMut() -> io::Result<Event>) -> io::Result<Msg> {
 
 /// Read the terminal on a thread of its own, each key, click or resize sent as its `Msg`. A
 /// terminal that cannot be read ends the screen (`Input::Fatal`), and so does a panic: with this
-/// thread gone no key reaches the loop, `q` and Ctrl-C among them.
+/// thread gone no key reaches the loop, `q` and Ctrl+C among them.
 fn input(tx: Sender<Msg>) -> io::Result<()> {
     std::thread::Builder::new()
         .name("input".into())
@@ -442,7 +442,7 @@ mod tests {
             map_event(&key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
             Some(Msg::KillLine)
         );
-        // Ctrl-A is not `a`: it must not accept.
+        // Ctrl+A is not `a`: it must not accept.
         assert_eq!(
             map_event(&key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
             None
