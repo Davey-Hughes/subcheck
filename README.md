@@ -2,6 +2,11 @@
 
 Proofread the text subtitles embedded in MKV files with an LLM, then review the fixes.
 
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="https://daveyhughes.com/readme/subcheck/window-light.webp">
+  <img alt="The subcheck window reviewing the subtitles of Monty Python's Life of Brian: the list of fixes, and the selected line paused in the video above its fix" src="https://daveyhughes.com/readme/subcheck/window-dark.webp">
+</picture>
+
 - `subcheck extract` writes a subtitle track out the way mkvextract does, reading only the
   subtitle packets (through the file's Cues) instead of the whole file.
 - `subcheck scan` sends the English lines to an LLM and records each suggested fix in its database
