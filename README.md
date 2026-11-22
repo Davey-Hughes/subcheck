@@ -193,6 +193,11 @@ that repository's pull request N.
 
 ## Review
 
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="https://daveyhughes.com/readme/subcheck/terminal-light.webp">
+  <img alt="The review screen in a terminal on Monty Python's Life of Brian: the run's fixes listed on the left, and on the right the selected one, bented to bent, with why and the lines around it" src="https://daveyhughes.com/readme/subcheck/terminal-dark.webp">
+</picture>
+
 `subcheck scan` opens this screen on the scan it starts, when stdout and stderr are a terminal
 (`--no-tui` keeps the log). Each file's findings join the list when the file is done, the
 selection staying on its row as rows come in above it. A typo that joins a row whose findings are
