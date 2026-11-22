@@ -283,6 +283,9 @@ pub struct Edit {
 
 /// Review's state, whatever UI shows it: the run's findings in rows, the list as shown and its
 /// selection, what is under way, and what the status line says.
+// No two flags are cases of one state, which an enum would name. `held` is set only while
+// `stamping` is, yet no part of its moment: a newer press replaces the moment and keeps `held`.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Review {
     pub run: Run,
     pub rows: Vec<Row>,
@@ -340,6 +343,17 @@ pub struct Review {
     ///
     /// [`Input::Stamped`]: crate::review::update::Input::Stamped
     pub stamping: Option<Moment>,
+    /// A Space (`Playback::Pause`) pressed while `Play` waits for its file's check, with no file
+    /// of review's in the player ([`Review::loaded`]) for it to toggle, kept for the video that
+    /// arrives: the Open the check's answer sends lands it playing ([`PlayerCommand::Open`]'s
+    /// `play`). A second Space undoes the first. Set only while [`Review::stamping`] is: the
+    /// check's answer takes it, and a file found missing, `ClosePlayer` and a `Play` that opens
+    /// nothing drop it, so that no Space acts after the wait it was pressed in. A newer `Play` that
+    /// waits keeps it: the Space was for whichever video arrives. With a file loaded, a Space goes
+    /// to the player at once, as before `Play`.
+    ///
+    /// [`PlayerCommand::Open`]: crate::player::PlayerCommand::Open
+    pub held: bool,
     /// Whether the newest `ClosePlayer` ended a `Play`'s wait ([`Review::stamping`]). The player's
     /// "nothing open" for a close that did is kept off the status line, even when other news came
     /// first: it would read as if the press had done nothing. Each press sets it and no answer
@@ -428,6 +442,7 @@ impl Review {
             replaced_by: HashMap::new(),
             loaded: None,
             stamping: None,
+            held: false,
             close_ended_wait: false,
             view_number: 0,
             switching: None,

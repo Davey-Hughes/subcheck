@@ -165,16 +165,16 @@ impl Screen {
 
     /// What the status line `line` says: review's ([`status`]); else what the run's LLM calls
     /// cost while [`Screen::show_cost`] holds, as much of it as fits beside `? help`. While `o`'s
-    /// file check waits ([`Review::stamping`]), the spinner after it, or alone with nothing said:
-    /// on a share that does not answer the wait has no end in sight, and a line that never moves
-    /// would read as a screen that hung.
+    /// file check waits ([`Review::stamping`]) or `v`'s view is read ([`Review::switching`]), the
+    /// spinner after it, or alone with nothing said: on a share that does not answer the wait has
+    /// no end in sight, and a line that never moves would read as a screen that hung.
     pub fn status_text(&self, m: &Review, line: Rect) -> Option<String> {
         let text = status(m).or_else(|| {
             self.show_cost
                 .then(|| cost_status(&m.run.spent, line))
                 .flatten()
         });
-        if m.stamping.is_none() {
+        if m.stamping.is_none() && m.switching.is_none() {
             return text;
         }
         let spinner = self.spinner();

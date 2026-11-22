@@ -160,7 +160,9 @@ QString statusWords(const Status &status) {
             },
             [](const Status::kOpeningView &) { return QStringLiteral("Opening the view…"); },
             [](const Status::kOpening &o) {
-                return QStringLiteral("Opening %1 at %2").arg(text(o.label), exactClock(o.at_ms));
+                const QString words =
+                    QStringLiteral("Opening %1 at %2").arg(text(o.label), exactClock(o.at_ms));
+                return o.play ? words + QStringLiteral(", will play") : words;
             },
             [](const Status::kNotAnswering &n) {
                 return QStringLiteral("%1: the share isn't answering, still waiting")

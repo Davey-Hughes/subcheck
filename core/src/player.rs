@@ -3,7 +3,9 @@
 
 /// A moment to open on a frame: a file, where to seek, and which subtitle track to show. Whether
 /// mpv plays there is the player's: it keeps mpv playing or paused as it was, and paused when no
-/// file is open, as mpv's own state says, which review does not see.
+/// file is open, as mpv's own state says, which review does not see. Only the user's own Space,
+/// pressed in subcheck during this very open, says otherwise, and the Open carries it
+/// ([`PlayerCommand::Open`]'s `play`), not the moment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Moment {
     pub file: String,
@@ -76,20 +78,28 @@ pub enum PlayerCommand {
     /// 1. mpv paused, so that a playing mpv does not go on past the frame while it gets there. A
     ///    refusal fails the open: mpv refuses no pause while it answers at all.
     /// 2. [`How::Seek`]: in the file mpv has open, the moment's subtitle track (`sid`, when it
-    ///    names one) and subtitles on, then an exact seek to it, then pause off if mpv played.
-    ///    With another file open or none, or with any of the first three refused, the player
-    ///    loads the file instead. A refused unpause leaves mpv paused on the frame, still opened.
-    ///    Review says seek only in a file it had loaded, so `options` hold for it still.
+    ///    names one) and subtitles on, then an exact seek to it, then pause off if mpv played or
+    ///    `play` is set. With another file open or none, or with any of the first three refused,
+    ///    the player loads the file instead. A refused unpause leaves mpv paused on the frame,
+    ///    still opened. Review says seek only in a file it had loaded, so `options` hold for it
+    ///    still.
     /// 3. [`How::Load`], or in place of a seek: the file, with options for that file alone: its
     ///    start at the moment, the subtitle track and subtitles on, every one of `options`, and
-    ///    pause as mpv is to end up; nothing after it. None of `options` names one the player
-    ///    sets itself, so no player need keep their order.
+    ///    pause as mpv is to end up, off if mpv played or `play` is set; nothing after it. None
+    ///    of `options` names one the player sets itself, so no player need keep their order.
     ///
     /// The player says whether mpv was left paused ([`Opened`]).
     Open {
         moment: Moment,
         how: How,
         options: Vec<FileOption>,
+        /// Land playing, whatever mpv's own state says: the user pressed Space in subcheck while
+        /// this open waited for its file's check, with no file of review's in the player for the
+        /// Space to toggle ([`Review::held`]). Unset, the play state is mpv's own, a pause made in
+        /// its window among it.
+        ///
+        /// [`Review::held`]: crate::review::model::Review::held
+        play: bool,
     },
     /// Pause or seek the open mpv.
     Playback(Playback),

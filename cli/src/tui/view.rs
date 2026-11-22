@@ -1118,6 +1118,38 @@ mod tests {
         assert!(lines[19].ends_with(" ? help"), "{screen}");
     }
 
+    // While `v`'s view is read, the status line carries the spinner after its words, as it does
+    // while a check waits; the failed read's words come without one.
+    #[test]
+    fn the_status_line_shows_a_spinner_while_a_view_switch_waits() {
+        let mut m = sample();
+        let mut s = Screen::default();
+        send(&mut m, &mut s, Msg::Resize(160, 20), now());
+        let status_line = |m: &Review, s: &Screen| {
+            let screen = render_on(m, s, 160, 20);
+            screen.lines().nth(19).unwrap().to_string()
+        };
+        send(&mut m, &mut s, Msg::Key(KeyCode::Char('v')), now());
+        let asked = m.switching.expect("v waits for the view's read");
+        assert_eq!(screen::status(&m).as_deref(), Some("opening the view…"));
+        assert_eq!(
+            s.status_text(&m, Rect::new(0, 19, 160, 1)).as_deref(),
+            Some("opening the view… ⠋")
+        );
+        let line = status_line(&m, &s);
+        assert!(line.starts_with("opening the view… ⠋ "), "{line}");
+        let failed = Input::Switched {
+            asked,
+            result: Err("disk I/O error".into()),
+        };
+        send(&mut m, &mut s, failed, now());
+        let words = screen::status(&m).unwrap();
+        assert!(words.starts_with("could not switch views"), "{words}");
+        let line = status_line(&m, &s);
+        assert!(line.starts_with(&format!("{words}  ")), "{line}");
+        assert!(!line.contains(s.spinner()), "{line}");
+    }
+
     // While `o`'s file check waits, the status line's words carry the spinner after them, turned a
     // step by each tick as the one after a job's count on the border is; with no words, the spinner
     // alone. Once the check answers, it goes.

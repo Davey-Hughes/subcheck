@@ -120,25 +120,27 @@ shows over the video once the wait has lasted 500 ms; it goes once the video sho
 Video (Shift+O) has closed the video. A check that has not answered in 3 s says so on the status
 line (`E05: the share isn't answering, still waiting`), and the wait and the animation go on; Close
 Video ends them (`Stopped waiting for E05`, or `Video closed` when a video was open or opening), and
-nothing opens when the check answers, as nothing does for any press but the newest. While a video
-plays, a drag of a column or of the window's edge stays smooth. A column drag stretches the video's
-frame until the drag ends, when mpv draws it again at its new size. The window keeps its size, its
-place on X11 and macOS (Wayland lets no window place itself), its columns' widths, the episodes'
-order and its settings for the next run, in `$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf` on Linux
-and macOS when `XDG_CONFIG_HOME` is an absolute path; otherwise in
-`~/.config/subcheck/subcheck-qt.conf` on Linux and in the app's preferences on macOS. At the end it
-prints the counts as the terminal does, but names a view of paths as its window's title does: by the
-first path's last part, and `+N` for the others. It exits with 1 after an error, or when review has
-not ended 10 s after quitting, and with 0 otherwise. The 10 s gives one decision's write time to
-wait out another process's lock on the store, which the store waits up to 5 s for. It is not enough
-for several writes queued behind a lock held longer, or for an open that waits on the lock more than
-once: the window then closes review, which can lose a decision not yet written. Quitting waits on no
-file's check: the window closes and prints the counts at once, even while a check, or mpv's open of
-a file, waits on a share that does not answer. While mpv's open waits on such a share, the process
-ends about 2 s after the quit without waiting for mpv, with the window's settings kept as any quit
-keeps them. On a FUSE share (sshfs, rclone) the process ends only once the share answers, whatever
-waits on it, as no program can end a request a FUSE share has taken; the window is gone all the
-same.
+nothing opens when the check answers, as nothing does for any press but the newest. Space, pressed
+while Show in Video is still opening a video, decides whether the video lands playing or paused, and
+a second Space undoes the first; pressed while the check waits and no video is open, it adds
+`, will play` to the status line (`Opening E05 at 0:02:45.060, will play`). While a video plays, a
+drag of a column or of the window's edge stays smooth. A column drag stretches the video's frame
+until the drag ends, when mpv draws it again at its new size. The window keeps its size, its place
+on X11 and macOS (Wayland lets no window place itself), its columns' widths, the episodes' order and
+its settings for the next run, in `$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf` on Linux and macOS
+when `XDG_CONFIG_HOME` is an absolute path; otherwise in `~/.config/subcheck/subcheck-qt.conf` on
+Linux and in the app's preferences on macOS. At the end it prints the counts as the terminal does,
+but names a view of paths as its window's title does: by the first path's last part, and `+N` for
+the others. It exits with 1 after an error, or when review has not ended 10 s after quitting, and
+with 0 otherwise. The 10 s gives one decision's write time to wait out another process's lock on the
+store, which the store waits up to 5 s for. It is not enough for several writes queued behind a lock
+held longer, or for an open that waits on the lock more than once: the window then closes review,
+which can lose a decision not yet written. Quitting waits on no file's check: the window closes and
+prints the counts at once, even while a check, or mpv's open of a file, waits on a share that does
+not answer. While mpv's open waits on such a share, the process ends about 2 s after the quit
+without waiting for mpv, with the window's settings kept as any quit keeps them. On a FUSE share
+(sshfs, rclone) the process ends only once the share answers, whatever waits on it, as no program
+can end a request a FUSE share has taken; the window is gone all the same.
 
 The video pane is mpv, inside the window through MpvQt. It reads its options from
 `$XDG_CONFIG_HOME/mpvqt/mpvqt.conf` on Linux (by default `~/.config/mpvqt/mpvqt.conf`) and
@@ -270,7 +272,7 @@ filter, to the next row).
 | `D` | dry run: what apply would do, writing nothing |
 | `o` | open the finding in mpv with its subtitle track: a line on its first frame, a timing finding on the frame that shows the error, or with none, its first moved line's first frame; paused if mpv is paused or has no file open, playing on if it plays, as the status line then says; again on the same row goes back there |
 | `O` | close mpv and end any wait of `o`'s for its file's check, and stay in review; the next `o` opens it again |
-| Space | pause or resume mpv |
+| Space | pause or resume mpv; pressed while `o` is still opening a video, it decides whether the video lands playing or paused, and a second Space undoes the first; pressed while `o`'s check waits and mpv has no file open, it adds `, will play` to the status line (`opening E05 at 0:02:45.060, will play`) |
 | ← → | mpv back or forward 5 s |
 | `,` `.` | mpv back or forward 1 s |
 | `[` `]` | mpv back or forward one frame (it stays paused) |
@@ -304,11 +306,11 @@ and its files' marks once their checks answer, so a share that is slow or does n
 no row. A recheck asks whether each of its files exists as it starts (after `c`, then `y`, or, for
 one that waited for a scan, once that scan ends), and until such a share answers, the terminal takes
 no key, `q` and Ctrl+C included. `v`'s view takes the place of the one shown once it has been read
-(`opening the view…`). While `o`'s check waits, a spinner turns at the end of the status line; a
-check that has not answered in 3 s says so (`E05: the share isn't answering, still waiting`), and
-the wait goes on until the check answers, when only the newest `o` opens, or until `O` ends it
-(`stopped waiting for E05`, or `closed mpv` when mpv was running too). A check that waits does not
-make `q` ask first.
+(`opening the view…`). While that read or `o`'s check waits, a spinner turns at the end of the
+status line; a check that has not answered in 3 s says so
+(`E05: the share isn't answering, still waiting`), and the wait goes on until the check answers,
+when only the newest `o` opens, or until `O` ends it (`stopped waiting for E05`, or `closed mpv`
+when mpv was running too). A check that waits does not make `q` ask first.
 
 ## LLM settings
 

@@ -35,8 +35,8 @@ Moment moment(const std::string &file, std::int64_t at, std::optional<std::uint6
 // itself, which core's own pair would hide.
 const std::vector<FileOption> given = {{"title", "t"}, {"osd-level", "1"}};
 
-PlayerCommand open(const Moment &m, How how = How::kLoad) {
-    return PlayerCommand(PlayerCommand::kOpen{m, how, given});
+PlayerCommand open(const Moment &m, How how = How::kLoad, bool play = false) {
+    return PlayerCommand(PlayerCommand::kOpen{m, how, given, play});
 }
 
 PlayerCommand playback(Playback p) { return PlayerCommand(PlayerCommand::kPlayback{std::move(p)}); }
@@ -44,6 +44,8 @@ PlayerCommand playback(Playback p) { return PlayerCommand(PlayerCommand::kPlayba
 PlayerCommand seek(std::int32_t by) { return playback(Playback(Playback::kSeek{by})); }
 
 PlayerCommand close() { return PlayerCommand(PlayerCommand::kClose{}); }
+
+PlayerCommand pause() { return playback(Playback(Playback::kPause{})); }
 
 // What an Open asks of mpv first, before its move: where mpv is; whether it plays, with a file
 // open only; then the pause every move starts with.
@@ -137,19 +139,164 @@ private slots:
         QCOMPARE(r.mpv.requests.size(), 3u);
     }
 
-    // Nothing can be open before mpv can show video: a Playback says so, or that the file is
-    // still opening, and a Close drops the Open that waits, or with none says nothing is open.
+    // Nothing can be open before mpv can show video: a Playback says so, a Space among them
+    // with no Open waiting, or a seek with one that the file is still opening; and a Close drops
+    // the Open that waits, or with none says nothing is open.
     void beforeThenAPlaybackOrACloseIsAnsweredAtOnce() {
         Rig r;
         r.player.run(seek(5));
+        r.player.run(pause());
         r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
         r.player.run(seek(5));
         r.player.run(close());
         r.player.run(close());
         r.player.ready();
-        QCOMPARE(r.reports, (QStringList{"play failed: no file", "play failed: still opening",
-                                         "closed", "closed: not open"}));
+        QCOMPARE(r.reports,
+                 (QStringList{"play failed: no file", "play failed: no file",
+                              "play failed: still opening", "closed", "closed: not open"}));
         QCOMPARE(r.mpv.requests.size(), 0u);
+    }
+
+    // A Space before the pane can show video has nothing open to toggle, so it is the waiting
+    // Open's, which then lands the other way from its play: nothing can play in a pane that is not
+    // ready, so the Open's play is how it lands. Nothing is reported for the Space; the Open says
+    // how it landed.
+    void aSpaceBeforeThePaneIsReadyLandsTheOpenPlaying() {
+        Rig r;
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        r.player.run(pause());
+        QCOMPARE(r.reports, QStringList());
+        QCOMPARE(r.mpv.requests.size(), 0u);
+        r.player.ready();
+        QCOMPARE(r.openWith(), firstWithNoFile);
+        QCOMPARE(r.mpv.last(), loadOf("/m/a.mkv", "0:00:00.000000", {}, false));
+        r.mpv.answer(r.player);
+        QCOMPARE(r.reports, QStringList());
+        r.player.restarted();
+        QCOMPARE(r.reports, QStringList{"opened playing"});
+    }
+
+    // A toggle: a second Space undoes the first.
+    void twoSpacesBeforeThePaneIsReadyLandItPaused() {
+        Rig r;
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        r.player.run(pause());
+        r.player.run(pause());
+        r.player.ready();
+        QCOMPARE(r.openWith(), firstWithNoFile);
+        QCOMPARE(r.mpv.last(), loadOf("/m/a.mkv", "0:00:00.000000"));
+        r.mpv.answer(r.player);
+        r.player.restarted();
+        QCOMPARE(r.reports, QStringList{"opened paused"});
+    }
+
+    // The Space was for the video about to show, whichever it is, as review keeps one across a
+    // newer press: a newer Open in the waiting one's place plays, as the waiting one would have.
+    void aNewerOpenKeepsASpaceMadeBeforeThePaneIsReady() {
+        Rig r;
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        r.player.run(pause());
+        r.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
+        r.player.ready();
+        QCOMPARE(r.openWith(), firstWithNoFile);
+        QCOMPARE(r.mpv.last(), loadOf("/m/b.mkv", "0:00:00.000000", {}, false));
+        r.mpv.answer(r.player);
+        r.player.restarted();
+        QCOMPARE(r.reports, QStringList{"opened playing"});
+    }
+
+    // A toggle, not "always play": an Open that says play, as review held a Space for it, lands
+    // paused after a Space in the port.
+    void aSpaceOnAWaitingOpenThatSaysPlayLandsItPaused() {
+        Rig r;
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt), How::kLoad, true));
+        r.player.run(pause());
+        r.player.ready();
+        QCOMPARE(r.openWith(), firstWithNoFile);
+        QCOMPARE(r.mpv.last(), loadOf("/m/a.mkv", "0:00:00.000000"));
+        r.mpv.answer(r.player);
+        r.player.restarted();
+        QCOMPARE(r.reports, QStringList{"opened paused"});
+    }
+
+    // An Open that says play, sent for a Space review held, keeps that Space for the newer Open in
+    // its place, as a Space in the port is kept.
+    void aNewerOpenKeepsAnOlderOpensPlay() {
+        Rig r;
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt), How::kLoad, true));
+        r.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
+        r.player.ready();
+        QCOMPARE(r.openWith(), firstWithNoFile);
+        QCOMPARE(r.mpv.last(), loadOf("/m/b.mkv", "0:00:00.000000", {}, false));
+        r.mpv.answer(r.player);
+        r.player.restarted();
+        QCOMPARE(r.reports, QStringList{"opened playing"});
+    }
+
+    // A newer Open that says play lands playing, as review's line says "will play" for it, whatever
+    // a Space made of the Open it replaces.
+    void aNewerOpenThatSaysPlayStillPlaysAfterAFlip() {
+        Rig r;
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        r.player.run(pause());
+        r.player.run(open(moment("/m/c.mkv", 0, std::nullopt), How::kLoad, true));
+        r.player.ready();
+        QCOMPARE(r.openWith(), firstWithNoFile);
+        QCOMPARE(r.mpv.last(), loadOf("/m/c.mkv", "0:00:00.000000", {}, false));
+        r.mpv.answer(r.player);
+        r.player.restarted();
+        QCOMPARE(r.reports, QStringList{"opened playing"});
+    }
+
+    // Two Spaces undo each other, the newer Open in the waiting one's place too: it lands as it
+    // says.
+    void aNewerOpenAfterTwoSpacesLandsAsItSays() {
+        Rig r;
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        r.player.run(pause());
+        r.player.run(pause());
+        r.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
+        r.player.ready();
+        QCOMPARE(r.openWith(), firstWithNoFile);
+        QCOMPARE(r.mpv.last(), loadOf("/m/b.mkv", "0:00:00.000000"));
+        r.mpv.answer(r.player);
+        r.player.restarted();
+        QCOMPARE(r.reports, QStringList{"opened paused"});
+    }
+
+    // A Space belongs to the wait it came in: a Close drops the waiting Open and the Space with
+    // it, as does the end of the Open's time for the pane, and the release, so the next Open lands
+    // as it says.
+    void aCloseOrTheWaitsEndForgetsASpace() {
+        Rig r;
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        r.player.run(pause());
+        r.player.run(close());
+        QCOMPARE(r.reports, QStringList{"closed"});
+        r.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
+        r.player.ready();
+        QCOMPARE(r.openWith(), firstWithNoFile);
+        QCOMPARE(r.mpv.last(), loadOf("/m/b.mkv", "0:00:00.000000"));
+
+        Rig slow(std::chrono::seconds(10), std::chrono::seconds(10),
+                 std::chrono::milliseconds(300));
+        slow.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        slow.player.run(pause());
+        QTRY_COMPARE_WITH_TIMEOUT(slow.reports, QStringList{"open failed: no video"}, 2000);
+        slow.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
+        slow.player.ready();
+        QCOMPARE(slow.openWith(), firstWithNoFile);
+        QCOMPARE(slow.mpv.last(), loadOf("/m/b.mkv", "0:00:00.000000"));
+
+        Rig released;
+        released.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        released.player.run(pause());
+        released.player.release();
+        released.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
+        released.player.ready();
+        QCOMPARE(released.openWith(), firstWithNoFile);
+        QCOMPARE(released.mpv.last(), loadOf("/m/b.mkv", "0:00:00.000000"));
+        QCOMPARE(released.reports, QStringList());
     }
 
     // Paused before mpv gets there, so that a playing mpv does not go on past the frame, and
@@ -248,6 +395,40 @@ private slots:
         r.player.restarted();
         QCOMPARE(r.mpv.last(), load);
         QCOMPARE(r.reports, QStringList{"opened playing"});
+    }
+
+    // An Open that says play lands playing, whatever mpv's own state, as the user pressed Space
+    // while it waited: by the load's option, with no file open and with one open and paused; by
+    // the unpause once the seek has landed, as a playing mpv's seek does.
+    void anOpenThatSaysPlayLandsPlaying() {
+        Rig r;
+        r.player.ready();
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt), How::kLoad, true));
+        QCOMPARE(r.openWith(), firstWithNoFile);
+        QCOMPARE(r.mpv.last(), loadOf("/m/a.mkv", "0:00:00.000000", {}, false));
+        r.mpv.answer(r.player);
+        QCOMPARE(r.reports, QStringList());
+        r.player.restarted();
+        QCOMPARE(r.reports, QStringList{"opened playing"});
+
+        r.player.run(open(moment("/m/b.mkv", 0, std::nullopt), How::kLoad, true));
+        QCOMPARE(r.openWith("/m/a.mkv"), firstWithAFile);
+        QCOMPARE(r.mpv.last(), loadOf("/m/b.mkv", "0:00:00.000000", {}, false));
+        r.mpv.answer(r.player);
+        r.player.restarted();
+        QCOMPARE(r.reports, (QStringList{"opened playing", "opened playing"}));
+
+        r.player.run(open(moment("/m/b.mkv", 5'000'000, std::nullopt), How::kSeek, true));
+        QCOMPARE(r.openWith("/m/b.mkv"), firstWithAFile);
+        QCOMPARE(r.mpv.last(), "set sub-visibility yes");
+        r.mpv.answer(r.player);
+        QCOMPARE(r.mpv.last(), "seek 0:00:05.000000 absolute+exact");
+        r.mpv.answer(r.player);
+        r.player.restarted();
+        QCOMPARE(r.mpv.last(), "set pause no");
+        QCOMPARE(r.reports.size(), 2);
+        r.mpv.answer(r.player);
+        QCOMPARE(r.reports, (QStringList{"opened playing", "opened playing", "opened playing"}));
     }
 
     // Review says seek when it had the player load the file, unchanged since: sought, if mpv still
@@ -458,6 +639,38 @@ private slots:
         QCOMPARE(r.mpv.last(), "stop");
         r.player.ended(End::Failed);
         QCOMPARE(r.reports, QStringList{"opened paused"});
+    }
+
+    // A late load's file still opens, and mpv keeps a pause toggled meanwhile, landing the file as
+    // the toggle leaves it: so a Space goes to mpv, and is reported as how the open will land. The
+    // load is still awaited. A seek still waits for the file.
+    void aLateLoadsSpaceGoesToMpvAndSaysHowItWillLand() {
+        Rig r(std::chrono::milliseconds(100));
+        r.player.ready();
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        r.openWith();
+        r.mpv.answer(r.player);
+        QTRY_COMPARE_WITH_TIMEOUT(r.reports, QStringList{"opened paused"}, 2000);
+        r.reports.clear();
+        r.player.run(pause());
+        QCOMPARE(r.mpv.last(), "get time-pos");
+        r.mpv.answer(r.player, {}, unavailable);
+        QCOMPARE(r.mpv.last(), "get path");
+        r.mpv.answer(r.player, QStringLiteral("/m/a.mkv"));
+        QCOMPARE(r.mpv.last(), "cycle pause");
+        r.mpv.answer(r.player);
+        QCOMPARE(r.mpv.last(), "get pause");
+        QCOMPARE(r.reports, QStringList());
+        r.mpv.answer(r.player, false);
+        QCOMPARE(r.reports, QStringList{"opened playing"});
+        QVERIFY(r.player.opening());
+
+        r.player.run(seek(5));
+        QCOMPARE(r.mpv.last(), "get time-pos");
+        r.mpv.answer(r.player, {}, unavailable);
+        QCOMPARE(r.mpv.last(), "get path");
+        r.mpv.answer(r.player, QStringLiteral("/m/a.mkv"));
+        QCOMPARE(r.reports, (QStringList{"opened playing", "play failed: still opening"}));
     }
 
     // The kind the pane gives the player for each end MpvQt names. A name MpvQt does not give is a
@@ -794,6 +1007,30 @@ private slots:
         QCOMPARE(r.reports, (QStringList{"played playing 6000", "closed"}));
     }
 
+    // With the pane ready, a Space during an Open under way waits behind it, as every command
+    // waits for the one before: the Open loads as review said, and the Space toggles the video
+    // once it has landed.
+    void aSpaceDuringAnOpenUnderWayRunsOnceItHasLanded() {
+        Rig r;
+        r.player.ready();
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        r.player.run(pause());
+        QCOMPARE(r.openWith(), firstWithNoFile);
+        QCOMPARE(r.mpv.last(), loadOf("/m/a.mkv", "0:00:00.000000"));
+        r.mpv.answer(r.player);
+        QCOMPARE(r.reports, QStringList());
+        r.player.restarted();
+        QCOMPARE(r.reports, QStringList{"opened paused"});
+        QCOMPARE(r.mpv.last(), "get time-pos");
+        r.mpv.answer(r.player, 0.0);
+        QCOMPARE(r.mpv.last(), "cycle pause");
+        r.mpv.answer(r.player);
+        QCOMPARE(r.mpv.last(), "get pause");
+        r.mpv.answer(r.player, false);
+        r.mpv.answer(r.player, 0.0);
+        QCOMPARE(r.reports, (QStringList{"opened paused", "played playing 0"}));
+    }
+
     // A request mpv does not answer in its time fails its command, as the terminal's do, and the
     // next runs: an answer that comes after is no one's. An answer ends its request's time, so a
     // command that has reported fails no later.
@@ -1010,7 +1247,9 @@ private slots:
 
     // Another mpv in place of the one a request waits on, which will not answer it now: the
     // command under way is run again as if it came now, nothing can be open yet, and the next
-    // runs on the new mpv once it can show video. The same mpv given again changes nothing.
+    // runs on the new mpv once it can show video. The same mpv given again changes nothing. A
+    // Space queued behind an Open under way was pressed against the old mpv's play state, so it is
+    // answered, not kept for the Open; one pressed after the new mpv is attached is kept.
     void aCommandUnderWayWhenItsMpvGoesIsRunAgain() {
         Rig r;
         r.loaded();
@@ -1036,6 +1275,34 @@ private slots:
         QCOMPARE(other.last(), loadOf("/m/b.mkv", "0:00:00.000000"));
         QCOMPARE(r.mpv.requests.size(), sent);
         QCOMPARE(r.reports.size(), 1);
+
+        Rig spaced;
+        spaced.loaded();
+        spaced.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
+        spaced.player.run(pause());
+        QCOMPARE(spaced.mpv.last(), "get path");
+        FakeMpv another;
+        spaced.player.attach(&another);
+        QCOMPARE(spaced.reports, QStringList{"play failed: still opening"});
+        QVERIFY(spaced.player.opening());
+        spaced.player.ready();
+        QCOMPARE(answerOpening(another, spaced.player), firstWithNoFile);
+        QCOMPARE(another.last(), loadOf("/m/b.mkv", "0:00:00.000000", {}, true));
+        another.answer(spaced.player);
+        spaced.player.restarted();
+        QCOMPARE(spaced.reports, (QStringList{"play failed: still opening", "opened paused"}));
+
+        Rig after;
+        after.loaded();
+        after.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
+        FakeMpv third;
+        after.player.attach(&third);
+        QCOMPARE(after.reports, QStringList());
+        after.player.run(pause());
+        QCOMPARE(after.reports, QStringList());
+        after.player.ready();
+        QCOMPARE(answerOpening(third, after.player), firstWithNoFile);
+        QCOMPARE(third.last(), loadOf("/m/b.mkv", "0:00:00.000000", {}, false));
     }
 
     // The mpv gone while a move settles: the wait goes with it, so that its end asks nothing of

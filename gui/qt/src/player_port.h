@@ -140,6 +140,15 @@ private:
     // newest is kept.
     std::optional<subcheck_ffi::PlayerCommand> waiting;
     QTimer notShown;
+    // A Space for the Open that waits, as there is nothing open to toggle: ready() hands it on
+    // inside that Open, which then lands the other way from its play. A newer Open in its place
+    // plays if it says play or if the one it replaces would have (its play turned by this Space),
+    // and this clears, as the newer Open's play now holds it. A Space is for whichever video
+    // arrives, as review keeps a held Space across a newer press, and an Open's play is such a
+    // Space, one review held; and an Open that says play is one review's line says "will play"
+    // for, which must not land paused. A Close, the end of `notShown` and the release forget it
+    // with the Open it was for.
+    bool flipPlay = false;
     std::deque<subcheck_ffi::PlayerCommand> queue;
     // The command under way, until it reports, and the request of it that mpv has yet to answer.
     std::optional<subcheck_ffi::PlayerCommand> busy;

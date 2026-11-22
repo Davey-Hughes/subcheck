@@ -150,13 +150,19 @@ pub enum How {
 pub enum PlayerCommand {
     /// Open the moment as `how` says, in the steps core's `PlayerCommand::Open` names: pause; for
     /// a seek, in the file mpv has open, the subtitle track and subtitles on, the exact seek, then
-    /// pause off if mpv played, or a load instead should any of it be refused or mpv have another
-    /// file open; for a load, the file with its start, subtitle track, subtitles on, every one of
-    /// `options` and pause as mpv is to end up, as options of that file alone.
+    /// pause off if mpv played or `play` is set, or a load instead should any of it be refused or
+    /// mpv have another file open; for a load, the file with its start, subtitle track, subtitles
+    /// on, every one of `options` and pause as mpv is to end up (off if mpv played or `play` is
+    /// set), as options of that file alone.
     Open {
         moment: Moment,
         how: How,
         options: Vec<FileOption>,
+        /// Land playing, whatever mpv's own state says: the user pressed Space in subcheck while
+        /// this open waited for its file's check, with no file of review's in the player for the
+        /// Space to toggle. Unset, the play state is mpv's own, a pause made in its window among
+        /// it.
+        play: bool,
     },
     /// Pause or seek the open player.
     Playback(Playback),
@@ -366,8 +372,14 @@ pub enum Status {
     /// A view switch (`SwitchView`, `OpenView`, `OpenFolder`) is reading the view it opens. The
     /// view shown stays, and works, until it comes.
     OpeningView,
-    /// `Play` asks the player to open file `label` at `at_ms`.
-    Opening { label: String, at_ms: i64 },
+    /// `Play` asks the player to open file `label` at `at_ms`. With `play`, the video lands
+    /// playing, for a Space pressed while the open waited; a later Space goes to the player, which
+    /// toggles the video as it lands, and the line stops saying so.
+    Opening {
+        label: String,
+        at_ms: i64,
+        play: bool,
+    },
     /// The check of file `label`, which `Play` waits for, has not answered in a while: its share
     /// is slow or down. The wait goes on.
     NotAnswering { label: String },
@@ -1248,10 +1260,12 @@ impl From<player::PlayerCommand> for PlayerCommand {
                 moment,
                 how,
                 options,
+                play,
             } => PlayerCommand::Open {
                 moment: moment.into(),
                 how: how.into(),
                 options: options.into_iter().map(FileOption::from).collect(),
+                play,
             },
             player::PlayerCommand::Playback(playback) => PlayerCommand::Playback(playback.into()),
             player::PlayerCommand::Close => PlayerCommand::Close,
@@ -1477,7 +1491,9 @@ impl From<status::Status> for Status {
             status::Status::QueuedAgain { label } => Status::QueuedAgain { label },
             status::Status::NoSuchFile { label } => Status::NoSuchFile { label },
             status::Status::OpeningView => Status::OpeningView,
-            status::Status::Opening { label, at_ms } => Status::Opening { label, at_ms },
+            status::Status::Opening { label, at_ms, play } => {
+                Status::Opening { label, at_ms, play }
+            }
             status::Status::NotAnswering { label } => Status::NotAnswering { label },
             status::Status::StoppedWaiting { label } => Status::StoppedWaiting { label },
             status::Status::Opened { paused } => Status::Opened { paused },
@@ -3209,13 +3225,14 @@ mod tests {
 
     #[test]
     fn each_player_command_and_the_end_cross() {
-        let open = |how| player::PlayerCommand::Open {
+        let open = |how, play| player::PlayerCommand::Open {
             moment: player::Moment {
                 file: "/m/E01.mkv".into(),
                 start_us: 165_064_500,
                 sid: Some(2),
             },
             how,
+            play,
             options: vec![
                 player::FileOption {
                     name: "a".into(),
@@ -3227,7 +3244,7 @@ mod tests {
                 },
             ],
         };
-        let crossed = |how| {
+        let crossed = |how, play| {
             Event::Player(PlayerCommand::Open {
                 moment: Moment {
                     file: "/m/E01.mkv".into(),
@@ -3235,6 +3252,7 @@ mod tests {
                     sid: Some(2),
                 },
                 how,
+                play,
                 options: vec![
                     FileOption {
                         name: "a".into(),
@@ -3253,12 +3271,20 @@ mod tests {
                 Event::Answered { answered: 7 },
             ),
             (
-                session::Event::Player(open(player::How::Seek)),
-                crossed(How::Seek),
+                session::Event::Player(open(player::How::Seek, false)),
+                crossed(How::Seek, false),
             ),
             (
-                session::Event::Player(open(player::How::Load)),
-                crossed(How::Load),
+                session::Event::Player(open(player::How::Seek, true)),
+                crossed(How::Seek, true),
+            ),
+            (
+                session::Event::Player(open(player::How::Load, false)),
+                crossed(How::Load, false),
+            ),
+            (
+                session::Event::Player(open(player::How::Load, true)),
+                crossed(How::Load, true),
             ),
             (
                 session::Event::Player(player::PlayerCommand::Close),
@@ -3595,10 +3621,24 @@ mod tests {
                 status::Status::Opening {
                     label: label("E08"),
                     at_ms: 165_060,
+                    play: false,
                 },
                 Status::Opening {
                     label: label("E08"),
                     at_ms: 165_060,
+                    play: false,
+                },
+            ),
+            (
+                status::Status::Opening {
+                    label: label("E08"),
+                    at_ms: 165_060,
+                    play: true,
+                },
+                Status::Opening {
+                    label: label("E08"),
+                    at_ms: 165_060,
+                    play: true,
                 },
             ),
             (

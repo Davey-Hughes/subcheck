@@ -36,8 +36,8 @@ QString mpvTime(std::int64_t us) {
 }
 
 // mpv's own pause, set before every move to a moment, or a playing mpv goes on past the frame; and
-// unset once a seek has landed, if mpv played before the Open, not sooner, or it plays on from
-// where it was meanwhile. A load sets its own, as the file's option (`load`).
+// unset once a seek has landed, if mpv played before the Open or the Open says play, not sooner,
+// or it plays on from where it was meanwhile. A load sets its own, as the file's option (`load`).
 QStringList setPause(bool paused) {
     return {QStringLiteral("set"), QStringLiteral("pause"),
             paused ? QStringLiteral("yes") : QStringLiteral("no")};
@@ -74,8 +74,11 @@ PlayerPort::PlayerPort(std::chrono::milliseconds settle, std::chrono::millisecon
 // The mpv gone will answer nothing more and land nothing, and a new one has shown nothing and is
 // not ready until it says so. So what review sent that has not reported (the command under way,
 // then those queued behind it) is given up there and run again as if it came now: an Open waits
-// for an mpv to be ready, as before the first was, and a Playback or a Close is answered at once,
-// as nothing can be open. The same mpv given again is still ready, if it was, and still answers.
+// for an mpv to be ready, as before the first was, and any Playback, a Space too, or a Close, is
+// answered at once, as nothing can be open. A Space is not kept for the Open: it was pressed
+// against the old mpv's play state, which the new one lacks, so flipping the Open would land it
+// the way the user did not mean. The same mpv given again is still ready, if it was, and still
+// answers.
 void PlayerPort::attach(Mpv *mpv) {
     if (mpv == this->mpv) {
         return;
@@ -89,7 +92,13 @@ void PlayerPort::attach(Mpv *mpv) {
     this->mpv = mpv;
     isReady = false;
     for (const PlayerCommand &command : again) {
-        take(command);
+        if (std::holds_alternative<PlayerCommand::kPlayback>(command.get_variant())) {
+            emit reported(PlayerReport(
+                PlayerReport::kPlayFailed{waiting ? PlayerError(PlayerError::kStillOpening{})
+                                                  : PlayerError(PlayerError::kNoFile{})}));
+        } else {
+            take(command);
+        }
     }
     noteOpening();
 }
@@ -109,13 +118,29 @@ void PlayerPort::take(const PlayerCommand &command) {
     if (!isReady) {
         // Nothing has opened yet, so nothing can play or need closing; an Open waits for mpv
         // to show what it opens, and a newer one replaces it, as review's status names only it,
-        // each for the time the port gives it.
+        // each for the time the port gives it, and plays as well if the one it replaces would have
+        // (`flipPlay`). A Space, with nothing open to toggle, toggles how the waiting Open will
+        // land, and is answered by the Open's own report.
         std::visit(Overloaded{
-                       [this, &command](const PlayerCommand::kOpen &) {
-                           waiting = command;
+                       [this, &command](const PlayerCommand::kOpen &newer) {
+                           if (waiting) {
+                               const bool olderPlays =
+                                   std::get<PlayerCommand::kOpen>(waiting->get_variant()).play !=
+                                   std::exchange(flipPlay, false);
+                               PlayerCommand::kOpen folded = newer;
+                               folded.play = folded.play || olderPlays;
+                               waiting = PlayerCommand(std::move(folded));
+                           } else {
+                               waiting = command;
+                           }
                            notShown.start();
                        },
-                       [this](const PlayerCommand::kPlayback &) {
+                       [this](const PlayerCommand::kPlayback &playback) {
+                           if (waiting && std::holds_alternative<Playback::kPause>(
+                                              playback.v1.get_variant())) {
+                               flipPlay = !flipPlay;
+                               return;
+                           }
                            emit reported(PlayerReport(PlayerReport::kPlayFailed{
                                waiting ? PlayerError(PlayerError::kStillOpening{})
                                        : PlayerError(PlayerError::kNoFile{})}));
@@ -123,6 +148,7 @@ void PlayerPort::take(const PlayerCommand &command) {
                        [this](const PlayerCommand::kClose &) {
                            const bool closed = waiting.has_value();
                            waiting.reset();
+                           flipPlay = false;
                            notShown.stop();
                            emit reported(PlayerReport(PlayerReport::kClosed{
                                closed ? std::nullopt
@@ -138,6 +164,7 @@ void PlayerPort::take(const PlayerCommand &command) {
 
 void PlayerPort::release() {
     waiting.reset();
+    flipPlay = false;
     notShown.stop();
     queue.clear();
     drop();
@@ -170,7 +197,15 @@ void PlayerPort::ready() {
     isReady = true;
     notShown.stop();
     if (waiting) {
-        queue.push_back(*std::exchange(waiting, std::nullopt));
+        PlayerCommand waited = *std::exchange(waiting, std::nullopt);
+        // Nothing is open in a pane that was not ready, so the Open lands as its play says, and a
+        // Space made while it waited is that play turned the other way.
+        if (std::exchange(flipPlay, false)) {
+            PlayerCommand::kOpen flipped = std::get<PlayerCommand::kOpen>(waited.get_variant());
+            flipped.play = !flipped.play;
+            waited = PlayerCommand(std::move(flipped));
+        }
+        queue.push_back(std::move(waited));
     }
     next();
 }
@@ -315,11 +350,13 @@ void PlayerPort::next() {
 // with none, nothing plays, whatever mpv's pause says. A read of the path that mpv refuses,
 // whatever its words, counts as no file open, so the file is loaded. Whether mpv plays decides
 // only whether it plays again once there, so a read that mpv fails, or that gives no flag, counts
-// as paused, which leaves mpv on the frame. Then the pause, whose refusal fails the Open; then the
-// seek, when review says seek and mpv still has the file open (a file opened in the pane since by
-// other means is loaded again), else the load.
+// as paused, which leaves mpv on the frame. An Open that says play, as the user pressed Space while
+// it waited, plays there all the same, whatever mpv's own state. Then the pause, whose refusal
+// fails the Open; then the seek, when review says seek and mpv still has the file open (a file
+// opened in the pane since by other means is loaded again), else the load.
 void PlayerPort::open(const PlayerCommand::kOpen &command) {
-    const auto go = [this, command](bool seek, bool resume) {
+    const auto go = [this, command](bool seek, bool playing) {
+        const bool resume = playing || command.play;
         askAll({setPause(true)}, [this, command, seek, resume] {
             if (seek) {
                 seekTo(command, resume);
@@ -343,8 +380,9 @@ void PlayerPort::open(const PlayerCommand::kOpen &command) {
         nullptr, [go](const QString &) { go(false, false); });
 }
 
-// Once a seek has landed: if mpv played before the Open, it plays again, only now, so that it plays
-// on from the frame, not from where it was, and the Open reports once mpv has answered that.
+// Once a seek has landed: if mpv played before the Open, or the Open says play, it plays, only now,
+// so that it plays on from the frame, not from where it was, and the Open reports once mpv has
+// answered that.
 // Refused, mpv stays paused on the frame, which is still the moment opened, and the report says so.
 void PlayerPort::opened(bool resume) {
     const auto done = [this](bool paused) { finish(PlayerReport(PlayerReport::kOpened{paused})); };
@@ -442,10 +480,24 @@ void PlayerPort::playback(Playback playback) {
                        },
                        playback.get_variant());
         },
-        [this] {
+        [this, playback] {
             read(
                 QStringLiteral("path"),
-                [this](const QVariant &) { fail(PlayerError(PlayerError::kStillOpening{})); },
+                [this, playback](const QVariant &) {
+                    // mpv keeps a pause toggled while the file opens, and lands the file as the
+                    // toggle leaves it: a Space is mpv's to keep, and says how the open will land.
+                    // A seek or a step needs the file open.
+                    if (std::holds_alternative<Playback::kPause>(playback.get_variant())) {
+                        ask({QStringLiteral("cycle"), QStringLiteral("pause")},
+                            [this](const QVariant &) {
+                                read(QStringLiteral("pause"), [this](const QVariant &paused) {
+                                    finish(PlayerReport(PlayerReport::kOpened{paused.toBool()}));
+                                });
+                            });
+                        return;
+                    }
+                    fail(PlayerError(PlayerError::kStillOpening{}));
+                },
                 [this] { fail(PlayerError(PlayerError::kNoFile{})); });
         });
 }
@@ -568,6 +620,7 @@ void PlayerPort::noAnswer() {
 void PlayerPort::notReady() {
     if (waiting) {
         waiting.reset();
+        flipPlay = false;
         emit reported(
             PlayerReport(PlayerReport::kOpenFailed{PlayerError(PlayerError::kNoVideo{})}));
         noteOpening();

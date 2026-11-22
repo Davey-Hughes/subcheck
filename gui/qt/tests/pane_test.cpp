@@ -45,7 +45,7 @@ namespace {
 PlayerCommand open(const std::string &file, std::int64_t at, std::optional<std::uint64_t> sid,
                    How how = How::kLoad) {
     return PlayerCommand(PlayerCommand::kOpen{
-        Moment{file, at, sid}, how, {{"hr-seek", "yes"}, {"rebase-start-time", "no"}}});
+        Moment{file, at, sid}, how, {{"hr-seek", "yes"}, {"rebase-start-time", "no"}}, false});
 }
 
 PlayerCommand playback(Playback p) { return PlayerCommand(PlayerCommand::kPlayback{std::move(p)}); }

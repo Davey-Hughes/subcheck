@@ -1012,6 +1012,7 @@ mod tests {
         Status::Opening {
             label: "E01".into(),
             at_ms: 165_060,
+            play: false,
         }
     }
 
@@ -2126,6 +2127,7 @@ mod tests {
                 },
                 how: How::Load,
                 options: player::load_options(),
+                play: false,
             }))
         );
         s.report(PlayerReport::Opened(Ok(player::Opened { paused: true })));
@@ -2918,6 +2920,47 @@ mod tests {
         assert_eq!(follows, [0, 1]);
     }
 
+    // A Space while `Play`'s check is stuck: the line says the video will play, and the Open the
+    // answer sends carries it, after a change that says an Open follows. The check is held so
+    // that the Space comes before the answer, as it does on a slow share.
+    #[test]
+    fn a_held_space_rides_in_the_open_and_the_change_before_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut share, stat) = Share::new(as_scanned());
+        share.hold(&tests_support::path(1));
+        let s = session_with(dir.path(), |_| {}, move |runner| runner.with_stat(stat));
+        next(&s);
+        s.send(Action::Play);
+        assert_eq!(next_change(&s).1.status, Some(opening_e01()));
+        s.send(Action::Playback(Playback::Pause));
+        let will_play = Status::Opening {
+            label: "E01".into(),
+            at_ms: 165_060,
+            play: true,
+        };
+        let (_, summary) = next_change(&s);
+        assert_eq!(
+            (summary.status, summary.stamping),
+            (Some(will_play.clone()), true)
+        );
+        share.let_go();
+        let mut before = None;
+        let open = loop {
+            match next(&s).expect("the stream ended") {
+                Event::Changed { summary, .. } => before = Some(summary),
+                Event::Player(command) => break command,
+                _ => {}
+            }
+        };
+        let before = before.expect("no change before the Open");
+        assert!(before.open_follows);
+        assert_eq!(before.status, Some(will_play));
+        assert!(
+            matches!(open, PlayerCommand::Open { play: true, .. }),
+            "{open:?}"
+        );
+    }
+
     // The same view published before an Open, then before none: the second is sent all the same,
     // so that a UI does not go on reading that an Open follows. A seek or a close is no Open.
     #[test]
@@ -2932,6 +2975,7 @@ mod tests {
             },
             how: How::Seek,
             options: vec![],
+            play: false,
         });
         let others = [
             Effect::Player(PlayerCommand::Playback(Playback::Seek(5))),
@@ -2972,6 +3016,7 @@ mod tests {
             },
             how: How::Seek,
             options: vec![],
+            play: false,
         };
         let open = Effect::Player(command.clone());
         let mut events = Vec::new();

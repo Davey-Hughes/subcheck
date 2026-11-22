@@ -411,8 +411,11 @@ fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
     }
     // A message stays until the user does something else. An answer, the end of an edit and
     // `Interrupt` leave it, so a message that came while a question or the editor held the line
-    // shows once they are done. A playback command leaves it too: its report always follows and
-    // takes its place, so that the line does not go blank between the two.
+    // shows once they are done. A playback command leaves it too. A Space sent on while the line
+    // says the video will play must find that `Opening` there to take the promise back
+    // (`playback`). And the line is not left blank: a Space review holds words the line itself,
+    // the player's report takes the place of a command sent on, and a Space the window's player
+    // turns onto an Open still waiting for its pane has no report but that Open's own.
     if !matches!(
         action,
         Action::Answer(_)
@@ -468,7 +471,7 @@ fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
         Action::Apply { dry_run } => return apply_key(m, dry_run),
         Action::Play => return open(m),
         Action::ClosePlayer => return close_player(m),
-        Action::Playback(p) => return vec![Effect::Player(PlayerCommand::Playback(p))],
+        Action::Playback(p) => return playback(m, p),
         Action::Answer(yes) => return answer(m, yes),
         Action::SelectFile(path) => select_file(m, &path),
         Action::ShowFileFindings => file_findings(m),
@@ -928,19 +931,23 @@ fn previous_file(m: &mut Review) {
 }
 
 fn open(m: &mut Review) -> Vec<Effect> {
-    // The newest press wins even when it opens nothing: the user has moved past the older one.
+    // The newest press wins even when it opens nothing: the user has moved past the older one. A
+    // Space held for the older one's video is for this one's, when it waits; with nothing to wait
+    // for, it would act after its wait had ended ([`Review::held`]).
     m.stamping = None;
+    let held = std::mem::take(&mut m.held);
     let Some(i) = m.focus() else {
         return Vec::new();
     };
     let f = m.finding(i);
     // Whether mpv plays once there is the player's to keep, from mpv's own state, a pause made in
-    // mpv's window among it, so the moment carries none. A timing finding with a frame that shows
-    // its error opens on that frame, sought at the frame's own time: worked out from the frame rate
-    // for the frame before a cut, it can be a millisecond off the time the file stores, either way,
-    // which the 5 ms that mpv shows a frame from before its target takes in, and a line's 4.5 ms
-    // past would not. One with no such frame opens on its first moved line, which, like any line,
-    // opens on its first frame.
+    // mpv's window among it, so the moment carries none; only the user's own Space during this
+    // open (`held`) has the Open say play. A timing finding with a frame that shows its error
+    // opens on that frame, sought at the frame's own time: worked out from the frame rate for the
+    // frame before a cut, it can be a millisecond off the time the file stores, either way, which
+    // the 5 ms that mpv shows a frame from before its target takes in, and a line's 4.5 ms past
+    // would not. One with no such frame opens on its first moved line, which, like any line, opens
+    // on its first frame.
     let (at_ms, start_us, sid) = if let Some(at) = list::timing_moment(&m.run, f) {
         let start_us = if at.on_frame {
             at.at_ms.saturating_mul(1000)
@@ -960,12 +967,42 @@ fn open(m: &mut Review) -> Vec<Effect> {
         start_us: start_us.max(0),
         sid,
     };
+    m.held = held;
     m.status = Some(Status::Opening {
         label: m.label(&moment.file),
         at_ms,
+        play: m.held,
     });
     m.stamping = Some(moment.clone());
     vec![Effect::Task(Task::Stamp(moment))]
+}
+
+/// A `Playback` key, sent to the player; but a Space while `Play` waits for its file's check,
+/// with no file of review's in the player for it to toggle, is held for the arriving video
+/// ([`Review::held`]), and a second undoes it. The line says which, as the press's `Opening`
+/// with `play`. A Space sent while the line says the video will play, after the Open has gone out
+/// with `play`, toggles the video as it lands, so the line stops promising it. Seeks and frame
+/// steps are never held: they mean a place in a video already shown.
+fn playback(m: &mut Review, p: Playback) -> Vec<Effect> {
+    if p == Playback::Pause
+        && m.loaded.is_none()
+        && let Some(moment) = &m.stamping
+    {
+        let (label, at_ms) = (m.label(&moment.file), player::start_ms(moment.start_us));
+        m.held = !m.held;
+        m.status = Some(Status::Opening {
+            label,
+            at_ms,
+            play: m.held,
+        });
+        return Vec::new();
+    }
+    if p == Playback::Pause
+        && let Some(Status::Opening { play, .. }) = &mut m.status
+    {
+        *play = false;
+    }
+    vec![Effect::Player(PlayerCommand::Playback(p))]
 }
 
 /// `Play`'s file check, and review's word to the player: a seek when review last had it load this
@@ -982,12 +1019,15 @@ fn stamped(m: &mut Review, moment: Moment, stamp: Option<(u64, Timestamp)>) -> V
         return Vec::new();
     }
     m.stamping = None;
+    // The wait the Space was held in ends here, whatever the answer.
+    let play = std::mem::take(&mut m.held);
     // The share has answered for this press, so its words that it has not would otherwise stay
     // through mpv's whole load; any other status was set since and is newer.
     if matches!(m.status, Some(Status::NotAnswering { .. })) {
         m.status = Some(Status::Opening {
             label: m.label(&moment.file),
             at_ms: player::start_ms(moment.start_us),
+            play,
         });
     }
     match note_for(&m.run, &moment.file, stamp) {
@@ -1011,13 +1051,16 @@ fn stamped(m: &mut Review, moment: Moment, stamp: Option<(u64, Timestamp)>) -> V
         moment,
         how,
         options: player::load_options(),
+        play,
     })]
 }
 
 /// `ClosePlayer`: the player closes what it has open, and a `Play` still waiting for its file's
-/// check stops waiting, so that the check's answer, however late, opens nothing.
+/// check stops waiting, so that the check's answer, however late, opens nothing, and a Space held
+/// for it plays nothing.
 fn close_player(m: &mut Review) -> Vec<Effect> {
     let waited = m.stamping.take();
+    m.held = false;
     m.close_ended_wait = waited.is_some();
     if let Some(moment) = waited {
         m.status = Some(Status::StoppedWaiting {
@@ -1626,6 +1669,17 @@ mod tests {
         Status::Opening {
             label: label.into(),
             at_ms,
+            play: false,
+        }
+    }
+
+    /// The message as `Play` asks to open file `label` at `at_ms`, with a Space pressed during
+    /// the open: it lands playing.
+    fn will_play(label: &str, at_ms: i64) -> Status {
+        Status::Opening {
+            label: label.into(),
+            at_ms,
+            play: true,
         }
     }
 
@@ -2693,7 +2747,23 @@ mod tests {
             moment,
             how,
             options: player::load_options(),
+            play: false,
         })]
+    }
+
+    /// The Open of `moment` with a Space held for it: it lands playing.
+    fn open_to_play(moment: Moment, how: How) -> Vec<Effect> {
+        vec![Effect::Player(PlayerCommand::Open {
+            moment,
+            how,
+            options: player::load_options(),
+            play: true,
+        })]
+    }
+
+    /// A Space: pause, or resume.
+    fn space(m: &mut Review) -> Vec<Effect> {
+        act(m, Action::Playback(Playback::Pause))
     }
 
     #[test]
@@ -3219,6 +3289,197 @@ mod tests {
             m.status,
             Some(Status::Refused(Refusal::FileMissing { path: path(1) }))
         );
+    }
+
+    #[test]
+    fn a_space_while_the_check_waits_is_held_and_said() {
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        assert_eq!(space(&mut m), []);
+        assert!(m.held);
+        assert_eq!(m.status, Some(will_play("E01", 165_060)));
+        assert_eq!(space(&mut m), []);
+        assert!(!m.held);
+        assert_eq!(m.status, Some(opening("E01", 165_060)));
+        assert_eq!(m.stamping, Some(moment));
+    }
+
+    #[test]
+    fn the_open_at_the_answer_carries_the_held_space() {
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        space(&mut m);
+        assert_eq!(
+            checked(&mut m, &moment, Some(stamp(1))),
+            open_to_play(moment, How::Load)
+        );
+        assert!(!m.held);
+        assert_eq!(m.status, Some(will_play("E01", 165_060)));
+        // A second Space undid the first: the Open says nothing of play.
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        space(&mut m);
+        space(&mut m);
+        assert_eq!(
+            checked(&mut m, &moment, Some(stamp(1))),
+            open(moment, How::Load)
+        );
+    }
+
+    // The Open has gone out saying play, so a Space now goes to the player, which toggles the
+    // video as it lands: the line no longer promises that it plays.
+    #[test]
+    fn a_space_sent_on_takes_will_play_back() {
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        space(&mut m);
+        checked(&mut m, &moment, Some(stamp(1)));
+        let sent = [Effect::Player(PlayerCommand::Playback(Playback::Pause))];
+        assert_eq!(space(&mut m), sent);
+        assert_eq!(m.status, Some(opening("E01", 165_060)));
+        assert_eq!(space(&mut m), sent);
+        assert_eq!(m.status, Some(opening("E01", 165_060)));
+        assert!(!m.held);
+    }
+
+    #[test]
+    fn a_held_space_is_dropped_on_a_missing_file() {
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        space(&mut m);
+        assert_eq!(checked(&mut m, &moment, None), []);
+        assert!(!m.held);
+        assert_eq!(
+            m.status,
+            Some(Status::Refused(Refusal::FileMissing { path: path(1) }))
+        );
+        let moment = asked(act(&mut m, Action::Play));
+        assert_eq!(
+            checked(&mut m, &moment, Some(stamp(1))),
+            open(moment, How::Load)
+        );
+    }
+
+    #[test]
+    fn close_video_drops_a_held_space() {
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        space(&mut m);
+        act(&mut m, Action::ClosePlayer);
+        assert!(!m.held);
+        assert_eq!(
+            m.status,
+            Some(Status::StoppedWaiting {
+                label: "E01".into()
+            })
+        );
+        assert_eq!(checked(&mut m, &moment, Some(stamp(1))), []);
+        let moment = asked(act(&mut m, Action::Play));
+        assert_eq!(
+            checked(&mut m, &moment, Some(stamp(1))),
+            open(moment, How::Load)
+        );
+    }
+
+    #[test]
+    fn a_press_that_opens_nothing_drops_a_held_space() {
+        let mut m = crate::review::model::tests_support::with_timing();
+        for f in &mut m.run.findings {
+            if let Some(t) = &mut f.timing {
+                for s in &mut t.stretches {
+                    (s.first, s.last, s.frame_ms) = (None, None, None);
+                }
+            }
+        }
+        m.selected = 0;
+        asked(act(&mut m, Action::Play));
+        space(&mut m);
+        assert!(m.held);
+        m.selected = 1;
+        assert_eq!(act(&mut m, Action::Play), []);
+        assert_eq!(m.status, Some(Status::Refused(Refusal::NothingToOpen)));
+        assert!(!m.held);
+    }
+
+    // The Space was for the video about to arrive, whichever it is.
+    #[test]
+    fn a_newer_press_keeps_a_held_space() {
+        let mut m = sample();
+        let e01 = asked(act(&mut m, Action::Play));
+        space(&mut m);
+        act(&mut m, Action::Move(1));
+        let e02 = asked(act(&mut m, Action::Play));
+        assert_eq!(e02.file, path(2));
+        assert_eq!(
+            m.status,
+            Some(will_play("E02", player::start_ms(e02.start_us)))
+        );
+        assert!(m.held);
+        assert_eq!(checked(&mut m, &e01, Some(stamp(1))), []);
+        assert_eq!(
+            checked(&mut m, &e02, Some(stamp(1))),
+            open_to_play(e02, How::Load)
+        );
+    }
+
+    // The common case: a video plays, `o` on another row, and Space while its check waits. The
+    // playing video pauses at once, as it did before `o`.
+    #[test]
+    fn a_space_with_a_file_loaded_goes_to_the_player_at_once() {
+        let mut m = sample();
+        let effects = act(&mut m, Action::Play);
+        stat(&mut m, effects, Some(stamp(1)));
+        assert!(m.loaded.is_some());
+        asked(act(&mut m, Action::Play));
+        assert_eq!(
+            space(&mut m),
+            [Effect::Player(PlayerCommand::Playback(Playback::Pause))]
+        );
+        assert!(!m.held);
+        assert_eq!(m.status, Some(opening("E01", 165_060)));
+    }
+
+    #[test]
+    fn a_held_space_outlasts_the_slow_word() {
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        space(&mut m);
+        word(&mut m, &moment);
+        assert_eq!(
+            m.status,
+            Some(Status::NotAnswering {
+                label: "E01".into()
+            })
+        );
+        let sent = checked(&mut m, &moment, Some(stamp(1)));
+        assert_eq!(m.status, Some(will_play("E01", 165_060)));
+        assert_eq!(sent, open_to_play(moment, How::Load));
+        // A Space after the word undoes the held one, and the line says so.
+        let mut m = sample();
+        let moment = asked(act(&mut m, Action::Play));
+        space(&mut m);
+        word(&mut m, &moment);
+        space(&mut m);
+        assert_eq!(m.status, Some(opening("E01", 165_060)));
+        assert!(!m.held);
+    }
+
+    #[test]
+    fn only_a_space_is_held() {
+        for playback in [
+            Playback::Seek(5),
+            Playback::NextFrame,
+            Playback::PreviousFrame,
+        ] {
+            let mut m = sample();
+            asked(act(&mut m, Action::Play));
+            assert_eq!(
+                act(&mut m, Action::Playback(playback)),
+                [Effect::Player(PlayerCommand::Playback(playback))]
+            );
+            assert!(!m.held);
+            assert_eq!(m.status, Some(opening("E01", 165_060)));
+        }
     }
 
     #[test]

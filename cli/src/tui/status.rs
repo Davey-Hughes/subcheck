@@ -60,7 +60,10 @@ pub fn words(status: &Status) -> String {
         }
         Status::NoSuchFile { label } => format!("{label}: no such file"),
         Status::OpeningView => "opening the view…".into(),
-        Status::Opening { label, at_ms } => format!("opening {label} at {}", timestamp_ms(*at_ms)),
+        Status::Opening { label, at_ms, play } => {
+            let then = if *play { ", will play" } else { "" };
+            format!("opening {label} at {}{then}", timestamp_ms(*at_ms))
+        }
         Status::NotAnswering { label } => {
             format!("{label}: the share isn't answering, still waiting")
         }
@@ -320,13 +323,23 @@ mod tests {
                 Status::Opening {
                     label: label("E14"),
                     at_ms: 165_060,
+                    play: false,
                 },
                 "opening E14 at 0:02:45.060",
             ),
             (
                 Status::Opening {
+                    label: label("E14"),
+                    at_ms: 165_060,
+                    play: true,
+                },
+                "opening E14 at 0:02:45.060, will play",
+            ),
+            (
+                Status::Opening {
                     label: label("E17"),
                     at_ms: -1_500,
+                    play: false,
                 },
                 "opening E17 at 0:00:00.000",
             ),

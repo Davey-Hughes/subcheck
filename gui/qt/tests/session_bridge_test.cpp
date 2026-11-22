@@ -203,7 +203,7 @@ struct StandIn {
     // Review's Open of a made-up moment, which the player runs on the test's mpv.
     void open() {
         emit bridge.eventArrived(Event(Event::kPlayer{PlayerCommand(
-            PlayerCommand::kOpen{Moment{"/m/a.mkv", 0, std::nullopt}, How::kLoad, {}})}));
+            PlayerCommand::kOpen{Moment{"/m/a.mkv", 0, std::nullopt}, How::kLoad, {}, false})}));
     }
 };
 

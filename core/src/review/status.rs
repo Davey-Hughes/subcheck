@@ -50,8 +50,16 @@ pub enum Status {
     /// A view switch (`SwitchView`, `OpenView`, `OpenFolder`) is reading the view it opens. The
     /// view shown stays, and works, until it comes.
     OpeningView,
-    /// `Play` asks the player to open file `label` at `at_ms`.
-    Opening { label: String, at_ms: i64 },
+    /// `Play` asks the player to open file `label` at `at_ms`. With `play`, the video lands
+    /// playing, for a Space pressed while the open waited ([`Review::held`]); a later Space goes
+    /// to the player, which toggles the video as it lands, and the line stops saying so.
+    ///
+    /// [`Review::held`]: crate::review::model::Review::held
+    Opening {
+        label: String,
+        at_ms: i64,
+        play: bool,
+    },
     /// The check of file `label`, which `Play` waits for, has not answered in a while: its share
     /// is slow or down. The wait goes on.
     NotAnswering { label: String },

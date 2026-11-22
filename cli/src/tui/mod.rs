@@ -38,7 +38,7 @@ use progress::Scan;
 use runner::Runner;
 use screen::{Mouse, Msg, Screen};
 use subcheck_core::group;
-use subcheck_core::player::PlayerCommand;
+use subcheck_core::player::{PlayerCommand, PlayerError};
 use subcheck_core::review::status::Status;
 use subcheck_core::review::{jobs, model, progress, runner, update};
 use subcheck_core::scan;
@@ -135,10 +135,21 @@ pub fn run_effect(effect: Effect, runner: &mut Runner<Msg>, player: &mut Player)
             moment,
             how,
             options,
-        }) => Input::Opened(player.open(&moment, how, &options)),
-        Effect::Player(PlayerCommand::Playback(p)) => Input::Played(player.playback(p)),
+            play,
+        }) => Input::Opened(player.open(&moment, how, &options, play)),
+        Effect::Player(PlayerCommand::Playback(p)) => played(player.playback(p)),
         Effect::Player(PlayerCommand::Close) => Input::Closed(player.close()),
     })
+}
+
+/// A playback key's result as the input core takes: a pause for a file still opening is a
+/// report of how the open lands, since the Open's own report said what it could not yet know.
+fn played(result: Result<mpv::Played, PlayerError>) -> Input {
+    match result {
+        Ok(mpv::Played::At(at)) => Input::Played(Ok(at)),
+        Ok(mpv::Played::Opening(opened)) => Input::Opened(Ok(opened)),
+        Err(e) => Input::Played(Err(e)),
+    }
 }
 
 /// Restores the terminal on every exit path: normal return, `?`, or panic.
@@ -429,11 +440,12 @@ fn run_effects(
     }
 }
 
-/// Whether the loop ticks, so that the spinner turns: while a job runs, and while `o`'s file check
-/// waits, which on a share that does not answer goes on until it does. Only a job makes `q` ask
-/// first (`Progress::busy`): quitting leaves a check to end on its own, and loses nothing.
+/// Whether the loop ticks, so that the spinner turns: while a job runs, while `o`'s file check
+/// waits and while `v`'s view is read, which on a share that does not answer go on until it does.
+/// Only a job makes `q` ask first (`Progress::busy`): quitting leaves a check or a read to end on
+/// its own, and loses nothing.
 fn ticking(model: &Review) -> bool {
-    model.progress.busy() || model.stamping.is_some()
+    model.progress.busy() || model.stamping.is_some() || model.switching.is_some()
 }
 
 /// The loop's next message: the terminal's, a job's or a check's, or, with `tick` ([`ticking`]),
@@ -463,7 +475,7 @@ mod tests {
     use crossterm::event::{KeyEvent, MouseEvent};
     use model::FileNote;
     use subcheck_core::apply;
-    use subcheck_core::player::{How, PlayerError};
+    use subcheck_core::player::{How, Opened};
     use subcheck_core::review::checks::Stat;
     use update::Task;
 
@@ -726,6 +738,30 @@ mod tests {
         assert!(ticking(&m));
     }
 
+    // A view switch's read waits like a check, and `q` quits at once during it: nothing is lost.
+    #[test]
+    fn the_terminal_ticks_while_a_view_switch_waits() {
+        let mut m = model::tests_support::sample();
+        let mut s = Screen::default();
+        let now = jiff::Timestamp::now();
+        assert!(!ticking(&m));
+        screen::update(&mut m, &mut s, Msg::Key(KeyCode::Char('v')), now);
+        let asked = m.switching.expect("v waits for the view's read");
+        assert!(ticking(&m));
+        assert!(!m.progress.busy());
+        let failed = Input::Switched {
+            asked,
+            result: Err("disk I/O error".into()),
+        };
+        screen::update(&mut m, &mut s, failed.into(), now);
+        assert!(!ticking(&m));
+        screen::update(&mut m, &mut s, Msg::Key(KeyCode::Char('v')), now);
+        assert!(m.switching.is_some());
+        screen::update(&mut m, &mut s, Msg::Key(KeyCode::Char('q')), now);
+        assert!(m.should_quit);
+        assert_eq!(m.confirm, None);
+    }
+
     #[test]
     fn each_player_command_runs_on_mpv_and_comes_back_as_its_input() {
         let dir = tempfile::tempdir().unwrap();
@@ -747,6 +783,7 @@ mod tests {
             moment,
             how: How::Load,
             options: Vec::new(),
+            play: false,
         });
         let missing = "no-mpv not found: install mpv to open findings";
         assert!(
@@ -762,6 +799,23 @@ mod tests {
         assert_eq!(
             ran(PlayerCommand::Close),
             Input::Closed(Err(PlayerError::NotOpen))
+        );
+    }
+
+    #[test]
+    fn a_space_for_a_file_still_opening_comes_back_as_opened() {
+        let at = subcheck_core::player::PlayState {
+            paused: false,
+            at_ms: 1,
+        };
+        assert_eq!(
+            played(Ok(mpv::Played::Opening(Opened { paused: false }))),
+            Input::Opened(Ok(Opened { paused: false }))
+        );
+        assert_eq!(played(Ok(mpv::Played::At(at))), Input::Played(Ok(at)));
+        assert_eq!(
+            played(Err(PlayerError::StillOpening)),
+            Input::Played(Err(PlayerError::StillOpening))
         );
     }
 
