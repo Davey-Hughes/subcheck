@@ -455,25 +455,42 @@ mod tests {
         (slow, heard, held)
     }
 
+    /// The slow word's count in the timing tests; long enough that a machine too busy to run the
+    /// test's thread for a while seldom spoils a try.
+    const COUNT: Duration = Duration::from_millis(500);
+
+    /// How long a timing test tries again when the machine spoiled its try.
+    const TRIES_FOR: Duration = Duration::from_secs(10);
+
+    /// Calls `case` until it returns `true` (a try that ran); a `false` is a spoiled try. Panics
+    /// once `TRIES_FOR` has passed since the first call.
+    fn tries(mut case: impl FnMut() -> bool) {
+        let began = Instant::now();
+        while !case() {
+            assert!(
+                began.elapsed() < TRIES_FOR,
+                "every try for {TRIES_FOR:?} was spoiled by a machine too busy to keep to the test's timing"
+            );
+        }
+    }
+
     #[test]
     fn the_slow_word_comes_for_the_newest_moment_only() {
-        let after = Duration::from_millis(50);
-        // B must be asked before A's count is up, or A's word would be right. A machine too busy to
-        // ask it in time spoils the try, and the case runs again.
-        for _ in 0..5 {
-            let (slow, said, _) = slow_word(after);
+        // B must be asked before A's count is up, or A's word would be right.
+        tries(|| {
+            let (slow, said, _) = slow_word(COUNT);
             let a_asked = Instant::now();
             slow.asked(moment("A"));
             thread::sleep(Duration::from_millis(20));
             let b_asked = Instant::now();
             slow.asked(moment("B"));
-            if a_asked.elapsed() >= after {
-                continue;
+            if a_asked.elapsed() >= COUNT {
+                return false;
             }
             let (word, at) = said.recv_timeout(LIMIT).expect("no word came");
             assert_eq!(word, moment("B"));
             assert!(
-                at.duration_since(b_asked) >= after,
+                at.duration_since(b_asked) >= COUNT,
                 "the word came {:?} after B was asked",
                 at.duration_since(b_asked)
             );
@@ -481,32 +498,45 @@ mod tests {
                 said.recv_timeout(Duration::from_millis(200)),
                 Err(RecvTimeoutError::Timeout)
             );
-            return;
-        }
-        panic!("no try asked B before A's count was up");
+            true
+        });
     }
 
     #[test]
     fn the_slow_word_never_comes_for_an_answered_moment() {
-        let (slow, said, _) = slow_word(Duration::from_millis(100));
-        slow.asked(moment("A"));
-        slow.answered(&moment("A"));
-        assert_eq!(
-            said.recv_timeout(Duration::from_millis(200)),
-            Err(RecvTimeoutError::Timeout)
-        );
+        // The answer must reach the count before A's count is up, or A's word would be right.
+        tries(|| {
+            let (slow, said, _) = slow_word(COUNT);
+            let a_asked = Instant::now();
+            slow.asked(moment("A"));
+            slow.answered(&moment("A"));
+            if a_asked.elapsed() >= COUNT {
+                return false;
+            }
+            assert_eq!(said.recv_timeout(2 * COUNT), Err(RecvTimeoutError::Timeout));
+            true
+        });
     }
 
     #[test]
     fn an_older_moments_answer_leaves_the_newest_counting() {
-        let (slow, said, _) = slow_word(Duration::from_millis(50));
-        slow.asked(moment("A"));
-        slow.asked(moment("B"));
-        slow.answered(&moment("A"));
-        assert_eq!(
-            said.recv_timeout(LIMIT).map(|(word, _)| word),
-            Ok(moment("B"))
-        );
+        // A's answer and B must both come in before A's count is up, or the try proves nothing:
+        // A's word would be right.
+        tries(|| {
+            let (slow, said, _) = slow_word(COUNT);
+            let a_asked = Instant::now();
+            slow.asked(moment("A"));
+            slow.asked(moment("B"));
+            slow.answered(&moment("A"));
+            if a_asked.elapsed() >= COUNT {
+                return false;
+            }
+            assert_eq!(
+                said.recv_timeout(LIMIT).map(|(word, _)| word),
+                Ok(moment("B"))
+            );
+            true
+        });
     }
 
     #[test]

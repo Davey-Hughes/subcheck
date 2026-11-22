@@ -161,7 +161,7 @@ run the app, with the same tools (on Linux, Xvfb and xdotool among them: configu
 that use them):
 
 ```sh
-cmake -S gui/qt -B ~/.cache/subcheck-qt-build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake -S gui/qt -B ~/.cache/subcheck-qt-build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build ~/.cache/subcheck-qt-build --target subcheck-qt
 ~/.cache/subcheck-qt-build/subcheck-qt
 ```
@@ -178,7 +178,7 @@ git -C ~/.cache/mpvqt-src rev-parse HEAD
 cmake -S ~/.cache/mpvqt-src -B ~/.cache/mpvqt-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/.local/opt/mpvqt" -DCMAKE_PREFIX_PATH="$(brew --prefix)"
 cmake --build ~/.cache/mpvqt-build
 cmake --install ~/.cache/mpvqt-build
-cmake -S gui/qt -B ~/.cache/subcheck-qt-build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH="$HOME/.local/opt/mpvqt;$(brew --prefix)"
+cmake -S gui/qt -B ~/.cache/subcheck-qt-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$HOME/.local/opt/mpvqt;$(brew --prefix)"
 cmake --build ~/.cache/subcheck-qt-build --target subcheck-qt
 ~/.cache/subcheck-qt-build/subcheck-qt
 ```

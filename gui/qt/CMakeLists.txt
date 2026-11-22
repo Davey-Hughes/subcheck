@@ -72,9 +72,10 @@ add_custom_command(
     VERBATIM)
 
 # The generated .cpp, with the staticlib, so that the app is one binary. It is built without our
-# warnings, which it does not pass; its header, which our code includes, passes them but for
-# -Wmaybe-uninitialized under GCC (see subcheck_warnings). The staticlib is named outright:
-# Corrosion's plain subcheck_ffi is the cdylib whenever BUILD_SHARED_LIBS is on.
+# warnings, which it does not pass; its header, which our code includes, passes them, all but
+# -Wmaybe-uninitialized under GCC in the files the block after the window's tests names. The
+# staticlib is named outright: Corrosion's plain subcheck_ffi is the cdylib whenever
+# BUILD_SHARED_LIBS is on.
 add_library(subcheck_bindings STATIC ${GENERATED})
 target_include_directories(subcheck_bindings PUBLIC "${BINDINGS_DIR}")
 target_link_libraries(subcheck_bindings PUBLIC subcheck_ffi-static Threads::Threads)
@@ -90,14 +91,8 @@ endif()
 # Our own code is held to these, and a warning in it fails the build. So is the C++ Qt generates
 # for a target given them: moc's, and the QML module's type registrations, resources and compiled
 # QML. The module's plugin, a target qt_add_qml_module makes, is not given them.
-# GCC alone is told to leave -Wmaybe-uninitialized off: with optimisation it reports members of
-# the bindings' nested variants as maybe uninitialized on the path a throwing copy takes, where
-# they are never read (GCC PR 114592), and that false report under -Werror would stop a Release
-# build. Our own code loses that check with it under GCC; -Wuninitialized, for a read that is
-# certain, stays on. Clang has no such warning, and under -Werror fails on the unknown option.
 function(subcheck_warnings target)
-    target_compile_options(${target} PRIVATE -Wall -Wextra -Werror
-        $<$<CXX_COMPILER_ID:GNU>:-Wno-maybe-uninitialized>)
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
 endfunction()
 
 # The window's C++ and QML, as the QML module Subcheck on a static library, which the app and the
@@ -277,6 +272,38 @@ subcheck_window_test(window_test)
 # window_test checks the window's default size and its columns, which the large screen holds.
 set_property(TEST window_test APPEND PROPERTY ENVIRONMENT_MODIFICATION
              "QT_QPA_PLATFORM=set:offscreen:configfile=${TEST_SCREENS}")
+
+# With optimisation, GCC reports members of the bindings' nested variants as maybe uninitialized
+# on the path a throwing copy takes, where they are never read (GCC PR 114592), and under -Werror
+# that false report stops a Release build. These files copy those types: the window library's moc
+# file, in QMetaType's copy of PlayerReport, and the tests, in their copies of PlayerReport and
+# Event. The rest of our code keeps the check: a file that comes to copy them fails GCC's Release
+# build the same way, and is added here. A multi-config generator names the moc file per
+# configuration, which this does not reach. GCC alone, as Clang has no such warning.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/subcheck_window_autogen/mocs_compilation.cpp"
+                        tests/player_port_test.cpp tests/window_test.cpp
+                 TARGET_DIRECTORY subcheck_window
+                 APPEND PROPERTY COMPILE_OPTIONS -Wno-maybe-uninitialized)
+endif()
+
+# A file of ours with a read GCC can only call maybe uninitialized must fail to build, so that the
+# check, off for the files above, cannot go from all of our code unseen. At -O2, as the warning
+# runs only with optimisation: the Debug build checks it too. GCC alone, as Clang has no such
+# warning. Colour off, as escape codes around the bracket would stop the test's pattern matching.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_library(maybe_uninitialized_canary OBJECT EXCLUDE_FROM_ALL
+        tests/maybe_uninitialized_canary.cpp)
+    set_target_properties(maybe_uninitialized_canary PROPERTIES AUTOMOC OFF AUTOUIC OFF)
+    subcheck_warnings(maybe_uninitialized_canary)
+    target_compile_options(maybe_uninitialized_canary PRIVATE -O2 -fdiagnostics-color=never)
+    add_test(NAME maybe_uninitialized_is_checked
+        COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}"
+                --target maybe_uninitialized_canary)
+    set_tests_properties(maybe_uninitialized_is_checked PROPERTIES
+        PASS_REGULAR_EXPRESSION "\\[-Werror=maybe-uninitialized\\]"
+        TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+endif()
 
 # The bridge during a job, where review's end ends the process's groups, after which no session
 # opens in the process: each test function in a process of its own, on a run seeded at its start
