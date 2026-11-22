@@ -19,6 +19,7 @@
 #include <QFileInfo>
 #include <QFont>
 #include <QFontInfo>
+#include <QFontMetricsF>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QQmlApplicationEngine>
@@ -1200,7 +1201,8 @@ private slots:
     }
 
     // Under a filter that shows no finding, a click on an episode with no findings still shows
-    // what its check said: alone in the details panel, with nothing of a finding.
+    // what its check said: alone in the details panel, with nothing of a finding, and Accept greyed
+    // in the toolbar.
     void aClickOnAnEpisodeWithNoFindingsShowsItsLogWithNoFindingSelected() {
         Shown w({clean(), media()});
         QVERIFY(w.start());
@@ -1226,7 +1228,9 @@ private slots:
         QTRY_VERIFY(inDetailsView(w, heading));
         QVERIFY(!w.bridge.episodeLog().isEmpty());
         QTRY_COMPARE(Shown::lines(w.item("episodeLog")), w.bridge.episodeLog());
-        QVERIFY(!w.item("acceptButton")->isVisible());
+        QQuickItem *accept = w.item("acceptButton");
+        QVERIFY(accept->isVisible());
+        QVERIFY(!accept->property("enabled").toBool());
         QTRY_VERIFY(w.item("episode0")->property("highlighted").toBool());
         QCOMPARE(w.bridge.statusLine(), QString());
     }
@@ -1281,8 +1285,8 @@ private slots:
 
     // A click on an episode the check found nothing in, with a finding selected, shows what its
     // check said alone under the video: nothing of the finding, which review still has selected,
-    // and no line above the log, which has nothing above it to set it off from. The list draws the
-    // finding's row in the inactive grey.
+    // and no line above the log, which has nothing above it to set it off from. Reject and Accept
+    // stay in the toolbar, greyed. The list draws the finding's row in the inactive grey.
     void aGreyedEpisodesViewShowsItsLogAlone() {
         Shown w({clean(), media()});
         QVERIFY(w.start());
@@ -1295,9 +1299,12 @@ private slots:
         w.click(w.item("episode0"));
         QTRY_VERIFY(w.bridge.showingEpisode());
         QCOMPARE(w.bridge.selected(), 0);
-        for (const char *name :
-             {"nowBlock", "fixedBlock", "acceptButton", "rejectButton", "detailKind"}) {
+        for (const char *name : {"nowBlock", "fixedBlock", "detailKind"}) {
             QTRY_VERIFY2(!w.item(name)->isVisible(), name);
+        }
+        for (const char *name : {"acceptButton", "rejectButton"}) {
+            QVERIFY2(w.item(name)->isVisible(), name);
+            QVERIFY2(!w.item(name)->property("enabled").toBool(), name);
         }
         QQuickItem *heading = w.item("episodeLogHeading");
         QVERIFY(heading->isVisible());
@@ -1358,8 +1365,8 @@ private slots:
     }
 
     // A click on the grey row, the row already selected, moves nothing in review, and still ends a
-    // greyed episode's view with review's answer: its finding shows again, and the sidebar marks
-    // the finding's episode.
+    // greyed episode's view with review's answer: its finding shows again, Accept with it, and the
+    // sidebar marks the finding's episode.
     void aClickOnTheGreyRowEndsTheEpisodesView() {
         Shown w({clean(), media()});
         QVERIFY(w.start());
@@ -1378,7 +1385,7 @@ private slots:
                  qPrintable(sent.join(" | ")));
         QTRY_VERIFY(!w.bridge.showingEpisode());
         QTRY_VERIFY(w.item("nowBlock")->isVisible());
-        QVERIFY(w.item("acceptButton")->isVisible());
+        QVERIFY(w.item("acceptButton")->property("enabled").toBool());
         QTRY_VERIFY(w.item("episode1")->property("highlighted").toBool());
         QVERIFY(!w.item("episode0")->property("highlighted").toBool());
         QCOMPARE(w.bridge.selected(), 0);
@@ -1537,7 +1544,7 @@ private slots:
                      qPrintable(QStringLiteral("the line starts at %1, the heading at %2")
                                     .arg(topInDetails(w, divider))
                                     .arg(topInDetails(w, heading))));
-        QVERIFY(topInDetails(w, w.item("acceptButton")) < topInDetails(w, divider));
+        QVERIFY(topInDetails(w, w.item("technical")) < topInDetails(w, divider));
     }
 
     // Each review's path shows as its tooltip while the pointer is on it. Whether controls follow
@@ -1838,8 +1845,8 @@ private slots:
         QTRY_VERIFY(undoEndsInPlace());
     }
 
-    // The details panel's buttons, the toolbar's Undo and a double-click on a row; and the
-    // finding's particulars under their disclosure.
+    // The toolbar's Accept, Reject and Undo, and a double-click on a row; and the finding's
+    // particulars under their disclosure.
     void theButtonsAndADoubleClickAskReview() {
         Shown w({media()});
         QVERIFY(w.start());
@@ -1878,6 +1885,174 @@ private slots:
                      sent.first().startsWith("Select row "),
                  qPrintable(sent.join(" | ")));
         QTRY_COMPARE(w.bridge.statusLine(), "Opening E01 at 0:00:20.000");
+    }
+
+    // Reject, Accept and Undo sit in the toolbar, in that order, at its right: Accept highlighted,
+    // none taking the keys from the window, and the Finding menu saying the buttons' words. At the
+    // window's least width, at the platform's text size and at the largest Settings offers, a title
+    // and counts too long for the bar are cut before the buttons, and leave all three whole in it.
+    void theToolbarHoldsRejectAcceptAndUndo_data() {
+        QTest::addColumn<bool>("largest");
+        QTest::newRow("the platform's size") << false;
+        QTest::newRow("the largest size") << true;
+    }
+    void theToolbarHoldsRejectAcceptAndUndo() {
+        QFETCH(bool, largest);
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        if (largest) {
+            w.settings.setWindowTextSize(w.settings.mostHalfPoints() / 2.0);
+        }
+        w.window->resize(w.window->minimumSize());
+        QTRY_COMPARE(w.window->width(), w.window->minimumWidth());
+        QQuickItem *toolbar = w.item("toolbar");
+        QQuickItem *title = w.item("title");
+        QQuickItem *counts = w.item("counts");
+        QVERIFY(toolbar && title && counts);
+        QCOMPARE(counts->property("font").value<QFont>().pointSizeF(), w.settings.windowTextSize());
+        const std::vector<std::pair<const char *, QString>> words = {
+            {"rejectButton", "Reject"}, {"acceptButton", "Accept"}, {"undoButton", "Undo"}};
+        QList<QQuickItem *> buttons;
+        for (const auto &[name, text] : words) {
+            QQuickItem *button = w.item(name);
+            QVERIFY2(button, name);
+            QCOMPARE(button->property("text").toString(), text);
+            QVERIFY2(toolbar->isAncestorOf(button), name);
+            QCOMPARE(button->property("focusPolicy").value<Qt::FocusPolicy>(), Qt::NoFocus);
+            buttons << button;
+        }
+        const auto left = [](QQuickItem *of) { return of->mapToScene(QPointF(0, 0)).x(); };
+        QVERIFY(left(buttons[0]) < left(buttons[1]));
+        QVERIFY(left(buttons[1]) < left(buttons[2]));
+        QVERIFY(buttons[1]->property("highlighted").toBool());
+        QCOMPARE(w.find("accept")->property("text").toString(), "&Accept");
+        QCOMPARE(w.find("reject")->property("text").toString(), "&Reject");
+
+        // The title and the counts are a column of their own, beside the buttons.
+        QQuickItem *column = title->parentItem();
+        QVERIFY(column->isAncestorOf(counts));
+        // What is out of place in the bar, nothing once it is laid out at the window's width: the
+        // column ends before Reject starts, and each button is whole inside the bar.
+        const auto outOfPlace = [toolbar, column, &buttons] {
+            QStringList out;
+            const qreal columnEnds = column->mapToItem(toolbar, QPointF(column->width(), 0)).x();
+            const qreal rejectStarts = buttons[0]->mapToItem(toolbar, QPointF(0, 0)).x();
+            if (columnEnds > rejectStarts) {
+                out << QStringLiteral("the title and counts end at %1, Reject starts at %2")
+                           .arg(columnEnds)
+                           .arg(rejectStarts);
+            }
+            for (QQuickItem *button : std::as_const(buttons)) {
+                const qreal starts = button->mapToItem(toolbar, QPointF(0, 0)).x();
+                const qreal ends = button->mapToItem(toolbar, QPointF(button->width(), 0)).x();
+                if (starts < 0 || ends > toolbar->width() ||
+                    button->width() < button->implicitWidth()) {
+                    out << QStringLiteral("%1 runs from %2 to %3, %4 of its %5 wide")
+                               .arg(button->objectName())
+                               .arg(starts)
+                               .arg(ends)
+                               .arg(button->width())
+                               .arg(button->implicitWidth());
+                }
+            }
+            return out;
+        };
+        // Settled at the window's least width and its text size: the bar's width and the buttons'
+        // alike at two looks, with the window free to draw between them.
+        QList<qreal> lastWidths;
+        const auto settled = [&w, toolbar, &buttons, &lastWidths] {
+            QList<qreal> widths{toolbar->width()};
+            for (QQuickItem *button : std::as_const(buttons)) {
+                widths << button->implicitWidth() << button->width();
+            }
+            const bool same = widths == lastWidths;
+            lastWidths = widths;
+            return same && toolbar->width() == w.window->width();
+        };
+        QTRY_VERIFY(settled());
+        // A title and counts too long for the bar, and the bar laid out for them, as the window
+        // lays out what changed before each frame it draws.
+        QSignalSpy laidOut(w.window, &QQuickWindow::afterAnimating);
+        title->setProperty("text", QStringLiteral("A very long name for a show ").repeated(10));
+        counts->setProperty("text", QStringLiteral("40 to review · 10 accepted · ").repeated(10));
+        QVERIFY(laidOut.wait());
+        const QStringList out = outOfPlace();
+        QVERIFY2(out.isEmpty(), qPrintable(out.join("; ")));
+        QVERIFY(title->property("truncated").toBool());
+        QVERIFY(counts->property("truncated").toBool());
+    }
+
+    // Accept and Reject act on the finding shown, so with none to act on they are greyed, never
+    // hidden, so that the toolbar keeps its width: while a greyed episode's log shows in the
+    // finding's place, while Settings holds the keys and while the filter shows no finding. A click
+    // on one then asks review nothing. The Finding menu's Accept, Reject and Back to Undecided, and
+    // with them their keys, follow the same rule.
+    void acceptAndRejectGreyWithNoFindingToActOn() {
+        Shown w({clean(), media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.item("episode0") && w.item("filter2") && w.delegate(0));
+        QQuickItem *accept = w.item("acceptButton");
+        QQuickItem *reject = w.item("rejectButton");
+        QVERIFY(accept && reject);
+        // Whether each is enabled and whether it shows, Accept's then Reject's.
+        const auto state = [accept, reject] {
+            return QList<bool>{accept->property("enabled").toBool(), accept->isVisible(),
+                               reject->property("enabled").toBool(), reject->isVisible()};
+        };
+        const QList<bool> enabled{true, true, true, true};
+        const QList<bool> greyed{false, true, false, true};
+        // Whether the Finding menu's Accept, Reject and Back to Undecided are each enabled.
+        const auto items = [&w] {
+            QList<bool> each;
+            for (const char *name : {"accept", "reject", "clear"}) {
+                each << w.find(name)->property("enabled").toBool();
+            }
+            return each;
+        };
+        const QList<bool> itemsOn{true, true, true};
+        const QList<bool> itemsOff{false, false, false};
+        QTRY_VERIFY(w.bridge.detail()->shown());
+        QTRY_COMPARE(state(), enabled);
+        QCOMPARE(items(), itemsOn);
+
+        w.click(w.item("episode0"));
+        QTRY_VERIFY(w.bridge.showingEpisode());
+        QTRY_COMPARE(state(), greyed);
+        QCOMPARE(items(), itemsOff);
+        qsizetype from = w.bridge.sent.size();
+        w.click(accept);
+        w.click(reject);
+        QCOMPARE(w.since(from), QStringList());
+        w.click(w.delegate(w.bridge.selected()));
+        QTRY_VERIFY(!w.bridge.showingEpisode());
+        QTRY_COMPARE(state(), enabled);
+        QCOMPARE(items(), itemsOn);
+
+        QQuickWindow *settings = w.settingsWindow();
+        QVERIFY(settings);
+        QTest::keyClick(w.window, Qt::Key_Comma, Qt::ControlModifier);
+        QTRY_VERIFY(settings->isVisible());
+        QCOMPARE(state(), greyed);
+        QCOMPARE(items(), itemsOff);
+        QTest::keyClick(settings, Qt::Key_Escape);
+        QTRY_VERIFY(!settings->isVisible());
+        QCOMPARE(state(), enabled);
+        QCOMPARE(items(), itemsOn);
+
+        w.click(w.item("filter2"));
+        QTRY_COMPARE(w.rows(), 0);
+        QTRY_VERIFY(!w.bridge.detail()->shown());
+        QTRY_COMPARE(state(), greyed);
+        QCOMPARE(items(), itemsOff);
+        from = w.bridge.sent.size();
+        w.click(accept);
+        w.click(reject);
+        for (const Qt::Key key : {Qt::Key_A, Qt::Key_R, Qt::Key_X}) {
+            QTest::keyClick(w.window, key);
+        }
+        QCOMPARE(w.since(from), QStringList());
     }
 
     // The three columns side by side, the list between; the video at the top of the details
@@ -2653,6 +2828,116 @@ private slots:
         QCOMPARE(Shown::text(now, "blockLabel"), "− In the subtitles now");
     }
 
+    // The two blocks keep their place from one finding to the next, so that the eye finds them
+    // where it left them: each has room for two lines of its text, at the panel's size and at a
+    // larger one, and what sets a finding apart, its banners and its mark, comes after them. A line
+    // of three pushes the second block down, clear of the first.
+    void theFixBlocksKeepTheirPlaceAcrossFindings_data() {
+        QTest::addColumn<bool>("larger");
+        QTest::newRow("the platform's size") << false;
+        QTest::newRow("24 pt") << true;
+    }
+    void theFixBlocksKeepTheirPlaceAcrossFindings() {
+        QFETCH(bool, larger);
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        DetailView *detail = w.bridge.detail();
+        QTRY_VERIFY(detail->shown());
+        // Review has said what it says of the start, so that none of it replaces a finding shown
+        // here.
+        QTRY_VERIFY(!w.bridge.episodeLog().isEmpty());
+        if (larger) {
+            w.settings.setDetailsTextSize(24);
+        }
+        QQuickItem *panel = w.item("details");
+        QQuickItem *now = Shown::item(panel, "nowBlock");
+        QQuickItem *fixed = Shown::item(panel, "fixedBlock");
+        QQuickItem *mark = Shown::item(panel, "mark");
+        QQuickItem *banners = Shown::item(panel, "banners");
+        QVERIFY(now && fixed && mark && banners);
+        QQuickItem *nowLine = Shown::item(now, "blockLine");
+        QQuickItem *fixedLine = Shown::item(fixed, "blockLine");
+        QVERIFY(nowLine && fixedLine);
+
+        // `finding` shown and the panel laid out for it, as the window lays out what changed
+        // before each frame it draws.
+        const auto show = [&w, detail](const subcheck_ffi::Detail &finding) {
+            QSignalSpy laidOut(w.window, &QQuickWindow::afterAnimating);
+            detail->show(finding);
+            return laidOut.wait();
+        };
+        // `line` and words after it, enough to wrap to `lines` lines of a block's line at its font
+        // and width, the last about half full: each line before it wraps at a space, at most a
+        // word short of full.
+        const auto filling = [nowLine](std::string line, int lines) {
+            const QFontMetricsF metrics(nowLine->property("font").value<QFont>());
+            while (metrics.horizontalAdvance(QString::fromStdString(line)) <
+                   (lines - 0.5) * nowLine->width()) {
+                line += " and on";
+            }
+            return line;
+        };
+        // Where each block starts in the panel, and how tall it is.
+        const auto blocks = [&w, now, fixed] {
+            return QList<qreal>{topInDetails(w, now), now->height(), topInDetails(w, fixed),
+                                fixed->height()};
+        };
+        const auto bottom = [&w](QQuickItem *item) {
+            return topInDetails(w, item) + item->height();
+        };
+
+        subcheck_ffi::Detail plain = everyPartOfAFinding();
+        plain.note = std::nullopt;
+        plain.checking = std::nullopt;
+        plain.truncated = std::nullopt;
+        plain.mark = std::nullopt;
+        QVERIFY(show(plain));
+        QVERIFY(nowLine->implicitWidth() <= nowLine->width());
+        QVERIFY(fixedLine->implicitWidth() <= fixedLine->width());
+        QVERIFY(!mark->isVisible() && !banners->isVisible());
+        const QList<qreal> onOneLine = blocks();
+        // How many lines a block's line wraps to, from how tall its text is: Text keeps no count
+        // of a rich text's lines.
+        const qreal oneLine = nowLine->property("contentHeight").toReal();
+        QCOMPARE(fixedLine->property("contentHeight").toReal(), oneLine);
+        const auto lineCount = [oneLine](QQuickItem *line) {
+            return qRound(line->property("contentHeight").toReal() / oneLine);
+        };
+
+        subcheck_ffi::Detail twoLines = plain;
+        twoLines.original = filling(plain.original, 2);
+        twoLines.wording = filling(plain.wording, 2);
+        QVERIFY(show(twoLines));
+        QCOMPARE(lineCount(nowLine), 2);
+        QCOMPARE(lineCount(fixedLine), 2);
+        QCOMPARE(blocks(), onOneLine);
+
+        subcheck_ffi::Detail marked = plain;
+        marked.mark = subcheck_ffi::Mark(subcheck_ffi::Mark::kApplied{});
+        subcheck_ffi::Detail bannered = plain;
+        bannered.note = subcheck_ffi::FileNote::kChanged;
+        for (const auto &[finding, apart] :
+             {std::pair{marked, mark}, std::pair{bannered, banners}}) {
+            QVERIFY(show(finding));
+            QVERIFY(apart->isVisible());
+            QCOMPARE(blocks(), onOneLine);
+            QVERIFY2(topInDetails(w, apart) >= bottom(fixed),
+                     qPrintable(QStringLiteral("%1 starts at %2, the fix's block ends at %3")
+                                    .arg(apart->objectName())
+                                    .arg(topInDetails(w, apart))
+                                    .arg(bottom(fixed))));
+        }
+
+        subcheck_ffi::Detail threeLines = plain;
+        threeLines.original = filling(plain.original, 3);
+        QVERIFY(show(threeLines));
+        QCOMPARE(lineCount(nowLine), 3);
+        QCOMPARE(topInDetails(w, now), onOneLine[0]);
+        QVERIFY(topInDetails(w, fixed) > onOneLine[2]);
+        QVERIFY(bottom(now) < topInDetails(w, fixed));
+    }
+
     // A palette chosen redraws the rows' states, badges and lines, the details' state, badge,
     // blocks and marks, at once, in the palette's tones; and moves nothing: the selected row, the
     // list's scroll and the panel's stay, and review is asked nothing.
@@ -2744,14 +3029,14 @@ private slots:
             return of->property("font").value<QFont>().pointSizeF();
         };
         QQuickItem *panel = w.item("details");
-        const QList<QObject *> windowParts = {w.item("title"), w.find("statusLine"),
-                                              w.item("episode0"), w.menu("&File"),
-                                              w.settingsWindow()};
+        const QList<QObject *> windowParts = {w.item("title"),      w.item("rejectButton"),
+                                              w.find("statusLine"), w.item("episode0"),
+                                              w.menu("&File"),      w.settingsWindow()};
         const QList<QObject *> listParts = {w.item("heading"),
                                             Shown::item(w.delegate(0), "rowLine"),
                                             Shown::item(w.delegate(0), "rowState")};
         const QList<QObject *> detailsParts = {Shown::item(panel, "place"),
-                                               Shown::item(panel, "rejectButton"),
+                                               Shown::item(panel, "technical"),
                                                Shown::item(panel, "nowBlock")};
         // The parts not at their size, each as its name and the size it is.
         const auto offSize = [&](qreal inWindow, qreal inList, qreal inDetails) {
@@ -2836,9 +3121,10 @@ private slots:
         }
     }
 
-    // The Controls that carry the list's and the details panel's sizes leave hover on, so that
-    // what is in them still follows the pointer where the platform lets it.
-    void theListAndDetailsControlsKeepHoverOn() {
+    // The toolbar, and the Controls that carry the list's and the details panel's sizes, leave
+    // hover on, so that what is in them still follows the pointer where the platform lets it: the
+    // toolbar's buttons, the list's scroll bar and the details' disclosure.
+    void theToolbarAndTheListAndDetailsControlsKeepHoverOn() {
         QStyleHints *hints = QGuiApplication::styleHints();
         const auto restore = qScopeGuard(
             [hints, was = hints->useHoverEffects()] { hints->setUseHoverEffects(was); });
@@ -2846,7 +3132,8 @@ private slots:
         Shown w({media()});
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
-        for (const char *name : {"acceptButton", "rejectButton", "technical"}) {
+        for (const char *name :
+             {"rejectButton", "acceptButton", "undoButton", "findingsScrollBar", "technical"}) {
             QQuickItem *item = w.item(name);
             QVERIFY2(item, name);
             QVERIFY2(item->property("hoverEnabled").toBool(), name);

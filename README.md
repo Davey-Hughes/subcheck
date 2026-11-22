@@ -92,39 +92,43 @@ first finding, when it has one); the findings, two lines a row (what found it, i
 its decision, and its line with the change marked, or for a timing row whose members the filter
 shows differ in their fixes, those fixes, counted); and the details panel, the video at its top, a
 mark in the video's corner saying whether it plays or is paused, then the selected finding, its line
-as the subtitles have it now in a block above the line with the fix, with Reject and Accept Fix. An
-episode the check found nothing in is greyed in the sidebar and says `No findings`. A click on one
-shows what its check said, alone under the video; the finding you were on stays greyed in the list,
-as the episode has none to go to, and Accept, Reject, Back to Undecided, Show in Video and Enter
-wait until you move to a finding again, by a move, a click or Undo. View ▸ Episodes Without Findings
-Last lists those episodes after the rest, while N and P still go to the next and previous episode in
-review's order. File ▸ Settings… (Ctrl+, or ⌘, on macOS) opens a window of its own that chooses the
-window's colours, the default or a palette for deuteranomaly/deuteranopia, protanomaly/protanopia,
-tritanomaly/tritanopia, or little or no colour vision, with a sample, and the size of the text of
-the window, the findings list and the details panel, each the platform's until set; each choice
-applies at once, Esc or Ctrl+W (⌘W on macOS) closes Settings, and while Settings is open no key of
-the main window's reaches review. The menus hold the rest and show their keys as this paragraph
-writes the window's: a letter alone is that key without Shift, and Shift is written out, so the
-menu's O is the terminal's `o`, and its Shift+O (⇧O on macOS) is the terminal's `O`. A, R and X
-accept, reject and put back to undecided, N and P go to the next and previous episode, V switches
-between a check and its folders, O (Show in Video) opens the selected finding in the video pane as
-the terminal's `o` does in mpv, playing on if the pane plays and paused if not, and Shift+O (Close
-Video) closes the video, leaving the pane black and review open; Space plays and pauses, Left and
-Right (← and → on macOS) seek 5 s, `,` and `.` 1 s, and `[` and `]` step a frame; Ctrl+Z undoes, and
-Ctrl+W and Ctrl+Q quit (⌘Z, ⌘W and ⌘Q on macOS). No menu shows the others: J and K (or Down and Up)
-move, Enter expands a row into its members or collapses it, F steps through the filters, U undoes
-and Q quits. No key in the window does what the terminal's `e`, `c`, `A`, `D`, `g`, `G`, Home, End,
-PgUp, PgDn, Tab or `?` does. A view shows its rows at once: the details panel's word on an episode's
-file (`This episode's file is missing`, or `This episode changed since it was checked`) comes once
-that file's check answers, so a share that is slow or does not answer holds up no row. Another view,
-by V or a review in the sidebar, takes the place of the one shown once it has been read
-(`Opening the view…`), and until then the view shown stays and works. Show in Video (O) checks its
-file each time, so a file that has come back opens, and the word on it comes up to date. From the
-press, while Show in Video waits for that check and then for mpv to open the file, a busy animation
-shows over the video once the wait has lasted 500 ms; it goes once the video shows, or once Close
-Video (Shift+O) has closed the video. A check that has not answered in 3 s says so on the status
-line (`E05: the share isn't answering, still waiting`), and the wait and the animation go on; Close
-Video ends them (`Stopped waiting for E05`, or `Video closed` when a video was open or opening), and
+as the subtitles have it now in a block above the line with the fix. The toolbar at the top of the
+window, under the menus where the window draws them, shows the view's name and its counts, and at
+its right Reject, Accept and Undo. An episode the check found nothing in is greyed in the sidebar
+and says `No findings`. A click on one shows what its check said, alone under the video; the finding
+you were on stays greyed in the list, as the episode has none to go to, and Accept, Reject, Back to
+Undecided, Show in Video and Enter wait until you move to a finding again, by a move, a click or
+Undo. Accept and Reject in the toolbar, and Accept, Reject and Back to Undecided in the Finding menu
+and by A, R and X, wait too while no finding shows, as under a filter with no rows. View ▸ Episodes
+Without Findings Last lists those episodes after the rest, while N and P still go to the next and
+previous episode in review's order. File ▸ Settings… (Ctrl+, or ⌘, on macOS) opens a window of its
+own that chooses the window's colours, the default or a palette for deuteranomaly/deuteranopia,
+protanomaly/protanopia, tritanomaly/tritanopia, or little or no colour vision, with a sample, and
+the size of the text of the window, the findings list and the details panel, each the platform's
+until set; each choice applies at once, Esc or Ctrl+W (⌘W on macOS) closes Settings, and while
+Settings is open no key of the main window's reaches review. The menus hold the rest and show their
+keys as this paragraph writes the window's: a letter alone is that key without Shift, and Shift is
+written out, so the menu's O is the terminal's `o`, and its Shift+O (⇧O on macOS) is the terminal's
+`O`. A, R and X accept, reject and put back to undecided, N and P go to the next and previous
+episode, V switches between a check and its folders, O (Show in Video) opens the selected finding in
+the video pane as the terminal's `o` does in mpv, playing on if the pane plays and paused if not,
+and Shift+O (Close Video) closes the video, leaving the pane black and review open; Space plays and
+pauses, Left and Right (← and → on macOS) seek 5 s, `,` and `.` 1 s, and `[` and `]` step a frame;
+Ctrl+Z undoes, and Ctrl+W and Ctrl+Q quit (⌘Z, ⌘W and ⌘Q on macOS). No menu shows the others: J and
+K (or Down and Up) move, Enter expands a row into its members or collapses it, F steps through the
+filters, U undoes and Q quits. No key in the window does what the terminal's `e`, `c`, `A`, `D`,
+`g`, `G`, Home, End, PgUp, PgDn, Tab or `?` does. A view shows its rows at once: the details panel's
+word on an episode's file (`This episode's file is missing`, or
+`This episode changed since it was checked`) comes once that file's check answers, so a share that
+is slow or does not answer holds up no row. Another view, by V or a review in the sidebar, takes the
+place of the one shown once it has been read (`Opening the view…`), and until then the view shown
+stays and works. Show in Video (O) checks its file each time, so a file that has come back opens,
+and the word on it comes up to date. From the press, while Show in Video waits for that check and
+then for mpv to open the file, a busy animation shows over the video once the wait has lasted
+500 ms; it goes once the video shows, or once Close Video (Shift+O) has closed the video. A check
+that has not answered in 3 s says so on the status line
+(`E05: the share isn't answering, still waiting`), and the wait and the animation go on; Close Video
+ends them (`Stopped waiting for E05`, or `Video closed` when a video was open or opening), and
 nothing opens when the check answers, as nothing does for any press but the newest. Space, pressed
 while Show in Video is still opening a video, decides whether the video lands playing or paused, and
 a second Space undoes the first; pressed while the check waits and no video is open, it adds

@@ -74,6 +74,8 @@ pub fn render(run: &Run, filter: Filter, mpv: bool) -> String {
         };
         let at = match &f.timing {
             Some(t) => track_label(run, f, t.track),
+            // A track with no styles (an OCR'd one) would leave a gap of spaces on every line.
+            None if f.style.is_empty() => format!("{when}{more}"),
             None => format!("{when}{more}  {}", f.style),
         };
         let _ = writeln!(out, "  #{}  {at}  [{}{applied}]", f.id, label(state));
@@ -402,6 +404,21 @@ mod tests {
         );
         assert!(
             text.contains("  #1  0:02:45.06 (+1 more)  OP en  [pending]\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_finding_whose_track_has_no_style_leaves_no_gap_for_one() {
+        let mut r = run();
+        r.findings[0].style = String::new();
+        let text = render(&r, Filter::All, false);
+        assert!(
+            text.contains("  #1  0:02:45.06 (+1 more)  [pending]\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  #2  0:12:59.08  OP en  [accepted]\n"),
             "{text}"
         );
     }

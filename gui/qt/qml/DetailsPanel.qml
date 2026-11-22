@@ -1,7 +1,10 @@
 // The details panel: the video, 16:9 at the panel's width, black until a finding is shown in it;
-// then the selected finding as the window words it, its line as it is now above its line with the
-// fix, each a block of its own, with Reject and Accept Fix; its file's particulars under a
-// disclosure; and what the check said of the episode selected while that is the finding's: below
+// then the selected finding as the window words it: its line as it is now above its line with the
+// fix, each a block of its own that keeps its place from one finding to the next for a line of one
+// or two lines at the block's own font (one of three or more, or one drawn partly in a taller
+// fallback font, moves what is below it down), as Reject and Accept keep theirs in the toolbar,
+// beside Undo; below them its banners, its mark and why it was found; its file's particulars under
+// a disclosure; and what the check said of the episode selected while that is the finding's: below
 // the finding, set off by a line, or alone with none selected. For a click on an episode the check
 // found nothing in, its log shows alone, in the finding's place, while review keeps the finding
 // selected: below the finding, the two would read as one, and the log is not the finding's. Over
@@ -18,7 +21,7 @@ import QtQuick.Layouts
 import Subcheck
 
 // A Control, so that the labels in it take the size of text the window gives the panel. Its hover
-// stays on, as a Control's is by default, so that its buttons still follow the pointer.
+// stays on, as a Control's is by default, so that what is in it still follows the pointer.
 Control {
     id: panel
 
@@ -198,6 +201,30 @@ Control {
                             color: panel.detail.stateTone
                         }
                     }
+
+                    // Right under the kind row, which is always one line, and each with room for
+                    // two lines, so that a line of one or two lines moves neither block: the
+                    // banners and the mark, which come and go, are below them.
+                    ChangeBlock {
+                        objectName: "nowBlock"
+                        label: qsTr("− In the subtitles now")
+                        line: panel.detail.now
+                        tone: panel.detail.oldTone
+                        minLines: 2
+                        Layout.topMargin: 8
+                        Layout.fillWidth: true
+                    }
+                    ChangeBlock {
+                        objectName: "fixedBlock"
+                        label: panel.detail.edited ? qsTr("+ With your wording")
+                                                   : qsTr("+ With the fix")
+                        line: panel.detail.fixed
+                        tone: panel.detail.newTone
+                        minLines: 2
+                        Layout.topMargin: 8
+                        Layout.bottomMargin: 4
+                        Layout.fillWidth: true
+                    }
                     Lines {
                         objectName: "banners"
                         each: panel.detail.banners
@@ -209,25 +236,6 @@ Control {
                         textFormat: Text.PlainText
                         visible: text !== ""
                         wrapMode: Text.Wrap
-                        Layout.fillWidth: true
-                    }
-
-                    ChangeBlock {
-                        objectName: "nowBlock"
-                        label: qsTr("− In the subtitles now")
-                        line: panel.detail.now
-                        tone: panel.detail.oldTone
-                        Layout.topMargin: 8
-                        Layout.fillWidth: true
-                    }
-                    ChangeBlock {
-                        objectName: "fixedBlock"
-                        label: panel.detail.edited ? qsTr("+ With your wording")
-                                                   : qsTr("+ With the fix")
-                        line: panel.detail.fixed
-                        tone: panel.detail.newTone
-                        Layout.topMargin: 8
-                        Layout.bottomMargin: 4
                         Layout.fillWidth: true
                     }
 
@@ -285,25 +293,6 @@ Control {
                         each: panel.detail.timing
                         Layout.topMargin: 6
                         Layout.fillWidth: true
-                    }
-
-                    RowLayout {
-                        Layout.topMargin: 10
-                        Layout.alignment: Qt.AlignRight
-
-                        Button {
-                            objectName: "rejectButton"
-                            text: qsTr("Reject")
-                            focusPolicy: Qt.NoFocus
-                            onClicked: panel.bridge.reject()
-                        }
-                        Button {
-                            objectName: "acceptButton"
-                            text: qsTr("Accept Fix")
-                            focusPolicy: Qt.NoFocus
-                            highlighted: true
-                            onClicked: panel.bridge.accept()
-                        }
                     }
 
                     ToolButton {

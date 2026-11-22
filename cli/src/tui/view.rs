@@ -399,13 +399,18 @@ fn entry_text(m: &Review, e: Entry, spinner: char, checked: &HashSet<&str>) -> L
             }
             let wording = m.wording(first);
             let (ra, rb) = changed(&f.original, wording);
+            // A track with no styles (an OCR'd one) would print [] on every row.
+            let style = if f.style.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", f.style)
+            };
             Line::from(format!(
-                "{} {who} {} {} → {}  [{}]{outcome}",
+                "{} {who} {} {} → {}{style}{outcome}",
                 mark(m.shown_state(r)),
                 timestamp(m.start_ms(first)),
                 &f.original[ra],
                 &wording[rb],
-                f.style
             ))
         }
         Entry::Member(_, i) => {
@@ -726,6 +731,32 @@ mod tests {
             screen
                 .lines()
                 .any(|l| l.contains("E03 0:02:45.06  by hand")),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn a_row_whose_track_has_no_style_ends_at_its_fix() {
+        let mut m = sample();
+        // The everyday row: finding 3 alone, on E02, from a track with no styles (an OCR'd one).
+        m.run.findings[2].style = String::new();
+        // The row's text, up to its pane's right border.
+        let row = |screen: &str| {
+            screen
+                .lines()
+                .find(|l| l.contains("everyday. → every day."))
+                .and_then(|l| l.split('│').nth(1))
+                .unwrap_or_default()
+                .trim_end()
+                .to_string()
+        };
+        let screen = render(&m, 140, 20);
+        assert!(!screen.contains("[]"), "{screen}");
+        assert!(row(&screen).ends_with("everyday. → every day."), "{screen}");
+        m.run.applied.insert(3);
+        let screen = render(&m, 140, 20);
+        assert!(
+            row(&screen).ends_with("everyday. → every day.  applied"),
             "{screen}"
         );
     }

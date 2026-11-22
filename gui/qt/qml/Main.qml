@@ -1,10 +1,10 @@
-// The window: its menus; a toolbar with the view's name and counts; three columns, the sidebar,
-// the findings and the details panel; the status bar; the Settings window; and the fatal end's
-// dialog. Layout, bindings and one-line handlers only: what each asks of review is the bridge's
-// (session_bridge.cpp), and what the window remembers the settings' (window_settings.cpp). Its
-// keys are the window's whatever has focus, but for a text field's, which takes the keys it types,
-// an open menu's, which takes them all (menu_keys.h), and the Settings window's, which holds all of
-// review's back.
+// The window: its menus; a toolbar with the view's name and counts, Reject, Accept and Undo; three
+// columns, the sidebar, the findings and the details panel; the status bar; the Settings window;
+// and the fatal end's dialog. Layout, bindings and one-line handlers only: what each asks of review
+// is the bridge's (session_bridge.cpp), and what the window remembers the settings'
+// (window_settings.cpp). Its keys are the window's whatever has focus, but for a text field's,
+// which takes the keys it types, an open menu's, which takes them all (menu_keys.h), and the
+// Settings window's, which holds all of review's back.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -40,6 +40,10 @@ ApplicationWindow {
     // window, where one still offers its items, could run them by key or click. Disabled, an item
     // or a shortcut runs on neither.
     readonly property bool keysToReview: !settingsWindow.visible
+
+    // Whether Accept, Reject and Back to Undecided have a finding to act on, by menu, key or the
+    // toolbar's buttons alike: one shown, and not a greyed episode's log in its place.
+    readonly property bool canDecide: keysToReview && !bridge.showingEpisode && bridge.detail.shown
 
     // The window's own size of text, which its menus and dialogs take too; the list and the details
     // panel each have their own below.
@@ -182,24 +186,24 @@ ApplicationWindow {
 
             // These four, and Enter, wait while a greyed episode's view shows: review still has the
             // finding selected, but the panel shows the episode's log in its place, so a key would
-            // act on a finding not in view.
+            // act on a finding not in view. The first three wait too while no finding shows.
             Action {
                 objectName: "accept"
-                enabled: window.keysToReview && !window.bridge.showingEpisode
-                text: qsTr("&Accept Fix")
+                enabled: window.canDecide
+                text: qsTr("&Accept")
                 shortcut: "A"
                 onTriggered: window.bridge.accept()
             }
             Action {
                 objectName: "reject"
-                enabled: window.keysToReview && !window.bridge.showingEpisode
-                text: qsTr("&Reject Fix")
+                enabled: window.canDecide
+                text: qsTr("&Reject")
                 shortcut: "R"
                 onTriggered: window.bridge.reject()
             }
             Action {
                 objectName: "clear"
-                enabled: window.keysToReview && !window.bridge.showingEpisode
+                enabled: window.canDecide
                 text: qsTr("&Back to Undecided")
                 shortcut: "X"
                 onTriggered: window.bridge.clear()
@@ -338,6 +342,8 @@ ApplicationWindow {
         }
 
         ToolBar {
+            id: toolbar
+
             objectName: "toolbar"
             Layout.fillWidth: true
 
@@ -346,7 +352,8 @@ ApplicationWindow {
                 anchors.leftMargin: 8
                 anchors.rightMargin: 8
 
-                // Takes what Undo leaves, so that a long title is cut rather than push Undo out.
+                // Takes what the buttons leave, so that a long title or long counts are cut rather
+                // than push them out.
                 ColumnLayout {
                     spacing: 0
 
@@ -363,7 +370,25 @@ ApplicationWindow {
                         text: window.bridge.counts
                         textFormat: Text.PlainText
                         opacity: 0.7
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
                     }
+                }
+                // Greyed with nothing to act on, never hidden, so that the bar keeps its width.
+                Button {
+                    objectName: "rejectButton"
+                    text: qsTr("Reject")
+                    enabled: window.canDecide
+                    focusPolicy: Qt.NoFocus
+                    onClicked: window.bridge.reject()
+                }
+                Button {
+                    objectName: "acceptButton"
+                    text: qsTr("Accept")
+                    enabled: window.canDecide
+                    focusPolicy: Qt.NoFocus
+                    highlighted: true
+                    onClicked: window.bridge.accept()
                 }
                 ToolButton {
                     objectName: "undoButton"
