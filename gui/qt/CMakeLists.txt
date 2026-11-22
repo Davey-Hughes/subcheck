@@ -72,9 +72,9 @@ add_custom_command(
     VERBATIM)
 
 # The generated .cpp, with the staticlib, so that the app is one binary. It is built without our
-# warnings, which it does not pass; its header, which our code includes, does pass them. The
-# staticlib is named outright: Corrosion's plain subcheck_ffi is the cdylib whenever
-# BUILD_SHARED_LIBS is on.
+# warnings, which it does not pass; its header, which our code includes, passes them but for
+# -Wmaybe-uninitialized under GCC (see subcheck_warnings). The staticlib is named outright:
+# Corrosion's plain subcheck_ffi is the cdylib whenever BUILD_SHARED_LIBS is on.
 add_library(subcheck_bindings STATIC ${GENERATED})
 target_include_directories(subcheck_bindings PUBLIC "${BINDINGS_DIR}")
 target_link_libraries(subcheck_bindings PUBLIC subcheck_ffi-static Threads::Threads)
@@ -90,8 +90,14 @@ endif()
 # Our own code is held to these, and a warning in it fails the build. So is the C++ Qt generates
 # for a target given them: moc's, and the QML module's type registrations, resources and compiled
 # QML. The module's plugin, a target qt_add_qml_module makes, is not given them.
+# GCC alone is told to leave -Wmaybe-uninitialized off: with optimisation it reports members of
+# the bindings' nested variants as maybe uninitialized on the path a throwing copy takes, where
+# they are never read (GCC PR 114592), and that false report under -Werror would stop a Release
+# build. Our own code loses that check with it under GCC; -Wuninitialized, for a read that is
+# certain, stays on. Clang has no such warning, and under -Werror fails on the unknown option.
 function(subcheck_warnings target)
-    target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Werror
+        $<$<CXX_COMPILER_ID:GNU>:-Wno-maybe-uninitialized>)
 endfunction()
 
 # The window's C++ and QML, as the QML module Subcheck on a static library, which the app and the

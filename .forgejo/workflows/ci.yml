@@ -156,24 +156,24 @@ jobs:
 
   # The Qt app (gui/qt/): its C++ bindings to ffi/, generated at build time, its window and its
   # video, and its tests, with a floor under the share of the window's C++ lines they reach; two of
-  # them run real mpv, each on a display of its own: the pane's, and the app's end to end. Not a
-  # merge gate: branch protection requires `CI / subcheck (pull_request)` alone, by that exact
-  # name. It runs on Arch, the desktop the app is built for first, with packages as new as that
-  # desktop's. Two things can break it with no change in the repository: an Arch upgrade, and the
-  # image, which this runner keeps as it first pulled it, so that every run upgrades an older copy
-  # (hence the keyring first, below). If either gets noisy, pin the image to a dated Arch Linux
-  # Archive snapshot. Nothing is cached, as this runner runs no JS actions, so the bindgen
-  # compiles every time. No path filter either: a change to core can break ffi/ or the app. It
-  # waits for `subcheck`, so that the gating job's result comes first, and the two of one run never
-  # build side by side on the one machine this runner shares. dev/check-gui.sh runs these same
-  # steps locally: change it with this job.
+  # them run real mpv, each on a display of its own: the pane's, and the app's end to end. Last, a
+  # Release build of every target, its tests not run. Not a merge gate: branch protection requires
+  # `CI / subcheck (pull_request)` alone, by that exact name. It runs on Arch, the desktop the app
+  # is built for first, with packages as new as that desktop's. Two things can break it with no
+  # change in the repository: an Arch upgrade, and the image, which this runner keeps as it first
+  # pulled it, so that every run upgrades an older copy (hence the keyring first, below). If either
+  # gets noisy, pin the image to a dated Arch Linux Archive snapshot. Nothing is cached, as this
+  # runner runs no JS actions, so the bindgen compiles every time. No path filter either: a change
+  # to core can break ffi/ or the app. It waits for `subcheck`, so that the gating job's result
+  # comes first, and the two of one run never build side by side on the one machine this runner
+  # shares. dev/check-gui.sh runs these same steps locally: change it with this job.
   gui:
     name: gui
     needs: subcheck
     runs-on: docker
     # A hang outside the tests, which CTest limits one by one (gui/qt/CMakeLists.txt), fails the job
     # rather than holding the runner until its own limit: a download, pacman, a build.
-    timeout-minutes: 20
+    timeout-minutes: 30
     container:
       image: archlinux:base-devel
     steps:
@@ -261,3 +261,8 @@ jobs:
         run: |
           cpp_floor=90
           gcovr --root . --filter gui/qt/src/ --exclude gui/qt/src/main.cpp --merge-lines --fail-under-line "$cpp_floor" build
+
+      # A Release build of every target, the tests built but not run: optimisation brings out GCC
+      # warnings that the Debug build above never runs.
+      - run: cmake -S gui/qt -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build-release

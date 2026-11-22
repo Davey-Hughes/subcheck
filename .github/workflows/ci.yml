@@ -54,8 +54,9 @@ jobs:
           SUBCHECK_NEED_FFMPEG: ${{ runner.os == 'Linux' && '1' || '' }}
 
   # The Qt app on macOS, built and tested as the gui job in .forgejo/workflows/ci.yml does it,
-  # less clang-format, which one platform is enough for, and the C++ floor, which is measured
-  # there only, as the Rust's is. Like that job it does not gate, so look at it before merging, as
+  # less clang-format, which one platform is enough for, the C++ floor, which is measured there
+  # only, as the Rust's is, and the Release build, as AppleClang's warnings do not depend on
+  # optimisation the way GCC's do. Like that job it does not gate, so look at it before merging, as
   # at the macOS leg above. Keep the steps the two share in step.
   gui-macos:
     name: gui-macos

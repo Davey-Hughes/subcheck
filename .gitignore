@@ -1,10 +1,12 @@
 /target
 
-# The build directory CI's commands make at the root (`-B build`), and those an IDE can make in
-# gui/qt/: kept out of git and out of dev/check-gui.sh's list. `build` and its symlink alike (no
-# trailing slash); build-* and cmake-build-*, the names Qt Creator and CLion give one, as
-# directories only, so that a source file whose name starts the same is not ignored with them.
+# The build directories CI's commands make at the root (`-B build`, `-B build-release`), and those
+# an IDE can make in gui/qt/: kept out of git and out of dev/check-gui.sh's list. `build` and its
+# symlink alike (no trailing slash); build-* and cmake-build-*, the names Qt Creator and CLion give
+# one, as directories only, so that a source file whose name starts the same is not ignored
+# with them.
 /build
+/build-release
 /gui/qt/build
 /gui/qt/build-*/
 /gui/qt/cmake-build-*/

@@ -45,7 +45,7 @@ PlayerCommand seek(std::int32_t by) { return playback(Playback(Playback::kSeek{b
 
 PlayerCommand close() { return PlayerCommand(PlayerCommand::kClose{}); }
 
-PlayerCommand pause() { return playback(Playback(Playback::kPause{})); }
+PlayerCommand space() { return playback(Playback(Playback::kPause{})); }
 
 // What an Open asks of mpv first, before its move: where mpv is; whether it plays, with a file
 // open only; then the pause every move starts with.
@@ -145,7 +145,7 @@ private slots:
     void beforeThenAPlaybackOrACloseIsAnsweredAtOnce() {
         Rig r;
         r.player.run(seek(5));
-        r.player.run(pause());
+        r.player.run(space());
         r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
         r.player.run(seek(5));
         r.player.run(close());
@@ -164,7 +164,7 @@ private slots:
     void aSpaceBeforeThePaneIsReadyLandsTheOpenPlaying() {
         Rig r;
         r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
-        r.player.run(pause());
+        r.player.run(space());
         QCOMPARE(r.reports, QStringList());
         QCOMPARE(r.mpv.requests.size(), 0u);
         r.player.ready();
@@ -180,8 +180,8 @@ private slots:
     void twoSpacesBeforeThePaneIsReadyLandItPaused() {
         Rig r;
         r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
-        r.player.run(pause());
-        r.player.run(pause());
+        r.player.run(space());
+        r.player.run(space());
         r.player.ready();
         QCOMPARE(r.openWith(), firstWithNoFile);
         QCOMPARE(r.mpv.last(), loadOf("/m/a.mkv", "0:00:00.000000"));
@@ -195,7 +195,7 @@ private slots:
     void aNewerOpenKeepsASpaceMadeBeforeThePaneIsReady() {
         Rig r;
         r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
-        r.player.run(pause());
+        r.player.run(space());
         r.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
         r.player.ready();
         QCOMPARE(r.openWith(), firstWithNoFile);
@@ -210,7 +210,7 @@ private slots:
     void aSpaceOnAWaitingOpenThatSaysPlayLandsItPaused() {
         Rig r;
         r.player.run(open(moment("/m/a.mkv", 0, std::nullopt), How::kLoad, true));
-        r.player.run(pause());
+        r.player.run(space());
         r.player.ready();
         QCOMPARE(r.openWith(), firstWithNoFile);
         QCOMPARE(r.mpv.last(), loadOf("/m/a.mkv", "0:00:00.000000"));
@@ -238,7 +238,7 @@ private slots:
     void aNewerOpenThatSaysPlayStillPlaysAfterAFlip() {
         Rig r;
         r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
-        r.player.run(pause());
+        r.player.run(space());
         r.player.run(open(moment("/m/c.mkv", 0, std::nullopt), How::kLoad, true));
         r.player.ready();
         QCOMPARE(r.openWith(), firstWithNoFile);
@@ -253,8 +253,8 @@ private slots:
     void aNewerOpenAfterTwoSpacesLandsAsItSays() {
         Rig r;
         r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
-        r.player.run(pause());
-        r.player.run(pause());
+        r.player.run(space());
+        r.player.run(space());
         r.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
         r.player.ready();
         QCOMPARE(r.openWith(), firstWithNoFile);
@@ -270,7 +270,7 @@ private slots:
     void aCloseOrTheWaitsEndForgetsASpace() {
         Rig r;
         r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
-        r.player.run(pause());
+        r.player.run(space());
         r.player.run(close());
         QCOMPARE(r.reports, QStringList{"closed"});
         r.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
@@ -281,7 +281,7 @@ private slots:
         Rig slow(std::chrono::seconds(10), std::chrono::seconds(10),
                  std::chrono::milliseconds(300));
         slow.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
-        slow.player.run(pause());
+        slow.player.run(space());
         QTRY_COMPARE_WITH_TIMEOUT(slow.reports, QStringList{"open failed: no video"}, 2000);
         slow.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
         slow.player.ready();
@@ -290,7 +290,7 @@ private slots:
 
         Rig released;
         released.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
-        released.player.run(pause());
+        released.player.run(space());
         released.player.release();
         released.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
         released.player.ready();
@@ -652,7 +652,7 @@ private slots:
         r.mpv.answer(r.player);
         QTRY_COMPARE_WITH_TIMEOUT(r.reports, QStringList{"opened paused"}, 2000);
         r.reports.clear();
-        r.player.run(pause());
+        r.player.run(space());
         QCOMPARE(r.mpv.last(), "get time-pos");
         r.mpv.answer(r.player, {}, unavailable);
         QCOMPARE(r.mpv.last(), "get path");
@@ -1014,7 +1014,7 @@ private slots:
         Rig r;
         r.player.ready();
         r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
-        r.player.run(pause());
+        r.player.run(space());
         QCOMPARE(r.openWith(), firstWithNoFile);
         QCOMPARE(r.mpv.last(), loadOf("/m/a.mkv", "0:00:00.000000"));
         r.mpv.answer(r.player);
@@ -1279,7 +1279,7 @@ private slots:
         Rig spaced;
         spaced.loaded();
         spaced.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
-        spaced.player.run(pause());
+        spaced.player.run(space());
         QCOMPARE(spaced.mpv.last(), "get path");
         FakeMpv another;
         spaced.player.attach(&another);
@@ -1298,7 +1298,7 @@ private slots:
         FakeMpv third;
         after.player.attach(&third);
         QCOMPARE(after.reports, QStringList());
-        after.player.run(pause());
+        after.player.run(space());
         QCOMPARE(after.reports, QStringList());
         after.player.ready();
         QCOMPARE(answerOpening(third, after.player), firstWithNoFile);

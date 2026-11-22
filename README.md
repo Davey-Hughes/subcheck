@@ -72,11 +72,11 @@ add or change one.
 
 `dev/check-gui.sh` does the same for the Qt app under `gui/qt/`, whose CI job does not gate yet:
 clang-format, then a CMake build that generates the C++ bindings to `ffi/`, qmllint over the QML,
-the app's tests, and the share of its C++ lines they reach, against CI's floor. Besides Rust from
-rustup, which the build asks for the toolchain `rust-toolchain.toml` names, it needs cmake, ninja,
-clang-format, Qt 6.12 (Quick, Test and qmllint), [MpvQt](https://invent.kde.org/libraries/mpvqt)
-1.2.1 with mpv 0.38 or later, [gcovr](https://gcovr.com),
-[Corrosion](https://github.com/corrosion-rs/corrosion) and
+the app's tests, the share of its C++ lines they reach, against CI's floor, and last a Release build
+of every target. Besides Rust from rustup, which the build asks for the toolchain
+`rust-toolchain.toml` names, it needs cmake, ninja, clang-format, Qt 6.12 (Quick, Test and qmllint),
+[MpvQt](https://invent.kde.org/libraries/mpvqt) 1.2.1 with mpv 0.38 or later,
+[gcovr](https://gcovr.com), [Corrosion](https://github.com/corrosion-rs/corrosion) and
 [uniffi-bindgen-cpp](https://github.com/NordSecurity/uniffi-bindgen-cpp), installed with
 `cargo install` at the tag CI installs; it stops first, naming the command, when the bindgen is
 missing or at another tag. On Linux, two tests run real mpv, each on an X display of its own, the

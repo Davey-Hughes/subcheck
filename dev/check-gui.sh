@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The local mirror of the gui job in .forgejo/workflows/ci.yml: for the Qt app under gui/qt/,
-# clang-format, qmllint, the build through the C++ bindings generated from ffi/, the tests, and the
-# C++ floor. Run it, as well as dev/check-all.sh, before you push a branch that changes gui/ or any
-# of the Rust: the bindings build on core, and the tests' seed runs cli's `subcheck scan`.
+# clang-format, qmllint, the build through the C++ bindings generated from ffi/, the tests, the
+# C++ floor, and a Release build of every target. Run it, as well as dev/check-all.sh, before you
+# push a branch that changes gui/ or any of the Rust: the bindings build on core, and the tests'
+# seed runs cli's `subcheck scan`.
 #
 #   dev/check-gui.sh
 #
@@ -15,7 +16,8 @@
 # real mpv, each on a display of its own, and a font, without which mpv draws no subtitle for
 # pane_test to find. The build directory is SUBCHECK_GUI_BUILD, or one per checkout under the XDG
 # cache: a CMake build directory belongs to one source directory, and it is large, with a build of
-# the Rust inside.
+# the Rust inside. The Release build goes in a directory beside it, with `-release` added to the
+# name.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -62,6 +64,7 @@ fi
 
 key=$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)
 build=${SUBCHECK_GUI_BUILD:-${XDG_CACHE_HOME:-$HOME/.cache}/subcheck-check-gui/$key}
+release=${build%/}-release
 
 # As in CI: which Rust this was, in the log (rust-toolchain.toml names it).
 run rustc --version
@@ -93,6 +96,10 @@ find "${build:?}" -name '*.gcda' -delete
 run ctest --test-dir "$build" --output-on-failure --no-tests=error
 run gcovr --root . --filter gui/qt/src/ --exclude gui/qt/src/main.cpp --merge-lines \
   --fail-under-line "$floor" "$build"
+# As in CI: a Release build of every target, the tests built but not run; optimisation brings out
+# GCC warnings that the Debug build never runs.
+run cmake -S gui/qt -B "$release" -G Ninja -DCMAKE_BUILD_TYPE=Release
+run cmake --build "$release"
 
 echo
 echo "all green"
