@@ -58,6 +58,14 @@ jobs:
   # only, as the Rust's is. It ends with a Release build of every target, its tests not run, as the
   # README's macOS commands build the app Release. Like that job it does not gate, so look at it
   # before merging, as at the macOS leg above. Keep the steps the two share in step.
+  #
+  # Unlike that job, it keeps the bindgen and the outside crates in GitHub's cache, as both come out
+  # the same from one run to the next. The bindgen's key hashes this file, the install line's tag
+  # among it, so a new tag installs afresh. The crates' key names Cargo.lock, the workspace's
+  # Cargo.toml files, rust-toolchain.toml and the month, so the outside crates a hit restores were
+  # built for these files at most a month before. Our own crates compile again from the checkout on
+  # every run, as cargo judges a crate in the repository by its sources' mtimes, which a checkout
+  # makes new.
   gui-macos:
     name: gui-macos
     runs-on: macos-latest
@@ -83,8 +91,43 @@ jobs:
           cmake -S "$RUNNER_TEMP/mpvqt-src" -B "$RUNNER_TEMP/mpvqt-build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/mpvqt" -DCMAKE_PREFIX_PATH="$(brew --prefix)"
           cmake --build "$RUNNER_TEMP/mpvqt-build"
           cmake --install "$RUNNER_TEMP/mpvqt-build"
+      # The bindgen as an earlier run of this same file installed it. The install below runs only
+      # when the key misses, rather than every time with cargo left to see that the tag is installed
+      # already: cargo writes the tag's `+` into its record of the install as it is, reads it back
+      # as a different tag, and so builds the bindgen again on every run. No restore-keys: an older
+      # entry would put a bindgen in ~/.cargo/bin with no record of its install, which cargo install
+      # refuses to overwrite without --force, so the install would fail.
+      - name: Cache uniffi-bindgen-cpp
+        id: bindgen
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/uniffi-bindgen-cpp
+          key: uniffi-bindgen-cpp-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/ci.yml') }}
       - name: Install uniffi-bindgen-cpp
+        if: steps.bindgen.outputs.cache-hit != 'true'
         run: cargo install uniffi-bindgen-cpp --git https://github.com/NordSecurity/uniffi-bindgen-cpp --tag v0.10.0+v0.31.0 --locked
+      # The crate cache's key, made in a step, as an expression cannot name the month.
+      - name: Name the crate cache's key
+        id: crates-key
+        env:
+          HASH: ${{ hashFiles('Cargo.lock', 'Cargo.toml', 'cli/Cargo.toml', 'core/Cargo.toml', 'ffi/Cargo.toml', 'rust-toolchain.toml') }}
+        run: echo "key=gui-macos-cargo-$RUNNER_OS-$RUNNER_ARCH-$HASH-$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      # Cargo's registry, less the sources, which cargo unpacks again from cache/; and the target
+      # dir Corrosion gives cargo in each build dir, which it names after the checkout's path inside
+      # cargo/, so cargo/ is what is listed. In build/, that dir also holds our own crates'
+      # incremental state, with which cargo compiles them again faster. The month in the key: an
+      # exact hit is never saved again, so the month bounds how long an entry that cargo finds
+      # partly stale goes on being restored. No restore-keys, as a fallback would carry old
+      # artifacts from one month's entry into the next.
+      - name: Cache the outside crates
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            build/cargo
+            build-release/cargo
+          key: ${{ steps.crates-key.outputs.key }}
       - run: cmake -S gui/qt -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/mpvqt;$(brew --prefix)"
       - name: qmllint
         run: cmake --build build --target all_qmllint
