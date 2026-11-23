@@ -108,6 +108,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::test_support::tries;
 
     /// Shorter than [`HOLD`], so the tests are quick; they wait three of it for a line that must
     /// not come.
@@ -195,32 +196,58 @@ mod tests {
 
     #[test]
     fn a_wait_over_within_the_hold_says_nothing() {
-        let (lines, flushed) = lines();
-        lines.say(Some(key_command()));
-        lines.say(None);
-        thread::sleep(3 * SHORT);
-        assert_eq!(said(&flushed), "");
+        // The wait must end before its hold is up, or its line would be right.
+        tries(|| {
+            let (lines, flushed) = lines();
+            let started = Instant::now();
+            lines.say(Some(key_command()));
+            lines.say(None);
+            if started.elapsed() >= SHORT {
+                return false;
+            }
+            thread::sleep(3 * SHORT);
+            assert_eq!(said(&flushed), "");
+            true
+        });
     }
 
     #[test]
     fn a_wait_that_replaces_another_within_the_hold_is_the_only_one_said() {
-        let (lines, flushed) = lines();
-        lines.say(Some(key_command()));
-        lines.say(Some(Wait::Asking(
-            "srv: asking http://h/v1 what it serves".into(),
-        )));
-        said_when(&flushed, |text| !text.is_empty());
-        thread::sleep(3 * SHORT);
-        assert_eq!(said(&flushed), "srv: asking http://h/v1 what it serves\n");
+        // The second wait must start before the first's hold is up, or the first's line would be
+        // right.
+        tries(|| {
+            let (lines, flushed) = lines();
+            let started = Instant::now();
+            lines.say(Some(key_command()));
+            lines.say(Some(Wait::Asking(
+                "srv: asking http://h/v1 what it serves".into(),
+            )));
+            if started.elapsed() >= SHORT {
+                return false;
+            }
+            said_when(&flushed, |text| !text.is_empty());
+            thread::sleep(3 * SHORT);
+            assert_eq!(said(&flushed), "srv: asking http://h/v1 what it serves\n");
+            true
+        });
     }
 
     #[test]
     fn a_load_that_replaces_a_held_wait_is_the_only_one_said() {
-        let (lines, flushed) = lines();
-        lines.say(Some(key_command()));
-        lines.say(Some(a_load()));
-        thread::sleep(3 * SHORT);
-        assert_eq!(said(&flushed), "loading m into Ollama at http://h\n");
+        // The load must start before the held wait's hold is up, or the held wait's line would be
+        // right.
+        tries(|| {
+            let (lines, flushed) = lines();
+            let started = Instant::now();
+            lines.say(Some(key_command()));
+            lines.say(Some(a_load()));
+            if started.elapsed() >= SHORT {
+                return false;
+            }
+            thread::sleep(3 * SHORT);
+            assert_eq!(said(&flushed), "loading m into Ollama at http://h\n");
+            true
+        });
     }
 
     #[test]

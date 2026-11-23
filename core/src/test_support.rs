@@ -4,12 +4,28 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::llm;
 use crate::store::{RunHeader, ScanRow};
 
 mod server;
 pub use server::*;
+
+/// How long a timing test tries again when the machine spoiled its try.
+pub const TRIES_FOR: Duration = Duration::from_secs(10);
+
+/// Calls `case` until it returns `true` (a try that ran); a `false` is a spoiled try. Panics
+/// once `TRIES_FOR` has passed since the first call.
+pub fn tries(mut case: impl FnMut() -> bool) {
+    let began = Instant::now();
+    while !case() {
+        assert!(
+            began.elapsed() < TRIES_FOR,
+            "every try for {TRIES_FOR:?} was spoiled by a machine too busy to keep to the test's timing"
+        );
+    }
+}
 
 /// The pid of a child `start` starts, and the session it is in; the child is killed after.
 pub fn a_childs_session(

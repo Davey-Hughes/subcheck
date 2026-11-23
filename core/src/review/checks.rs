@@ -321,6 +321,7 @@ mod tests {
     use std::sync::mpsc::TryRecvError;
 
     use super::*;
+    use crate::test_support::tries;
 
     /// How long a test waits for what should come at once: a lane that hangs fails its test, and
     /// does not hang the run.
@@ -458,21 +459,6 @@ mod tests {
     /// The slow word's count in the timing tests; long enough that a machine too busy to run the
     /// test's thread for a while seldom spoils a try.
     const COUNT: Duration = Duration::from_millis(500);
-
-    /// How long a timing test tries again when the machine spoiled its try.
-    const TRIES_FOR: Duration = Duration::from_secs(10);
-
-    /// Calls `case` until it returns `true` (a try that ran); a `false` is a spoiled try. Panics
-    /// once `TRIES_FOR` has passed since the first call.
-    fn tries(mut case: impl FnMut() -> bool) {
-        let began = Instant::now();
-        while !case() {
-            assert!(
-                began.elapsed() < TRIES_FOR,
-                "every try for {TRIES_FOR:?} was spoiled by a machine too busy to keep to the test's timing"
-            );
-        }
-    }
 
     #[test]
     fn the_slow_word_comes_for_the_newest_moment_only() {
