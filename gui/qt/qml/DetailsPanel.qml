@@ -1,16 +1,17 @@
-// The details panel: the video's place, 16:9 at the panel's width, which the window fills with the
-// video (Main.qml); under it a row of its own with Undo at the left and Reject and Accept at the
-// right, which stays between the video and what scrolls; then the selected finding as the window
-// words it: its line as it is now above its line with the fix, each a block of its own that keeps
-// its place from one finding to the next for a line of one or two lines at the block's own font
-// (one of three or more, or one drawn partly in a taller fallback font, moves what is below it
-// down); a click on the block with the fix opens its edit at the nearest character, while it can
-// be reworded, and while an edit is open the line gives way to a field for its wording; below them
-// its banners, its mark and why it was found; its file's particulars under a disclosure; and what
-// the check said of the episode selected while that is the finding's: below the finding, set off
-// by a line, or alone with none selected. For a click on an episode the check found nothing in,
-// its log shows alone, in the finding's place, while review keeps the finding selected: below the
-// finding, the two would read as one, and the log is not the finding's.
+// The details panel: the video's place, 16:9 at the panel's width with the video's control bar
+// under it, which the window fills with the video (Main.qml); under it a row of its own with Undo
+// at the left and Reject and Accept at the right, which stays between the video and what scrolls;
+// then the selected finding as the window words it: its line as it is now above its line with the
+// fix, each a block of its own that keeps its place from one finding to the next for a line of one
+// or two lines at the block's own font (one of three or more, or one drawn partly in a taller
+// fallback font, moves what is below it down); a click on the block with the fix opens its edit at
+// the nearest character, while it can be reworded, and while an edit is open the line gives way to
+// a field for its wording; below them its banners, its mark and why it was found; its file's
+// particulars under a disclosure; and what the check said of the episode selected while that is
+// the finding's: below the finding, set off by a line, or alone with none selected. For a click on
+// an episode the check found nothing in, its log shows alone, in the finding's place, while review
+// keeps the finding selected: below the finding, the two would read as one, and the log is not the
+// finding's.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -28,6 +29,11 @@ Control {
     // The video's place, which nothing here fills: the window puts the video there, in a window of
     // its own or in its own scene, so that the video can leave the panel.
     property alias videoSlot: slot
+    // The video's control bar's height, which the place holds under the video, and the least width
+    // that keeps each of its groups whole, which the panel keeps: the window gives both, from the
+    // video's pane.
+    property real videoBarHeight
+    property real videoLeastWidth
     // The window's line between parts, drawn here between the finding and its episode's log.
     required property color separator
     // Whether Reject and Accept have a finding to act on, which the window decides, as its menu and
@@ -36,9 +42,11 @@ Control {
     // The window's own font, which the decision row takes rather than this panel's: its buttons
     // follow the window's size of text, as the menus and the toolbar do.
     required property font windowFont
-    // The least width that shows the decision row's three buttons whole, which follows the window's
-    // size of text and the style's buttons; the window never makes the panel narrower.
-    readonly property real leastWidth: decisions.implicitWidth
+    // The least width that shows the decision row's three buttons whole and each group of the
+    // video's control bar whole, which follow the window's size of text and the style's buttons;
+    // the window never makes the panel narrower. The bar counts while the video is out too, on
+    // purpose: the window then does not grow wider at once as the video comes back in.
+    readonly property real leastWidth: Math.max(decisions.implicitWidth, videoLeastWidth)
     // Whether a greyed episode's log shows alone, in the finding's place. Its end can move no
     // selection, as a click on the finding's own row does not, so the finding comes back at its
     // top here, as another finding opens at its own, rather than as far down as the log was. An
@@ -159,14 +167,15 @@ Control {
         anchors.fill: parent
         spacing: 0
 
-        // Black, so that the video's place shows before the video first draws there.
+        // Black, so that the video's place shows before the video first draws there. The video,
+        // 16:9, and its control bar under it.
         Rectangle {
             id: slot
 
             objectName: "videoSlot"
             color: "black"
             Layout.fillWidth: true
-            Layout.preferredHeight: width * 9 / 16
+            Layout.preferredHeight: width * 9 / 16 + panel.videoBarHeight
         }
 
         // Fixed between the video and what scrolls, so that it never scrolls away nor moves with

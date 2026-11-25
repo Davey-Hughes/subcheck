@@ -1,5 +1,7 @@
 #include "mpv_item.h"
 
+#include "words.h"
+
 #include <MpvController>
 
 MpvItem::MpvItem(QQuickItem *parent) : MpvAbstractItem(parent) {
@@ -71,9 +73,17 @@ void MpvItem::setPlayer(PlayerPort *player) {
 }
 
 void MpvItem::heard(const QString &name, const QVariant &value) {
-    // A position that is gone, as when a file ends, is no landing.
-    if (port && name == QStringLiteral("time-pos") && value.isValid()) {
-        port->moved();
+    if (name == QStringLiteral("time-pos")) {
+        // A position that is gone, as when a file ends, is no landing.
+        if (port && value.isValid()) {
+            port->moved();
+        }
+        const QString now =
+            value.isValid() ? exactClock(qRound64(value.toDouble() * 1000)) : QString();
+        if (now != saidClock) {
+            saidClock = now;
+            emit clockChanged();
+        }
     }
     if (name == QStringLiteral("pause") && isPaused != value.toBool()) {
         isPaused = value.toBool();

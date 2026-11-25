@@ -18,6 +18,9 @@ class MpvItem : public MpvAbstractItem, public Mpv {
     // As mpv says: whether it is paused, and whether it has a video output, which a file open has.
     Q_PROPERTY(bool paused READ paused NOTIFY pausedChanged)
     Q_PROPERTY(bool showing READ showing NOTIFY showingChanged)
+    // Where mpv last said the video is, to the millisecond, as the details panel says a time:
+    // 0:12:34.450. Empty while mpv has no place to say, as with no file open or once one ends.
+    Q_PROPERTY(QString clock READ clock NOTIFY clockChanged)
     // Whether the frame drawn is stretched to the pane's size rather than drawn again at it, which
     // the window sets while a column is dragged: mpv drawing the frame again at each step of a
     // drag holds the drag back, where the frame it has, stretched, does not.
@@ -31,6 +34,7 @@ public:
     void setPlayer(PlayerPort *player);
     bool paused() const { return isPaused; }
     bool showing() const { return isShowing; }
+    QString clock() const { return saidClock; }
     bool stretching() const { return isStretching; }
     void setStretching(bool stretching);
 
@@ -48,6 +52,7 @@ signals:
     void playerChanged();
     void pausedChanged();
     void showingChanged();
+    void clockChanged();
     void stretchingChanged();
 
 private:
@@ -55,5 +60,6 @@ private:
     QPointer<PlayerPort> port;
     bool isPaused = false;
     bool isShowing = false;
+    QString saidClock;
     bool isStretching = false;
 };

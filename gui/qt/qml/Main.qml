@@ -31,8 +31,8 @@ ApplicationWindow {
     // sidebar, whose widest leaves the other two their least.
     readonly property int sidebarLeast: 160
     readonly property int listLeast: 260
-    // Never narrower than the details panel's three buttons, whose width follows the window's size
-    // of text and the style.
+    // Never narrower than the details panel's least: its three buttons and each group of the
+    // video's control bar whole, whose widths follow the window's size of text and the style.
     readonly property int detailsLeast: Math.max(340, Math.ceil(details.leastWidth))
     readonly property int handles: 2 * handleWidth
 
@@ -841,6 +841,8 @@ ApplicationWindow {
             separator: window.separator
             canDecide: window.canDecide
             windowFont: window.font
+            videoBarHeight: videoPane.barHeight
+            videoLeastWidth: videoPane.leastWidth
             font.pointSize: window.settings.detailsTextSize
             SplitView.preferredWidth: window.settings.detailsWidth
             SplitView.minimumWidth: window.detailsLeast
@@ -905,7 +907,9 @@ ApplicationWindow {
     }
 
     // In the video's window, or where the video has none, in this window's scene at the video's
-    // place. Given this window's font, which a window of its own does not take from this one.
+    // place. Given this window's font, which a window of its own does not take from this one, and
+    // its palette, which a window of its own takes but, while this one holds it, does not follow:
+    // Qt sends a change of the platform's palette only to the windows that no other window holds.
     VideoPane {
         id: videoPane
 
@@ -913,7 +917,12 @@ ApplicationWindow {
         anchors.fill: parent
         bridge: window.bridge
         font: window.font
+        palette: window.palette
         stretching: columns.resizing && !window.videoOut
+        out: window.videoOut
+        canPopOut: window.videoWindowed && window.bridge.fatal === ""
+        keysToReview: window.keysToReview
+        onPopAsked: window.videoOut ? window.popIn() : window.popOut()
     }
 
     footer: Label {

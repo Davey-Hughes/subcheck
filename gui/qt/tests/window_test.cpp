@@ -25,6 +25,7 @@
 #include <QFontMetricsF>
 #include <QKeyEvent>
 #include <QKeySequence>
+#include <QPalette>
 #include <QPointingDevice>
 #include <QQmlApplicationEngine>
 #include <QQmlComponent>
@@ -189,6 +190,17 @@ struct Shown {
     QQmlApplicationEngine engine;
     QQuickWindow *window = nullptr;
 
+    // Taken down once its video's place is laid out, or after a second all the same: the video's
+    // window lays its bar out a frame or more after this one changes size, and this one answers
+    // with a layout of its own; taken down between the two, Qt warns that its animation driver is
+    // not running.
+    ~Shown() {
+        if (engine.rootObjects().contains(window)) {
+            static_cast<void>(
+                QTest::qWaitFor([this] { return videoNotLaidOut().isEmpty(); }, 1000));
+        }
+    }
+
     explicit Shown(std::vector<std::string> selector, const QString &kept = {},
                    const QVariantMap &more = {})
         : bridge(std::move(selector), player, out, err, std::chrono::seconds(1)),
@@ -206,8 +218,8 @@ struct Shown {
         }
     }
 
-    // The window shown, as main.cpp shows it, and active, as a person's would be; the session not
-    // started yet.
+    // The window shown, as main.cpp shows it, and active, as a person's would be, its video's place
+    // laid out; the session not started yet.
     bool show() {
         if (!window) {
             return false;
@@ -217,7 +229,8 @@ struct Shown {
     }
 
     // The window shown and the session started in main.cpp's order, review before the window's
-    // first frame, so that what review says before then is covered too; then the window active.
+    // first frame, so that what review says before then is covered too; then the window active
+    // and its video's place laid out.
     bool start() {
         if (!window) {
             return false;
@@ -256,6 +269,64 @@ struct Shown {
     QQuickItem *videoItem(const char *name) const {
         auto *pane = qobject_cast<QQuickItem *>(find("videoPane"));
         return pane ? item(pane, name) : nullptr;
+    }
+
+    // What keeps the video's place from holding the video and its control bar as laid out at the
+    // place's width, said; nothing once it does. The bar is laid out in the video's own window,
+    // which can draw after this one has placed it, and the bar's height moves all that is under
+    // the place, so a test that clicks there waits for it. Out, the bar is laid out at the
+    // pop-out's width; hidden, the video's window lays nothing out.
+    QString videoNotLaidOut() const {
+        QQuickItem *slot = item("videoSlot");
+        QQuickItem *bar = videoItem("controlBar");
+        if (!slot || !bar) {
+            return QStringLiteral("no videoSlot or controlBar");
+        }
+        if (!bar->window()->isVisible()) {
+            return {};
+        }
+        auto *flow = bar->property("contentItem").value<QQuickItem *>();
+        QStringList off;
+        // The lines the bar's groups take at its width, as its Flow fills them, against the lines
+        // they are drawn on.
+        const qreal spacing = flow->property("spacing").toReal();
+        int lines = 0;
+        int drawn = 0;
+        qreal x = 0;
+        qreal lastY = -1;
+        const QList<QQuickItem *> groups = flow->childItems();
+        for (QQuickItem *group : groups) {
+            if (lines == 0 || (x > 0 && x + group->width() > flow->width())) {
+                ++lines;
+                x = 0;
+            }
+            x += group->width() + spacing;
+            if (qAbs(group->y() - lastY) >= 0.5) {
+                ++drawn;
+                lastY = group->y();
+            }
+        }
+        if (drawn != lines) {
+            off << QStringLiteral("the bar's groups are on %1 lines, where %2 wide takes %3")
+                       .arg(drawn)
+                       .arg(flow->width())
+                       .arg(lines);
+        }
+        if (window->property("videoOut").toBool()) {
+            return off.join(QStringLiteral("; "));
+        }
+        if (qAbs(bar->width() - slot->width()) >= 0.5) {
+            off << QStringLiteral("the bar is %1 wide in a place %2 wide")
+                       .arg(bar->width())
+                       .arg(slot->width());
+        }
+        if (qAbs(slot->height() - (slot->width() * 9 / 16 + bar->height())) > 1) {
+            off << QStringLiteral("the place is %1x%2, the bar %3 tall")
+                       .arg(slot->width())
+                       .arg(slot->height())
+                       .arg(bar->height());
+        }
+        return off.join(QStringLiteral("; "));
     }
 
     static QQuickItem *item(QQuickItem *in, const char *name) {
@@ -382,13 +453,15 @@ struct Shown {
     QString last() const { return bridge.sent.isEmpty() ? QString() : bridge.sent.last(); }
 
 private:
-    // The window shown waited for until it is exposed, then made active, as a person's would be.
+    // The window shown waited for until it is exposed, then made active, as a person's would be,
+    // and until its video's place is laid out.
     bool exposedAndActive() {
         if (!QTest::qWaitForWindowExposed(window)) {
             return false;
         }
         window->requestActivate();
-        return QTest::qWaitForWindowActive(window);
+        return QTest::qWaitForWindowActive(window) &&
+               QTest::qWaitFor([this] { return videoNotLaidOut().isEmpty(); });
     }
 };
 
@@ -411,11 +484,24 @@ bool inDetailsView(const Shown &w, QQuickItem *item) {
     return top >= -0.5 && top + item->height() <= detailsView(w)->height() + 0.5;
 }
 
+// The window grown by the video's control bar's height, so that the details' view keeps the room
+// it had before the bar: at the window's first size, a part low in the finding lies below the view
+// under the bar. Grown, not scrolled to, as a scroll shows the view's scroll bar, which fades for a
+// while after, and the window would be taken down while it fades.
+void roomForTheBar(Shown &w) {
+    QQuickItem *bar = w.videoItem("controlBar");
+    QVERIFY2(bar, "no controlBar");
+    QQuickItem *view = detailsView(w);
+    const qreal before = view->height();
+    w.window->resize(w.window->width(), w.window->height() + qCeil(bar->height()));
+    QTRY_VERIFY(view->height() >= before + bar->height() - 0.5);
+}
+
 // What keeps the details panel's block with the fix from being laid out as the window draws it
-// next, the panel `width` wide, nothing once it is: the block as wide as the column it is in, and
-// its line inside it. A change of the text's size or the window's moves the line's own size at
-// once, and the panel and the block only as the window lays out what changed, before its next
-// frame.
+// next, the panel `width` wide, nothing once it is: the block as wide as the column it is in, its
+// line inside it, and the video's place above it laid out. A change of the text's size or the
+// window's moves the line's own size at once, and the panel and the block only as the window lays
+// out what changed, before its next frame.
 QString fixNotLaidOut(const Shown &w, qreal width) {
     QQuickItem *panel = w.item("details");
     QQuickItem *fixed = w.item("fixedBlock");
@@ -439,6 +525,9 @@ QString fixNotLaidOut(const Shown &w, qreal width) {
                    .arg(fixed->width())
                    .arg(fixed->height());
     }
+    if (const QString video = w.videoNotLaidOut(); !video.isEmpty()) {
+        off << video;
+    }
     return off.join(QStringLiteral("; "));
 }
 
@@ -446,9 +535,9 @@ QString fixNotLaidOut(const Shown &w, qreal width) {
 // window with it (`roomForOneLine`, which callers pass to fixNotLaidOut), an allowance that the
 // wait below checks and that Row 0's fix fits in any font this suite meets, so that what a test
 // says of a line of one never counts on a font. The window's height grows with the video above the
-// line, which is as tall as the panel is wide times 9/16, so the details' view keeps the room it
-// had. Fails the test, saying what it could not get, when the panel does not take the width or the
-// line is not drawn on one line at it.
+// line, which is as tall as the panel is wide times 9/16, and by the video's control bar under it,
+// so that the details' view keeps the room it had before the bar. Fails the test, saying what it
+// could not get, when the panel does not take the width or the line is not drawn on one line at it.
 constexpr int roomForOneLine = 900;
 
 void askRoomForOneLine(Shown &w, QQuickItem *line) {
@@ -458,9 +547,12 @@ void askRoomForOneLine(Shown &w, QQuickItem *line) {
         return qRound(line->property("contentHeight").toReal() / QFontMetricsF(font).lineSpacing());
     };
     const int videoGrowth = qMax(0, qCeil((asked - w.item("details")->width()) * 9.0 / 16.0));
+    QQuickItem *bar = w.videoItem("controlBar");
+    QVERIFY2(bar, "no controlBar");
+    const int barHeight = qCeil(bar->height());
     w.window->resize(w.settings.sidebarWidth() + asked + w.window->property("listLeast").toInt() +
                          w.window->property("handles").toInt(),
-                     w.window->height() + videoGrowth);
+                     w.window->height() + videoGrowth + barHeight);
     w.settings.keepColumns(w.settings.sidebarWidth(), asked);
     QTRY_VERIFY2(fixNotLaidOut(w, asked).isEmpty() && drawnLines() == 1,
                  qPrintable(QStringLiteral("asked for a panel %1 wide; it is %2 wide and draws the "
@@ -508,6 +600,48 @@ void typeIn(const Shown &w, const char *text) {
 // The colour of the window palette's `role`.
 QColor paletteColour(const Shown &w, const char *role) {
     return w.window->property("palette").value<QObject *>()->property(role).value<QColor>();
+}
+
+// The play mark drawn in `holder`: the glyph whose bars it draws while paused.
+QQuickItem *glyphIn(QQuickItem *holder) {
+    QQuickItem *bars = Shown::item(holder, "pausedBars");
+    return bars ? bars->parentItem() : nullptr;
+}
+
+// `item`'s layouts laid out now, the innermost first, as the window lays them out before its next
+// frame: an outer layout sizes its items from the implicit sizes the inner ones have then.
+void layOut(QQuickItem *item) {
+    const QList<QQuickItem *> children = item->childItems();
+    for (QQuickItem *child : children) {
+        layOut(child);
+    }
+    item->ensurePolished();
+}
+
+// The least width the window keeps: the sidebar's and the list's least, the handles between the
+// columns, and the details panel's least, 340 px or, where either is wider, its row of decisions or
+// the widest group of the video's control bar, whole pixels up.
+int leastWindowWidth(const Shown &w) {
+    const qreal decisions = w.item("decisions")->implicitWidth();
+    const qreal bar = w.videoItem("controlBar")->property("leastWidth").toReal();
+    return 160 + 260 + 2 + std::max(340, int(std::ceil(std::max(decisions, bar))));
+}
+
+// The window at its least width. Read each time: the decisions' and the bar's widths follow their
+// font's, and settle after a size of text does; and a window is never shrunk to a lowered minimum,
+// so it is asked for the least each time the least has moved.
+void toTheLeastWidth(Shown &w) {
+    QVERIFY2(w.item("decisions") && w.videoItem("controlBar"), "no decisions or controlBar");
+    QTRY_VERIFY2(
+        [&w] {
+            w.window->resize(w.window->minimumWidth(), w.window->minimumHeight());
+            return w.window->minimumWidth() == leastWindowWidth(w) &&
+                   w.window->width() == leastWindowWidth(w);
+        }(),
+        qPrintable(QStringLiteral("minimumWidth %1, width %2, least %3")
+                       .arg(w.window->minimumWidth())
+                       .arg(w.window->width())
+                       .arg(leastWindowWidth(w))));
 }
 
 // The outline of the findings list's highlight, which marks the selected row.
@@ -3389,6 +3523,11 @@ Window {
         QQuickItem *scroll = w.item("detailsScroll");
         QQuickItem *technical = w.item("technical");
         QVERIFY(scroll && technical);
+        roomForTheBar(w);
+        if (QTest::currentTestFailed()) {
+            return;
+        }
+        QTRY_VERIFY(inDetailsView(w, technical));
         w.click(technical);
         QTRY_VERIFY(w.item("technicalLines")->isVisible());
         QTRY_COMPARE(scroll->property("contentWidth").toReal(),
@@ -3611,6 +3750,11 @@ Window {
         QVERIFY(particulars);
         QVERIFY(!technical->property("checked").toBool());
         QVERIFY(!particulars->isVisible());
+        roomForTheBar(w);
+        if (QTest::currentTestFailed()) {
+            return;
+        }
+        QTRY_VERIFY(inDetailsView(w, technical));
         w.click(technical);
         QVERIFY(technical->property("checked").toBool());
         QTRY_VERIFY(particulars->isVisible());
@@ -3880,23 +4024,13 @@ Window {
         QQuickItem *toolbar = w.item("toolbar");
         QQuickItem *scroll = w.item("detailsScroll");
         QQuickItem *slot = w.item("videoSlot");
-        QVERIFY(panel && decisions && toolbar && scroll && slot);
-        // Read each time: the row's width follows its font's, and settles after the text size does.
-        const auto least = [decisions] {
-            return 160 + 260 + 2 + std::max(340, int(std::ceil(decisions->implicitWidth())));
-        };
-        // A window is never shrunk to a lowered minimum, so it is asked for the least each time the
-        // least has moved.
-        QTRY_VERIFY2(
-            [&] {
-                w.window->resize(w.window->minimumWidth(), w.window->minimumHeight());
-                return w.window->minimumWidth() == least() && w.window->width() == least();
-            }(),
-            qPrintable(QStringLiteral("minimumWidth %1, width %2, least %3")
-                           .arg(w.window->minimumWidth())
-                           .arg(w.window->width())
-                           .arg(least())));
-        QTRY_COMPARE(panel->width(), qreal(least() - 160 - 260 - 2));
+        QQuickItem *bar = w.videoItem("controlBar");
+        QVERIFY(panel && decisions && toolbar && scroll && slot && bar);
+        toTheLeastWidth(w);
+        if (QTest::currentTestFailed()) {
+            return;
+        }
+        QTRY_COMPARE(panel->width(), qreal(leastWindowWidth(w) - 160 - 260 - 2));
         const std::vector<std::pair<const char *, QString>> words = {
             {"undoButton", "Undo"}, {"rejectButton", "Reject"}, {"acceptButton", "Accept"}};
         QList<QQuickItem *> buttons;
@@ -3921,6 +4055,12 @@ Window {
         QVERIFY(left(buttons[1]) < left(buttons[2]));
         QVERIFY(qAbs(left(buttons[0]) - 8) < 0.5);
         QVERIFY(qAbs(left(buttons[2]) + buttons[2]->width() - (panel->width() - 8)) < 0.5);
+        // The video's place holds the video, 16:9, and its control bar under it.
+        QTRY_VERIFY2(qAbs(slot->height() - (slot->width() * 9 / 16 + bar->height())) <= 1,
+                     qPrintable(QStringLiteral("the place is %1x%2, the bar %3 tall")
+                                    .arg(slot->width())
+                                    .arg(slot->height())
+                                    .arg(bar->height())));
         const qreal videoBottom = slot->mapToItem(panel, QPointF(0, slot->height())).y();
         const qreal top = decisions->mapToItem(panel, QPointF()).y();
         QVERIFY(top >= videoBottom - 0.5);
@@ -5756,6 +5896,10 @@ Window {
             QQuickItem *clicked = w.item(qPrintable(where));
             QVERIFY(clicked && clicked->isVisible());
             if (where != "title") {
+                roomForTheBar(w);
+                if (QTest::currentTestFailed()) {
+                    return;
+                }
                 QTRY_VERIFY(inDetailsView(w, clicked));
             }
             at = w.middle(clicked);
@@ -5792,7 +5936,8 @@ Window {
         QQuickItem *details = w.item("details");
         QQuickItem *slot = w.item("videoSlot");
         QQuickItem *video = w.videoItem("video");
-        QVERIFY(sidebar && list && details && slot && video);
+        QQuickItem *bar = w.videoItem("controlBar");
+        QVERIFY(sidebar && list && details && slot && video && bar);
         const auto left = [](QQuickItem *of) { return of->mapToScene(QPointF(0, 0)).x(); };
         QCOMPARE(left(sidebar), 0.0);
         QVERIFY(left(list) >= sidebar->width());
@@ -5801,7 +5946,7 @@ Window {
         QCOMPARE(video->property("player").value<PlayerPort *>(), &w.player);
         QCOMPARE(left(slot), left(details));
         QCOMPARE(slot->width(), details->width());
-        QVERIFY(qAbs(slot->height() - slot->width() * 9 / 16) < 1);
+        QTRY_VERIFY(qAbs(slot->height() - (slot->width() * 9 / 16 + bar->height())) < 1);
         QCOMPARE(slot->mapToItem(details, QPointF(0, 0)).y(), 0.0);
 
         QObject *status = w.find("statusLine");
@@ -5817,9 +5962,10 @@ Window {
     }
 
     // The video draws in a window of its own, black, which a container in the details panel holds
-    // at the video's place, 16:9 at the panel's width: the video, the mark in its corner and the
-    // busy animation are that window's, and none of them is in the main window's scene. The window
-    // keeps to the place as the main window is resized and as the columns are dragged.
+    // at the video's place, 16:9 at the panel's width with the video's control bar under it: the
+    // video, the mark in its corner, the busy animation and the bar are that window's, and none of
+    // them is in the main window's scene. The window keeps to the place as the main window is
+    // resized and as the columns are dragged.
     void theVideoDrawsInAWindowOfItsOwnThatTheDetailsPanelHolds() {
         Shown w({media()});
         QVERIFY(w.start());
@@ -5828,7 +5974,8 @@ Window {
         QVERIFY(video);
         QVERIFY(video->isVisible());
         QCOMPARE(video->color(), QColor(Qt::black));
-        for (const char *name : {"videoPane", "video", "playIndicator", "videoLoading"}) {
+        for (const char *name :
+             {"videoPane", "video", "playIndicator", "videoLoading", "controlBar", "quietLine"}) {
             QQuickItem *each = w.videoItem(name);
             QVERIFY2(each, name);
             QVERIFY2(each->window() == video, name);
@@ -5836,9 +5983,12 @@ Window {
         QVERIFY(!w.item("video"));
         auto *mpv = qobject_cast<MpvItem *>(w.videoItem("video"));
         QQuickItem *pane = w.videoItem("videoPane");
-        QVERIFY(mpv && pane);
+        QQuickItem *bar = w.videoItem("controlBar");
+        QVERIFY(mpv && pane && bar);
         QCOMPARE(mpv->player(), &w.player);
-        QCOMPARE(mpv->mapRectToItem(pane, mpv->boundingRect()), pane->boundingRect());
+        // The video fills the pane above the bar.
+        QTRY_COMPARE(mpv->mapRectToItem(pane, mpv->boundingRect()),
+                     pane->boundingRect().adjusted(0, 0, 0, -bar->height()));
         auto *container = qobject_cast<QQuickItem *>(w.find("videoContainer"));
         QQuickItem *slot = w.item("videoSlot");
         QQuickItem *details = w.item("details");
@@ -5857,11 +6007,12 @@ Window {
                             .arg(slot->height());
             }
             if (qAbs(slot->width() - details->width()) >= 0.5 ||
-                qAbs(slot->height() - slot->width() * 9 / 16) > 1) {
-                said << QStringLiteral("the place is %1x%2 in a panel %3 wide")
+                qAbs(slot->height() - (slot->width() * 9 / 16 + bar->height())) > 1) {
+                said << QStringLiteral("the place is %1x%2 in a panel %3 wide, the bar %4 tall")
                             .arg(slot->width())
                             .arg(slot->height())
-                            .arg(details->width());
+                            .arg(details->width())
+                            .arg(bar->height());
             }
             const QRect held(container->mapToScene(QPointF()).toPoint(),
                              container->size().toSize());
@@ -6022,7 +6173,8 @@ Window {
     }
 
     // Where the video has no window of its own, its pane draws in the main window's scene, at its
-    // place in the details panel, and Pop Out is greyed: Ctrl+W quits, as it always does there.
+    // place in the details panel, the control bar under the video and the quiet line on it, and
+    // Pop Out is greyed, on the bar too: Ctrl+W quits, as it always does there.
     void withoutAWindowOfItsOwnTheVideoDrawsInTheWindowAndCannotPopOut() {
         Shown w({media()}, {}, {{QStringLiteral("videoWindowed"), false}});
         QSignalSpy finished(&w.bridge, &SessionBridge::finished);
@@ -6033,14 +6185,379 @@ Window {
         QObject *popOut = w.find("popOutVideo");
         QVERIFY(pane && container && popOut && w.videoWindow());
         QCOMPARE(pane->window(), w.window);
-        QCOMPARE(pane->parentItem(), w.item("videoSlot"));
-        QVERIFY(w.item("video"));
+        QQuickItem *slot = w.item("videoSlot");
+        QCOMPARE(pane->parentItem(), slot);
+        QQuickItem *video = w.item("video");
+        QVERIFY(video);
         QCOMPARE(container->property("window").value<QWindow *>(), nullptr);
         QVERIFY(!w.videoWindow()->isVisible());
         QVERIFY(!popOut->property("enabled").toBool());
+        QQuickItem *bar = w.item("controlBar");
+        QQuickItem *line = w.item("quietLine");
+        QVERIFY(bar && line);
+        QVERIFY(qAbs(bar->mapToItem(pane, QPointF()).y() -
+                     video->mapToItem(pane, QPointF(0, video->height())).y()) <= 0.5);
+        QTRY_VERIFY2(qAbs(slot->height() - (slot->width() * 9 / 16 + bar->height())) <= 1,
+                     qPrintable(QStringLiteral("the place is %1x%2, the bar %3 tall")
+                                    .arg(slot->width())
+                                    .arg(slot->height())
+                                    .arg(bar->height())));
+        QVERIFY(!w.item("popButton")->property("enabled").toBool());
+        qsizetype from = w.bridge.sent.size();
+        w.click(w.item("playButton"));
+        QCOMPARE(w.since(from), QStringList{"Playback Pause"});
+        from = w.bridge.sent.size();
         QTest::keyClick(w.window, Qt::Key_W, Qt::ControlModifier);
-        QCOMPARE(w.bridge.sent, (QStringList{"Interrupt", "Interrupt"}));
+        QCOMPARE(w.since(from), (QStringList{"Interrupt", "Interrupt"}));
         QTRY_COMPARE(finished.count(), 1);
+    }
+
+    // The control bar's clock says where mpv last said the video is, to the millisecond, as the
+    // details panel says a time; nothing while mpv has no place to say, as with no file open. The
+    // same time said again changes nothing.
+    void theClockSaysWhereMpvIsToTheMillisecond() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        auto *video = qobject_cast<MpvItem *>(w.videoItem("video"));
+        QQuickItem *label = w.videoItem("clockLabel");
+        QVERIFY(video && label);
+        QCOMPARE(video->clock(), QString());
+        QSignalSpy changed(video, &MpvItem::clockChanged);
+        video->heard(QStringLiteral("time-pos"), 754.45);
+        QCOMPARE(video->clock(), "0:12:34.450");
+        QCOMPARE(label->property("text").toString(), "0:12:34.450");
+        QCOMPARE(changed.count(), 1);
+        video->heard(QStringLiteral("time-pos"), 754.45);
+        QCOMPARE(changed.count(), 1);
+        video->heard(QStringLiteral("time-pos"), 0.0);
+        QCOMPARE(video->clock(), "0:00:00.000");
+        QCOMPARE(label->property("text").toString(), "0:00:00.000");
+        QCOMPARE(changed.count(), 2);
+        video->heard(QStringLiteral("time-pos"), QVariant());
+        QCOMPARE(video->clock(), QString());
+        QCOMPARE(label->property("text").toString(), QString());
+        QCOMPARE(changed.count(), 3);
+    }
+
+    // Under the video, in its window, a bar: Play/Pause with the state's mark and word, which a
+    // toggle never moves, the seeks and the frame steps, each sending what its item of the Video
+    // menu sends and named as that item is; and Pop Out, which sends nothing and takes the video
+    // out, then, as Pop In, puts it back. None takes the keys, and the bar waits while Settings is
+    // open. The mark grows with the word's text, where the one in the video's corner keeps its
+    // size.
+    void theControlBarSitsUnderTheVideoAndSendsWhatTheVideoMenuSends() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickWindow *video = w.videoWindow();
+        auto *mpv = qobject_cast<MpvItem *>(w.videoItem("video"));
+        QQuickItem *pane = w.videoItem("videoPane");
+        QQuickItem *bar = w.videoItem("controlBar");
+        QQuickItem *play = w.videoItem("playButton");
+        QQuickItem *word = w.videoItem("playWord");
+        QQuickItem *pop = w.videoItem("popButton");
+        QObject *container = w.find("videoContainer");
+        QVERIFY(video && mpv && pane && bar && play && word && pop && container);
+        QCOMPARE(bar->window(), video);
+        const qreal videoFoot = mpv->mapToItem(pane, QPointF(0, mpv->height())).y();
+        QVERIFY(qAbs(bar->mapToItem(pane, QPointF()).y() - videoFoot) <= 0.5);
+        QVERIFY(qAbs(bar->mapToItem(pane, QPointF(0, bar->height())).y() - pane->height()) <= 0.5);
+
+        struct Part {
+            const char *name;
+            QString words;
+            QString said;
+            QStringList sends;
+        };
+        const std::vector<Part> parts = {
+            {"playButton", "Paused", "Play/Pause", {"Playback Pause"}},
+            {"back5Button", "−5 s", "Back 5 s", {"Playback Seek -5"}},
+            {"previousFrameButton", "‹ Frame", "Previous Frame", {"Playback PreviousFrame"}},
+            {"nextFrameButton", "Frame ›", "Next Frame", {"Playback NextFrame"}},
+            {"forward5Button", "+5 s", "Forward 5 s", {"Playback Seek 5"}},
+        };
+        for (const Part &part : parts) {
+            QQuickItem *button = w.videoItem(part.name);
+            QVERIFY2(button, part.name);
+            QVERIFY2(bar->isAncestorOf(button), part.name);
+            // Play/Pause's words are its word's, beside the mark.
+            QQuickItem *words = button == play ? word : button;
+            QCOMPARE(words->property("text").toString(), part.words);
+            QAccessibleInterface *named = QAccessible::queryAccessibleInterface(button);
+            QVERIFY2(named, part.name);
+            QCOMPARE(named->text(QAccessible::Name), part.said);
+            QCOMPARE(button->property("focusPolicy").value<Qt::FocusPolicy>(), Qt::NoFocus);
+            const qsizetype from = w.bridge.sent.size();
+            w.click(button);
+            QVERIFY2(w.since(from) == part.sends,
+                     qPrintable(QStringLiteral("%1: %2").arg(
+                         part.name, w.since(from).join(QStringLiteral(" | ")))));
+        }
+
+        QCOMPARE(pop->property("text").toString(), "Pop Out");
+        QCOMPARE(pop->property("focusPolicy").value<Qt::FocusPolicy>(), Qt::NoFocus);
+        const qsizetype beforePop = w.bridge.sent.size();
+        w.click(pop);
+        QCOMPARE(w.since(beforePop), QStringList());
+        QVERIFY(w.window->property("videoOut").toBool());
+        QCOMPARE(container->property("window").value<QWindow *>(), nullptr);
+        QCOMPARE(pop->property("text").toString(), "Pop In");
+        QCOMPARE(pop->window(), video);
+        w.click(pop);
+        QCOMPARE(w.since(beforePop), QStringList());
+        QVERIFY(!w.window->property("videoOut").toBool());
+        QCOMPARE(container->property("window").value<QWindow *>(), video);
+        QCOMPARE(pop->property("text").toString(), "Pop Out");
+
+        // The word and the mark say the state, and nothing plays while nothing shows.
+        QQuickItem *bars = Shown::item(play, "pausedBars");
+        QQuickItem *triangle = Shown::item(play, "playingTriangle");
+        QVERIFY(bars && triangle);
+        QCOMPARE(word->property("text").toString(), "Paused");
+        QVERIFY(bars->isVisible());
+        QVERIFY(!triangle->isVisible());
+        layOut(bar);
+        const qreal pausedWidth = play->width();
+        mpv->heard(QStringLiteral("vo-configured"), true);
+        mpv->heard(QStringLiteral("pause"), false);
+        QCOMPARE(word->property("text").toString(), "Playing");
+        QVERIFY(triangle->isVisible());
+        QVERIFY(!bars->isVisible());
+        layOut(bar);
+        QVERIFY2(
+            qAbs(play->width() - pausedWidth) <= 0.5,
+            qPrintable(
+                QStringLiteral("%1 wide playing, %2 paused").arg(play->width()).arg(pausedWidth)));
+        mpv->heard(QStringLiteral("pause"), true);
+        QCOMPARE(word->property("text").toString(), "Paused");
+        QVERIFY(bars->isVisible());
+        QVERIFY(!triangle->isVisible());
+        mpv->heard(QStringLiteral("vo-configured"), false);
+        QCOMPARE(word->property("text").toString(), "Paused");
+
+        QQuickWindow *settings = w.settingsWindow();
+        QVERIFY(settings);
+        QTest::keyClick(w.window, Qt::Key_Comma, Qt::ControlModifier);
+        QTRY_VERIFY(settings->isVisible());
+        QVERIFY(!bar->isEnabled());
+        QTest::keyClick(settings, Qt::Key_Escape);
+        QTRY_VERIFY(!settings->isVisible());
+        QVERIFY(bar->isEnabled());
+
+        // The mark as tall as the word's letters reach, at the window's size of text and at the
+        // largest; the corner's the same at both.
+        QQuickItem *glyph = glyphIn(play);
+        QQuickItem *corner = glyphIn(w.videoItem("playIndicator"));
+        QVERIFY(glyph && corner);
+        const auto ascent = [word] {
+            return QFontMetricsF(word->property("font").value<QFont>()).ascent();
+        };
+        const auto tall = [glyph, ascent] {
+            return QStringLiteral("%1 tall, ascent %2").arg(glyph->height()).arg(ascent());
+        };
+        QVERIFY2(qAbs(glyph->height() - ascent()) <= 1, qPrintable(tall()));
+        QCOMPARE(corner->height(), 16.0);
+        w.settings.setWindowTextSize(24);
+        QTRY_COMPARE(word->property("font").value<QFont>().pointSizeF(), 24.0);
+        QTRY_VERIFY2(qAbs(glyph->height() - ascent()) <= 1, qPrintable(tall()));
+        QCOMPARE(corner->height(), 16.0);
+    }
+
+    void theControlBarKeepsEachGroupWholeAtEveryTextSize_data() {
+        QTest::addColumn<qreal>("points");
+        QTest::newRow("the platform's size") << qreal(0);
+        QTest::newRow("14 pt") << qreal(14);
+        QTest::newRow("18 pt") << qreal(18);
+        QTest::newRow("24 pt") << qreal(24);
+    }
+    // At each size of text, with the window at its least width, the control bar wraps between its
+    // groups, never inside one, as the window's least width counts its widest group: each part
+    // whole and inside the bar, the four seeks on one line, and Play/Pause on the clock's. Each
+    // part is drawn at the window's size of text.
+    void theControlBarKeepsEachGroupWholeAtEveryTextSize() {
+        QFETCH(qreal, points);
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        if (points > 0) {
+            w.settings.setWindowTextSize(points);
+        }
+        auto *mpv = qobject_cast<MpvItem *>(w.videoItem("video"));
+        QQuickItem *bar = w.videoItem("controlBar");
+        QVERIFY(mpv && bar);
+        // A time, so that the clock draws one.
+        mpv->heard(QStringLiteral("time-pos"), 754.45);
+        toTheLeastWidth(w);
+        if (QTest::currentTestFailed()) {
+            return;
+        }
+        const std::vector<const char *> names = {
+            "playButton",          "playWord",        "clockLabel",     "back5Button",
+            "previousFrameButton", "nextFrameButton", "forward5Button", "popButton"};
+        for (const char *name : names) {
+            QVERIFY2(w.videoItem(name), name);
+        }
+        // What keeps a part from being whole, inside the bar, on its group's line and at the
+        // window's size of text, said; nothing once each is.
+        const auto off = [&] {
+            QStringList said;
+            const qreal left = bar->property("leftPadding").toReal();
+            const qreal right = bar->width() - bar->property("rightPadding").toReal();
+            for (const char *name : names) {
+                QQuickItem *part = w.videoItem(name);
+                const QRectF at = part->mapRectToItem(bar, part->boundingRect());
+                if (part->width() < part->implicitWidth() - 0.5) {
+                    said << QStringLiteral("%1 is %2 wide of %3")
+                                .arg(name)
+                                .arg(part->width())
+                                .arg(part->implicitWidth());
+                }
+                if (at.left() < left - 0.5 || at.right() > right + 0.5 || at.top() < -0.5 ||
+                    at.bottom() > bar->height() + 0.5) {
+                    said << QStringLiteral("%1 is at %2,%3 %4x%5 in a bar %6x%7")
+                                .arg(name)
+                                .arg(at.x())
+                                .arg(at.y())
+                                .arg(at.width())
+                                .arg(at.height())
+                                .arg(bar->width())
+                                .arg(bar->height());
+                }
+                const qreal size = part->property("font").value<QFont>().pointSizeF();
+                if (size != w.settings.windowTextSize()) {
+                    said << QStringLiteral("%1 is at %2 pt").arg(name).arg(size);
+                }
+            }
+            const auto middle = [&w, bar](const char *name) {
+                QQuickItem *part = w.videoItem(name);
+                return part->mapToItem(bar, QPointF(0, part->height() / 2)).y();
+            };
+            for (const char *name : {"previousFrameButton", "nextFrameButton", "forward5Button"}) {
+                if (qAbs(middle(name) - middle("back5Button")) > 0.5) {
+                    said << QStringLiteral("%1 is not on back5Button's line").arg(name);
+                }
+            }
+            if (qAbs(middle("clockLabel") - middle("playButton")) > 0.5) {
+                said << QStringLiteral("clockLabel is not on playButton's line");
+            }
+            return said.join(QStringLiteral("; "));
+        };
+        QTRY_VERIFY2(off().isEmpty(), qPrintable(off()));
+    }
+
+    // While the video is black, a quiet line at its foot says how to show a finding in it: a fixed
+    // white, as the pane is black in every palette, centred, at the window's size of text, wrapping
+    // inside the video's sides and kept below its middle, where the busy animation draws. It goes
+    // while mpv shows a video, and while Show in Video waits, once the animation shows.
+    void theQuietLineShowsWhileTheVideoIsBlack() {
+        const auto restore = qScopeGuard([] { useColours(Colours::Default); });
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        auto *mpv = qobject_cast<MpvItem *>(w.videoItem("video"));
+        QQuickItem *line = w.videoItem("quietLine");
+        QQuickItem *loading = w.videoItem("videoLoading");
+        QVERIFY(mpv && line && loading);
+        QVERIFY(line->isVisible());
+        QCOMPARE(line->property("text").toString(), "Show in Video, or press O");
+        QCOMPARE(line->property("textFormat").toInt(), int(Qt::PlainText));
+        // As a text draws it, eight bits a channel.
+        const QRgb white = QColor::fromRgbF(1, 1, 1, 0.7).rgba();
+        QCOMPARE(line->property("color").value<QColor>().rgba(), white);
+        for (const Colours colours : everyColours) {
+            useColours(colours);
+            QCOMPARE(line->property("color").value<QColor>().rgba(), white);
+        }
+        useColours(Colours::Default);
+        // What keeps the line from its place on the video, said; nothing once it is there.
+        const auto off = [&w, mpv, line] {
+            QStringList said;
+            const QRectF at = line->mapRectToItem(mpv, line->boundingRect());
+            if (qAbs(at.bottom() - (mpv->height() - 8)) > 0.5) {
+                said << QStringLiteral("its foot is at %1 on a video %2 tall")
+                            .arg(at.bottom())
+                            .arg(mpv->height());
+            }
+            if (qAbs(at.center().x() - mpv->width() / 2) > 0.5) {
+                said << QStringLiteral("its middle is at %1 on a video %2 wide")
+                            .arg(at.center().x())
+                            .arg(mpv->width());
+            }
+            if (at.left() < -0.5 || at.right() > mpv->width() + 0.5) {
+                said << QStringLiteral("it spans %1 to %2 on a video %3 wide")
+                            .arg(at.left())
+                            .arg(at.right())
+                            .arg(mpv->width());
+            }
+            if (at.top() <= mpv->height() / 2) {
+                said << QStringLiteral("its top is at %1 on a video %2 tall")
+                            .arg(at.top())
+                            .arg(mpv->height());
+            }
+            const qreal size = line->property("font").value<QFont>().pointSizeF();
+            if (size != w.settings.windowTextSize()) {
+                said << QStringLiteral("it is at %1 pt").arg(size);
+            }
+            return said.join(QStringLiteral("; "));
+        };
+        QTRY_VERIFY2(off().isEmpty(), qPrintable(off()));
+        w.settings.setWindowTextSize(24);
+        toTheLeastWidth(w);
+        if (QTest::currentTestFailed()) {
+            return;
+        }
+        QTRY_VERIFY2(off().isEmpty(), qPrintable(off()));
+
+        mpv->heard(QStringLiteral("vo-configured"), true);
+        QVERIFY(!line->isVisible());
+        mpv->heard(QStringLiteral("vo-configured"), false);
+        QVERIFY(line->isVisible());
+        QTest::keyClick(w.window, Qt::Key_O);
+        QTRY_VERIFY(loading->property("running").toBool());
+        QVERIFY(!line->isVisible());
+        QTest::keyClick(w.window, Qt::Key_O, Qt::ShiftModifier);
+        QTRY_COMPARE(w.bridge.statusLine(), "Video closed");
+        QTRY_VERIFY(line->isVisible());
+    }
+
+    // The control bar draws in the style's palette, its window colour behind it and its mark in
+    // the button text's colour, as its buttons' words are, and follows a palette the platform
+    // changes to; a palette of the window's own, which colours what review says, leaves it alone.
+    void theControlBarDrawsInTheStylesPalette() {
+        const auto restore = qScopeGuard([] { useColours(Colours::Default); });
+        Shown w({media()});
+        QVERIFY(w.show());
+        QQuickItem *bar = w.videoItem("controlBar");
+        QQuickItem *play = w.videoItem("playButton");
+        QVERIFY(bar && play);
+        auto *background = bar->property("background").value<QQuickItem *>();
+        QQuickItem *glyph = glyphIn(play);
+        QVERIFY(background && glyph);
+        const auto behind = [background] { return background->property("color").value<QColor>(); };
+        const auto mark = [glyph] { return glyph->property("colour").value<QColor>(); };
+        const QColor window = paletteColour(w, "window");
+        const QColor buttonText = paletteColour(w, "buttonText");
+        QCOMPARE(behind(), window);
+        QCOMPARE(mark(), buttonText);
+        {
+            const auto putBack = qScopeGuard([] { QGuiApplication::setPalette(QPalette()); });
+            QPalette dark;
+            dark.setColor(QPalette::Window, QColor("#202020"));
+            dark.setColor(QPalette::ButtonText, QColor("#f0f0f0"));
+            QGuiApplication::setPalette(dark);
+            QTRY_COMPARE(behind(), QColor("#202020"));
+            QTRY_COMPARE(mark(), QColor("#f0f0f0"));
+            QCOMPARE(paletteColour(w, "window"), QColor("#202020"));
+            QCOMPARE(paletteColour(w, "buttonText"), QColor("#f0f0f0"));
+        }
+        QTRY_COMPARE(behind(), window);
+        QTRY_COMPARE(mark(), buttonText);
+        for (const Colours colours : everyColours) {
+            useColours(colours);
+            QCOMPARE(behind(), window);
+            QCOMPARE(mark(), buttonText);
+        }
     }
 
     // However many reviews the store holds, they take a third of the sidebar at most, and Show and
