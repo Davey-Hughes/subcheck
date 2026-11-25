@@ -1685,6 +1685,31 @@ Window {
         QCOMPARE(w.last(), "Clear");
     }
 
+    // The bar's seven menus, the View menu's two among them, open in windows of their own, over the
+    // video's window, under which the window's scene draws wherever the two meet. The list's Rows
+    // menu, which opens over the list, away from the video, stays in the scene, and the right-click
+    // menu is the platform's own where it has one. Qt Quick's Popup.Item, Popup.Window and
+    // Popup.Native are 0, 1 and 2.
+    void theBarsMenusOpenInWindowsOfTheirOwn() {
+        Shown w({media()});
+        QVERIFY(w.show());
+        QStringList inTheScene;
+        for (const char *title :
+             {"&File", "&Edit", "&View", "&Show", "&Rows", "F&inding", "Vi&deo"}) {
+            QObject *menu = w.menu(title);
+            QVERIFY2(menu, title);
+            if (menu->property("popupType").toInt() != 1) {
+                inTheScene << QString::fromUtf8(title);
+            }
+        }
+        QCOMPARE(inTheScene, QStringList());
+        QObject *rowsMenu = w.find("rowsMenu");
+        QObject *rowMenu = w.find("rowMenu");
+        QVERIFY(rowsMenu && rowMenu);
+        QCOMPARE(rowsMenu->property("popupType").toInt(), 0);
+        QCOMPARE(rowMenu->property("popupType").toInt(), 2);
+    }
+
     // Every menu the window draws is as wide as its items, each drawn whole with its shortcut, at
     // the platform's text size and at the largest Settings offers: the right-click menu, the list's
     // Rows menu, each menu of the bar and the View menu's two, Show among them, whose items come
@@ -7888,6 +7913,47 @@ Window {
             }
             QTRY_COMPARE(finished.count(), 1);
             QCOMPARE(finished[0][0].toInt(), 1);
+        }
+    }
+
+    // Review ending in an error takes the video's window from the window while the error's dialog
+    // shows, so that nothing of the video draws over the dialog, which the window draws in its
+    // scene; and Pop Out waits, as the window has nothing left to show. The same whether review
+    // ends before the window's first frame, as main.cpp starts it, with the video's window held,
+    // or with it out.
+    void aFatalEndTakesTheVideoOutFromUnderItsDialog() {
+        enum class Before { FirstFrame, Held, Out };
+        for (const Before before : {Before::FirstFrame, Before::Held, Before::Out}) {
+            const char *round = before == Before::FirstFrame ? "before the first frame"
+                                : before == Before::Held     ? "held"
+                                                             : "out";
+            Shown w({"no-such-run"});
+            QObject *dialog = w.find("fatal");
+            QObject *container = w.find("videoContainer");
+            QObject *popOut = w.find("popOutVideo");
+            QVERIFY2(dialog && container && popOut, round);
+            if (before == Before::FirstFrame) {
+                QVERIFY2(w.start(), round);
+            } else {
+                QVERIFY2(w.show(), round);
+                QQuickWindow *video = w.videoWindow();
+                QVERIFY2(video, round);
+                QTRY_VERIFY2(video->isVisible(), round);
+                if (before == Before::Out) {
+                    QVERIFY2(QMetaObject::invokeMethod(popOut, "trigger"), round);
+                    QVERIFY2(w.window->property("videoOut").toBool(), round);
+                    QVERIFY2(video->isVisible(), round);
+                } else {
+                    QCOMPARE(container->property("window").value<QWindow *>(), video);
+                }
+                w.bridge.start();
+            }
+            QTRY_VERIFY2(dialog->property("opened").toBool(), round);
+            QVERIFY2(!container->property("window").value<QWindow *>(), round);
+            QQuickWindow *video = w.videoWindow();
+            QVERIFY2(video, round);
+            QVERIFY2(!video->isVisible(), round);
+            QVERIFY2(!popOut->property("enabled").toBool(), round);
         }
     }
 };

@@ -157,8 +157,13 @@ ApplicationWindow {
     menuBar: MenuBar {
         id: bar
 
+        // Each menu of the bar opens in a window of its own, the View menu's two too: drawn in the
+        // window's scene, a menu draws under the video's window wherever the two meet. Each is
+        // given the window's font, which a menu of the bar in a window of its own does not take.
         WholeMenu {
             title: qsTr("&File")
+            popupType: Popup.Window
+            font: window.font
 
             // Not StandardKey.Preferences, which some platforms leave with no key. Enabled while
             // Settings is open, so that where a menu bar still offers it, it brings Settings to
@@ -204,6 +209,8 @@ ApplicationWindow {
         }
         WholeMenu {
             title: qsTr("&Edit")
+            popupType: Popup.Window
+            font: window.font
 
             // Not StandardKey.Undo, which has further keys on some platforms, that KDE's styles
             // warn of as they draw the item. It waits while an edit is open, as its U and the
@@ -246,11 +253,15 @@ ApplicationWindow {
         }
         WholeMenu {
             title: qsTr("&View")
+            popupType: Popup.Window
+            font: window.font
 
             WholeMenu {
                 id: showMenu
 
                 title: qsTr("&Show")
+                popupType: Popup.Window
+                font: window.font
 
                 Instantiator {
                     model: window.bridge.filters
@@ -275,6 +286,8 @@ ApplicationWindow {
             // heading opens these three under its Rows button too.
             WholeMenu {
                 title: qsTr("&Rows")
+                popupType: Popup.Window
+                font: window.font
 
                 Action {
                     id: rowsCompactAction
@@ -323,10 +336,11 @@ ApplicationWindow {
             }
             // Takes the video out into a window of its own, or puts it back, as its check now
             // says; that window's close, and Ctrl+W typed in it, put it back too. Greyed where the
-            // video has no window of its own.
+            // video has no window of its own, and once review has ended in an error, while the
+            // video's window stays hidden.
             Action {
                 objectName: "popOutVideo"
-                enabled: window.keysToReview && window.videoWindowed
+                enabled: window.keysToReview && window.videoWindowed && window.bridge.fatal === ""
                 text: qsTr("&Pop Out Video")
                 checkable: true
                 checked: window.videoOut
@@ -341,6 +355,8 @@ ApplicationWindow {
         }
         WholeMenu {
             title: qsTr("F&inding")
+            popupType: Popup.Window
+            font: window.font
 
             // These six, and the keypad's Enter, wait while a greyed episode's view shows: review
             // still has the finding selected, but the panel shows the episode's log in its place,
@@ -431,6 +447,8 @@ ApplicationWindow {
         }
         WholeMenu {
             title: qsTr("Vi&deo")
+            popupType: Popup.Window
+            font: window.font
 
             Action {
                 objectName: "pause"
@@ -702,11 +720,14 @@ ApplicationWindow {
                     onClicked: rowsMenu.open()
 
                     // Its right edge at the button's, so that it opens over the list it styles
-                    // rather than the details beside it.
+                    // rather than the details beside it. In the window's scene, unlike the bar's
+                    // menus: it opens over the list, away from the video, and in the scene it
+                    // keeps its place under its button.
                     WholeMenu {
                         id: rowsMenu
 
                         objectName: "rowsMenu"
+                        popupType: Popup.Item
                         x: rowStyleButton.width - width
                         y: rowStyleButton.height
 
@@ -861,11 +882,26 @@ ApplicationWindow {
         activeFocusOnTab: false
     }
     // The window the container holds, bound from outside it: inside, `window` names the
-    // container's own property, not this window.
+    // container's own property, not this window. None once review has ended in an error, while the
+    // error's dialog shows.
     Binding {
         target: videoContainer
         property: "window"
-        value: window.videoWindowed && !window.videoOut ? videoWindow : null
+        value: window.videoWindowed && !window.videoOut && window.bridge.fatal === ""
+               ? videoWindow : null
+    }
+    // Once review has ended in an error, the video's window hides, held or out: let go by the
+    // container, a window stays shown, on its own at the place it was held. This and the binding
+    // above both follow the error's one change, before the window's next frame, so that whichever
+    // runs first, no frame shows the video's window let go.
+    Connections {
+        target: window.bridge
+
+        function onFatalChanged() {
+            if (window.bridge.fatal !== "") {
+                videoWindow.visible = false;
+            }
+        }
     }
 
     // In the video's window, or where the video has none, in this window's scene at the video's
@@ -1000,6 +1036,10 @@ ApplicationWindow {
         separator: window.separator
     }
 
+    // What ended review in an error; closing it ends the program. Drawn in the window's scene,
+    // which draws under the video's window wherever the two meet: so the video's window hides while
+    // it shows, held or out (the handler beside the video's container), as the error has ended
+    // review and the video has nothing more to show.
     Dialog {
         objectName: "fatal"
         anchors.centerIn: parent
