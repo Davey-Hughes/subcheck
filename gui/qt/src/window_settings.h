@@ -1,14 +1,16 @@
 // What the window remembers between runs: its size, the place of its frame where the platform lets
 // a window place itself, and the widths of its sidebar and details panel, the list taking what is
-// left; what the Settings window chooses, the palette and the size of each part's text; the style
-// the list draws its rows in; and whether the View menu lists the episodes without findings last.
-// The frame's place is what is kept and what is restored, so that a window comes back to one place
-// however many times it starts.
+// left; the popped-out video's size and place, kept apart from the window's; what the Settings
+// window chooses, the palette and the size of each part's text; the style the list draws its rows
+// in; and whether the View menu lists the episodes without findings last. The frame's place is
+// what is kept and what is restored, so that a window comes back to one place however many times
+// it starts.
 #pragma once
 
 #include <QFont>
 #include <QObject>
 #include <QPoint>
+#include <QPointer>
 #include <QRect>
 #include <QRegion>
 #include <QSettings>
@@ -21,13 +23,16 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <utility>
 
 class QQuickWindow;
+class QScreen;
 
 class WindowSettings : public QObject {
     Q_OBJECT
     QML_ELEMENT
     QML_UNCREATABLE("main.cpp makes the one settings")
+    Q_MOC_INCLUDE(<QQuickWindow>)
     // The columns' widths, as last left: the window starts with them.
     Q_PROPERTY(int sidebarWidth READ sidebarWidth NOTIFY columnsChanged)
     Q_PROPERTY(int detailsWidth READ detailsWidth NOTIFY columnsChanged)
@@ -103,9 +108,21 @@ public:
     // maximized last time comes back to its own size when it is restored.
     void show(QQuickWindow *window);
 
-    // Keeps what the window last said, if it has said anything since this last ran, and writes
+    // Shows `video`, the video's window popped out of `main`, at its size from last time, else 960
+    // by 540, no larger than the free area of the screen it opens on unless its least size is; its
+    // frame where it was last time (`placeBack`), as `show` brings the main window back, else
+    // centred on the free area of `main`'s screen; where the platform lets no window place itself,
+    // the compositor places it. From then on it keeps its size, and its frame's place where the
+    // platform lets it, as they settle, as `show` keeps the main window's, under keys of its own,
+    // video/size and video/place; its maximized state is not kept. Only while it is a window of its
+    // own: held by another, as the details panel holds it, its size and place are the holder's to
+    // give, which a resize of the main window or a column's drag changes, and are none of the
+    // pop-out's. Watched from the first call for a window; a later call shows it from what is kept.
+    Q_INVOKABLE void showVideo(QQuickWindow *video, QQuickWindow *main);
+
+    // Keeps what each window last said, if it has said anything since this last ran, and writes
     // everything kept to the store at once.
-    void keep();
+    Q_INVOKABLE void keep();
 
     int sidebarWidth() const;
     int detailsWidth() const;
@@ -166,11 +183,36 @@ private:
         bool whole;
     };
 
+    // A window whose size and place are kept: its keys, with none for its maximized state where
+    // that is not kept; what it last said, until that is kept; the wait for it to settle, its own,
+    // so that one window's settling never keeps what another said halfway through a maximize; and
+    // the window, once it is watched.
+    struct Watch {
+        Watch(QString size, QString place, QString maximized);
+
+        const QString sizeKey;
+        const QString placeKey;
+        const QString maximizedKey;
+        std::optional<Said> said;
+        QTimer settled;
+        QPointer<QQuickWindow> window;
+    };
+
+    // Gives `window` the size and frame's place `watch` kept, as `show` says: its size, else
+    // `size`, bounded by the free area of the screen it comes back to, or of `screen` where it
+    // comes back to none. The size given, and whether the window was placed.
+    std::pair<QSize, bool> restore(const Watch &watch, QQuickWindow *window, QSize size,
+                                   const QScreen *screen);
+    // Has `watch` hear what `window` says from now on.
+    void watch(Watch &watch, QQuickWindow *window);
+    // Writes what `watch`'s window last said, if anything, to the store.
+    void keepSaid(Watch &watch);
+
     qreal textSize(const QString &key) const;
     void setTextSize(const QString &key, qreal points);
 
     std::unique_ptr<QSettings> store;
     bool placed;
-    std::optional<Said> said;
-    QTimer settled;
+    Watch mainWatch;
+    Watch videoWatch;
 };

@@ -514,6 +514,167 @@ private slots:
         QCOMPARE(in(dir)->value("window/place").toPoint(), place);
     }
 
+    // The first pop-out opens at 960 by 540, its frame centred on the free area of the screen the
+    // main window is on, whichever that is.
+    void thePopOutOpensAt960By540CentredOnTheMainWindowsScreen_data() {
+        QTest::addColumn<QString>("screen");
+        QTest::addColumn<QPoint>("at");
+        QTest::newRow("large") << "large" << QPoint(480, 270);
+        QTest::newRow("small") << "small" << QPoint(1952, 30);
+    }
+
+    void thePopOutOpensAt960By540CentredOnTheMainWindowsScreen() {
+        QFETCH(QString, screen);
+        QFETCH(QPoint, at);
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        WindowSettings settings(in(dir), "offscreen");
+        QQuickWindow main;
+        settings.show(&main);
+        if (screen == "small") {
+            main.setFramePosition(QPoint(1950, 10));
+        }
+        QTRY_COMPARE(main.screen()->name(), screen);
+        QQuickWindow video;
+        settings.showVideo(&video, &main);
+        QVERIFY(QTest::qWaitForWindowExposed(&video));
+        QCOMPARE(video.size(), QSize(960, 540));
+        QCOMPARE(video.framePosition(), at);
+    }
+
+    // The pop-out's size and place, once settled, are those the next run's pop-out opens at.
+    void thePopOutComesBackAtItsSizeAndPlace() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        {
+            WindowSettings settings(in(dir), "offscreen", std::chrono::milliseconds(1));
+            QQuickWindow main;
+            settings.show(&main);
+            QQuickWindow video;
+            settings.showVideo(&video, &main);
+            QVERIFY(move(video, QSize(800, 450), QPoint(300, 200)));
+            QTRY_COMPARE(in(dir)->value("video/size").toSize(), QSize(800, 450));
+            QTRY_COMPARE(in(dir)->value("video/place").toPoint(), QPoint(300, 200) - frame);
+        }
+        WindowSettings settings(in(dir), "offscreen");
+        QQuickWindow main;
+        settings.show(&main);
+        QQuickWindow video;
+        settings.showVideo(&video, &main);
+        QCOMPARE(video.size(), QSize(800, 450));
+        QCOMPARE(video.position(), QPoint(300, 200));
+    }
+
+    // Where the platform does not let a window place itself, the pop-out's size alone is kept and
+    // given back, and its place is neither kept nor set, centred or otherwise.
+    void onWaylandThePopOutComesBackAtItsSizeOnly() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        {
+            WindowSettings settings(in(dir), "wayland", std::chrono::milliseconds(1));
+            QQuickWindow main;
+            settings.show(&main);
+            QQuickWindow video;
+            video.setPosition(5, 6);
+            settings.showVideo(&video, &main);
+            QCOMPARE(video.position(), QPoint(5, 6));
+            QVERIFY(move(video, QSize(800, 450), QPoint(300, 200)));
+            QTRY_COMPARE(in(dir)->value("video/size").toSize(), QSize(800, 450));
+        }
+        QVERIFY(!in(dir)->contains("video/place"));
+        WindowSettings settings(in(dir), "wayland");
+        QQuickWindow main;
+        settings.show(&main);
+        QQuickWindow video;
+        video.setPosition(5, 6);
+        settings.showVideo(&video, &main);
+        QCOMPARE(video.size(), QSize(800, 450));
+        QCOMPARE(video.position(), QPoint(5, 6));
+    }
+
+    // A pop-out kept larger than the screen it opens on comes back no larger than its free area.
+    void aPopOutKeptLargerThanItsScreenComesBackInsideIt() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        in(dir)->setValue("video/size", QSize(3000, 2000));
+        WindowSettings settings(in(dir), "offscreen");
+        QQuickWindow main;
+        settings.show(&main);
+        QQuickWindow video;
+        settings.showVideo(&video, &main);
+        QCOMPARE(video.screen()->name(), "large");
+        QCOMPARE(video.size(), QSize(1920, 1080));
+    }
+
+    // The main window and the pop-out each keep their own size: resizing one leaves the other's as
+    // it was kept.
+    void theWindowAndThePopOutKeepTheirOwnSizes() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        WindowSettings settings(in(dir), "offscreen", std::chrono::milliseconds(1));
+        QQuickWindow main;
+        settings.show(&main);
+        QQuickWindow video;
+        settings.showVideo(&video, &main);
+        QTRY_COMPARE(in(dir)->value("window/size").toSize(), QSize(1280, 800));
+        QTRY_COMPARE(in(dir)->value("video/size").toSize(), QSize(960, 540));
+        QVERIFY(move(video, QSize(700, 400), QPoint(100, 100)));
+        QTRY_COMPARE(in(dir)->value("video/size").toSize(), QSize(700, 400));
+        QCOMPARE(in(dir)->value("window/size").toSize(), QSize(1280, 800));
+        QVERIFY(move(main, QSize(1000, 700), QPoint(50, 40)));
+        QTRY_COMPARE(in(dir)->value("window/size").toSize(), QSize(1000, 700));
+        QCOMPARE(in(dir)->value("video/size").toSize(), QSize(700, 400));
+    }
+
+    // keep writes what the pop-out last said too, before it settled, as the window's Pop In and
+    // its end keep it. The file is read as text, as in keepWritesTheFileAtOnce.
+    void keepWritesThePopOutsLastWord() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        WindowSettings settings(in(dir), "offscreen", std::chrono::hours(1));
+        QQuickWindow main;
+        settings.show(&main);
+        QQuickWindow video;
+        settings.showVideo(&video, &main);
+        QVERIFY(move(video, QSize(700, 400), QPoint(100, 100)));
+        settings.keep();
+        QFile file(dir.filePath("subcheck-qt.conf"));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const QByteArray text = file.readAll();
+        const qsizetype group = text.indexOf("[video]");
+        QVERIFY2(group >= 0, text.constData());
+        const QByteArray popOut = text.mid(group, text.indexOf("\n[", group + 1) - group);
+        QVERIFY2(popOut.contains("size=@Size(700 400)"), text.constData());
+    }
+
+    // Held by another window, as the details panel's container holds the video's, a window's size
+    // and place are its holder's to give and none of them is kept; let go, what it says is kept
+    // again. The platform cannot put a window in another, and says so at each change of parent.
+    void aVideoWindowHeldByAnotherIsNotKept() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        WindowSettings settings(in(dir), "offscreen", std::chrono::milliseconds(1));
+        QQuickWindow main;
+        settings.show(&main);
+        QQuickWindow video;
+        settings.showVideo(&video, &main);
+        QTRY_COMPARE(in(dir)->value("video/size").toSize(), QSize(960, 540));
+        QTRY_COMPARE(in(dir)->value("video/place").toPoint(), QPoint(480, 270));
+
+        QTest::ignoreMessage(QtWarningMsg, "This plugin does not support setParent!");
+        video.setParent(&main);
+        QVERIFY(move(video, QSize(400, 225), QPoint(10, 20)));
+        QTest::qWait(20);
+        settings.keep();
+        QCOMPARE(in(dir)->value("video/size").toSize(), QSize(960, 540));
+        QCOMPARE(in(dir)->value("video/place").toPoint(), QPoint(480, 270));
+
+        QTest::ignoreMessage(QtWarningMsg, "This plugin does not support setParent!");
+        video.setParent(nullptr);
+        QVERIFY(move(video, QSize(700, 400), QPoint(100, 100)));
+        QTRY_COMPARE(in(dir)->value("video/size").toSize(), QSize(700, 400));
+    }
+
     // The palette is kept by its name and drawn with from the start: the settings use the kept one
     // as they are made, a choice at once, and a name no palette has as the default.
     void thePaletteIsKeptByNameAndDrawnWithFromTheStart() {

@@ -86,6 +86,11 @@ class SessionBridge : public QObject {
     // Open, has lasted a moment, until a moment after it ends.
     Q_PROPERTY(PlayerPort *player READ player CONSTANT)
     Q_PROPERTY(bool videoLoading READ videoLoading NOTIFY videoLoadingChanged)
+    // The name the episodes list gives the file of the last Open handed to the player, which the
+    // popped-out video's title says: empty before the first Open, once a Close has been handed
+    // over, and should the list not name the file, as it names every file an Open can come from, a
+    // finding of the view.
+    Q_PROPERTY(QString videoLabel READ videoLabel NOTIFY videoLabelChanged)
 
 public:
     // `selector` is `subcheck review`'s: a run, or paths. `player` runs review's player commands,
@@ -126,6 +131,7 @@ public:
     bool showingEpisode() const;
     QString fatal() const;
     bool videoLoading() const;
+    QString videoLabel() const;
 
     // What the window's menus, keys, buttons and clicks ask of review, each one action but where
     // it says otherwise. The entry at `row`, as a click selects it.
@@ -223,6 +229,7 @@ signals:
     void episodeShown();
     void fatalChanged();
     void videoLoadingChanged();
+    void videoLabelChanged();
     // The window is done, and the process exits with `status`.
     void finished(int status);
 
@@ -335,7 +342,8 @@ private:
     // hand-over from the check to the Open nor at a change review sends while the Open runs, whose
     // summary has no check waiting and no Open to follow.
     bool waitingForVideo() const;
-    // The player's command from review, handed to the port; an Open uses up `openFollows`.
+    // The player's command from review, handed to the port; an Open uses up `openFollows` and names
+    // the video, and a Close leaves it nameless.
     void handOver(const subcheck_ffi::PlayerCommand &command);
     void ended(const subcheck_ffi::Event::kEnded &end);
     template <typename Call> void guarded(Call call);
@@ -387,6 +395,8 @@ private:
     std::optional<Found> found;
     // The count of the last Edit sent, until review answers it (editAnswered).
     std::optional<uint64_t> editAt;
+    // The name of the file the last Open handed over, as videoLabel says.
+    QString videoName;
     bool opened = false;
     bool quitting = false;
     bool done = false;

@@ -80,8 +80,10 @@ ApplicationWindow {
     // transient parent is set again, to this window, so that this window's shortcuts and menu
     // items hear the keys typed in it: a window a container has held has lost its transient
     // parent, though it can still read this one, and setting the value it reads changes nothing;
-    // hence null first. Its size is set and it is shown in this same handler: let go, the window
-    // stays where the container held it, at the pane's size, and would show there first.
+    // hence null first. It is sized, placed and shown in this same handler, where it was left or
+    // else at its first size in the middle of this window's screen (WindowSettings::showVideo): let
+    // go, the window stays where the container held it, at the pane's size, and would show there
+    // first.
     function popOut() {
         if (!window.videoWindowed || window.videoOut) {
             return;
@@ -89,15 +91,15 @@ ApplicationWindow {
         window.videoOut = true;
         videoWindow.transientParent = null;
         videoWindow.transientParent = window;
-        videoWindow.width = 960;
-        videoWindow.height = 540;
-        videoWindow.visible = true;
+        window.settings.showVideo(videoWindow, window);
         videoWindow.requestActivate();
     }
 
     // Puts the video's window back in the details panel, and gives this window the keys, which
-    // the pop-out had.
+    // the pop-out had. What the pop-out last said of its size and place is kept first, before the
+    // container gives it the pane's, so that the next Pop Out opens where this one was left.
     function popIn() {
+        window.settings.keep();
         window.videoOut = false;
         window.requestActivate();
     }
@@ -122,10 +124,19 @@ ApplicationWindow {
         onPressedAway: findBox.release()
     }
     // The same for a press in the video's window, held or out: no part of it keeps the box's keys.
+    // Out, while an edit is open, the press gives this window back the keys too, so that the next
+    // letter goes on into the edit's field: a person who clicks the video while typing means to go
+    // on typing, and the pop-out's keys are this window's shortcuts, a letter among them, which
+    // would end the edit or quit. Held, the video's window takes no keys from the field.
     PressAway {
         target: videoWindow
         menus: menuKeys
-        onPressedAway: findBox.release()
+        onPressedAway: {
+            findBox.release();
+            if (window.videoOut && window.bridge.editing) {
+                window.requestActivate();
+            }
+        }
     }
 
     // One filter is always the one shown, so that choosing it again keeps its check.
@@ -843,6 +854,7 @@ ApplicationWindow {
             windowFont: window.font
             videoBarHeight: videoPane.barHeight
             videoLeastWidth: videoPane.leastWidth
+            videoOut: window.videoOut
             font.pointSize: window.settings.detailsTextSize
             SplitView.preferredWidth: window.settings.detailsWidth
             SplitView.minimumWidth: window.detailsLeast
@@ -860,8 +872,17 @@ ApplicationWindow {
 
         objectName: "videoWindow"
         color: "black"
-        title: "subcheck"
+        // The episode of the file the video shows, not the selected finding's: the video stays on
+        // the moment it opened, whatever is selected after, until O opens another.
+        title: videoPane.showing && window.bridge.videoLabel !== ""
+               ? qsTr("%1 · subcheck").arg(window.bridge.videoLabel) : qsTr("subcheck")
         flags: Qt.Window | (window.videoOut ? 0 : Qt.WindowDoesNotAcceptFocus)
+        // Out, room for each group of the control bar whole and a video above it at 16:9, at the
+        // bar's height as it is laid out now. Held, none: the container sizes it, and for a layout
+        // pass after the size of text rises, the place can be narrower than the bar's least.
+        minimumWidth: window.videoOut ? Math.ceil(videoPane.leastWidth) : 0
+        minimumHeight: window.videoOut
+                       ? Math.ceil(videoPane.leastWidth * 9 / 16 + videoPane.barHeight) : 0
         onClosing: close => {
             close.accepted = false;
             window.popIn();

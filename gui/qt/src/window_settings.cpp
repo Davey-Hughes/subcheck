@@ -32,9 +32,13 @@ const QString windowTextKey = QStringLiteral("text/window");
 const QString listTextKey = QStringLiteral("text/list");
 const QString detailsTextKey = QStringLiteral("text/details");
 const QString noFindingsLastKey = QStringLiteral("view/noFindingsLast");
+const QString videoSizeKey = QStringLiteral("video/size");
+const QString videoPlaceKey = QStringLiteral("video/place");
 const QString rowStyleKey = QStringLiteral("rows/style");
 const QString defaultRowStyle = QStringLiteral("twoLines");
 const QSize defaultSize(1280, 800);
+// The popped-out video's, until it has one of its own: the whole window, its control bar in it.
+const QSize defaultVideoSize(960, 540);
 const int defaultSidebar = 220;
 const int defaultDetails = 480;
 
@@ -84,11 +88,30 @@ const QScreen *screenFor(QPoint place, QSize size) {
 
 } // namespace
 
+WindowSettings::Watch::Watch(QString size, QString place, QString maximized)
+    : sizeKey(std::move(size)), placeKey(std::move(place)), maximizedKey(std::move(maximized)) {}
+
 WindowSettings::WindowSettings(std::unique_ptr<QSettings> store, const QString &platform,
                                std::chrono::milliseconds settle, QObject *parent)
-    : QObject(parent), store(std::move(store)), placed(places(platform)) {
-    settled.setSingleShot(true);
-    settled.setInterval(settle);
+    : QObject(parent), store(std::move(store)), placed(places(platform)),
+      mainWatch(sizeKey, placeKey, maximizedKey), videoWatch(videoSizeKey, videoPlaceKey, {}) {
+    for (Watch *each : {&mainWatch, &videoWatch}) {
+        each->settled.setSingleShot(true);
+        each->settled.setInterval(settle);
+        // A window manager can report the frame's margins after the window's last move, and a
+        // change of margins emits nothing, so the frame's place is read once more as the window
+        // settles. Only while it shows, as a window of its own: a closed window has no margins, and
+        // would report its contents' corner. Only this window's word is kept: another's can be
+        // halfway through a maximize.
+        connect(&each->settled, &QTimer::timeout, this, [this, each] {
+            QQuickWindow *const shown = each->window;
+            if (placed && each->said && shown && shown->isVisible() && !shown->parent()) {
+                each->said->place = shown->framePosition();
+            }
+            keepSaid(*each);
+            this->store->sync();
+        });
+    }
     useColours(coloursNamed(this->store->value(paletteKey).toString()));
     // An unset size is the platform's as it is now, so a change of the desktop's font moves it;
     // with no one to say so the window would keep the old size until a restart. The application's
@@ -147,66 +170,99 @@ QPoint WindowSettings::placeBack(QPoint place, QSize size, const QRect &room, co
             std::max(room.y(), std::min(place.y(), room.y() + room.height() - size.height()))};
 }
 
-void WindowSettings::show(QQuickWindow *window) {
+std::pair<QSize, bool> WindowSettings::restore(const Watch &watch, QQuickWindow *window, QSize size,
+                                               const QScreen *screen) {
     std::optional<QPoint> place;
-    if (placed && store->contains(placeKey)) {
-        place = store->value(placeKey).toPoint();
+    if (placed && store->contains(watch.placeKey)) {
+        place = store->value(watch.placeKey).toPoint();
     }
     // The screen the window comes back to bounds its size, as until it is placed the window is on
     // the primary one, which can be smaller or larger than that screen.
-    QSize size = store->value(sizeKey, defaultSize).toSize();
+    size = store->value(watch.sizeKey, size).toSize();
     const QScreen *const there = place ? screenFor(*place, size) : nullptr;
-    if (const QScreen *screen = there ? there : window->screen()) {
-        size = size.boundedTo(screen->availableSize());
+    if (const QScreen *bound = there ? there : screen) {
+        size = size.boundedTo(bound->availableSize());
     }
     size = size.expandedTo(window->minimumSize());
     window->resize(size);
-    if (there) {
-        QRegion free;
-        const QList<QScreen *> screens = there->virtualSiblings();
-        for (const QScreen *each : screens) {
-            free += each->availableGeometry();
+    if (!there) {
+        return {size, false};
+    }
+    QRegion free;
+    const QList<QScreen *> screens = there->virtualSiblings();
+    for (const QScreen *each : screens) {
+        free += each->availableGeometry();
+    }
+    window->setFramePosition(placeBack(*place, size, there->availableGeometry(), free));
+    return {size, true};
+}
+
+void WindowSettings::watch(Watch &watch, QQuickWindow *window) {
+    watch.window = window;
+    const auto read = [&watch, window] {
+        // Held by another window, it has the size and place its holder gives it, not its own.
+        if (window->parent()) {
+            return;
         }
-        window->setFramePosition(placeBack(*place, size, there->availableGeometry(), free));
-    }
-    // Shown at its own size first, which is then the size it is restored to.
-    window->show();
-    if (store->value(maximizedKey, false).toBool()) {
-        window->showMaximized();
-    }
-    const auto read = [this, window] {
         const Qt::WindowStates states = window->windowStates();
-        said = Said{window->size(), window->framePosition(), states.testFlag(Qt::WindowMaximized),
-                    (states & (Qt::WindowMaximized | Qt::WindowFullScreen)) != 0};
-        settled.start();
+        watch.said =
+            Said{window->size(), window->framePosition(), states.testFlag(Qt::WindowMaximized),
+                 (states & (Qt::WindowMaximized | Qt::WindowFullScreen)) != 0};
+        watch.settled.start();
     };
     connect(window, &QWindow::widthChanged, this, read);
     connect(window, &QWindow::heightChanged, this, read);
     connect(window, &QWindow::xChanged, this, read);
     connect(window, &QWindow::yChanged, this, read);
     connect(window, &QWindow::windowStateChanged, this, read);
-    // A window manager can report the frame's margins after the window's last move, and a change of
-    // margins emits nothing, so the frame's place is read once more as the window settles. Only
-    // while it shows: a closed window has no margins, and would report its contents' corner.
-    connect(&settled, &QTimer::timeout, this, [this, shown = QPointer<QQuickWindow>(window)] {
-        if (placed && said && shown && shown->isVisible()) {
-            said->place = shown->framePosition();
+}
+
+void WindowSettings::show(QQuickWindow *window) {
+    restore(mainWatch, window, defaultSize, window->screen());
+    // Shown at its own size first, which is then the size it is restored to.
+    window->show();
+    if (store->value(maximizedKey, false).toBool()) {
+        window->showMaximized();
+    }
+    if (mainWatch.window != window) {
+        watch(mainWatch, window);
+    }
+}
+
+void WindowSettings::showVideo(QQuickWindow *video, QQuickWindow *main) {
+    const QScreen *const screen = main->screen();
+    const auto [size, back] = restore(videoWatch, video, defaultVideoSize, screen);
+    if (!back && placed && screen) {
+        // Its top left corner in view, should its least size be larger than the free area.
+        const QRect room = screen->availableGeometry();
+        video->setFramePosition({room.x() + std::max(0, (room.width() - size.width()) / 2),
+                                 room.y() + std::max(0, (room.height() - size.height()) / 2)});
+    }
+    video->show();
+    if (videoWatch.window != video) {
+        watch(videoWatch, video);
+    }
+}
+
+void WindowSettings::keepSaid(Watch &watch) {
+    if (!watch.said) {
+        return;
+    }
+    if (!watch.maximizedKey.isEmpty()) {
+        store->setValue(watch.maximizedKey, watch.said->maximized);
+    }
+    if (!watch.said->whole) {
+        store->setValue(watch.sizeKey, watch.said->size);
+        if (placed) {
+            store->setValue(watch.placeKey, watch.said->place);
         }
-        keep();
-    });
+    }
+    watch.said.reset();
 }
 
 void WindowSettings::keep() {
-    if (said) {
-        store->setValue(maximizedKey, said->maximized);
-        if (!said->whole) {
-            store->setValue(sizeKey, said->size);
-            if (placed) {
-                store->setValue(placeKey, said->place);
-            }
-        }
-        said.reset();
-    }
+    keepSaid(mainWatch);
+    keepSaid(videoWatch);
     // Now, not as the store would, at the event loop's next pass or as it is destroyed: the
     // window's hard end (main.cpp) ends the process straight after this, which runs neither.
     store->sync();

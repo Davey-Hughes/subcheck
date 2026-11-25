@@ -251,6 +251,8 @@ QString SessionBridge::fatal() const { return fatalText; }
 
 bool SessionBridge::videoLoading() const { return loading.shown(); }
 
+QString SessionBridge::videoLabel() const { return videoName; }
+
 void SessionBridge::select(int row) {
     // The core owns the selection: the list's moves wait for the summary that follows.
     if (std::optional<EntryKey> key = list.keyAt(row)) {
@@ -607,10 +609,18 @@ void SessionBridge::leaveQuietEpisode() {
 }
 
 void SessionBridge::handOver(const PlayerCommand &command) {
+    std::optional<QString> name;
     // An Open is what the change's open_follows told of, so the port's own count of it takes over
     // from here; no other command is.
-    if (std::holds_alternative<PlayerCommand::kOpen>(command.get_variant())) {
+    if (const auto *open = std::get_if<PlayerCommand::kOpen>(&command.get_variant())) {
         openFollows = false;
+        name = QString::fromStdString(files.labelOf(open->moment.file).value_or(std::string()));
+    } else if (std::holds_alternative<PlayerCommand::kClose>(command.get_variant())) {
+        name = QString();
+    }
+    if (name && *name != videoName) {
+        videoName = *name;
+        emit videoLabelChanged();
     }
     port.run(command);
     loading.set(waitingForVideo());

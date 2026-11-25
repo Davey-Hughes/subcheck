@@ -99,11 +99,15 @@ int run(int argc, char **argv) {
         return 1;
     }
     settings.show(window);
-    // The settings kept now, as no teardown will keep them, and the window heard no more: hidden
-    // next, it can say it is no longer maximized, which the settings would keep once it settled.
-    const auto keepSettings = [&settings, window] {
+    // The settings kept now, as no teardown will keep them, and no window heard any more, the
+    // popped-out video's among them: hidden next, a window can say it is no longer maximized, or
+    // where it is as it goes, which the settings would keep once it settled.
+    const auto keepSettings = [&settings] {
         settings.keep();
-        QObject::disconnect(window, nullptr, &settings, nullptr);
+        const QWindowList windows = QGuiApplication::allWindows();
+        for (QWindow *each : windows) {
+            QObject::disconnect(each, nullptr, &settings, nullptr);
+        }
     };
     const auto hideWindows = [] {
         const QWindowList windows = QGuiApplication::topLevelWindows();

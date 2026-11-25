@@ -1,17 +1,17 @@
 // The details panel: the video's place, 16:9 at the panel's width with the video's control bar
-// under it, which the window fills with the video (Main.qml); under it a row of its own with Undo
-// at the left and Reject and Accept at the right, which stays between the video and what scrolls;
-// then the selected finding as the window words it: its line as it is now above its line with the
-// fix, each a block of its own that keeps its place from one finding to the next for a line of one
-// or two lines at the block's own font (one of three or more, or one drawn partly in a taller
-// fallback font, moves what is below it down); a click on the block with the fix opens its edit at
-// the nearest character, while it can be reworded, and while an edit is open the line gives way to
-// a field for its wording; below them its banners, its mark and why it was found; its file's
-// particulars under a disclosure; and what the check said of the episode selected while that is
-// the finding's: below the finding, set off by a line, or alone with none selected. For a click on
-// an episode the check found nothing in, its log shows alone, in the finding's place, while review
-// keeps the finding selected: below the finding, the two would read as one, and the log is not the
-// finding's.
+// under it, which the window fills with the video (Main.qml), while the video is not out in a
+// window of its own; under it a row of its own with Undo at the left and Reject and Accept at the
+// right, which stays between the video and what scrolls; then the selected finding as the window
+// words it: its line as it is now above its line with the fix, each a block of its own that keeps
+// its place from one finding to the next for a line of one or two lines at the block's own font
+// (one of three or more, or one drawn partly in a taller fallback font, moves what is below it
+// down); a click on the block with the fix opens its edit at the nearest character, while it can be
+// reworded, and while an edit is open the line gives way to a field for its wording; below them its
+// banners, its mark and why it was found; its file's particulars under a disclosure; and what the
+// check said of the episode selected while that is the finding's: below the finding, set off by a
+// line, or alone with none selected. For a click on an episode the check found nothing in, its log
+// shows alone, in the finding's place, while review keeps the finding selected: below the finding,
+// the two would read as one, and the log is not the finding's.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -34,6 +34,9 @@ Control {
     // video's pane.
     property real videoBarHeight
     property real videoLeastWidth
+    // Whether the video is out, a window of its own: its place goes, and the decisions' row is the
+    // panel's first.
+    property bool videoOut
     // The window's line between parts, drawn here between the finding and its episode's log.
     required property color separator
     // Whether Reject and Accept have a finding to act on, which the window decides, as its menu and
@@ -174,6 +177,7 @@ Control {
 
             objectName: "videoSlot"
             color: "black"
+            visible: !panel.videoOut
             Layout.fillWidth: true
             Layout.preferredHeight: width * 9 / 16 + panel.videoBarHeight
         }

@@ -616,6 +616,22 @@ void typeIn(const Shown &w, const char *text) {
     }
 }
 
+// `window` resized and moved to `to`, waited for in an event loop until it has said so, as the
+// settings hear it: its geometry reads as the platform has it at once, and the window says what
+// changed only as the platform's report of it is handled.
+bool resizeAndMove(QQuickWindow *window, const QRect &to) {
+    QRect said = window->geometry();
+    const QObject heard;
+    QObject::connect(window, &QWindow::xChanged, &heard, [&said](int x) { said.moveLeft(x); });
+    QObject::connect(window, &QWindow::yChanged, &heard, [&said](int y) { said.moveTop(y); });
+    QObject::connect(window, &QWindow::widthChanged, &heard, [&said](int w) { said.setWidth(w); });
+    QObject::connect(window, &QWindow::heightChanged, &heard,
+                     [&said](int h) { said.setHeight(h); });
+    window->resize(to.size());
+    window->setPosition(to.topLeft());
+    return Shown::runUntil([&said, &to] { return said == to; });
+}
+
 // The colour of the window palette's `role`.
 QColor paletteColour(const Shown &w, const char *role) {
     return w.window->property("palette").value<QObject *>()->property(role).value<QColor>();
@@ -6082,6 +6098,7 @@ Window {
             QCOMPARE(w.since(from), QStringList());
             QCOMPARE(container->property("window").value<QWindow *>(), nullptr);
             QVERIFY(video->isVisible());
+            // Holds offscreen without popOut's null first: only the Plasma and Mac runs guard it.
             QCOMPARE(video->transientParent(), w.window);
             QCOMPARE(video->size(), QSize(960, 540));
             QVERIFY(popOut->property("checked").toBool());
@@ -6189,6 +6206,332 @@ Window {
         QTest::keyClick(w.window, Qt::Key_Escape);
         QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
         QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // The first Pop Out opens the video at 960 by 540, centred on the free area of the main
+    // window's screen; after that, at the size and place it was left at: across a Pop In, however
+    // the main window and its columns move the video while it is held, and across a restart.
+    void popOutOpensWhereItWasLeftAndKeepsItAcrossARestart() {
+        QTemporaryDir kept;
+        QVERIFY(kept.isValid());
+        const QRect left(QPoint(300, 200), QSize(800, 450));
+        const auto there = [&left](QQuickWindow *video) {
+            return video->geometry() == left ? QString()
+                                             : QStringLiteral("the pop-out is at %1,%2 %3x%4")
+                                                   .arg(video->x())
+                                                   .arg(video->y())
+                                                   .arg(video->width())
+                                                   .arg(video->height());
+        };
+        {
+            Shown w({media()}, kept.path());
+            QVERIFY(w.start());
+            QTRY_COMPARE(w.rows(), 2);
+            QObject *popOut = w.find("popOutVideo");
+            QQuickWindow *video = w.videoWindow();
+            QQuickItem *list = w.item("findings");
+            QQuickItem *details = w.item("details");
+            QVERIFY(popOut && video && list && details);
+            QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+            QCOMPARE(video->size(), QSize(960, 540));
+            const QRect free = w.window->screen()->availableGeometry();
+            const QPoint centred =
+                free.topLeft() + QPoint((free.width() - 960) / 2, (free.height() - 540) / 2);
+            const QPoint frame = video->framePosition();
+            QVERIFY2(qAbs(frame.x() - centred.x()) <= 1 && qAbs(frame.y() - centred.y()) <= 1,
+                     qPrintable(QStringLiteral("the frame is at %1,%2, centred is %3,%4")
+                                    .arg(frame.x())
+                                    .arg(frame.y())
+                                    .arg(centred.x())
+                                    .arg(centred.y())));
+            QVERIFY(resizeAndMove(video, left));
+
+            QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+            QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+            QVERIFY2(there(video).isEmpty(), qPrintable(there(video)));
+
+            QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+            QTRY_VERIFY(w.videoNotLaidOut().isEmpty());
+            const QRect held = video->geometry();
+            w.window->resize(1100, 700);
+            w.drag(list, details, 40);
+            QTRY_VERIFY(video->geometry().size() != held.size() &&
+                        video->geometry().topLeft() != held.topLeft());
+            QTRY_VERIFY(w.videoNotLaidOut().isEmpty());
+            // Longer than the settings wait for a window to settle.
+            static_cast<void>(Shown::runUntil([] { return false; }, 400));
+            QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+            QVERIFY2(there(video).isEmpty(), qPrintable(there(video)));
+        }
+        Shown w({media()}, kept.path());
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickWindow *video = w.videoWindow();
+        QVERIFY(video);
+        QVERIFY(QMetaObject::invokeMethod(w.find("popOutVideo"), "trigger"));
+        QVERIFY2(there(video).isEmpty(), qPrintable(there(video)));
+    }
+
+    // The pop-out's title names the episode of the file the video shows, once it shows one, as
+    // review's last Open named it; with none shown, or once the video is closed, it is the app's
+    // name. The main window's title is the view's all the while.
+    void thePopOutsTitleNamesTheEpisodeItShows() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QVERIFY(QMetaObject::invokeMethod(w.find("popOutVideo"), "trigger"));
+        QQuickWindow *video = w.videoWindow();
+        auto *mpv = qobject_cast<MpvItem *>(w.videoItem("video"));
+        QVERIFY(video && mpv);
+        QCOMPARE(video->title(), "subcheck");
+        const QString label = QString::fromStdString(w.bridge.findings()->at(0)->label);
+        QCOMPARE(label, "E01");
+        QTest::keyClick(w.window, Qt::Key_O);
+        QTRY_COMPARE(w.bridge.videoLabel(), label);
+        QCOMPARE(video->title(), "subcheck");
+        mpv->heard(QStringLiteral("vo-configured"), true);
+        QCOMPARE(video->title(), "E01 · subcheck");
+        QCOMPARE(w.window->title(), w.bridge.title());
+        QTest::keyClick(w.window, Qt::Key_O, Qt::ShiftModifier);
+        QTRY_COMPARE(w.bridge.videoLabel(), QString());
+        QCOMPARE(video->title(), "subcheck");
+        QCOMPARE(w.window->title(), w.bridge.title());
+    }
+
+    // While the video is out, its place in the details panel goes, and the row of decisions is the
+    // panel's first; put back, the row is under the place again.
+    void whileTheVideoIsOutTheDecisionsSitAtTheTopOfTheDetails() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *details = w.item("details");
+        QQuickItem *slot = w.item("videoSlot");
+        QQuickItem *decisions = w.item("decisions");
+        QObject *popOut = w.find("popOutVideo");
+        QVERIFY(details && slot && decisions && popOut);
+        const auto top = [details, decisions] {
+            return decisions->mapToItem(details, QPointF(0, 0)).y();
+        };
+        const auto slotFoot = [details, slot] {
+            return slot->mapToItem(details, QPointF(0, slot->height())).y();
+        };
+        QVERIFY(slotFoot() > 0);
+        QTRY_VERIFY(qAbs(top() - slotFoot()) < 0.5);
+        QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+        QTRY_VERIFY(!slot->isVisible());
+        QTRY_COMPARE(top(), 0.0);
+        QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+        QTRY_VERIFY(slot->isVisible());
+        QTRY_VERIFY(slotFoot() > 0 && qAbs(top() - slotFoot()) < 0.5);
+        QTRY_VERIFY(w.videoNotLaidOut().isEmpty());
+    }
+
+    // A key typed in the pop-out reaches review once, as from the main window; Settings, opened
+    // from the pop-out, holds them back there too, until it closes.
+    void keysFromThePopOutReachReviewOnceAndSettingsHoldsThemBack() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickWindow *settings = w.settingsWindow();
+        QVERIFY(settings);
+        QVERIFY(QMetaObject::invokeMethod(w.find("popOutVideo"), "trigger"));
+        QQuickWindow *video = w.videoWindow();
+        QVERIFY(video);
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(video));
+        qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(video, Qt::Key_J);
+        QCOMPARE(w.since(from), QStringList{"Move 1"});
+        QTest::keyClick(video, Qt::Key_Comma, Qt::ControlModifier);
+        QTRY_VERIFY(settings->isVisible());
+        from = w.bridge.sent.size();
+        QTest::keyClick(video, Qt::Key_J);
+        QTest::keyClick(video, Qt::Key_Space);
+        QCOMPARE(w.since(from), QStringList());
+        QTest::keyClick(settings, Qt::Key_Escape);
+        QTRY_VERIFY(!settings->isVisible());
+        video->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(video));
+        from = w.bridge.sent.size();
+        QTest::keyClick(video, Qt::Key_J);
+        QCOMPARE(w.since(from), QStringList{"Move 1"});
+    }
+
+    // Out, while an edit is open, a press in the pop-out gives the main window back the keys, so
+    // that the next letter goes on into the edit's field, and none of the main window's keys runs:
+    // on the video, and on the control bar, whose button still does what it does. With no edit
+    // open, the pop-out keeps the keys, which reach review.
+    void aPressInThePopOutWhileAnEditIsOpenGivesTheFieldItsKeys() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QVERIFY(QMetaObject::invokeMethod(w.find("popOutVideo"), "trigger"));
+        QQuickWindow *video = w.videoWindow();
+        QVERIFY(video);
+        w.window->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_E);
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(field);
+        QTRY_VERIFY(field->hasActiveFocus());
+
+        video->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(video));
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(video));
+        const qsizetype clicked = w.bridge.sent.size();
+        w.click(w.videoItem("video"));
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+        QTRY_VERIFY(field->hasActiveFocus());
+        QTest::keyClick(QGuiApplication::focusWindow(), 'q');
+        QCOMPARE(w.since(clicked), QStringList());
+        QVERIFY(field->property("text").toString().endsWith('q'));
+        const qsizetype played = w.bridge.sent.size();
+        w.click(w.videoItem("playButton"));
+        QCOMPARE(w.since(played), QStringList{"Playback Pause"});
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+        QVERIFY(field->hasActiveFocus());
+        // Ended unsaved, so that the run is left as found.
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!w.bridge.editing());
+        QCOMPARE(w.since(from), (QStringList{"Edit", "Playback Pause", "CancelEdit"}));
+
+        video->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(video));
+        w.click(w.videoItem("video"));
+        // Long enough for an activation asked for to have landed.
+        static_cast<void>(Shown::runUntil([] { return false; }, 100));
+        QCOMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(video));
+        const qsizetype moved = w.bridge.sent.size();
+        QTest::keyClick(video, Qt::Key_J);
+        QCOMPARE(w.since(moved), QStringList{"Move 1"});
+    }
+
+    // Show in Video while the video is out: the busy animation shows in the pop-out once the wait
+    // has lasted its moment, in place of the quiet line, and the title follows the file once it
+    // shows.
+    void showInVideoWhilePoppedOutLoadsThere() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QVERIFY(QMetaObject::invokeMethod(w.find("popOutVideo"), "trigger"));
+        QQuickWindow *video = w.videoWindow();
+        auto *mpv = qobject_cast<MpvItem *>(w.videoItem("video"));
+        QQuickItem *loading = w.videoItem("videoLoading");
+        QQuickItem *line = w.videoItem("quietLine");
+        QVERIFY(video && mpv && loading && line);
+        QCOMPARE(loading->window(), video);
+        QCOMPARE(line->window(), video);
+        QVERIFY(line->isVisible());
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(video));
+        QElapsedTimer pressed;
+        pressed.start();
+        QTest::keyClick(video, Qt::Key_O);
+        QVERIFY(!loading->property("running").toBool());
+        QTRY_VERIFY(loading->property("running").toBool());
+        // A coarse timer can end a little early.
+        QVERIFY2(pressed.elapsed() >= 475, qPrintable(QString::number(pressed.elapsed())));
+        QVERIFY(!line->isVisible());
+        QCOMPARE(w.bridge.videoLabel(), "E01");
+        QCOMPARE(video->title(), "subcheck");
+        mpv->heard(QStringLiteral("vo-configured"), true);
+        QCOMPARE(video->title(), "E01 · subcheck");
+        QTest::keyClick(video, Qt::Key_O, Qt::ShiftModifier);
+        QTRY_COMPARE(w.bridge.statusLine(), "Video closed");
+        QCOMPARE(video->title(), "subcheck");
+    }
+
+    // Quitting from the pop-out ends review as from the main window, and the pop-out's size, said
+    // just before, before it could settle, is kept for the next start.
+    void quittingWhilePoppedOutEndsAndKeepsItsSize() {
+        QTemporaryDir kept;
+        QVERIFY(kept.isValid());
+        {
+            Shown w({media()}, kept.path());
+            QSignalSpy finished(&w.bridge, &SessionBridge::finished);
+            QVERIFY(w.start());
+            QTRY_COMPARE(w.rows(), 2);
+            QVERIFY(QMetaObject::invokeMethod(w.find("popOutVideo"), "trigger"));
+            QQuickWindow *video = w.videoWindow();
+            QVERIFY(video);
+            QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(video));
+            QVERIFY(resizeAndMove(video, QRect(video->position(), QSize(700, 400))));
+            const qsizetype from = w.bridge.sent.size();
+            QTest::keyClick(video, Qt::Key_Q);
+            QCOMPARE(w.since(from), (QStringList{"Interrupt", "Interrupt"}));
+            QTRY_COMPARE(finished.count(), 1);
+            QCOMPARE(finished.at(0).at(0).toInt(), 0);
+        }
+        const QSettings settings(kept.filePath("subcheck-qt.conf"), QSettings::IniFormat);
+        QCOMPARE(settings.value("video/size").toSize(), QSize(700, 400));
+    }
+
+    // A size of text or a palette changed while the video is out reaches the pop-out at once: its
+    // bar's buttons take the size and wrap inside the pop-out, whose size stays, and whose least
+    // width keeps each of the bar's groups whole; and its bar draws in the new palette. Put back,
+    // the window has no least size of its own, as the container sizes it.
+    void aTextSizeChangedWhileOutReachesThePopOut() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *popOut = w.find("popOutVideo");
+        QVERIFY(popOut);
+        QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+        QQuickWindow *video = w.videoWindow();
+        QQuickItem *bar = w.videoItem("controlBar");
+        QVERIFY(video && bar);
+        QCOMPARE(video->size(), QSize(960, 540));
+        w.settings.setWindowTextSize(24);
+        const std::vector<const char *> buttons = {"playButton",          "back5Button",
+                                                   "previousFrameButton", "nextFrameButton",
+                                                   "forward5Button",      "popButton"};
+        for (const char *name : buttons) {
+            QQuickItem *button = w.videoItem(name);
+            QVERIFY2(button, name);
+            QTRY_COMPARE(button->property("font").value<QFont>().pointSizeF(), 24.0);
+        }
+        auto *flow = bar->property("contentItem").value<QQuickItem *>();
+        QVERIFY(flow);
+        // What keeps a group of the bar from lying inside the pop-out, said; nothing once each
+        // does.
+        const auto off = [&w, video, flow] {
+            QStringList said;
+            const QList<QQuickItem *> groups = flow->childItems();
+            for (QQuickItem *group : groups) {
+                const QRectF at = group->mapRectToItem(video->contentItem(), group->boundingRect());
+                if (at.left() < -0.5 || at.right() > video->width() + 0.5) {
+                    said << QStringLiteral("a group spans %1 to %2 in a pop-out %3 wide")
+                                .arg(at.left())
+                                .arg(at.right())
+                                .arg(video->width());
+                }
+            }
+            if (const QString laidOut = w.videoNotLaidOut(); !laidOut.isEmpty()) {
+                said << laidOut;
+            }
+            return said.join(QStringLiteral("; "));
+        };
+        QTRY_VERIFY2(off().isEmpty(), qPrintable(off()));
+        QCOMPARE(video->size(), QSize(960, 540));
+        const auto least = [bar] { return qCeil(bar->property("leastWidth").toReal()); };
+        QTRY_COMPARE(video->minimumWidth(), least());
+        QTRY_COMPARE(video->minimumHeight(), qCeil(least() * 9.0 / 16 + bar->implicitHeight()));
+
+        auto *background = bar->property("background").value<QQuickItem *>();
+        QVERIFY(background);
+        const QColor before = background->property("color").value<QColor>();
+        {
+            const auto putBack = qScopeGuard([] { QGuiApplication::setPalette(QPalette()); });
+            QPalette dark;
+            dark.setColor(QPalette::Window, QColor("#202020"));
+            QGuiApplication::setPalette(dark);
+            QTRY_COMPARE(background->property("color").value<QColor>(), QColor("#202020"));
+        }
+        QTRY_COMPARE(background->property("color").value<QColor>(), before);
+
+        QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+        QCOMPARE(video->minimumWidth(), 0);
+        QCOMPARE(video->minimumHeight(), 0);
+        QTRY_VERIFY(w.videoNotLaidOut().isEmpty());
     }
 
     // Where the video has no window of its own, its pane draws in the main window's scene, at its
