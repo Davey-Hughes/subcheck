@@ -381,8 +381,9 @@ set_tests_properties(app_starts_with_nothing_to_open PROPERTIES
 
 # The tests on real mpv, each on an X display of its own: the pane as the player's mpv
 # (tests/pane_test.cpp), on timing.mkv and ties.mkv, two fixtures with video; and the app end to
-# end (tests/end_to_end_test.cpp), over a run of timing.mkv. Linux only, as Xvfb and xdotool are
-# X11's: the gui job runs them, and gui-macos does not.
+# end (tests/end_to_end_test.cpp), over runs of timing.mkv and apply.mkv, fixtures with video, the
+# second with a typo to edit. Linux only, as Xvfb and xdotool are X11's: the gui job runs them,
+# and gui-macos does not.
 if(NOT APPLE)
     find_program(XVFB Xvfb REQUIRED)
     find_program(XDOTOOL xdotool REQUIRED)

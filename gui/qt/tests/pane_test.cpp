@@ -4,8 +4,13 @@
 // moves, and a load that fails when its file ends on an error. A line opens on its first frame,
 // paused or playing as mpv was, and the pane draws it. Once closed, the pane is black again. mpv's
 // render call never holds the window to the video's frame rate, and a frame stretched is drawn
-// again once the stretch ends. mpv's config is one a user could have: `hr-seek=no`, which would
-// land a load on a keyframe but for the option review gives each load, and
+// again once the stretch ends. The pane is held as the app holds the video: in a window of its
+// own, which a container embeds in the test's window, and which the last tests take out and put
+// back as Pop Out and Pop In do, while a subtitle shows, while the video plays and while an open
+// waits on mpv. So the pane's pixels are grabbed from its own window, as a grab of the window that
+// holds an embedded window leaves that window out; and its frames are counted there, as they are
+// its own window's, not the test window's. mpv's config is one a user could have: `hr-seek=no`,
+// which would land a load on a keyframe but for the option review gives each load, and
 // `reset-on-next-file=pause`, under which the play state still holds. Linux only: Xvfb is X11's.
 #include "desktop_session.h"
 #include "mpv_item.h"
@@ -59,6 +64,10 @@ class PaneTest : public QObject {
     PlayerPort player{std::chrono::seconds(20), std::chrono::seconds(20), std::chrono::seconds(20)};
     QQmlEngine engine;
     std::unique_ptr<QObject> window;
+    // What holds the pane's window in the test's window, as the details panel holds the app's, and
+    // that window, in which the pane draws.
+    QObject *container = nullptr;
+    QQuickWindow *videoWindow = nullptr;
     MpvItem *pane = nullptr;
     QStringList reports;
     std::string video = qEnvironmentVariable("SUBCHECK_TEST_VIDEO").toStdString();
@@ -66,11 +75,11 @@ class PaneTest : public QObject {
     // leaves in it: the player seeks only in the file mpv says it has open.
     std::string lines = QDir::cleanPath(qEnvironmentVariable("SUBCHECK_TEST_LINES")).toStdString();
 
-    // The pane's pixels that are bright, in what the window shows now: the fixture's video is all
+    // The pane's pixels that are bright, in what its window shows now: the fixture's video is all
     // but black, so these are a subtitle's. -1 when the grab holds none of the pane, so that a
     // failed grab is never taken for a black pane.
     int bright() const {
-        const QImage shot = qobject_cast<QQuickWindow *>(window.get())->grabWindow();
+        const QImage shot = pane->window()->grabWindow();
         const qreal scale = shot.devicePixelRatio();
         const QRectF area = pane->mapRectToScene(pane->boundingRect());
         const QRect pixels =
@@ -89,6 +98,27 @@ class PaneTest : public QObject {
         return count;
     }
 
+    // Out of the test's window, as Main.qml's popOut() takes the video out, by the same steps:
+    // let go by the container; made transient for the test's window again, null first, as a
+    // window a container has held has lost that parent but still reads it, so that setting the
+    // value it reads changes nothing; given Pop Out's first size, and shown. False when the
+    // container takes no such window.
+    bool popOut() {
+        if (!container->setProperty("window", QVariant::fromValue<QWindow *>(nullptr))) {
+            return false;
+        }
+        videoWindow->setTransientParent(nullptr);
+        videoWindow->setTransientParent(qobject_cast<QWindow *>(window.get()));
+        videoWindow->resize(960, 540);
+        videoWindow->show();
+        return true;
+    }
+
+    // Back in, as popIn() puts it: held by the container again, at its place and size.
+    bool popIn() {
+        return container->setProperty("window", QVariant::fromValue<QWindow *>(videoWindow));
+    }
+
 private slots:
     void initTestCase() {
         QVERIFY2(!video.empty() && !lines.empty() && qEnvironmentVariableIsSet("XDG_CONFIG_HOME"),
@@ -96,13 +126,20 @@ private slots:
         connect(&player, &PlayerPort::reported, this,
                 [this](const PlayerReport &r) { reports << said(r); });
         QQmlComponent component(&engine);
-        component.setData("import QtQuick; import Subcheck; Window { visible: true; width: 320; "
-                          "height: 180; MpvItem { objectName: 'video'; anchors.fill: parent } }",
-                          QUrl());
+        component.setData(
+            "import QtQuick; import Subcheck; Window { visible: true; width: 640; height: 400; "
+            "WindowContainer { objectName: 'container'; width: 320; height: 180; "
+            "window: videoWindow } "
+            "Window { id: videoWindow; objectName: 'videoWindow'; color: 'black'; "
+            "MpvItem { objectName: 'video'; anchors.fill: parent } } }",
+            QUrl());
         window.reset(component.create());
         QVERIFY2(window, qPrintable(component.errorString()));
+        container = window->findChild<QObject *>("container");
+        videoWindow = window->findChild<QQuickWindow *>("videoWindow");
         pane = window->findChild<MpvItem *>("video");
-        QVERIFY(pane);
+        QVERIFY(container && videoWindow && pane);
+        QCOMPARE(pane->window(), videoWindow);
         pane->setPlayer(&player);
     }
 
@@ -354,8 +391,7 @@ private slots:
         // Counted on the test's thread, as the render thread can swap.
         int frames = 0;
         QObject counting;
-        connect(qobject_cast<QQuickWindow *>(window.get()), &QQuickWindow::frameSwapped, &counting,
-                [&frames] { ++frames; });
+        connect(pane->window(), &QQuickWindow::frameSwapped, &counting, [&frames] { ++frames; });
         QVERIFY(QTest::qWaitFor([&frames] {
             const int before = frames;
             QTest::qWait(200);
@@ -367,6 +403,67 @@ private slots:
         QVERIFY(pane->textureFollowsItemSize());
         QCOMPARE(changed.count(), 2);
         QTRY_VERIFY_WITH_TIMEOUT(frames > 0, 5000);
+    }
+
+    // The subtitle drawn where the app draws its video, in the window the container holds; then in
+    // that window let go, made transient and shown at Pop Out's first size; then held again. Each
+    // move takes the window from one X parent to another with the GL it draws with, which mpv's
+    // video output must outlive: mpv keeps it configured, and keeps its video track, which an
+    // output that failed would take with it. Twice round, so that the second move out starts from
+    // a window held again.
+    void theSubtitleIsDrawnEmbeddedPoppedOutAndBack() {
+        reports.clear();
+        player.run(open(video, 2'500'000, 4));
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened paused"}, 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(bright() > 0, "no subtitle: mpv draws none without a font", 5000);
+        const QVariant vid = pane->getProperty("vid");
+        for (int round = 0; round < 2; ++round) {
+            QVERIFY(popOut());
+            QTRY_VERIFY_WITH_TIMEOUT(bright() > 0, 5000);
+            QCOMPARE(pane->getProperty("vo-configured").toBool(), true);
+            QCOMPARE(pane->getProperty("vid"), vid);
+            QVERIFY(popIn());
+            QTRY_VERIFY_WITH_TIMEOUT(bright() > 0, 5000);
+            QCOMPARE(pane->getProperty("vo-configured").toBool(), true);
+        }
+    }
+
+    // Playing, the video plays on through a move out and a move back: the position goes on past
+    // where it was before each move, as it would not with mpv's video output stuck on a window
+    // that no longer draws.
+    void aPlayingVideoPopsOutAndBackAndPlaysOn() {
+        reports.clear();
+        player.run(playback(Playback(Playback::kPause{})));
+        QTRY_COMPARE_WITH_TIMEOUT(reports.size(), 1, 5000);
+        QVERIFY2(reports[0].startsWith("played playing "), qPrintable(reports[0]));
+        // Playing, not only unpaused.
+        QTRY_COMPARE_WITH_TIMEOUT(pane->getProperty("core-idle").toBool(), false, 5000);
+        for (const bool out : {true, false}) {
+            const double before = pane->getProperty("time-pos").toDouble();
+            QVERIFY(out ? popOut() : popIn());
+            QTRY_VERIFY_WITH_TIMEOUT(pane->getProperty("time-pos").toDouble() > before, 5000);
+            QCOMPARE(pane->getProperty("vo-configured").toBool(), true);
+        }
+    }
+
+    // Pop Out while Show in Video still waits for mpv: the window moves before the open lands,
+    // which mpv makes its video output again for, as the Close before it took that output. The
+    // open lands all the same, as mpv says, and its frame is drawn in the pop-out. The open waits
+    // as long as the first, for the same work.
+    void aPopOutWhileAnOpenWaitsLetsItLand() {
+        reports.clear();
+        player.run(PlayerCommand(PlayerCommand::kClose{}));
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"closed"}, 5000);
+        reports.clear();
+        player.run(open(video, 2'500'000, 4));
+        QVERIFY(popOut());
+        // Out before the open has said anything: it says it through this thread's events, which
+        // nothing has let run since the open.
+        QVERIFY(reports.isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(reports, QStringList{"opened paused"}, 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(bright() > 0, "no subtitle: mpv draws none without a font", 5000);
+        // Back, so that the pane's window ends the test held, as it began.
+        QVERIFY(popIn());
     }
 };
 
