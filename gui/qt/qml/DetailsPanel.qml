@@ -1,21 +1,16 @@
-// The details panel: the video, 16:9 at the panel's width, black until a finding is shown in it;
-// under it a row of its own with Undo at the left and Reject and Accept at the right, which stays
-// between the video and what scrolls; then the selected finding as the window words it: its line as
-// it is now above its line with the fix, each a block of its own that keeps its place from one
-// finding to the next for a line of one or two lines at the block's own font (one of three or
-// more, or one drawn partly in a taller fallback font, moves what is below it down); a click on
-// the block with the fix opens its edit at the nearest character, while it can be reworded, and
-// while an edit is open the line gives way to a field for its wording; below them its banners,
-// its mark and why it was found; its file's particulars under a disclosure; and what the check
-// said of the episode selected while that is the finding's: below the finding, set off by a line,
-// or alone with none selected. For a click on an episode the check found nothing in, its log shows
-// alone, in the finding's place, while review keeps the finding selected: below the finding, the
-// two would read as one, and the log is not the finding's. Over the video, whether it plays or is
-// paused, and a busy animation while Show in Video waits for it, in the highlight colour
-// (LoadingArc) on a backing in the window's colour: a highlight can be as dark as the pane is
-// until mpv draws there, and every palette sets its highlight apart from its window colour. While
-// the window's columns are dragged, the video's frame is stretched across its changing size, and
-// drawn again at its size once the drag ends.
+// The details panel: the video's place, 16:9 at the panel's width, which the window fills with the
+// video (Main.qml); under it a row of its own with Undo at the left and Reject and Accept at the
+// right, which stays between the video and what scrolls; then the selected finding as the window
+// words it: its line as it is now above its line with the fix, each a block of its own that keeps
+// its place from one finding to the next for a line of one or two lines at the block's own font
+// (one of three or more, or one drawn partly in a taller fallback font, moves what is below it
+// down); a click on the block with the fix opens its edit at the nearest character, while it can
+// be reworded, and while an edit is open the line gives way to a field for its wording; below them
+// its banners, its mark and why it was found; its file's particulars under a disclosure; and what
+// the check said of the episode selected while that is the finding's: below the finding, set off
+// by a line, or alone with none selected. For a click on an episode the check found nothing in,
+// its log shows alone, in the finding's place, while review keeps the finding selected: below the
+// finding, the two would read as one, and the log is not the finding's.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -30,8 +25,9 @@ Control {
 
     required property SessionBridge bridge
     readonly property DetailView detail: bridge.detail
-    // Whether the window's columns are being dragged, which the video stretches its frame for.
-    property bool columnsResizing: false
+    // The video's place, which nothing here fills: the window puts the video there, in a window of
+    // its own or in its own scene, so that the video can leave the panel.
+    property alias videoSlot: slot
     // The window's line between parts, drawn here between the finding and its episode's log.
     required property color separator
     // Whether Reject and Accept have a finding to act on, which the window decides, as its menu and
@@ -163,48 +159,14 @@ Control {
         anchors.fill: parent
         spacing: 0
 
-        // Black behind the video, so that its place shows before mpv first draws there.
+        // Black, so that the video's place shows before the video first draws there.
         Rectangle {
+            id: slot
+
+            objectName: "videoSlot"
             color: "black"
             Layout.fillWidth: true
             Layout.preferredHeight: width * 9 / 16
-
-            MpvItem {
-                id: video
-
-                objectName: "video"
-                anchors.fill: parent
-                player: panel.bridge.player
-                stretching: panel.columnsResizing
-            }
-            PlayIndicator {
-                objectName: "playIndicator"
-                anchors.top: parent.top
-                anchors.right: parent.right
-                anchors.margins: 8
-                paused: video.paused
-                visible: video.showing
-            }
-            // Only while the animation runs. The alpha is its colour's alone, as an opacity would
-            // fade the animation with it; it takes no click, as the animation takes none.
-            Rectangle {
-                objectName: "videoLoadingBacking"
-                anchors.centerIn: video
-                width: loading.width + 16
-                height: loading.height + 16
-                radius: 6
-                color: Qt.alpha(panel.palette.window, 0.85)
-                visible: loading.running
-
-                LoadingArc {
-                    id: loading
-
-                    objectName: "videoLoading"
-                    anchors.centerIn: parent
-                    running: panel.bridge.videoLoading
-                    Accessible.name: qsTr("Loading video")
-                }
-            }
         }
 
         // Fixed between the video and what scrolls, so that it never scrolls away nor moves with

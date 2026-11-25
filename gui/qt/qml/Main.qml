@@ -1,13 +1,14 @@
 // The window: its menus, and a row's right-click menu; a toolbar with the view's name and counts,
 // and at its right the Find box, which Edit ▸ Find… gives the keys; three columns, the sidebar, the
-// findings and the details panel, with Undo, Reject and Accept under its video; the status bar; the
-// Settings window; and the fatal end's dialog. Layout, bindings and one-line handlers only: what
-// each asks of review is the bridge's (session_bridge.cpp), and what the window remembers the
-// settings' (window_settings.cpp). Its keys are the window's whatever has focus, but for a text
-// field's, which takes the keys it types and those it moves through and ends by (KeyField.qml), an
-// open menu's, which takes them all (menu_keys.h), and the Settings window's, which holds all of
-// review's back. A press anywhere in the window but on the Find box, while no menu has the keys,
-// takes the keys back from the box (press_away.h).
+// findings and the details panel, with Undo, Reject and Accept under its video; the video, in a
+// window of its own that the details panel holds, or that View ▸ Pop Out Video takes out beside
+// this one; the status bar; the Settings window; and the fatal end's dialog. Layout, bindings and
+// one-line handlers only: what each asks of review is the bridge's (session_bridge.cpp), and what
+// the window remembers the settings' (window_settings.cpp). Its keys are the window's whatever has
+// focus, but for a text field's, which takes the keys it types and those it moves through and ends
+// by (KeyField.qml), an open menu's, which takes them all (menu_keys.h), and the Settings window's,
+// which holds all of review's back. A press anywhere in the window or the video's but on the Find
+// box, while no menu has the keys, takes the keys back from the box (press_away.h).
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -53,6 +54,14 @@ ApplicationWindow {
     readonly property bool canDecide: keysToReview && !bridge.showingEpisode && bridge.detail.shown
                                       && !bridge.editing
 
+    // Whether the video's pane draws in a window of its own, which the details panel holds at the
+    // video's place, rather than in this window's scene at that place. Pop Out needs it: only a
+    // window of its own can be taken out of this one.
+    property bool videoWindowed: true
+    // Whether the video's window is out, a window beside this one, rather than held by the details
+    // panel.
+    property bool videoOut: false
+
     // The window's own size of text, which its menus and dialogs take too; the list and the details
     // panel each have their own below.
     font.pointSize: settings.windowTextSize
@@ -65,6 +74,32 @@ ApplicationWindow {
     onClosing: close => {
         close.accepted = false;
         bridge.quit();
+    }
+
+    // Takes the video's window out of the details panel, a window of its own beside this one. Its
+    // transient parent is set again, to this window, so that this window's shortcuts and menu
+    // items hear the keys typed in it: a window a container has held has lost its transient
+    // parent, though it can still read this one, and setting the value it reads changes nothing;
+    // hence null first. Its size is set and it is shown in this same handler: let go, the window
+    // stays where the container held it, at the pane's size, and would show there first.
+    function popOut() {
+        if (!window.videoWindowed || window.videoOut) {
+            return;
+        }
+        window.videoOut = true;
+        videoWindow.transientParent = null;
+        videoWindow.transientParent = window;
+        videoWindow.width = 960;
+        videoWindow.height = 540;
+        videoWindow.visible = true;
+        videoWindow.requestActivate();
+    }
+
+    // Puts the video's window back in the details panel, and gives this window the keys, which
+    // the pop-out had.
+    function popIn() {
+        window.videoOut = false;
+        window.requestActivate();
     }
 
     // An open menu has the keys, each of which is otherwise one of the window's shortcuts: a menu
@@ -83,6 +118,12 @@ ApplicationWindow {
     PressAway {
         target: window
         keeper: findBox
+        menus: menuKeys
+        onPressedAway: findBox.release()
+    }
+    // The same for a press in the video's window, held or out: no part of it keeps the box's keys.
+    PressAway {
+        target: videoWindow
         menus: menuKeys
         onPressedAway: findBox.release()
     }
@@ -134,12 +175,22 @@ ApplicationWindow {
             MenuSeparator {}
             // Not StandardKey.Close, which on Linux has a second key, Ctrl+F4, that KDE's styles
             // warn of as they draw the item. Qt reads Ctrl as Command on macOS, here and below.
+            // Typed in the popped-out video, it puts the video back rather than quit: a person
+            // closes the window the key is typed in, whose keys are this window's. Which window
+            // has the keys tells, not whether the pop-out is active: transient for this window, it
+            // reads active whenever this window does.
             Action {
                 objectName: "close"
                 enabled: window.keysToReview
                 text: qsTr("&Close")
                 shortcut: "Ctrl+W"
-                onTriggered: window.bridge.quit()
+                onTriggered: {
+                    if (window.videoOut && videoWindow.activeFocusItem !== null) {
+                        window.popIn();
+                    } else {
+                        window.bridge.quit();
+                    }
+                }
             }
             // Not StandardKey.Quit, which some platforms leave with no key, Qt's offscreen one
             // among them.
@@ -269,6 +320,23 @@ ApplicationWindow {
                 text: window.bridge.switchLabel
                 shortcut: "V"
                 onTriggered: window.bridge.switchView()
+            }
+            // Takes the video out into a window of its own, or puts it back, as its check now
+            // says; that window's close, and Ctrl+W typed in it, put it back too. Greyed where the
+            // video has no window of its own.
+            Action {
+                objectName: "popOutVideo"
+                enabled: window.keysToReview && window.videoWindowed
+                text: qsTr("&Pop Out Video")
+                checkable: true
+                checked: window.videoOut
+                onTriggered: {
+                    if (checked) {
+                        window.popOut();
+                    } else {
+                        window.popIn();
+                    }
+                }
             }
         }
         WholeMenu {
@@ -752,12 +820,64 @@ ApplicationWindow {
             separator: window.separator
             canDecide: window.canDecide
             windowFont: window.font
-            columnsResizing: columns.resizing
             font.pointSize: window.settings.detailsTextSize
             SplitView.preferredWidth: window.settings.detailsWidth
             SplitView.minimumWidth: window.detailsLeast
             onMenuAsked: at => rowMenu.openFor(window.bridge.selected, details, at)
         }
+    }
+
+    // The video's own window, which the container holds in the details panel, or which Pop Out
+    // takes out. Held, it takes no focus: a clicked window takes the keys on X11, and the next
+    // letter would then be one of this window's keys, not the field's that had them, an open
+    // edit's among them. Out, it takes the keys, which are this window's (popOut). Its close puts
+    // it back rather than close it.
+    Window {
+        id: videoWindow
+
+        objectName: "videoWindow"
+        color: "black"
+        title: "subcheck"
+        flags: Qt.Window | (window.videoOut ? 0 : Qt.WindowDoesNotAcceptFocus)
+        onClosing: close => {
+            close.accepted = false;
+            window.popIn();
+        }
+    }
+
+    // Holds the video's window at its place in the details panel while the video is in. One
+    // container for the window's whole life, which never goes while it holds the window: a
+    // container destroyed holding a window destroys that window, and mpv's video with it. So no
+    // Loader holds it, nor a layout that drops what it does not show: to move the video, the
+    // container moves.
+    WindowContainer {
+        id: videoContainer
+
+        objectName: "videoContainer"
+        parent: details.videoSlot
+        anchors.fill: parent
+        // Tab passes it by, as it passes the video by: given the focus, the container would hand
+        // it to the window it holds, which takes none while held.
+        activeFocusOnTab: false
+    }
+    // The window the container holds, bound from outside it: inside, `window` names the
+    // container's own property, not this window.
+    Binding {
+        target: videoContainer
+        property: "window"
+        value: window.videoWindowed && !window.videoOut ? videoWindow : null
+    }
+
+    // In the video's window, or where the video has none, in this window's scene at the video's
+    // place. Given this window's font, which a window of its own does not take from this one.
+    VideoPane {
+        id: videoPane
+
+        parent: window.videoWindowed ? videoWindow.contentItem : details.videoSlot
+        anchors.fill: parent
+        bridge: window.bridge
+        font: window.font
+        stretching: columns.resizing && !window.videoOut
     }
 
     footer: Label {

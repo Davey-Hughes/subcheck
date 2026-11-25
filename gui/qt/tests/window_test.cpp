@@ -64,17 +64,20 @@ std::string media() { return qEnvironmentVariable("SUBCHECK_TEST_MEDIA").toStdSt
 
 std::string clean() { return qEnvironmentVariable("SUBCHECK_TEST_CLEAN").toStdString(); }
 
-// The message handler quietOffscreen was installed over, which every message but the two it drops
-// goes on to, and whether it was installed, so that the end of the run puts that handler back.
+// The message handler quietOffscreen was installed over, which every message but the three it
+// drops goes on to, and whether it was installed, so that the end of the run puts that handler
+// back.
 QtMessageHandler testsOwn = nullptr;
 bool quieted = false;
 
-// The offscreen platform can neither raise a window nor pass a window's least size on, and says so
-// each time Settings is raised or its contents grow: nothing here rests on either. With no handler
-// beneath it, a message goes to stderr, as Qt's own handler would write it.
+// The offscreen platform can neither raise a window, pass a window's least size on nor put a
+// window in another, and says so each time Settings is raised or its contents grow and each time
+// the details panel takes the video's window in or lets it go: nothing here rests on any of them.
+// With no handler beneath it, a message goes to stderr, as Qt's own handler would write it.
 void quietOffscreen(QtMsgType type, const QMessageLogContext &context, const QString &message) {
     if (message == QLatin1String("This plugin does not support raise()") ||
-        message == QLatin1String("This plugin does not support propagateSizeHints()")) {
+        message == QLatin1String("This plugin does not support propagateSizeHints()") ||
+        message == QLatin1String("This plugin does not support setParent!")) {
         return;
     }
     if (testsOwn) {
@@ -174,7 +177,8 @@ subcheck_ffi::EntryView rowOfTwelve(const subcheck_ffi::EntryKey &key,
 // long wait for the pane, which offscreen never shows video, so that a Show in Video still waits
 // there however slow the runner. Its settings are kept in `settings`, a directory given, or else
 // its own. Its bridge tells each action it sends, and holds them back from review once a test asks
-// it to, so that a test sees what the window does before review answers.
+// it to, so that a test sees what the window does before review answers. The window's other
+// initial properties are `more`, given as main.cpp would give them.
 struct Shown {
     std::ostringstream out;
     std::ostringstream err;
@@ -185,14 +189,17 @@ struct Shown {
     QQmlApplicationEngine engine;
     QQuickWindow *window = nullptr;
 
-    explicit Shown(std::vector<std::string> selector, const QString &kept = {})
+    explicit Shown(std::vector<std::string> selector, const QString &kept = {},
+                   const QVariantMap &more = {})
         : bridge(std::move(selector), player, out, err, std::chrono::seconds(1)),
           settings(std::make_unique<QSettings>((kept.isEmpty() ? own.path() : kept) +
                                                    "/subcheck-qt.conf",
                                                QSettings::IniFormat),
                    QGuiApplication::platformName()) {
-        engine.setInitialProperties({{QStringLiteral("bridge"), QVariant::fromValue(&bridge)},
-                                     {QStringLiteral("settings"), QVariant::fromValue(&settings)}});
+        QVariantMap properties{{QStringLiteral("bridge"), QVariant::fromValue(&bridge)},
+                               {QStringLiteral("settings"), QVariant::fromValue(&settings)}};
+        properties.insert(more);
+        engine.setInitialProperties(properties);
         engine.loadFromModule("Subcheck", "Main");
         if (!engine.rootObjects().isEmpty()) {
             window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
@@ -233,6 +240,22 @@ struct Shown {
     QQuickItem *settingsItem(const char *name) const {
         QQuickWindow *settings = settingsWindow();
         return settings ? item(settings->contentItem(), name) : nullptr;
+    }
+
+    // The video's own window, which the details panel holds, or which is out on its own. Out, it is
+    // no child of the main window, which it is while held and where it is never held: the pane
+    // drawn in it names it then.
+    QQuickWindow *videoWindow() const {
+        if (auto *child = qobject_cast<QQuickWindow *>(find("videoWindow"))) {
+            return child;
+        }
+        QQuickItem *pane = videoItem("videoPane");
+        return pane && pane->window() != window ? pane->window() : nullptr;
+    }
+    // The item called `name` in the video's pane, whichever window draws it.
+    QQuickItem *videoItem(const char *name) const {
+        auto *pane = qobject_cast<QQuickItem *>(find("videoPane"));
+        return pane ? item(pane, name) : nullptr;
     }
 
     static QQuickItem *item(QQuickItem *in, const char *name) {
@@ -818,7 +841,7 @@ private slots:
                  "run through ctest, which gives this test a large screen");
         // As main.cpp, before the first window.
         QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
-        // Only where the two messages it drops are the platform's.
+        // Only where the three messages it drops are the platform's.
         if (QGuiApplication::platformName() == QLatin1String("offscreen")) {
             testsOwn = qInstallMessageHandler(quietOffscreen);
             quieted = true;
@@ -1155,6 +1178,16 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(switchView, "trigger"));
         QTRY_COMPARE(switchView->property("text").toString(), "Show Newest Check");
 
+        // Pop Out Video asks review nothing: it takes the video out, and again puts it back.
+        QObject *popOut = w.find("popOutVideo");
+        QVERIFY(popOut);
+        for (const bool out : {true, false}) {
+            const qsizetype from = w.bridge.sent.size();
+            QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+            QCOMPARE(w.since(from), QStringList());
+            QCOMPARE(w.window->property("videoOut").toBool(), out);
+        }
+
         // Find asks review nothing: it gives the Find box's field the keys.
         QObject *find = w.find("find");
         QVERIFY(find);
@@ -1166,7 +1199,7 @@ private slots:
 
         // What each menu holds: the items above, and only those.
         const std::vector<std::pair<const char *, int>> counts = {
-            {"&File", 4}, {"&Edit", 4},     {"&View", 4}, {"&Show", 4},
+            {"&File", 4}, {"&Edit", 4},     {"&View", 5}, {"&Show", 4},
             {"&Rows", 3}, {"F&inding", 10}, {"Vi&deo", 9}};
         for (const auto &[title, count] : counts) {
             QObject *each = w.menu(title);
@@ -3821,8 +3854,8 @@ Window {
         QQuickItem *decisions = w.item("decisions");
         QQuickItem *toolbar = w.item("toolbar");
         QQuickItem *scroll = w.item("detailsScroll");
-        QQuickItem *video = w.item("video");
-        QVERIFY(panel && decisions && toolbar && scroll && video);
+        QQuickItem *slot = w.item("videoSlot");
+        QVERIFY(panel && decisions && toolbar && scroll && slot);
         // Read each time: the row's width follows its font's, and settles after the text size does.
         const auto least = [decisions] {
             return 160 + 260 + 2 + std::max(340, int(std::ceil(decisions->implicitWidth())));
@@ -3863,7 +3896,7 @@ Window {
         QVERIFY(left(buttons[1]) < left(buttons[2]));
         QVERIFY(qAbs(left(buttons[0]) - 8) < 0.5);
         QVERIFY(qAbs(left(buttons[2]) + buttons[2]->width() - (panel->width() - 8)) < 0.5);
-        const qreal videoBottom = video->mapToItem(panel, QPointF(0, video->height())).y();
+        const qreal videoBottom = slot->mapToItem(panel, QPointF(0, slot->height())).y();
         const qreal top = decisions->mapToItem(panel, QPointF()).y();
         QVERIFY(top >= videoBottom - 0.5);
         QVERIFY(top + decisions->height() <= scroll->mapToItem(panel, QPointF()).y() + 0.5);
@@ -5605,7 +5638,9 @@ Window {
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
         QQuickItem *field = w.item("findField");
-        QQuickItem *clicked = w.item(qPrintable(control));
+        // The video in its own window, where the click lands.
+        QQuickItem *clicked =
+            control == "video" ? w.videoItem("video") : w.item(qPrintable(control));
         QObject *rowsMenu = w.find("rowsMenu");
         QVERIFY(field && clicked && rowsMenu);
         // Opened, so that the find lands on another row, a member.
@@ -5719,10 +5754,10 @@ Window {
         QCOMPARE(field->property("text").toString(), "befor");
     }
 
-    // The three columns side by side, the list between; the video at the top of the details
-    // panel, 16:9 at its width, as the mpv of the window's player; a key of the video's reaches
-    // it through review, whose answer is the status bar. Offscreen, mpv never becomes ready, so
-    // Show in Video waits there.
+    // The three columns side by side, the list between; the video's place at the top of the
+    // details panel, 16:9 at its width, and the video the mpv of the window's player; a key of the
+    // video's reaches it through review, whose answer is the status bar. Offscreen, mpv never
+    // becomes ready, so Show in Video waits there.
     void theColumnsAndTheVideoAreWhereTheyBelong() {
         Shown w({media()});
         QVERIFY(w.start());
@@ -5730,18 +5765,19 @@ Window {
         QQuickItem *sidebar = w.item("sidebar");
         QQuickItem *list = w.item("findings");
         QQuickItem *details = w.item("details");
-        QQuickItem *video = w.item("video");
-        QVERIFY(sidebar && list && details && video);
+        QQuickItem *slot = w.item("videoSlot");
+        QQuickItem *video = w.videoItem("video");
+        QVERIFY(sidebar && list && details && slot && video);
         const auto left = [](QQuickItem *of) { return of->mapToScene(QPointF(0, 0)).x(); };
         QCOMPARE(left(sidebar), 0.0);
         QVERIFY(left(list) >= sidebar->width());
         QVERIFY(left(details) >= left(list) + list->width());
         QVERIFY(qAbs(left(details) + details->width() - w.window->width()) < 1);
         QCOMPARE(video->property("player").value<PlayerPort *>(), &w.player);
-        QCOMPARE(left(video), left(details));
-        QCOMPARE(video->width(), details->width());
-        QVERIFY(qAbs(video->height() - video->width() * 9 / 16) < 1);
-        QCOMPARE(video->mapToItem(details, QPointF(0, 0)).y(), 0.0);
+        QCOMPARE(left(slot), left(details));
+        QCOMPARE(slot->width(), details->width());
+        QVERIFY(qAbs(slot->height() - slot->width() * 9 / 16) < 1);
+        QCOMPARE(slot->mapToItem(details, QPointF(0, 0)).y(), 0.0);
 
         QObject *status = w.find("statusLine");
         QTest::keyClick(w.window, Qt::Key_Space);
@@ -5753,6 +5789,233 @@ Window {
         QTRY_COMPARE(status->property("text").toString(), "The video is still opening the file");
         QTest::keyClick(w.window, Qt::Key_O, Qt::ShiftModifier);
         QTRY_COMPARE(status->property("text").toString(), "Video closed");
+    }
+
+    // The video draws in a window of its own, black, which a container in the details panel holds
+    // at the video's place, 16:9 at the panel's width: the video, the mark in its corner and the
+    // busy animation are that window's, and none of them is in the main window's scene. The window
+    // keeps to the place as the main window is resized and as the columns are dragged.
+    void theVideoDrawsInAWindowOfItsOwnThatTheDetailsPanelHolds() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickWindow *video = w.videoWindow();
+        QVERIFY(video);
+        QVERIFY(video->isVisible());
+        QCOMPARE(video->color(), QColor(Qt::black));
+        for (const char *name : {"videoPane", "video", "playIndicator", "videoLoading"}) {
+            QQuickItem *each = w.videoItem(name);
+            QVERIFY2(each, name);
+            QVERIFY2(each->window() == video, name);
+        }
+        QVERIFY(!w.item("video"));
+        auto *mpv = qobject_cast<MpvItem *>(w.videoItem("video"));
+        QQuickItem *pane = w.videoItem("videoPane");
+        QVERIFY(mpv && pane);
+        QCOMPARE(mpv->player(), &w.player);
+        QCOMPARE(mpv->mapRectToItem(pane, mpv->boundingRect()), pane->boundingRect());
+        auto *container = qobject_cast<QQuickItem *>(w.find("videoContainer"));
+        QQuickItem *slot = w.item("videoSlot");
+        QQuickItem *details = w.item("details");
+        QQuickItem *list = w.item("findings");
+        QVERIFY(container && slot && details && list);
+        QCOMPARE(container->property("window").value<QWindow *>(), video);
+        QCOMPARE(container->parentItem(), slot);
+        // What keeps the video's window from its place, said; nothing once it is there.
+        const auto off = [&] {
+            QStringList said;
+            if (container->size() != slot->size()) {
+                said << QStringLiteral("the container is %1x%2 in a place %3x%4")
+                            .arg(container->width())
+                            .arg(container->height())
+                            .arg(slot->width())
+                            .arg(slot->height());
+            }
+            if (qAbs(slot->width() - details->width()) >= 0.5 ||
+                qAbs(slot->height() - slot->width() * 9 / 16) > 1) {
+                said << QStringLiteral("the place is %1x%2 in a panel %3 wide")
+                            .arg(slot->width())
+                            .arg(slot->height())
+                            .arg(details->width());
+            }
+            const QRect held(container->mapToScene(QPointF()).toPoint(),
+                             container->size().toSize());
+            if (video->geometry() != held) {
+                said << QStringLiteral("the window is at %1,%2 %3x%4, held at %5,%6 %7x%8")
+                            .arg(video->x())
+                            .arg(video->y())
+                            .arg(video->width())
+                            .arg(video->height())
+                            .arg(held.x())
+                            .arg(held.y())
+                            .arg(held.width())
+                            .arg(held.height());
+            }
+            return said.join(QStringLiteral("; "));
+        };
+        const auto place = [slot] { return slot->mapRectToScene(slot->boundingRect()); };
+        QTRY_VERIFY2(off().isEmpty(), qPrintable(off()));
+        const QRectF first = place();
+        w.window->resize(1100, 700);
+        QTRY_VERIFY(place() != first);
+        QTRY_VERIFY2(off().isEmpty(), qPrintable(off()));
+        const QRectF resized = place();
+        w.drag(list, details, 40);
+        QTRY_VERIFY(place() != resized);
+        QTRY_VERIFY2(off().isEmpty(), qPrintable(off()));
+    }
+
+    // View ▸ Pop Out Video takes the video's window out of the details panel, into a window of its
+    // own, 960 by 540, whose keys reach review as the main window's do, once each; Ctrl+W typed in
+    // it puts it back rather than quit, as a person closes the window the key is typed in. Twice
+    // round, as each time out sets again what the container's hold took away. The main window has
+    // its keys after.
+    void popOutVideoTakesTheVideoOutAndCtrlWPutsItBack() {
+        Shown w({media()});
+        QSignalSpy finished(&w.bridge, &SessionBridge::finished);
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickWindow *video = w.videoWindow();
+        QObject *container = w.find("videoContainer");
+        QObject *popOut = w.find("popOutVideo");
+        QVERIFY(video && container && popOut);
+        const std::vector<std::pair<Qt::Key, QStringList>> keys = {
+            {Qt::Key_J, {"Move 1"}}, {Qt::Key_K, {"Move -1"}}, {Qt::Key_Space, {"Playback Pause"}}};
+        for (int round = 1; round <= 2; ++round) {
+            qsizetype from = w.bridge.sent.size();
+            QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+            QCOMPARE(w.since(from), QStringList());
+            QCOMPARE(container->property("window").value<QWindow *>(), nullptr);
+            QVERIFY(video->isVisible());
+            QCOMPARE(video->transientParent(), w.window);
+            QCOMPARE(video->size(), QSize(960, 540));
+            QVERIFY(popOut->property("checked").toBool());
+            video->requestActivate();
+            QVERIFY(QTest::qWaitForWindowActive(video));
+            for (const auto &[key, actions] : keys) {
+                from = w.bridge.sent.size();
+                QTest::keyClick(video, key);
+                QVERIFY2(w.since(from) == actions,
+                         qPrintable(QStringLiteral("round %1, %2: %3")
+                                        .arg(round)
+                                        .arg(QKeySequence(key).toString(),
+                                             w.since(from).join(QStringLiteral(" | ")))));
+            }
+            from = w.bridge.sent.size();
+            QTest::keyClick(video, Qt::Key_W, Qt::ControlModifier);
+            QCOMPARE(w.since(from), QStringList());
+            QCOMPARE(container->property("window").value<QWindow *>(), video);
+            QVERIFY(!popOut->property("checked").toBool());
+        }
+        QCOMPARE(finished.count(), 0);
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_J);
+        QCOMPARE(w.since(from), QStringList{"Move 1"});
+    }
+
+    // Ctrl+W typed in the main window while the video is out quits, as it does with the video in:
+    // the pop-out, transient for the main window, reads active whenever the main window does, so
+    // it is the pop-out's keys, not its being active, that make Ctrl+W put the video back.
+    void ctrlWInTheMainWindowQuitsWhileTheVideoIsOut() {
+        Shown w({media()});
+        QSignalSpy finished(&w.bridge, &SessionBridge::finished);
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *popOut = w.find("popOutVideo");
+        QVERIFY(popOut);
+        QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+        QVERIFY(QTest::qWaitForWindowActive(w.videoWindow()));
+        w.window->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_W, Qt::ControlModifier);
+        QCOMPARE(w.since(from), (QStringList{"Interrupt", "Interrupt"}));
+        QVERIFY(w.window->property("videoOut").toBool());
+        QTRY_COMPARE(finished.count(), 1);
+    }
+
+    // The popped-out window's own close puts the video back, the same window and the same video,
+    // and asks review nothing.
+    void closingThePoppedOutWindowPutsItBack() {
+        Shown w({media()});
+        QSignalSpy finished(&w.bridge, &SessionBridge::finished);
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        const QPointer<QQuickWindow> video = w.videoWindow();
+        const QPointer<QQuickItem> mpv = w.videoItem("video");
+        QObject *container = w.find("videoContainer");
+        QObject *popOut = w.find("popOutVideo");
+        QVERIFY(video && mpv && container && popOut);
+        QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+        QVERIFY(w.window->property("videoOut").toBool());
+        QCOMPARE(container->property("window").value<QWindow *>(), nullptr);
+        const qsizetype from = w.bridge.sent.size();
+        QVERIFY(!video->close());
+        QVERIFY(!w.window->property("videoOut").toBool());
+        QVERIFY(video && mpv);
+        QCOMPARE(container->property("window").value<QWindow *>(), video.data());
+        QCOMPARE(w.videoWindow(), video.data());
+        QCOMPARE(w.videoItem("video"), mpv.data());
+        QCOMPARE(w.since(from), QStringList());
+        QCOMPARE(finished.count(), 0);
+    }
+
+    // Held in the details panel, the video's window takes no focus, so that a click on the video
+    // leaves the keys where they were: with an open edit's field, which the next letter is typed
+    // into. Out, it takes focus, and in again, none. Offscreen, no click moves the focus between
+    // windows: this sees the flag, and that no part of the video takes the keys.
+    void theEmbeddedVideoTakesNoFocus() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickWindow *video = w.videoWindow();
+        QObject *popOut = w.find("popOutVideo");
+        QVERIFY(video && popOut);
+        QVERIFY(video->flags().testFlag(Qt::WindowDoesNotAcceptFocus));
+        QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+        QVERIFY(!video->flags().testFlag(Qt::WindowDoesNotAcceptFocus));
+        QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+        QVERIFY(video->flags().testFlag(Qt::WindowDoesNotAcceptFocus));
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_E);
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(field);
+        QTRY_VERIFY(field->hasActiveFocus());
+        const QString wording = field->property("text").toString();
+        const qsizetype clicked = w.bridge.sent.size();
+        w.click(w.videoItem("video"));
+        QVERIFY(field->hasActiveFocus());
+        QTest::keyClick(w.window, 'q');
+        QCOMPARE(w.since(clicked), QStringList());
+        QCOMPARE(field->property("text").toString(), wording + "q");
+        // Ended unsaved, so that the run is left as found.
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // Where the video has no window of its own, its pane draws in the main window's scene, at its
+    // place in the details panel, and Pop Out is greyed: Ctrl+W quits, as it always does there.
+    void withoutAWindowOfItsOwnTheVideoDrawsInTheWindowAndCannotPopOut() {
+        Shown w({media()}, {}, {{QStringLiteral("videoWindowed"), false}});
+        QSignalSpy finished(&w.bridge, &SessionBridge::finished);
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *pane = w.videoItem("videoPane");
+        QObject *container = w.find("videoContainer");
+        QObject *popOut = w.find("popOutVideo");
+        QVERIFY(pane && container && popOut && w.videoWindow());
+        QCOMPARE(pane->window(), w.window);
+        QCOMPARE(pane->parentItem(), w.item("videoSlot"));
+        QVERIFY(w.item("video"));
+        QCOMPARE(container->property("window").value<QWindow *>(), nullptr);
+        QVERIFY(!w.videoWindow()->isVisible());
+        QVERIFY(!popOut->property("enabled").toBool());
+        QTest::keyClick(w.window, Qt::Key_W, Qt::ControlModifier);
+        QCOMPARE(w.bridge.sent, (QStringList{"Interrupt", "Interrupt"}));
+        QTRY_COMPARE(finished.count(), 1);
     }
 
     // However many reviews the store holds, they take a third of the sidebar at most, and Show and
@@ -6154,8 +6417,8 @@ Window {
         Shown w({media()});
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
-        auto *video = qobject_cast<MpvItem *>(w.item("video"));
-        QQuickItem *indicator = w.item("playIndicator");
+        auto *video = qobject_cast<MpvItem *>(w.videoItem("video"));
+        QQuickItem *indicator = w.videoItem("playIndicator");
         QVERIFY(video && indicator);
         QVERIFY(!indicator->isVisible());
         video->MpvAbstractItem::setProperty(QStringLiteral("pause"), true);
@@ -6197,9 +6460,9 @@ Window {
         Shown w({media()});
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
-        QQuickItem *video = w.item("video");
-        QQuickItem *loading = w.item("videoLoading");
-        QQuickItem *backing = w.item("videoLoadingBacking");
+        QQuickItem *video = w.videoItem("video");
+        QQuickItem *loading = w.videoItem("videoLoading");
+        QQuickItem *backing = w.videoItem("videoLoadingBacking");
         QVERIFY(video && loading && backing);
         QVERIFY(!loading->property("running").toBool());
         QVERIFY(!loading->isVisible());
@@ -6291,7 +6554,7 @@ Window {
         Shown w({media()});
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
-        QQuickItem *loading = w.item("videoLoading");
+        QQuickItem *loading = w.videoItem("videoLoading");
         QVERIFY(loading);
         const QString file = QString::fromStdString(media()) + "/typos - E01.mkv";
         const QString away = file + ".away";
@@ -6314,7 +6577,7 @@ Window {
     void theLoadingArcIsMaterialsInTheHighlightColour() {
         Shown w({media()});
         QVERIFY(w.show());
-        QQuickItem *loading = w.item("videoLoading");
+        QQuickItem *loading = w.videoItem("videoLoading");
         QVERIFY(loading);
         auto *arc = loading->property("contentItem").value<QQuickItem *>();
         QVERIFY(arc);
@@ -6365,7 +6628,13 @@ Window {
         };
         const int entry = w.middle(w.item("episode0")).y();
         const int row = w.middle(w.delegate(0)).y();
-        const int video = w.middle(w.item("video")).y();
+        // The video's middle, in the main window, which holds the video's window at its place.
+        QQuickItem *drawn = w.videoItem("video");
+        QVERIFY(drawn);
+        const int video = qRound(w.window
+                                     ->mapFromGlobal(drawn->mapToGlobal(
+                                         QPointF(drawn->width() / 2, drawn->height() / 2)))
+                                     .y());
         // The grip stays within the columns' 8 px margins, but for 3 px over the sidebar's
         // scroll bars on the handle beside the sidebar. Offsets are from lineOf, which rounds the
         // line's centre up to the pixel after the handle's x (L = x + 1): the grip spans
@@ -6466,7 +6735,7 @@ Window {
         QTRY_COMPARE(w.rows(), 2);
         QQuickItem *list = w.item("findings");
         QQuickItem *details = w.item("details");
-        auto *video = qobject_cast<MpvItem *>(w.item("video"));
+        auto *video = qobject_cast<MpvItem *>(w.videoItem("video"));
         QVERIFY(list && details && video);
         QVERIFY(!video->stretching());
         QVERIFY(video->textureFollowsItemSize());

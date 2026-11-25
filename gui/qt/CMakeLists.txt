@@ -110,7 +110,7 @@ qt_add_qml_module(subcheck_window
     QML_FILES qml/Main.qml qml/Sidebar.qml qml/FindingRow.qml qml/DetailsPanel.qml
             qml/PlayIndicator.qml qml/ChangeBlock.qml qml/SettingsWindow.qml qml/LoadingArc.qml
             qml/ListScrollBar.qml qml/CompactRow.qml qml/Disclosure.qml qml/KeyField.qml
-            qml/FindBox.qml qml/WholeMenu.qml
+            qml/FindBox.qml qml/WholeMenu.qml qml/VideoPane.qml
     SOURCES src/findings_model.h src/findings_model.cpp src/session_bridge.h
             src/session_bridge.cpp src/status_words.h src/status_words.cpp src/player_port.h
             src/player_port.cpp src/mpv_item.h src/mpv_item.cpp src/overloaded.h src/spliced.h
