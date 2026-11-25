@@ -4,15 +4,18 @@
 // runs as it found them. Its video pane makes a real mpv, which offscreen can never show video:
 // the player's own tests run it on a fake. Its settings are in a directory each window makes and
 // removes, never the user's.
+#include "key_names.h"
 #include "menu_keys.h"
 #include "mpv_item.h"
 #include "offscreen_main.h"
+#include "press_away.h"
 #include "said.h"
 #include "told.h"
 #include "window_settings.h"
 #include "words.h"
 
 #include <QAccessible>
+#include <QClipboard>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -22,8 +25,10 @@
 #include <QFontMetricsF>
 #include <QKeyEvent>
 #include <QKeySequence>
+#include <QPointingDevice>
 #include <QQmlApplicationEngine>
 #include <QQmlComponent>
+#include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QRegularExpression>
@@ -157,6 +162,9 @@ subcheck_ffi::EntryView rowOfTwelve(const subcheck_ffi::EntryKey &key,
         .check = subcheck_ffi::Check::kLlm,
         .original_changed = {0, 5},
         .wording_changed = {0, 6},
+        .reason = "befor for before",
+        .file = "/m/S1/E01.mkv",
+        .editable = true,
     };
 }
 
@@ -165,12 +173,13 @@ subcheck_ffi::EntryView rowOfTwelve(const subcheck_ffi::EntryKey &key,
 // review's end, and a review that does not end fails its test sooner. Its player gives an Open a
 // long wait for the pane, which offscreen never shows video, so that a Show in Video still waits
 // there however slow the runner. Its settings are kept in `settings`, a directory given, or else
-// its own.
+// its own. Its bridge tells each action it sends, and holds them back from review once a test asks
+// it to, so that a test sees what the window does before review answers.
 struct Shown {
     std::ostringstream out;
     std::ostringstream err;
     PlayerPort player{std::chrono::seconds(1), std::chrono::seconds(2), std::chrono::minutes(1)};
-    Telling bridge;
+    Holding bridge;
     QTemporaryDir own;
     WindowSettings settings;
     QQmlApplicationEngine engine;
@@ -320,10 +329,13 @@ struct Shown {
         return of->mapToScene(QPointF(of->width() / 2, of->height() / 2)).toPoint();
     }
 
-    void click(QQuickItem *of) { click(window, of); }
+    // In the window the item is drawn in: an item of a menu Qt draws in a popup window of its own,
+    // the right-click menu's among them, takes its clicks in that window.
+    void click(QQuickItem *of) { click(of->window(), of); }
     void click(QQuickWindow *in, QQuickItem *of) {
         QTest::mouseClick(in, Qt::LeftButton, {}, middle(of));
     }
+    void rightClick(QQuickItem *of) { QTest::mouseClick(window, Qt::RightButton, {}, middle(of)); }
 
     // The middle of the handle between the column `left` ends and the one `right` starts.
     QPoint handle(QQuickItem *left, QQuickItem *right) const {
@@ -376,6 +388,100 @@ bool inDetailsView(const Shown &w, QQuickItem *item) {
     return top >= -0.5 && top + item->height() <= detailsView(w)->height() + 0.5;
 }
 
+// What keeps the details panel's block with the fix from being laid out as the window draws it
+// next, the panel `width` wide, nothing once it is: the block as wide as the column it is in, and
+// its line inside it. A change of the text's size or the window's moves the line's own size at
+// once, and the panel and the block only as the window lays out what changed, before its next
+// frame.
+QString fixNotLaidOut(const Shown &w, qreal width) {
+    QQuickItem *panel = w.item("details");
+    QQuickItem *fixed = w.item("fixedBlock");
+    QQuickItem *line = Shown::item(fixed, "blockLine");
+    const QRectF drawn = line->mapRectToItem(fixed, line->boundingRect());
+    QStringList off;
+    if (qAbs(panel->width() - width) >= 0.5) {
+        off << QStringLiteral("the panel is %1 wide, not %2").arg(panel->width()).arg(width);
+    }
+    if (qAbs(fixed->width() - fixed->parentItem()->width()) >= 0.5) {
+        off << QStringLiteral("the block is %1 wide in a column %2 wide")
+                   .arg(fixed->width())
+                   .arg(fixed->parentItem()->width());
+    }
+    if (!fixed->boundingRect().adjusted(-0.5, -0.5, 0.5, 0.5).contains(drawn)) {
+        off << QStringLiteral("the line is at %1,%2 %3x%4 in a block %5x%6")
+                   .arg(drawn.x())
+                   .arg(drawn.y())
+                   .arg(drawn.width())
+                   .arg(drawn.height())
+                   .arg(fixed->width())
+                   .arg(fixed->height());
+    }
+    return off.join(QStringLiteral("; "));
+}
+
+// The fix's line drawn on one line: the details panel is given one fixed width at once, the
+// window with it (`roomForOneLine`, which callers pass to fixNotLaidOut), an allowance that the
+// wait below checks and that Row 0's fix fits in any font this suite meets, so that what a test
+// says of a line of one never counts on a font. The window's height grows with the video above the
+// line, which is as tall as the panel is wide times 9/16, so the details' view keeps the room it
+// had. Fails the test, saying what it could not get, when the panel does not take the width or the
+// line is not drawn on one line at it.
+constexpr int roomForOneLine = 900;
+
+void askRoomForOneLine(Shown &w, QQuickItem *line) {
+    constexpr int asked = roomForOneLine;
+    const QFont font = line->property("font").value<QFont>();
+    const auto drawnLines = [line, font] {
+        return qRound(line->property("contentHeight").toReal() / QFontMetricsF(font).lineSpacing());
+    };
+    const int videoGrowth = qMax(0, qCeil((asked - w.item("details")->width()) * 9.0 / 16.0));
+    w.window->resize(w.settings.sidebarWidth() + asked + w.window->property("listLeast").toInt() +
+                         w.window->property("handles").toInt(),
+                     w.window->height() + videoGrowth);
+    w.settings.keepColumns(w.settings.sidebarWidth(), asked);
+    QTRY_VERIFY2(fixNotLaidOut(w, asked).isEmpty() && drawnLines() == 1,
+                 qPrintable(QStringLiteral("asked for a panel %1 wide; it is %2 wide and draws the "
+                                           "line in %3 lines; %4")
+                                .arg(asked)
+                                .arg(w.item("details")->width())
+                                .arg(drawnLines())
+                                .arg(fixNotLaidOut(w, asked))));
+}
+
+// The entry `list` draws for its row `row`; none while it draws none.
+QQuickItem *drawnEntry(QQuickItem *list, int row) {
+    QQuickItem *each = nullptr;
+    QMetaObject::invokeMethod(list, "itemAtIndex", Q_RETURN_ARG(QQuickItem *, each),
+                              Q_ARG(int, row));
+    return each;
+}
+
+// Where `entry` starts in `list`'s view, and whether it lies wholly inside it.
+qreal topInList(QQuickItem *list, QQuickItem *entry) {
+    return entry->mapToItem(list, QPointF(0, 0)).y();
+}
+bool inList(QQuickItem *list, QQuickItem *entry) {
+    if (!entry) {
+        return false;
+    }
+    const qreal top = topInList(list, entry);
+    return top >= -0.5 && top + entry->height() <= list->height() + 0.5;
+}
+
+// The part called `name` of the details panel's block with the fix, where its edit opens: the field
+// and its buttons, which the block above it has too, never shown.
+QQuickItem *inEdit(const Shown &w, const char *name) {
+    QQuickItem *fixed = w.item("fixedBlock");
+    return fixed ? Shown::item(fixed, name) : nullptr;
+}
+
+// `text` typed a key at a time into what has the window's keys.
+void typeIn(const Shown &w, const char *text) {
+    for (const char *key = text; *key; ++key) {
+        QTest::keyClick(w.window, *key);
+    }
+}
+
 // The colour of the window palette's `role`.
 QColor paletteColour(const Shown &w, const char *role) {
     return w.window->property("palette").value<QObject *>()->property(role).value<QColor>();
@@ -386,6 +492,263 @@ QColor selectionOutline(const Shown &w) {
     auto *selection = w.find("findings")->property("highlightItem").value<QQuickItem *>();
     auto *border = selection ? selection->property("border").value<QObject *>() : nullptr;
     return border ? border->property("color").value<QColor>() : QColor();
+}
+
+// Counts the key events that reach the object it watches. Installed before another filter, it
+// hears only what that filter lets through, as Qt asks the filter installed last first.
+struct HeardKeys : QObject {
+    int heard = 0;
+
+    bool eventFilter(QObject *, QEvent *event) override {
+        if (event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyPress) {
+            ++heard;
+        }
+        return false;
+    }
+};
+
+// The style `row` is drawn in, told by a part only that style draws: Compact's glyph, or Rich's
+// tile.
+QString drawnStyle(QQuickItem *row) {
+    if (Shown::item(row, "rowGlyph")) {
+        return QStringLiteral("compact");
+    }
+    QQuickItem *tile = Shown::item(row, "rowTile");
+    return tile && tile->isVisible() ? QStringLiteral("rich") : QStringLiteral("twoLines");
+}
+
+// The style of each row the list draws now.
+QStringList drawnStyles(const Shown &w) {
+    auto *content = w.find("findings")->property("contentItem").value<QQuickItem *>();
+    QStringList styles;
+    const QList<QQuickItem *> rows = content->childItems();
+    for (QQuickItem *row : rows) {
+        if (row->property("index").isValid() && row->isVisible()) {
+            styles << drawnStyle(row);
+        }
+    }
+    return styles;
+}
+
+// The names a screen reader is told of under `in`, in the order of its tree.
+QStringList accessibleNames(QAccessibleInterface *in) {
+    QStringList names;
+    for (int i = 0; in && i < in->childCount(); ++i) {
+        QAccessibleInterface *child = in->child(i);
+        if (child) {
+            names << child->text(QAccessible::Name) << accessibleNames(child);
+        }
+    }
+    return names;
+}
+
+// The View menu's Rows items checked now, by name.
+QStringList checkedRowStyles(const Shown &w) {
+    QStringList checked;
+    for (const char *name : {"rowsCompact", "rowsTwoLines", "rowsRich"}) {
+        QObject *action = w.find(name);
+        if (!action) {
+            checked << QStringLiteral("(no %1)").arg(QLatin1String(name));
+        } else if (action->property("checked").toBool()) {
+            checked << QString::fromLatin1(name);
+        }
+    }
+    return checked;
+}
+
+// What `menu` holds, in order: each item's words, and "-" for a separator.
+QStringList menuWords(QObject *menu) {
+    QStringList words;
+    const int count = menu->property("count").toInt();
+    for (int i = 0; i < count; ++i) {
+        QQuickItem *each = nullptr;
+        QMetaObject::invokeMethod(menu, "itemAt", Q_RETURN_ARG(QQuickItem *, each), Q_ARG(int, i));
+        if (!each) {
+            words << QStringLiteral("(no item %1)").arg(i);
+        } else if (each->inherits("QQuickMenuSeparator")) {
+            words << QStringLiteral("-");
+        } else {
+            words << each->property("text").toString();
+        }
+    }
+    return words;
+}
+
+// What keeps a person from reading `item` of a menu whole, said of each of its words: a text cut
+// short, one running past the item's left or right edge, two running into each other, a text over
+// the item's check box, and a shortcut of its action's that it does not show, as Fusion hides one
+// it has no room for, where the platform shows shortcuts in menus. Empty for an item drawn whole.
+QStringList notWhole(QQuickItem *item) {
+    QList<QQuickItem *> texts;
+    const std::function<void(QQuickItem *)> collect = [&texts, &collect](QQuickItem *in) {
+        const QList<QQuickItem *> children = in->childItems();
+        for (QQuickItem *child : children) {
+            if (child->isVisible() && child->inherits("QQuickText") &&
+                !child->property("text").toString().isEmpty()) {
+                texts << child;
+            }
+            collect(child);
+        }
+    };
+    collect(item);
+    // Where `part` draws across the item: for a text, its words, which run out of its box where the
+    // box is narrower than they are, to the box's left for words aligned to its right.
+    const auto across = [item](QQuickItem *part) {
+        return part->mapRectToItem(item, part->boundingRect());
+    };
+    const auto meet = [](const QRectF &one, const QRectF &other) {
+        return one.left() < other.right() - 0.5 && other.left() < one.right() - 0.5;
+    };
+    QStringList wrong;
+    auto *box = item->property("indicator").value<QQuickItem *>();
+    for (qsizetype i = 0; i < texts.size(); ++i) {
+        const QString words = texts[i]->property("text").toString();
+        const QRectF drawn = across(texts[i]);
+        if (texts[i]->property("truncated").toBool()) {
+            wrong << QStringLiteral("\"%1\" is cut short").arg(words);
+        }
+        if (drawn.left() < -0.5 || drawn.right() > item->width() + 0.5) {
+            wrong << QStringLiteral("\"%1\" runs past the item's edge").arg(words);
+        }
+        for (qsizetype j = i + 1; j < texts.size(); ++j) {
+            if (meet(drawn, across(texts[j]))) {
+                wrong << QStringLiteral("\"%1\" runs into \"%2\"")
+                             .arg(words, texts[j]->property("text").toString());
+            }
+        }
+        if (box && box->isVisible() && meet(drawn, across(box))) {
+            wrong << QStringLiteral("\"%1\" runs over the check box").arg(words);
+        }
+    }
+    auto *action = item->property("action").value<QObject *>();
+    const QString keys = action ? action->property("shortcut").toString() : QString();
+    if (!keys.isEmpty() && QGuiApplication::styleHints()->showShortcutsInContextMenus()) {
+        const QString shown = QKeySequence(keys).toString(QKeySequence::NativeText);
+        if (std::none_of(texts.begin(), texts.end(), [&shown](QQuickItem *text) {
+                return text->property("text").toString() == shown;
+            })) {
+            wrong << QStringLiteral("its shortcut \"%1\" is not shown").arg(shown);
+        }
+    }
+    return wrong;
+}
+
+// What keeps a person from reading each item of `menu` but its separators whole, each said with
+// the menu and the item.
+QStringList itemsNotWhole(QObject *menu) {
+    const QString title = menu->property("title").toString();
+    const QString name = title.isEmpty() ? menu->objectName() : title;
+    QStringList wrong;
+    const int count = menu->property("count").toInt();
+    for (int i = 0; i < count; ++i) {
+        QQuickItem *each = nullptr;
+        QMetaObject::invokeMethod(menu, "itemAt", Q_RETURN_ARG(QQuickItem *, each), Q_ARG(int, i));
+        if (!each) {
+            wrong << QStringLiteral("%1: no item %2").arg(name).arg(i);
+        } else if (!each->inherits("QQuickMenuSeparator")) {
+            const QString words = each->property("text").toString();
+            const QStringList found = notWhole(each);
+            for (const QString &what : found) {
+                wrong << QStringLiteral("%1 ▸ %2: %3").arg(name, words, what);
+            }
+        }
+    }
+    return wrong;
+}
+
+// The popup windows open, none once every one is closed. Qt hands each press to the popup window
+// open last, and Qt Quick's popup window takes a press on the menu bar as one outside it: it
+// closes and keeps the press from the bar, whose menu then never opens.
+QString popupWindowsOpen() {
+    QStringList open;
+    const QWindowList windows = QGuiApplication::allWindows();
+    for (QWindow *each : windows) {
+        if (each->type() == Qt::Popup && each->isVisible()) {
+            open << QString::fromLatin1(each->metaObject()->className());
+        }
+    }
+    return open.join(QStringLiteral(", "));
+}
+
+// The rect Qt hands Wayland to place a menu it draws in a popup window of its own, below the rect's
+// bottom-left corner, whatever the menu's place in its parent: the parent item's rect in the
+// window, moved right by the menu's overlap and narrowed by twice it, to no less than a quarter of
+// its width. It follows Qt 6.12's QQuickPopupWindow::parentControlGeometry, which is private and
+// can change in any release, so a newer Qt needs it checked against that function again.
+QRect waylandAnchor(QObject *menu) {
+    auto *parent = menu->property("parent").value<QQuickItem *>();
+    const qreal overlap = menu->property("overlap").toReal();
+    const QRectF bounds = parent->boundingRect();
+    const QPointF at = parent->mapToScene(bounds.topLeft());
+    return {qFloor(at.x() + overlap), qFloor(at.y()),
+            qCeil(qMax(qAbs(bounds.width() - overlap * 2), bounds.width() / 4)),
+            qCeil(bounds.height())};
+}
+
+// The windows shown, the one with the keys and the bar's entries it takes as current: what a menu
+// that did not open met.
+QString menusMet(const Shown &w) {
+    QStringList shown;
+    const QWindowList windows = QGuiApplication::allWindows();
+    for (QWindow *each : windows) {
+        if (each->isVisible()) {
+            shown << QStringLiteral("%1 (type %2)")
+                         .arg(QString::fromLatin1(each->metaObject()->className()))
+                         .arg(int(each->type()), 0, 16);
+        }
+    }
+    QStringList current;
+    for (int i = 0; i < 5; ++i) {
+        QQuickItem *entry = w.barEntry(i);
+        if (entry && entry->property("highlighted").toBool()) {
+            current << entry->property("text").toString();
+        }
+    }
+    QWindow *keys = QGuiApplication::focusWindow();
+    return QStringLiteral("windows shown: %1; the keys: %2; the bar's current entry: %3")
+        .arg(shown.join(QStringLiteral(", ")),
+             keys ? QString::fromLatin1(keys->metaObject()->className()) : QStringLiteral("none"),
+             current.join(QStringLiteral(", ")));
+}
+
+// The item of `menu` that opens its menu `sub`; none while it has none.
+QQuickItem *subMenuItem(QObject *menu, QObject *sub) {
+    const int count = menu->property("count").toInt();
+    for (int i = 0; i < count; ++i) {
+        QQuickItem *each = nullptr;
+        QMetaObject::invokeMethod(menu, "itemAt", Q_RETURN_ARG(QQuickItem *, each), Q_ARG(int, i));
+        if (each && each->property("subMenu").value<QObject *>() == sub) {
+            return each;
+        }
+    }
+    return nullptr;
+}
+
+// The action a click on the list's row at `row` sends: its Select.
+QString selecting(Shown &w, int row) {
+    const subcheck_ffi::EntryView *entry = w.bridge.findings()->at(row);
+    return entry ? told(subcheck_ffi::Action(subcheck_ffi::Action::kSelect{entry->key}))
+                 : QStringLiteral("(no row %1)").arg(row);
+}
+
+// The item called `name` of the right-click menu, open or not.
+QQuickItem *rowMenuItem(const Shown &w, const char *name) {
+    return qobject_cast<QQuickItem *>(w.find(name));
+}
+
+// A timing row made up in the selected row's place, drawn as review's next change would: its fix
+// is accepted or rejected, never reworded. False if the list would not take it.
+bool timingRowAtTheSelection(Shown &w) {
+    subcheck_ffi::EntryView timing =
+        rowOfTwelve(subcheck_ffi::EntryKey(subcheck_ffi::EntryKey::kRow{{500}}));
+    timing.check = subcheck_ffi::Check::kTiming;
+    timing.editable = false;
+    if (!w.bridge.findings()->apply(
+            subcheck_ffi::Splice{static_cast<uint64_t>(w.bridge.selected()), 1, {timing}})) {
+        return false;
+    }
+    emit w.bridge.summaryChanged();
+    return true;
 }
 
 // The window on that view at its least size, E01 clicked: its file selected and its first
@@ -415,6 +778,9 @@ void clickE01AtTheLeastSize(Shown &w) {
 
 class WindowTest : public QObject {
     Q_OBJECT
+
+    // As main.cpp, made after the application and before the first window (key_names.h).
+    KeyNames keyNames;
 
 private slots:
     void initTestCase() {
@@ -550,6 +916,54 @@ private slots:
         QTRY_COMPARE(list->property("currentIndex").toInt(), 1);
     }
 
+    // Home and g go to the first row, End and Shift+G to the last, and a page is the rows the list
+    // shows at once: fewer in Rich than in Compact, as its rows are taller.
+    void homeEndAndPagesMoveAsTheTerminalsDo() {
+        int pages[2] = {0, 0};
+        int at = 0;
+        for (const char *style : {"compact", "rich"}) {
+            Shown w({media()});
+            w.settings.setRowStyle(QString::fromLatin1(style));
+            QVERIFY(w.start());
+            QTRY_COMPARE(w.rows(), 2);
+            w.window->resize(w.window->minimumSize());
+            QTRY_COMPARE(w.window->height(), 480);
+            std::vector<subcheck_ffi::EntryView> more;
+            for (uint64_t id = 100; id < 120; ++id) {
+                more.push_back(
+                    rowOfTwelve(subcheck_ffi::EntryKey(subcheck_ffi::EntryKey::kRow{{id}})));
+            }
+            QVERIFY(w.bridge.findings()->apply(subcheck_ffi::Splice{2, 0, more}));
+            auto *list = qobject_cast<QQuickItem *>(w.find("findings"));
+            QTRY_VERIFY(list->property("contentHeight").toReal() > list->height());
+            QTRY_VERIFY(w.delegate(0));
+            QCOMPARE(w.bridge.selected(), 0);
+            const int rows = int(std::floor(list->height() / w.delegate(0)->height()));
+            QVERIFY(rows > 1);
+            QCOMPARE(list->property("pageRows").toInt(), rows);
+            const QString last = selecting(w, w.bridge.findings()->rowCount() - 1);
+            QVERIFY2(last.contains("119"), qPrintable(last));
+            const qsizetype from = w.bridge.sent.size();
+            for (const auto &[key, modifiers] :
+                 {std::pair{Qt::Key_End, Qt::KeyboardModifiers{}},
+                  std::pair{Qt::Key_G, Qt::KeyboardModifiers{Qt::ShiftModifier}}}) {
+                QTest::keyClick(w.window, key, modifiers);
+                QCOMPARE(w.last(), last);
+            }
+            for (const Qt::Key key : {Qt::Key_Home, Qt::Key_G}) {
+                QTest::keyClick(w.window, key);
+                QCOMPARE(w.last(), selecting(w, 0));
+            }
+            QTest::keyClick(w.window, Qt::Key_PageDown);
+            QCOMPARE(w.last(), QString("Move %1").arg(rows));
+            QTest::keyClick(w.window, Qt::Key_PageUp);
+            QCOMPARE(w.last(), QString("Move -%1").arg(rows));
+            QCOMPARE(w.since(from).size(), 6);
+            pages[at++] = rows;
+        }
+        QVERIFY2(pages[1] < pages[0], qPrintable(QString("%1 %2").arg(pages[0]).arg(pages[1])));
+    }
+
     // Every key the window has sends its action; review takes them in order, so only a key whose
     // action the window works out from what review last said waits for that, and the run is left
     // as found. The keys that quit are the next test's.
@@ -559,11 +973,26 @@ private slots:
         QTRY_COMPARE(w.rows(), 2);
         QObject *heading = w.find("heading");
         QVERIFY(heading);
+        // Ctrl+C copies the selected row's line, and asks review nothing.
+        QGuiApplication::clipboard()->clear();
+        QCOMPARE(w.bridge.selected(), 0);
+        QTest::keyClick(w.window, Qt::Key_C, Qt::ControlModifier);
+        QCOMPARE(w.bridge.sent, QStringList());
+        QCOMPARE(QGuiApplication::clipboard()->text(),
+                 QString::fromStdString(w.bridge.findings()->at(0)->original));
+        const int page = w.item("findings")->property("pageRows").toInt();
+        QVERIFY(page > 1);
         const std::vector<std::tuple<int, Qt::KeyboardModifiers, QString>> keys = {
             {Qt::Key_J, {}, "Move 1"},
             {Qt::Key_Down, {}, "Move 1"},
             {Qt::Key_K, {}, "Move -1"},
             {Qt::Key_Up, {}, "Move -1"},
+            {Qt::Key_Home, {}, selecting(w, 0)},
+            {Qt::Key_End, {}, selecting(w, 1)},
+            {Qt::Key_G, {}, selecting(w, 0)},
+            {Qt::Key_G, Qt::ShiftModifier, selecting(w, 1)},
+            {Qt::Key_PageUp, {}, QString("Move -%1").arg(page)},
+            {Qt::Key_PageDown, {}, QString("Move %1").arg(page)},
             {Qt::Key_Return, {}, "Toggle"},
             {Qt::Key_Enter, Qt::KeypadModifier, "Toggle"},
             {Qt::Key_A, {}, "Accept"},
@@ -605,6 +1034,27 @@ private slots:
         QCOMPARE(w.bridge.sent.mid(w.bridge.sent.size() - 4),
                  (QStringList{"SetFilter Pending", "SetFilter Accepted", "SetFilter Rejected",
                               "SetFilter All"}));
+        // Last, as the edit it opens and the Find box each have the keys: Esc, their field's, ends
+        // the edit and gives the window its keys back from the box, which stays. Ctrl+F asks review
+        // nothing.
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_E);
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QTRY_VERIFY(inEdit(w, "editField")->hasActiveFocus());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
+        QTRY_VERIFY(!w.bridge.editing());
+        QQuickItem *findBox = w.item("findBox");
+        QQuickItem *findField = w.item("findField");
+        QVERIFY(findBox && findField);
+        QVERIFY(findBox->isVisible());
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(findField->hasActiveFocus());
+        QVERIFY(findBox->isVisible());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QVERIFY(!findField->hasActiveFocus());
+        QVERIFY(findBox->isVisible());
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
     }
 
     // The window's quit key, Close and Quit each quit: two Interrupts, the second stopping a job a
@@ -647,15 +1097,26 @@ private slots:
         Shown w({media()});
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
+        // Copy Subtitle Line copies the selected row's line, and asks review nothing.
+        QGuiApplication::clipboard()->clear();
+        QCOMPARE(w.bridge.selected(), 0);
+        QObject *copyLine = w.find("copyLine");
+        QVERIFY(copyLine);
+        QVERIFY(QMetaObject::invokeMethod(copyLine, "trigger"));
+        QCOMPARE(w.bridge.sent, QStringList());
+        QCOMPARE(QGuiApplication::clipboard()->text(),
+                 QString::fromStdString(w.bridge.findings()->at(0)->original));
         const std::vector<std::pair<const char *, QStringList>> items = {
             {"accept", {"Accept"}},
             {"undo", {"Undo"}},
             {"reject", {"Reject"}},
             {"undo", {"Undo"}},
             {"clear", {"Clear"}},
+            {"edit", {"Edit"}},
             {"nextEpisode", {"NextFile"}},
             {"previousEpisode", {"PreviousFile"}},
             {"play", {"Play"}},
+            {"showEachEpisode", {"Toggle"}},
             {"pause", {"Playback Pause"}},
             {"back5", {"Playback Seek -5"}},
             {"forward5", {"Playback Seek 5"}},
@@ -675,6 +1136,10 @@ private slots:
             const qsizetype from = w.bridge.sent.size();
             QVERIFY(QMetaObject::invokeMethod(item, "trigger"));
             QCOMPARE(w.since(from), actions);
+            // The edit it opens would hold the decisions after it back.
+            if (actions == QStringList{"Edit"}) {
+                w.bridge.cancelEdit();
+            }
         }
         QTRY_COMPARE(w.decision(0), "To review");
         QObject *show0 = w.find("show0");
@@ -690,9 +1155,19 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(switchView, "trigger"));
         QTRY_COMPARE(switchView->property("text").toString(), "Show Newest Check");
 
+        // Find asks review nothing: it gives the Find box's field the keys.
+        QObject *find = w.find("find");
+        QVERIFY(find);
+        QCOMPARE(find->property("text").toString(), "&Find…");
+        const qsizetype from = w.bridge.sent.size();
+        QVERIFY(QMetaObject::invokeMethod(find, "trigger"));
+        QCOMPARE(w.since(from), QStringList());
+        QTRY_VERIFY(w.item("findField")->hasActiveFocus());
+
         // What each menu holds: the items above, and only those.
         const std::vector<std::pair<const char *, int>> counts = {
-            {"&File", 4}, {"&Edit", 1}, {"&View", 3}, {"&Show", 4}, {"F&inding", 8}, {"Vi&deo", 9}};
+            {"&File", 4}, {"&Edit", 4},     {"&View", 4}, {"&Show", 4},
+            {"&Rows", 3}, {"F&inding", 10}, {"Vi&deo", 9}};
         for (const auto &[title, count] : counts) {
             QObject *each = w.menu(title);
             QVERIFY2(each, title);
@@ -700,6 +1175,11 @@ private slots:
         }
         // One key, as StandardKey.Undo's several draw a warning on KDE's styles.
         QCOMPARE(w.find("undo")->property("shortcut").toString(), "Ctrl+Z");
+        // Return, which the menu item shows; the keypad's Enter is a shortcut of its own.
+        QCOMPARE(w.find("showEachEpisode")->property("shortcut").toString(), "Return");
+        QCOMPARE(w.find("edit")->property("shortcut").toString(), "E");
+        QCOMPARE(copyLine->property("shortcut").toString(), "Ctrl+C");
+        QCOMPARE(find->property("shortcut").toString(), "Ctrl+F");
     }
 
     // The Show menu checks the filter shown and no other, whichever that is, and choosing the one
@@ -834,6 +1314,870 @@ private slots:
         toSecond.ignore();
         QCoreApplication::sendEvent(&second, &toSecond);
         QVERIFY(toSecond.isAccepted());
+    }
+
+    // An open popup the window draws that has the keys keeps them from the window's shortcuts on
+    // every platform, a Mac's among them: a menu off the bar, a text field's own menu, a sheet.
+    // Closed, it keeps nothing, and on a Mac an open menu of the bar alone still keeps nothing.
+    void aPopupWithTheKeysHoldsThemOnEveryPlatform() {
+        QQmlEngine engine;
+        QQmlComponent component(&engine);
+        component.setData(QByteArrayLiteral(R"(
+import QtQuick
+import QtQuick.Controls
+
+Window {
+    width: 200
+    height: 200
+
+    Item {
+        objectName: "outer"
+        focus: true
+    }
+    Popup {
+        objectName: "popup"
+        focus: true
+
+        Item {
+            objectName: "inner"
+            focus: true
+        }
+    }
+}
+)"),
+                          QUrl(QStringLiteral("popup.qml")));
+        const std::unique_ptr<QObject> made(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(made.get());
+        QVERIFY2(window, qPrintable(component.errorString()));
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(window));
+        QObject *popup = window->findChild<QObject *>("popup");
+        auto *outer = window->findChild<QQuickItem *>("outer");
+        auto *inner = popup ? popup->findChild<QQuickItem *>("inner") : nullptr;
+        QVERIFY(popup && outer && inner);
+        // Whether `platform`'s MenuKeys, watching the window, keeps a key sent to it as `type`:
+        // accepted, so that it is no shortcut, and none of the window's to handle. Whether the
+        // window then accepts a key it is given is Qt's: an open popup accepts every key press.
+        const auto kept = [window](const QString &platform, QEvent::Type type,
+                                   bool menuOpen = false) {
+            HeardKeys past;
+            window->installEventFilter(&past);
+            MenuKeys keys(platform);
+            keys.setTarget(window);
+            keys.setProperty("menuOpen", menuOpen);
+            QKeyEvent event(type, Qt::Key_X, Qt::NoModifier);
+            event.ignore();
+            QCoreApplication::sendEvent(window, &event);
+            window->removeEventFilter(&past);
+            return event.isAccepted() && past.heard == 0;
+        };
+        const QStringList platforms = {"xcb", "wayland", "offscreen", "windows", "cocoa"};
+
+        QTRY_VERIFY(outer->hasActiveFocus());
+        for (const QString &platform : platforms) {
+            QVERIFY2(!kept(platform, QEvent::ShortcutOverride), qPrintable(platform));
+            QVERIFY2(!kept(platform, QEvent::KeyPress), qPrintable(platform));
+        }
+        QVERIFY(!kept("cocoa", QEvent::ShortcutOverride, true));
+
+        QVERIFY(QMetaObject::invokeMethod(popup, "open"));
+        QTRY_VERIFY(popup->property("opened").toBool());
+        QTRY_VERIFY(inner->hasActiveFocus());
+        for (const QString &platform : platforms) {
+            QVERIFY2(kept(platform, QEvent::ShortcutOverride), qPrintable(platform));
+            QVERIFY2(!kept(platform, QEvent::KeyPress), qPrintable(platform));
+        }
+
+        QVERIFY(QMetaObject::invokeMethod(popup, "close"));
+        QTRY_VERIFY(!popup->property("visible").toBool());
+        outer->forceActiveFocus();
+        QTRY_VERIFY(outer->hasActiveFocus());
+        for (const QString &platform : platforms) {
+            QVERIFY2(!kept(platform, QEvent::ShortcutOverride), qPrintable(platform));
+            QVERIFY2(!kept(platform, QEvent::KeyPress), qPrintable(platform));
+        }
+    }
+
+    // A popup Qt Quick opens in a window of its own over the window, as Fusion's text field menu
+    // is, holds the keys too on every platform, whichever window a key reaches: its own, where the
+    // platform sends a key while it is open, or the window, both of whose shortcuts Qt asks about
+    // it. Closed, it holds none.
+    void aPopupInAWindowOfItsOwnHoldsTheKeysOnEveryPlatform() {
+        QQmlEngine engine;
+        QQmlComponent component(&engine);
+        component.setData(QByteArrayLiteral(R"(
+import QtQuick
+import QtQuick.Controls
+
+Window {
+    width: 200
+    height: 200
+
+    Item {
+        objectName: "outer"
+        focus: true
+    }
+    Popup {
+        objectName: "popup"
+        popupType: Popup.Window
+        focus: true
+        width: 50
+        height: 50
+
+        Item {
+            objectName: "inner"
+            focus: true
+        }
+    }
+}
+)"),
+                          QUrl(QStringLiteral("popup-window.qml")));
+        const std::unique_ptr<QObject> made(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(made.get());
+        QVERIFY2(window, qPrintable(component.errorString()));
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(window));
+        QObject *popup = window->findChild<QObject *>("popup");
+        QVERIFY(popup);
+        // Whether `platform`'s MenuKeys, watching the window, keeps a key sent to `to` from every
+        // shortcut.
+        const auto kept = [window](const QString &platform, QWindow *to) {
+            MenuKeys keys(platform);
+            keys.setTarget(window);
+            QKeyEvent event(QEvent::ShortcutOverride, Qt::Key_X, Qt::NoModifier);
+            event.ignore();
+            QCoreApplication::sendEvent(to, &event);
+            return event.isAccepted();
+        };
+        const QStringList platforms = {"xcb", "wayland", "offscreen", "windows", "cocoa"};
+        for (const QString &platform : platforms) {
+            QVERIFY2(!kept(platform, window), qPrintable(platform));
+        }
+
+        QVERIFY(QMetaObject::invokeMethod(popup, "open"));
+        QTRY_VERIFY(popup->property("opened").toBool());
+        QTRY_VERIFY(QGuiApplication::focusWindow() != window);
+        QWindow *own = QGuiApplication::focusWindow();
+        QVERIFY(own);
+        QCOMPARE(own->type(), Qt::Popup);
+        QCOMPARE(own->transientParent(), window);
+        for (const QString &platform : platforms) {
+            QVERIFY2(kept(platform, own), qPrintable(platform));
+            QVERIFY2(kept(platform, window), qPrintable(platform));
+        }
+
+        QVERIFY(QMetaObject::invokeMethod(popup, "close"));
+        QTRY_VERIFY(!popup->property("visible").toBool());
+        for (const QString &platform : platforms) {
+            QVERIFY2(!kept(platform, window), qPrintable(platform));
+        }
+    }
+
+    // A press in the window away from the keeper is told, by the mouse or by touch, and one on the
+    // keeper is not; nor is one while a popup the window draws has the keys, on the popup or
+    // beside it, closing it. With no keeper every press is away, and a window it no longer watches
+    // tells nothing.
+    void aPressAwayFromTheKeeperIsToldWhileNoPopupHasTheKeys() {
+        QQmlEngine engine;
+        QQmlComponent component(&engine);
+        component.setData(QByteArrayLiteral(R"(
+import QtQuick
+import QtQuick.Controls
+
+Window {
+    width: 200
+    height: 200
+
+    Item {
+        objectName: "keeper"
+        width: 50
+        height: 50
+    }
+    Item {
+        objectName: "outer"
+        focus: true
+    }
+    Popup {
+        objectName: "popup"
+        popupType: Popup.Item
+        focus: true
+        x: 100
+        width: 50
+        height: 50
+
+        Item {
+            objectName: "inner"
+            focus: true
+        }
+    }
+}
+)"),
+                          QUrl(QStringLiteral("press-away.qml")));
+        const std::unique_ptr<QObject> made(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(made.get());
+        QVERIFY2(window, qPrintable(component.errorString()));
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(window));
+        QObject *popup = window->findChild<QObject *>("popup");
+        auto *keeper = window->findChild<QQuickItem *>("keeper");
+        auto *outer = window->findChild<QQuickItem *>("outer");
+        auto *inner = popup ? popup->findChild<QQuickItem *>("inner") : nullptr;
+        QVERIFY(popup && keeper && outer && inner);
+        PressAway away;
+        away.setTarget(window);
+        away.setTarget(window);
+        QCOMPARE(away.target(), window);
+        away.setKeeper(keeper);
+        away.setKeeper(keeper);
+        QCOMPARE(away.keeper(), keeper);
+        QSignalSpy told(&away, &PressAway::pressedAway);
+        // Whether `press` is told.
+        const auto toldOf = [&told](const std::function<void()> &press) {
+            const qsizetype before = told.count();
+            press();
+            return told.count() > before;
+        };
+        static QPointingDevice *const touch = QTest::createTouchDevice();
+        const auto tap = [window](QPoint at) {
+            QTest::touchEvent(window, touch).press(0, at, window);
+            QTest::touchEvent(window, touch).release(0, at, window);
+        };
+        const QPoint onKeeper(25, 25);
+        const QPoint elsewhere(25, 150);
+        const QPoint onPopup(125, 25);
+        for (const Qt::MouseButton button : {Qt::LeftButton, Qt::RightButton}) {
+            QVERIFY(!toldOf([&] { QTest::mouseClick(window, button, {}, onKeeper); }));
+            QVERIFY(toldOf([&] { QTest::mouseClick(window, button, {}, elsewhere); }));
+        }
+        QVERIFY(!toldOf([&] { tap(onKeeper); }));
+        QVERIFY(toldOf([&] { tap(elsewhere); }));
+
+        QVERIFY(QMetaObject::invokeMethod(popup, "open"));
+        QTRY_VERIFY(popup->property("opened").toBool());
+        QTRY_VERIFY(inner->hasActiveFocus());
+        QVERIFY(!toldOf([&] { QTest::mouseClick(window, Qt::LeftButton, {}, onPopup); }));
+        QVERIFY(popup->property("visible").toBool());
+        QVERIFY(!toldOf([&] { QTest::mouseClick(window, Qt::LeftButton, {}, elsewhere); }));
+        QTRY_VERIFY(!popup->property("visible").toBool());
+        outer->forceActiveFocus();
+        QTRY_VERIFY(outer->hasActiveFocus());
+        QVERIFY(toldOf([&] { QTest::mouseClick(window, Qt::LeftButton, {}, elsewhere); }));
+
+        away.setKeeper(nullptr);
+        QVERIFY(toldOf([&] { QTest::mouseClick(window, Qt::LeftButton, {}, onKeeper); }));
+        away.setTarget(nullptr);
+        QVERIFY(!toldOf([&] { QTest::mouseClick(window, Qt::LeftButton, {}, elsewhere); }));
+    }
+
+    // While a menu of a bar the window draws is open, a press away from the keeper is the menu's,
+    // as its keys are (menu_keys.h): it is not told. On a Mac the bar is the system's, and a press
+    // that reaches the window is told; so is one once the menu has closed.
+    void aPressWhileAMenuOfTheDrawnBarIsOpenIsNotTold() {
+        QQmlEngine engine;
+        QQmlComponent component(&engine);
+        component.setData(QByteArrayLiteral(R"(
+import QtQuick
+
+Window {
+    width: 200
+    height: 200
+
+    Item {
+        objectName: "keeper"
+        width: 50
+        height: 50
+    }
+}
+)"),
+                          QUrl(QStringLiteral("press-away-bar.qml")));
+        const std::unique_ptr<QObject> made(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(made.get());
+        QVERIFY2(window, qPrintable(component.errorString()));
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto *keeper = window->findChild<QQuickItem *>("keeper");
+        QVERIFY(keeper);
+        // Whether a press away from the keeper is told while `platform`'s bar has a menu `open`.
+        const auto told = [window, keeper](const QString &platform, bool open) {
+            MenuKeys keys(platform);
+            keys.setTarget(window);
+            keys.setProperty("menuOpen", open);
+            PressAway away;
+            away.setTarget(window);
+            away.setKeeper(keeper);
+            away.setMenus(&keys);
+            away.setMenus(&keys);
+            if (away.menus() != &keys) {
+                return false;
+            }
+            QSignalSpy spy(&away, &PressAway::pressedAway);
+            QTest::mouseClick(window, Qt::LeftButton, {}, QPoint(150, 150));
+            return spy.count() == 1;
+        };
+        for (const char *platform : {"xcb", "wayland", "offscreen", "windows"}) {
+            QVERIFY2(!told(platform, true), platform);
+            QVERIFY2(told(platform, false), platform);
+        }
+        QVERIFY(told("cocoa", true));
+    }
+
+    // While the list's Rows menu is open the keys are its own, as an open menu of the bar has
+    // them: a letter that is a shortcut elsewhere and no item's here does nothing, and Esc closes
+    // the menu. Closed, each key is the window's again.
+    void theRowsMenuHasTheKeys() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *menu = w.find("rowsMenu");
+        QQuickItem *button = w.item("rowStyleButton");
+        QVERIFY(menu && button);
+        w.click(button);
+        QTRY_VERIFY(menu->property("opened").toBool());
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_X);
+        QTest::keyClick(w.window, Qt::Key_J);
+        QVERIFY(menu->property("visible").toBool());
+        QCOMPARE(w.since(from), QStringList());
+        QCOMPARE(w.settings.rowStyle(), "twoLines");
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!menu->property("visible").toBool());
+        QCOMPARE(w.since(from), QStringList());
+        QTest::keyClick(w.window, Qt::Key_X);
+        QCOMPARE(w.last(), "Clear");
+    }
+
+    // Every menu the window draws is as wide as its items, each drawn whole with its shortcut, at
+    // the platform's text size and at the largest Settings offers: the right-click menu, the list's
+    // Rows menu, each menu of the bar and the View menu's two, Show among them, whose items come
+    // from review after the window starts. Each takes the window's size of text, the Rows menu
+    // too, which opens over the list.
+    void everyMenuDrawsEachItemWhole_data() {
+        QTest::addColumn<bool>("largest");
+        QTest::newRow("the platform's size") << false;
+        QTest::newRow("the largest size") << true;
+    }
+    void everyMenuDrawsEachItemWhole() {
+        QFETCH(bool, largest);
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        if (largest) {
+            QSignalSpy laidOut(w.window, &QQuickWindow::afterAnimating);
+            w.settings.setWindowTextSize(w.settings.mostHalfPoints() / 2.0);
+            // The bar's entries take their new widths at once, but the bar moves them only as the
+            // window lays itself out for its next frame, which it says by afterAnimating: until
+            // then an entry runs over its neighbour's old place, and a click at its middle lands on
+            // the neighbour, which lies above it.
+            QTRY_VERIFY(!laidOut.isEmpty());
+        }
+        QTRY_VERIFY(w.delegate(0));
+        QQuickItem *rowStyleButton = w.item("rowStyleButton");
+        QVERIFY(rowStyleButton);
+        // Each menu, what opens it, and the menu it opens from, which closes after it.
+        std::vector<std::tuple<QObject *, std::function<void()>, QObject *>> menus = {
+            {w.find("rowMenu"), [&w] { w.rightClick(w.delegate(0)); }, nullptr},
+            {w.find("rowsMenu"), [&w, rowStyleButton] { w.click(rowStyleButton); }, nullptr},
+        };
+        for (int i = 0; i < 5; ++i) {
+            QQuickItem *entry = w.barEntry(i);
+            QVERIFY(entry);
+            menus.emplace_back(
+                entry->property("menu").value<QObject *>(), [&w, entry] { w.click(entry); },
+                nullptr);
+        }
+        QObject *view = w.menu("&View");
+        QVERIFY(view);
+        for (const char *title : {"&Show", "&Rows"}) {
+            QObject *sub = w.menu(title);
+            QVERIFY(sub);
+            menus.emplace_back(
+                sub,
+                [&w, view, sub] {
+                    w.click(w.barEntry(2));
+                    QTRY_VERIFY(view->property("opened").toBool());
+                    QQuickItem *item = subMenuItem(view, sub);
+                    QVERIFY(item);
+                    w.click(item);
+                },
+                view);
+        }
+        for (const auto &[menu, open, from] : menus) {
+            QVERIFY(menu);
+            const QString name = menu->property("title").toString() + menu->objectName();
+            QTRY_COMPARE(popupWindowsOpen(), QString());
+            open();
+            QTRY_VERIFY2(menu->property("opened").toBool(), qPrintable(name + ": " + menusMet(w)));
+            QCOMPARE(menu->property("font").value<QFont>().pointSizeF(),
+                     w.settings.windowTextSize());
+            QStringList wrong;
+            QTRY_VERIFY2((wrong = itemsNotWhole(menu)).isEmpty(), qPrintable(wrong.join(" | ")));
+            QTest::keyClick(w.window, Qt::Key_Escape);
+            QTRY_VERIFY2(!menu->property("visible").toBool(), qPrintable(name));
+            if (from) {
+                QTest::keyClick(w.window, Qt::Key_Escape);
+                QTRY_VERIFY2(!from->property("visible").toBool(), qPrintable(name));
+            }
+            // The window manager gives the keys back to the window a menu drawn in a window of its
+            // own was over, which offscreen has none to do.
+            w.window->requestActivate();
+            QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+        }
+    }
+
+    // Return is named by its symbol, ⏎, wherever Qt names it for a person, Shift+Return as
+    // Shift+⏎, so that the word beside a menu item's words does not read as more of them; the
+    // keypad's Enter keeps its name, and the window's "Return" still names the key. A menu measures
+    // the symbol: the Finding menu's Show Each Episode asks room for it. macOS names these keys by
+    // symbols of its own.
+    void returnIsNamedByItsSymbol() {
+#ifdef Q_OS_MACOS
+        const QString symbol = QStringLiteral("↵");
+        const QString shifted = QStringLiteral("⇧↵");
+        const QString enter = QStringLiteral("⌤");
+#else
+        const QString symbol = QStringLiteral("⏎");
+        const QString shifted = QStringLiteral("Shift+⏎");
+        const QString enter = QStringLiteral("Enter");
+#endif
+        QCOMPARE(QKeySequence(Qt::Key_Return).toString(QKeySequence::NativeText), symbol);
+        QCOMPARE(QKeySequence(Qt::SHIFT | Qt::Key_Return).toString(QKeySequence::NativeText),
+                 shifted);
+        QCOMPARE(QKeySequence(Qt::Key_Enter).toString(QKeySequence::NativeText), enter);
+        QCOMPARE(QKeySequence(Qt::Key_Return).toString(QKeySequence::PortableText), "Return");
+        QCOMPARE(QKeySequence(QStringLiteral("Return")), QKeySequence(Qt::Key_Return));
+        QCOMPARE(QKeySequence(QStringLiteral("Shift+Return")),
+                 QKeySequence(Qt::SHIFT | Qt::Key_Return));
+
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *finding = w.menu("F&inding");
+        QObject *show = w.find("showEachEpisode");
+        QVERIFY(finding && show);
+        // WholeMenu's measures, one for each item, in the menu's order.
+        auto *needs =
+            finding->findChild<QObject *>(QStringLiteral("itemNeeds"), Qt::FindDirectChildrenOnly);
+        QVERIFY(needs);
+        QObject *need = nullptr;
+        const int count = finding->property("count").toInt();
+        for (int i = 0; i < count; ++i) {
+            QQuickItem *each = nullptr;
+            QMetaObject::invokeMethod(finding, "itemAt", Q_RETURN_ARG(QQuickItem *, each),
+                                      Q_ARG(int, i));
+            if (each && each->property("action").value<QObject *>() == show) {
+                QMetaObject::invokeMethod(needs, "objectAt", Q_RETURN_ARG(QObject *, need),
+                                          Q_ARG(int, i));
+            }
+        }
+        QVERIFY(need);
+        QCOMPARE(need->property("text").toString(), symbol);
+        QCOMPARE(need->property("advanceWidth").toReal(),
+                 QFontMetricsF(need->property("font").value<QFont>()).horizontalAdvance(symbol));
+    }
+
+    void aRightClickMenuOpensWhereTheClickWas_data() {
+        QTest::addColumn<QString>("where");
+        for (const char *where : {"a Two Lines row", "a Compact row", "a Rich row",
+                                  "a row's triangle", "the finding in the details"}) {
+            QTest::newRow(where) << QString::fromLatin1(where);
+        }
+    }
+    // The menu opens at the click, whatever the pointer's position on the screen is: Wayland gives
+    // a window none. Offscreen goes by the menu's place in its parent, but Wayland places a menu Qt
+    // draws in a popup window of its own by the rect waylandAnchor gives, its parent's: so the menu
+    // opens from an item a pixel square at the click, never from one of the window's parts. The
+    // click is a quarter across and a third down the part, the triangle's the middle of it, so that
+    // no part's middle is the point.
+    void aRightClickMenuOpensWhereTheClickWas() {
+        QFETCH(QString, where);
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        const bool compact = where == "a Compact row";
+        w.settings.setRowStyle(compact ? "compact" : where == "a Rich row" ? "rich" : "twoLines");
+        QTRY_VERIFY(w.delegate(1));
+        QObject *menu = w.find("rowMenu");
+        QVERIFY(menu);
+        QQuickItem *of = nullptr;
+        QPoint at;
+        if (where == "the finding in the details") {
+            QTest::keyClick(w.window, Qt::Key_J);
+            QTRY_COMPARE(w.bridge.selected(), 1);
+            of = w.item("nowBlock");
+            QTRY_VERIFY(of->isVisible());
+            QVERIFY(inDetailsView(w, of));
+        } else if (where == "a row's triangle") {
+            of = Shown::item(w.delegate(0), "rowDisclosure");
+            QVERIFY(of);
+            at = w.middle(of);
+        } else {
+            of = w.delegate(1);
+        }
+        if (at.isNull()) {
+            at = of->mapToScene(QPointF(of->width() / 4, of->height() / 3)).toPoint();
+        }
+        QCursor::setPos(w.window->mapToGlobal(QPoint(5, w.window->height() - 5)));
+        QTest::mouseClick(w.window, Qt::RightButton, {}, at);
+        QTRY_VERIFY(menu->property("opened").toBool());
+        auto *parent = menu->property("parent").value<QQuickItem *>();
+        QVERIFY(parent);
+        QVERIFY(parent != w.window->property("contentItem").value<QQuickItem *>());
+        QCOMPARE(parent->size(), QSizeF(1, 1));
+        QCOMPARE(parent->mapToScene(QPointF(0, 0)), QPointF(at));
+        QCOMPARE(waylandAnchor(menu), QRect(at, QSize(1, 1)));
+        const QPointF opened =
+            parent->mapToScene(QPointF(menu->property("x").toReal(), menu->property("y").toReal()));
+        QVERIFY2(qAbs(opened.x() - at.x()) <= 3 && qAbs(opened.y() - at.y()) <= 3,
+                 qPrintable(QStringLiteral("opened at %1,%2 for a click at %3,%4")
+                                .arg(opened.x())
+                                .arg(opened.y())
+                                .arg(at.x())
+                                .arg(at.y())));
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!menu->property("visible").toBool());
+    }
+
+    // A right-click on a row selects it, as a click does, then opens the row's menu over it: the
+    // Finding menu's items that act on a finding, then Copy Subtitle Line and Show File in Folder,
+    // in each row style. Check Episode Again… is not among them: the window has no way to check an
+    // episode again.
+    void aRightClickSelectsTheRowThenOpensItsMenu() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *menu = w.find("rowMenu");
+        QVERIFY(menu);
+        const QStringList words = {"&Accept",
+                                   "&Reject",
+                                   "&Edit Wording…",
+                                   "&Back to Undecided",
+                                   "-",
+                                   "Show in &Video",
+                                   "&Show Each Episode",
+                                   "-",
+                                   "&Copy Subtitle Line",
+                                   "Show &File in Folder"};
+        for (const char *style : {"twoLines", "compact", "rich"}) {
+            w.settings.setRowStyle(style);
+            QTRY_COMPARE(drawnStyles(w), (QStringList{style, style}));
+            QTRY_VERIFY(w.delegate(1));
+            const QString select = selecting(w, 1);
+            const qsizetype from = w.bridge.sent.size();
+            w.rightClick(w.delegate(1));
+            QVERIFY2(w.since(from) == QStringList{select},
+                     qPrintable(QString::fromLatin1(style) + ": " + w.since(from).join(" | ")));
+            QTRY_VERIFY2(menu->property("opened").toBool(), style);
+            QCOMPARE(menu->property("row").toInt(), 1);
+            QCOMPARE(menuWords(menu), words);
+            QVERIFY(!menuWords(menu).contains("Check Episode Again…"));
+            QTest::keyClick(w.window, Qt::Key_Escape);
+            QTRY_VERIFY2(!menu->property("visible").toBool(), style);
+            QCOMPARE(w.since(from), QStringList{select});
+            QTRY_COMPARE(w.bridge.selected(), 1);
+        }
+        // The triangle's clicks are its own, but not a right-click, which is the row's.
+        QQuickItem *triangle = Shown::item(w.delegate(0), "rowDisclosure");
+        QVERIFY(triangle && triangle->isVisible() && triangle->opacity() > 0);
+        const QString select = selecting(w, 0);
+        const qsizetype from = w.bridge.sent.size();
+        w.rightClick(triangle);
+        QCOMPARE(w.since(from), QStringList{select});
+        QTRY_VERIFY(menu->property("opened").toBool());
+        QCOMPARE(menu->property("row").toInt(), 0);
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!menu->property("visible").toBool());
+        QCOMPARE(w.rows(), 2);
+    }
+
+    // Each item of a row's menu, chosen on a fresh right-click of row 0, does what its item of the
+    // bar's menus does, after the right-click's Select; and the menu closes once one is chosen.
+    // Back to Undecided comes after Reject, which moves review on to row 1, so that it takes the
+    // row clicked, not the one review had selected before the click.
+    void eachRightClickItemDoesWhatItsMenuItemDoes() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *menu = w.find("rowMenu");
+        QVERIFY(menu);
+        const QString line = text(w.bridge.findings()->at(0)->original);
+        const QString file = text(w.bridge.findings()->at(0)->file);
+        QGuiApplication::clipboard()->clear();
+        // What each item sends after the Select, and what the test then checks, or does to leave
+        // the run as found.
+        const std::vector<std::tuple<const char *, QStringList, std::function<void()>>> items = {
+            {"rowAccept",
+             {"Accept"},
+             [&w] {
+                 QTRY_COMPARE(w.decision(0), "Accepted");
+                 w.bridge.undo();
+                 QTRY_COMPARE(w.decision(0), "To review");
+             }},
+            {"rowReject",
+             {"Reject"},
+             [&w] {
+                 QTRY_COMPARE(w.decision(0), "Rejected");
+                 QTRY_COMPARE(w.bridge.selected(), 1);
+             }},
+            {"rowClear",
+             {"Clear"},
+             [&w] {
+                 QTRY_COMPARE(w.decision(0), "To review");
+                 w.bridge.undo();
+                 QTRY_COMPARE(w.decision(0), "Rejected");
+                 w.bridge.undo();
+                 QTRY_COMPARE(w.decision(0), "To review");
+             }},
+            {"rowPlay", {"Play"}, [] {}},
+            {"rowShowEachEpisode", {"Toggle"}, [&w] { QTRY_COMPARE(w.rows(), 4); }},
+            {"rowEdit",
+             {"Edit"},
+             [&w] {
+                 QTRY_VERIFY(w.bridge.editing());
+                 QQuickItem *cancel = inEdit(w, "cancelButton");
+                 QTRY_VERIFY(cancel && cancel->isVisible());
+                 const qsizetype from = w.bridge.sent.size();
+                 w.click(cancel);
+                 QCOMPARE(w.since(from), QStringList{"CancelEdit"});
+                 QTRY_VERIFY(!w.bridge.editing());
+             }},
+            {"rowCopy", {}, [line] { QCOMPARE(QGuiApplication::clipboard()->text(), line); }},
+            {"rowShowInFolder", {}, [&w, file] { QCOMPARE(w.bridge.revealed, QStringList{file}); }},
+        };
+        for (const auto &[name, actions, then] : items) {
+            QTRY_VERIFY(w.delegate(0));
+            const QString select = selecting(w, 0);
+            const qsizetype from = w.bridge.sent.size();
+            w.rightClick(w.delegate(0));
+            QTRY_VERIFY2(menu->property("opened").toBool(), name);
+            QQuickItem *item = rowMenuItem(w, name);
+            QVERIFY2(item, name);
+            QTRY_VERIFY2(item->property("enabled").toBool(), name);
+            w.click(item);
+            QTRY_VERIFY2(!menu->property("visible").toBool(), name);
+            QVERIFY2(w.since(from) == QStringList{select} + actions,
+                     qPrintable(QString::fromLatin1(name) + ": " + w.since(from).join(" | ")));
+            then();
+            if (QTest::currentTestFailed()) {
+                return;
+            }
+        }
+    }
+
+    // While a row's menu is open the keys are its own, as an open menu of the bar has them: a
+    // letter that is a shortcut elsewhere and no item's here does nothing; one an item underlines
+    // chooses that item; and Esc closes the menu. Closed, each key is the window's again.
+    void anOpenRowMenuHasTheKeys() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *menu = w.find("rowMenu");
+        QVERIFY(menu);
+        // Qt has no mnemonics on Apple platforms, so there a letter chooses no item: it still stays
+        // with the menu, and no shortcut fires.
+#ifdef Q_OS_MACOS
+        const QStringList chosen;
+#else
+        const QStringList chosen{"Accept"};
+#endif
+        QTRY_VERIFY(w.delegate(0));
+        w.rightClick(w.delegate(0));
+        QTRY_VERIFY(menu->property("opened").toBool());
+        qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_X);
+        QVERIFY(menu->property("visible").toBool());
+        QCOMPARE(w.since(from), QStringList());
+        QTest::keyClick(w.window, Qt::Key_A);
+        QTRY_COMPARE(w.since(from), chosen);
+        if (!chosen.isEmpty()) {
+            QTRY_VERIFY(!menu->property("visible").toBool());
+            QTRY_COMPARE(w.decision(0), "Accepted");
+            w.bridge.undo();
+            QTRY_COMPARE(w.decision(0), "To review");
+            w.rightClick(w.delegate(0));
+            QTRY_VERIFY(menu->property("opened").toBool());
+            from = w.bridge.sent.size();
+        }
+        QVERIFY(menu->property("visible").toBool());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!menu->property("visible").toBool());
+        QCOMPARE(w.since(from), QStringList());
+        QTest::keyClick(w.window, Qt::Key_X);
+        QCOMPARE(w.last(), "Clear");
+    }
+
+    // A timing row's menu greys what a timing fix cannot take, Edit Wording… and Copy Subtitle
+    // Line, and offers the rest, Show Each Episode among them, as the row is one of several.
+    void aTimingRowsMenuGreysWhatItCannotTake() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *menu = w.find("rowMenu");
+        QVERIFY(menu);
+        // A timing row of three made up in the selected row's place, drawn as review's next change
+        // would. Review is held, as the right-click's Select names an entry review never sent.
+        const int at = w.bridge.selected();
+        subcheck_ffi::EntryView timing =
+            rowOfTwelve(subcheck_ffi::EntryKey(subcheck_ffi::EntryKey::kRow{{500}}));
+        timing.shown = 3;
+        timing.total = 3;
+        timing.check = subcheck_ffi::Check::kTiming;
+        timing.editable = false;
+        QVERIFY(w.bridge.findings()->apply(
+            subcheck_ffi::Splice{static_cast<uint64_t>(at), 1, {timing}}));
+        emit w.bridge.summaryChanged();
+        w.bridge.holding = true;
+        QTRY_VERIFY(w.delegate(at));
+        w.rightClick(w.delegate(at));
+        QTRY_VERIFY(menu->property("opened").toBool());
+        QCOMPARE(menu->property("row").toInt(), at);
+        const auto enabled = [&w](const char *name) {
+            QQuickItem *item = rowMenuItem(w, name);
+            return item && item->property("enabled").toBool();
+        };
+        QVERIFY(!enabled("rowEdit"));
+        QVERIFY(!enabled("rowCopy"));
+        for (const char *name : {"rowAccept", "rowReject", "rowClear", "rowPlay",
+                                 "rowShowEachEpisode", "rowShowInFolder"}) {
+            QVERIFY2(enabled(name), name);
+        }
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!menu->property("visible").toBool());
+    }
+
+    // Copy Subtitle Line reads its row again at each opening of the menu, and while the menu is
+    // open at each change of review's, as a change can put another entry at the same row number: a
+    // timing row decided under a filter that hides it leaves the list, and the text row after it
+    // takes its number. Review is held, and its changes stood in for, as the timing row is made up.
+    void theRowMenusCopyFollowsTheEntryAtItsRow() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *menu = w.find("rowMenu");
+        QVERIFY(menu);
+        subcheck_ffi::EntryView timing =
+            rowOfTwelve(subcheck_ffi::EntryKey(subcheck_ffi::EntryKey::kRow{{500}}));
+        timing.check = subcheck_ffi::Check::kTiming;
+        timing.editable = false;
+        // Review's change at row 1, drawn as review's would be.
+        const auto change = [&w](uint64_t removed, std::vector<subcheck_ffi::EntryView> inserted) {
+            const bool applied =
+                w.bridge.findings()->apply(subcheck_ffi::Splice{1, removed, std::move(inserted)});
+            emit w.bridge.summaryChanged();
+            return applied;
+        };
+        const auto copyEnabled = [&w] {
+            QQuickItem *item = rowMenuItem(w, "rowCopy");
+            return item && item->property("enabled").toBool();
+        };
+        QVERIFY(change(0, {timing}));
+        QCOMPARE(w.rows(), 3);
+        w.bridge.holding = true;
+        QTRY_VERIFY(w.delegate(1));
+        w.rightClick(w.delegate(1));
+        QTRY_VERIFY(menu->property("opened").toBool());
+        QCOMPARE(menu->property("row").toInt(), 1);
+        QVERIFY(!copyEnabled());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!menu->property("visible").toBool());
+
+        // Decided, the timing row leaves, and the text row after it is row 1.
+        QVERIFY(change(1, {}));
+        QCOMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.delegate(1));
+        w.rightClick(w.delegate(1));
+        QTRY_VERIFY(menu->property("opened").toBool());
+        QCOMPARE(menu->property("row").toInt(), 1);
+        QVERIFY(copyEnabled());
+        // The decision undone while the menu is open: the timing row is row 1 again.
+        QVERIFY(change(0, {timing}));
+        QVERIFY(!copyEnabled());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!menu->property("visible").toBool());
+    }
+
+    // Copy Subtitle Line and Show File in Folder take the row right-clicked at once, though review
+    // has not answered the right-click's Select, as while a job runs, and the selection stays where
+    // review has it. The row is row 1's member in the second episode, whose line and file are both
+    // unlike row 0's: rows 0 and 1 are both the first episode's.
+    void copyAndShowFileInFolderReadTheClickedRowAtOnce() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *menu = w.find("rowMenu");
+        QVERIFY(menu);
+        w.bridge.toggleRow(1);
+        QTRY_COMPARE(w.rows(), 4);
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        w.bridge.select(0);
+        QTRY_COMPARE(w.bridge.selected(), 0);
+        const subcheck_ffi::EntryView *clicked = w.bridge.findings()->at(3);
+        const subcheck_ffi::EntryView *selected = w.bridge.findings()->at(0);
+        QVERIFY(clicked && selected);
+        QVERIFY(clicked->original != selected->original);
+        QVERIFY(clicked->file != selected->file);
+        const QString line = text(clicked->original);
+        const QString file = text(clicked->file);
+        const QString select = selecting(w, 3);
+        w.bridge.holding = true;
+        QGuiApplication::clipboard()->clear();
+        const qsizetype from = w.bridge.sent.size();
+
+        QTRY_VERIFY(w.delegate(3));
+        w.rightClick(w.delegate(3));
+        QTRY_VERIFY(menu->property("opened").toBool());
+        QCOMPARE(menu->property("row").toInt(), 3);
+        w.click(rowMenuItem(w, "rowShowInFolder"));
+        QTRY_VERIFY(!menu->property("visible").toBool());
+        QCOMPARE(w.bridge.revealed, QStringList{file});
+        QCOMPARE(w.bridge.selected(), 0);
+
+        w.rightClick(w.delegate(3));
+        QTRY_VERIFY(menu->property("opened").toBool());
+        w.click(rowMenuItem(w, "rowCopy"));
+        QTRY_VERIFY(!menu->property("visible").toBool());
+        QCOMPARE(QGuiApplication::clipboard()->text(), line);
+        QCOMPARE(w.bridge.selected(), 0);
+        QCOMPARE(w.since(from), (QStringList{select, select}));
+    }
+
+    // A right-click on the finding in the details panel opens the menu of its row, the one
+    // selected, and sends nothing, as review has that row selected already. A greyed episode's log
+    // in the finding's place has no menu.
+    void aRightClickOnTheDetailsOpensTheMenuForTheFindingShown() {
+        Shown w({clean(), media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *menu = w.find("rowMenu");
+        QVERIFY(menu);
+        QTest::keyClick(w.window, Qt::Key_J);
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        QQuickItem *now = w.item("nowBlock");
+        QTRY_VERIFY(now->isVisible());
+        QVERIFY(inDetailsView(w, now));
+        qsizetype from = w.bridge.sent.size();
+        w.rightClick(now);
+        QTRY_VERIFY(menu->property("opened").toBool());
+        QCOMPARE(menu->property("row").toInt(), 1);
+        QCOMPARE(w.since(from), QStringList());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!menu->property("visible").toBool());
+
+        QTRY_VERIFY(w.item("episode0"));
+        w.click(w.item("episode0"));
+        QTRY_VERIFY(w.bridge.showingEpisode());
+        QQuickItem *heading = w.item("episodeLogHeading");
+        QTRY_VERIFY(heading->isVisible());
+        QTRY_VERIFY(inDetailsView(w, heading));
+        from = w.bridge.sent.size();
+        w.rightClick(heading);
+        QVERIFY(!menu->property("visible").toBool());
+        QCOMPARE(w.since(from), QStringList());
     }
 
     // The window's Close and Quit, from their menu.
@@ -1102,6 +2446,53 @@ private slots:
         QVERIFY(entry()->property("highlighted").toBool());
     }
 
+    // The sidebar's lists keep their marks in view as the marks move, which nothing else scrolls
+    // them to: the marked episode, far down the list and then back at its top, and the open review
+    // of a new list. The reviews and episodes are made up, in a window whose review is not started,
+    // at the least size, where each list is longer than its view.
+    void theSidebarsListsFollowTheirMarks() {
+        Shown w({media()});
+        QVERIFY(w.show());
+        w.window->resize(w.window->minimumSize());
+        QTRY_COMPARE(w.window->height(), 480);
+        auto *files = qobject_cast<EpisodesModel *>(w.bridge.episodes()->sourceModel());
+        QVERIFY(files);
+        QVERIFY(files->apply(subcheck_ffi::FilesSplice{0, 0, manyEpisodes()}));
+        QQuickItem *episodes = w.item("episodes");
+        QQuickItem *reviews = w.item("reviews");
+        QVERIFY(episodes && reviews);
+        // Laid out, showing fewer than ten from the top.
+        QTRY_VERIFY(drawnEntry(episodes, 0) &&
+                    episodes->height() < 10 * drawnEntry(episodes, 0)->height());
+        QCOMPARE(episodes->property("contentY").toReal(), 0.0);
+
+        files->follow("/m/S1/E35.mkv");
+        QTRY_VERIFY(inList(episodes, drawnEntry(episodes, 35)));
+        QVERIFY(drawnEntry(episodes, 35)->property("highlighted").toBool());
+
+        files->follow("/m/S1/E00.mkv");
+        QTRY_VERIFY(drawnEntry(episodes, 0) &&
+                    qAbs(topInList(episodes, drawnEntry(episodes, 0))) < 0.5);
+        QVERIFY(inList(episodes, drawnEntry(episodes, 0)));
+        QVERIFY(drawnEntry(episodes, 0)->property("highlighted").toBool());
+
+        // A new list of reviews, open at row 25, and the mark moved in the same go, as one change
+        // of review's can bring them, the mark first: the reviews take room from the episodes,
+        // and each list still shows its mark once both are laid out.
+        std::vector<subcheck_ffi::FolderView> folders = manyReviews();
+        folders[25].open = true;
+        const qreal tall = episodes->height();
+        files->follow("/m/S1/E35.mkv");
+        w.bridge.folders()->set(folders);
+        QTRY_VERIFY(inList(reviews, drawnEntry(reviews, 25)));
+        QVERIFY(drawnEntry(reviews, 25)->property("highlighted").toBool());
+        // Scrolled to it: the list shows only a few from its top.
+        QVERIFY(reviews->property("contentY").toReal() > 0);
+        QTRY_VERIFY(episodes->height() < tall);
+        QTRY_VERIFY(inList(episodes, drawnEntry(episodes, 35)));
+        QVERIFY(drawnEntry(episodes, 35)->property("highlighted").toBool());
+    }
+
     // A click on an episode the check found nothing in selects its file alone: it has no finding
     // to go to, and review's word for that would take the status bar. What the check said of it
     // shows, scrolled into view, while review keeps the finding selected; and the sidebar marks the
@@ -1201,8 +2592,8 @@ private slots:
     }
 
     // Under a filter that shows no finding, a click on an episode with no findings still shows
-    // what its check said: alone in the details panel, with nothing of a finding, and Accept greyed
-    // in the toolbar.
+    // what its check said: alone in the details panel, with nothing of a finding, and Accept
+    // greyed.
     void aClickOnAnEpisodeWithNoFindingsShowsItsLogWithNoFindingSelected() {
         Shown w({clean(), media()});
         QVERIFY(w.start());
@@ -1286,7 +2677,7 @@ private slots:
     // A click on an episode the check found nothing in, with a finding selected, shows what its
     // check said alone under the video: nothing of the finding, which review still has selected,
     // and no line above the log, which has nothing above it to set it off from. Reject and Accept
-    // stay in the toolbar, greyed. The list draws the finding's row in the inactive grey.
+    // stay under the video, greyed. The list draws the finding's row in the inactive grey.
     void aGreyedEpisodesViewShowsItsLogAlone() {
         Shown w({clean(), media()});
         QVERIFY(w.start());
@@ -1323,9 +2714,10 @@ private slots:
         QVERIFY(qAbs(tint.alphaF() - 0.3) < 0.01);
     }
 
-    // While a greyed episode's view shows, the keys and menu items that act on the finding wait,
-    // as the finding is not shown: Accept, Reject, Back to Undecided, Show in Video and Enter. The
-    // rest still work. Undo, which takes a decision back and with it the selection, ends the view.
+    // While a greyed episode's view shows, the keys, menu items and buttons that act on the finding
+    // wait, as the finding is not shown: Accept, Reject, Back to Undecided, Edit Wording…, Show in
+    // Video, Show Each Episode, by Return or Enter, and Copy Subtitle Line, by Ctrl+C. The rest
+    // still work. Undo, which takes a decision back and with it the selection, ends the view.
     void theFindingKeysWaitWhileAnEpisodesViewShows() {
         Shown w({clean(), media()});
         QVERIFY(w.start());
@@ -1335,12 +2727,17 @@ private slots:
         QTRY_VERIFY(w.bridge.showingEpisode());
 
         const qsizetype from = w.bridge.sent.size();
-        for (const Qt::Key key : {Qt::Key_A, Qt::Key_R, Qt::Key_X, Qt::Key_O, Qt::Key_Return}) {
+        QGuiApplication::clipboard()->setText(QStringLiteral("held before the view"));
+        for (const Qt::Key key :
+             {Qt::Key_A, Qt::Key_R, Qt::Key_X, Qt::Key_E, Qt::Key_O, Qt::Key_Return}) {
             QTest::keyClick(w.window, key);
         }
         QTest::keyClick(w.window, Qt::Key_Enter, Qt::KeypadModifier);
+        QTest::keyClick(w.window, Qt::Key_C, Qt::ControlModifier);
         QCOMPARE(w.since(from), QStringList());
-        for (const char *name : {"accept", "reject", "clear", "play"}) {
+        QCOMPARE(QGuiApplication::clipboard()->text(), "held before the view");
+        for (const char *name :
+             {"accept", "reject", "clear", "edit", "play", "showEachEpisode", "copyLine"}) {
             QObject *action = w.find(name);
             QVERIFY2(action, name);
             QVERIFY2(!action->property("enabled").toBool(), name);
@@ -1359,9 +2756,33 @@ private slots:
         QTRY_VERIFY(!w.bridge.showingEpisode());
         QTRY_VERIFY(w.item("nowBlock")->isVisible());
         QTRY_COMPARE(selectionOutline(w), paletteColour(w, "highlight"));
-        for (const char *name : {"accept", "reject", "clear", "play"}) {
+        for (const char *name :
+             {"accept", "reject", "clear", "edit", "play", "showEachEpisode", "copyLine"}) {
             QVERIFY2(w.find(name)->property("enabled").toBool(), name);
         }
+
+        // A right-click on a row ends the view as a click does, once review answers its Select;
+        // the menu's items then act on that row.
+        QObject *menu = w.find("rowMenu");
+        QVERIFY(menu);
+        w.click(w.item("episode0"));
+        QTRY_VERIFY(w.bridge.showingEpisode());
+        QTRY_VERIFY(w.delegate(1));
+        const QString select = selecting(w, 1);
+        const qsizetype right = w.bridge.sent.size();
+        w.rightClick(w.delegate(1));
+        QCOMPARE(w.since(right), QStringList{select});
+        QTRY_VERIFY(menu->property("opened").toBool());
+        QTRY_VERIFY(!w.bridge.showingEpisode());
+        QCOMPARE(w.bridge.selected(), 1);
+        QQuickItem *accept = rowMenuItem(w, "rowAccept");
+        QVERIFY(accept);
+        QTRY_VERIFY(accept->property("enabled").toBool());
+        w.click(accept);
+        QCOMPARE(w.since(right), (QStringList{select, "Accept"}));
+        QTRY_COMPARE(w.decision(1), "Accepted");
+        w.bridge.undo();
+        QTRY_COMPARE(w.decision(1), "To review");
     }
 
     // A click on the grey row, the row already selected, moves nothing in review, and still ends a
@@ -1621,17 +3042,23 @@ private slots:
         QCOMPARE(outline->property("color").value<QColor>(), highlight);
         QCOMPARE(outline->property("width").toInt(), 1);
 
-        // A member sits in under its row.
+        // A row's parts start where its triangle's column ends; a member, which has none, sits in
+        // under its row by the triangle's glyph and the gap after it.
         const auto sitsAt = [&w](int row) -> qreal {
             QQuickItem *drawn = w.delegate(row);
             QQuickItem *line = drawn ? Shown::item(drawn, "rowLine") : nullptr;
             return line ? line->mapToItem(drawn, QPointF(0, 0)).x() : -1;
         };
-        QTRY_COMPARE(sitsAt(0), 8.0);
+        QQuickItem *triangle = Shown::item(w.delegate(0), "rowDisclosure");
+        QVERIFY(triangle);
+        const qreal start = triangle->mapToItem(w.delegate(0), QPointF(triangle->width(), 0)).x();
+        const qreal glyph = triangle->property("glyphWidth").toReal();
+        QVERIFY(glyph > 0);
+        QTRY_COMPARE(sitsAt(0), start);
         QTest::keyClick(w.window, Qt::Key_Return);
         QTRY_COMPARE(w.rows(), 4);
-        QTRY_COMPARE(sitsAt(1), 28.0);
-        QTRY_COMPARE(sitsAt(0), 8.0);
+        QTRY_COMPARE(sitsAt(1), start + glyph + 6);
+        QTRY_COMPARE(sitsAt(0), start);
         QTest::keyClick(w.window, Qt::Key_Return);
         QTRY_COMPARE(w.rows(), 2);
 
@@ -1655,6 +3082,94 @@ private slots:
         QCOMPARE(Shown::text(fixed, "blockLine"), detail->fixed());
         QCOMPARE(Shown::text(panel, "reason"), detail->reason());
         QCOMPARE(Shown::text(panel, "mark"), detail->mark());
+    }
+
+    // Each row style draws its parts of a row from what review says of it. Compact, on one line
+    // and so shorter than Two Lines' row: the state's glyph, where the row is in short, and its
+    // change. Rich, taller: Two Lines' two lines and why the row was found, beside a dark tile
+    // with its line, 16:9 and as tall as the lines, but no wider than a quarter of the row, so
+    // that a narrow list keeps room for the lines.
+    void eachRowStyleDrawsItsParts() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        FindingsModel *list = w.bridge.findings();
+        const auto says = [list](int row, int role) { return list->data(list->index(row), role); };
+        QTRY_VERIFY(w.delegate(0) && w.delegate(1));
+        const qreal twoLines[] = {w.delegate(0)->height(), w.delegate(1)->height()};
+        // Row 1's place, as Two Lines words it and in short.
+        QCOMPARE(says(1, FindingsModel::PlaceRole).toString(), "E01 · 0:20");
+        QCOMPARE(says(1, FindingsModel::ShortPlaceRole).toString(), "E01 0:20");
+
+        w.settings.setRowStyle("compact");
+        for (const int row : {0, 1}) {
+            QTRY_VERIFY(w.delegate(row) && drawnStyle(w.delegate(row)) == "compact");
+            QQuickItem *drawn = w.delegate(row);
+            QCOMPARE(Shown::text(drawn, "rowGlyph"),
+                     says(row, FindingsModel::GlyphRole).toString());
+            QCOMPARE(Shown::item(drawn, "rowGlyph")->property("color").value<QColor>(),
+                     says(row, FindingsModel::StateToneRole).value<QColor>());
+            QCOMPARE(Shown::text(drawn, "rowShortPlace"),
+                     says(row, FindingsModel::ShortPlaceRole).toString());
+            QCOMPARE(Shown::text(drawn, "rowChange"),
+                     says(row, FindingsModel::ChangeRole).toString());
+            QVERIFY(!Shown::item(drawn, "rowLine"));
+            QVERIFY2(drawn->height() < twoLines[row],
+                     qPrintable(
+                         QStringLiteral("%1 against %2").arg(drawn->height()).arg(twoLines[row])));
+        }
+        QCOMPARE(Shown::text(w.delegate(1), "rowShortPlace"), "E01 0:20");
+
+        w.settings.setRowStyle("rich");
+        const QColor separator = w.window->property("separator").value<QColor>();
+        // The tile's width against the row's lines' height, and its height against its width.
+        const auto tileIn = [](QQuickItem *row) {
+            QQuickItem *tile = Shown::item(row, "rowTile");
+            QQuickItem *lines = Shown::item(row, "rowReason")->parentItem();
+            return QStringLiteral("a tile %1 by %2 beside lines %3 high in a row %4 wide")
+                .arg(tile->width())
+                .arg(tile->height())
+                .arg(lines->height())
+                .arg(row->width());
+        };
+        for (const int row : {0, 1}) {
+            QTRY_VERIFY(w.delegate(row) && drawnStyle(w.delegate(row)) == "rich");
+            QQuickItem *drawn = w.delegate(row);
+            QQuickItem *tile = Shown::item(drawn, "rowTile");
+            QQuickItem *tileLine = Shown::item(drawn, "rowTileLine");
+            QQuickItem *reason = Shown::item(drawn, "rowReason");
+            QVERIFY(tile && tileLine && reason);
+            QVERIFY(!says(row, FindingsModel::ReasonRole).toString().isEmpty());
+            QCOMPARE(Shown::text(drawn, "rowTileLine"),
+                     says(row, FindingsModel::TileLineRole).toString());
+            QCOMPARE(tileLine->property("color").value<QColor>(), QColor("#f0f0f0"));
+            QCOMPARE(tileLine->property("font").value<QFont>().pointSizeF(),
+                     reason->property("font").value<QFont>().pointSizeF() - 2);
+            QCOMPARE(tile->property("color").value<QColor>(), QColor("#202020"));
+            auto *edge = tile->property("border").value<QObject *>();
+            QCOMPARE(edge->property("width").toInt(), 1);
+            QCOMPARE(edge->property("color").value<QColor>(), separator);
+            QCOMPARE(Shown::text(drawn, "rowReason"),
+                     says(row, FindingsModel::ReasonRole).toString());
+            QVERIFY(reason->isVisible());
+            QVERIFY(Shown::item(drawn, "rowLine")->isVisible());
+            QVERIFY2(drawn->height() > twoLines[row],
+                     qPrintable(
+                         QStringLiteral("%1 against %2").arg(drawn->height()).arg(twoLines[row])));
+            QQuickItem *lines = reason->parentItem();
+            QTRY_VERIFY2(qAbs(tile->width() - lines->height() * 16 / 9) <= 1,
+                         qPrintable(tileIn(drawn)));
+            QVERIFY2(qAbs(tile->height() - tile->width() * 9 / 16) <= 1, qPrintable(tileIn(drawn)));
+        }
+
+        w.window->resize(w.window->minimumSize());
+        QTRY_COMPARE(qRound(w.item("findings")->width()), 260);
+        for (const int row : {0, 1}) {
+            QQuickItem *drawn = w.delegate(row);
+            QQuickItem *tile = Shown::item(drawn, "rowTile");
+            QTRY_VERIFY2(tile->width() <= drawn->width() / 4 + 0.5, qPrintable(tileIn(drawn)));
+            QVERIFY2(qAbs(tile->height() - tile->width() * 9 / 16) <= 1, qPrintable(tileIn(drawn)));
+        }
     }
 
     // Every part of a finding is drawn in the details panel, from what review says of it: the
@@ -1822,31 +3337,190 @@ private slots:
                      scroll->property("availableWidth").toReal());
     }
 
-    // A title too long for the toolbar is cut, and Undo stays where it is.
-    void aLongTitleLeavesUndoInTheWindow() {
+    // The toolbar holds the view's name and counts at its left, the Find box at its right, and no
+    // decision. At the window's least width, at the platform's text size and at the largest
+    // Settings offers, the Find field and its ‹ and › lie after the title and counts, left to
+    // right, each whole in the bar, at the window's size of text. A title and counts too long for
+    // the bar are cut, and leave the box its width. "No match" shows whole inside the field's right
+    // end, clear of the words typed, and moves nothing.
+    void theToolbarHoldsTheTitleCountsAndFind_data() {
+        QTest::addColumn<bool>("largest");
+        QTest::newRow("the platform's size") << false;
+        QTest::newRow("the largest size") << true;
+    }
+    void theToolbarHoldsTheTitleCountsAndFind() {
+        QFETCH(bool, largest);
         Shown w({media()});
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
+        if (largest) {
+            w.settings.setWindowTextSize(w.settings.mostHalfPoints() / 2.0);
+            QCOMPARE(w.settings.windowTextSize(), 24.0);
+        }
         w.window->resize(w.window->minimumSize());
-        QTRY_COMPARE(w.window->width(), 762);
-        QQuickItem *title = w.item("title");
-        QQuickItem *undo = w.item("undoButton");
-        QVERIFY(title && undo);
+        QTRY_COMPARE(w.window->width(), w.window->minimumWidth());
         QQuickItem *toolbar = w.item("toolbar");
-        QVERIFY(toolbar);
-        const auto undoEndsInPlace = [toolbar, undo] {
-            const qreal end = undo->mapToItem(toolbar, QPointF(undo->width(), 0)).x();
-            return qAbs(end - (toolbar->width() - toolbar->property("rightPadding").toReal() - 8)) <
-                   1;
+        QQuickItem *title = w.item("title");
+        QQuickItem *counts = w.item("counts");
+        QQuickItem *box = w.item("findBox");
+        QQuickItem *field = w.item("findField");
+        QQuickItem *previous = w.item("findPrevious");
+        QQuickItem *next = w.item("findNext");
+        QQuickItem *noMatch = w.item("noMatch");
+        QVERIFY(toolbar && title && counts && box && field && previous && next && noMatch);
+        for (const QString words : {"Reject", "Accept", "Undo", "Edit Wording…"}) {
+            QVERIFY2(!Shown::button(toolbar, words), qPrintable(words));
+        }
+        QVERIFY(!w.item("editButton"));
+        // The two glyphs, and what they find in words.
+        const std::vector<std::tuple<QQuickItem *, QString, QString>> glyphs = {
+            {previous, "‹", "Previous Match"}, {next, "›", "Next Match"}};
+        for (const auto &[button, glyph, name] : glyphs) {
+            QCOMPARE(button->property("text").toString(), glyph);
+            QAccessibleInterface *said = QAccessible::queryAccessibleInterface(button);
+            QVERIFY(said);
+            QCOMPARE(said->text(QAccessible::Name), name);
+            QCOMPARE(button->property("focusPolicy").value<Qt::FocusPolicy>(), Qt::NoFocus);
+        }
+        QCOMPARE(field->property("placeholderText").toString(), "Find");
+        QAccessibleInterface *fieldSaid = QAccessible::queryAccessibleInterface(field);
+        QVERIFY(fieldSaid);
+        QCOMPARE(fieldSaid->text(QAccessible::Name), "Find");
+        QCOMPARE(field->property("font").value<QFont>().pointSizeF(), w.settings.windowTextSize());
+        const QList<QQuickItem *> parts = {box, field, previous, next};
+        for (QQuickItem *part : parts) {
+            QVERIFY2(toolbar->isAncestorOf(part), qPrintable(part->objectName()));
+        }
+
+        // The title and the counts are a column of their own, before the box.
+        QQuickItem *column = title->parentItem();
+        QVERIFY(column->isAncestorOf(counts));
+        const auto starts = [toolbar](QQuickItem *of) {
+            return of->mapToItem(toolbar, QPointF()).x();
         };
-        QTRY_VERIFY(undoEndsInPlace());
+        const auto ends = [toolbar](QQuickItem *of) {
+            return of->mapToItem(toolbar, QPointF(of->width(), 0)).x();
+        };
+        // What is out of place in the bar, nothing once it is laid out at the window's width: the
+        // column ends before the field starts, the field, ‹ and › follow each other, each part is
+        // whole inside the bar, and the box is no narrower than its least.
+        const auto outOfPlace = [&] {
+            QStringList out;
+            const QList<QQuickItem *> inTurn = {column, field, previous, next};
+            for (qsizetype i = 1; i < inTurn.size(); ++i) {
+                if (ends(inTurn[i - 1]) > starts(inTurn[i]) + 0.5) {
+                    out << QStringLiteral("%1 ends at %2, %3 starts at %4")
+                               .arg(inTurn[i - 1]->objectName())
+                               .arg(ends(inTurn[i - 1]))
+                               .arg(inTurn[i]->objectName())
+                               .arg(starts(inTurn[i]));
+                }
+            }
+            for (QQuickItem *part : parts) {
+                const qreal top = part->mapToItem(toolbar, QPointF()).y();
+                if (starts(part) < -0.5 || ends(part) > toolbar->width() + 0.5 || top < -0.5 ||
+                    top + part->height() > toolbar->height() + 0.5) {
+                    out << QStringLiteral("%1 runs from %2 to %3, %4 to %5 down")
+                               .arg(part->objectName())
+                               .arg(starts(part))
+                               .arg(ends(part))
+                               .arg(top)
+                               .arg(top + part->height());
+                }
+            }
+            for (QQuickItem *button : {previous, next}) {
+                if (button->width() < button->implicitWidth() - 0.5) {
+                    out << QStringLiteral("%1 is %2 of its %3 wide")
+                               .arg(button->objectName())
+                               .arg(button->width())
+                               .arg(button->implicitWidth());
+                }
+            }
+            const qreal least = box->property("leastWidth").toReal();
+            if (least <= 0 || box->width() < least - 0.5) {
+                out << QStringLiteral("the box is %1 of its least %2 wide")
+                           .arg(box->width())
+                           .arg(least);
+            }
+            return out;
+        };
+        QStringList out;
+        QTRY_VERIFY2((out = outOfPlace()).isEmpty(), qPrintable(out.join("; ")));
+
+        // A title and counts too long for the bar, and the bar laid out for them, as the window
+        // lays out what changed before each frame it draws.
+        const qreal kept = box->width();
+        QSignalSpy laidOut(w.window, &QQuickWindow::afterAnimating);
         title->setProperty("text", QStringLiteral("A very long name for a show ").repeated(10));
-        QTRY_VERIFY(title->property("truncated").toBool());
-        QTRY_VERIFY(undoEndsInPlace());
+        counts->setProperty("text", QStringLiteral("40 to review · 10 accepted · ").repeated(10));
+        QVERIFY(laidOut.wait());
+        QVERIFY(title->property("truncated").toBool());
+        QVERIFY(counts->property("truncated").toBool());
+        QVERIFY2(qAbs(box->width() - kept) <= 0.5, qPrintable(QString::number(box->width())));
+        out = outOfPlace();
+        QVERIFY2(out.isEmpty(), qPrintable(out.join("; ")));
+
+        // Words no row holds: "No match" inside the field's right end, past the room for the words.
+        const QSizeF fieldWas = field->size();
+        const qreal toolbarWas = toolbar->height();
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(field->hasActiveFocus());
+        typeIn(w, "zzz");
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QTRY_VERIFY(noMatch->isVisible());
+        QVERIFY(laidOut.wait());
+        QCOMPARE(noMatch->property("text").toString(), "No match");
+        QVERIFY(!noMatch->property("truncated").toBool());
+        QVERIFY(field->isAncestorOf(noMatch));
+        const QRectF drawn =
+            noMatch->mapRectToItem(field, QRectF(0, 0, noMatch->width(), noMatch->height()));
+        QVERIFY2(drawn.left() >= -0.5 && drawn.right() <= field->width() + 0.5 &&
+                     drawn.top() >= -0.5 && drawn.bottom() <= field->height() + 0.5 &&
+                     noMatch->width() >= noMatch->implicitWidth() - 0.5,
+                 qPrintable(QStringLiteral("%1, %2 to %3, %4 in a field %5 by %6")
+                                .arg(drawn.left())
+                                .arg(drawn.top())
+                                .arg(drawn.right())
+                                .arg(drawn.bottom())
+                                .arg(field->width())
+                                .arg(field->height())));
+        const qreal wordsEnd = field->width() - field->property("rightPadding").toReal();
+        QVERIFY2(drawn.left() >= wordsEnd + 6 - 0.5,
+                 qPrintable(QStringLiteral("starts at %1, the words end at %2")
+                                .arg(drawn.left())
+                                .arg(wordsEnd)));
+        QCOMPARE(field->size(), fieldWas);
+        QVERIFY(qAbs(box->width() - kept) <= 0.5);
+        QCOMPARE(toolbar->height(), toolbarWas);
     }
 
-    // The toolbar's Accept, Reject and Undo, and a double-click on a row; and the finding's
-    // particulars under their disclosure.
+    // The Find field's right inset, with no "No match" in it, is the style's own at a field's
+    // right, as a shown field of the style has it, the edit's: the field never shown that the Find
+    // field reads it from has it as a shown one does.
+    void theFindFieldsRightInsetIsAShownFieldsOfTheStyle() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *find = w.item("findField");
+        QQuickItem *plain = w.item("plainField");
+        QQuickItem *noMatch = w.item("noMatch");
+        QQuickItem *edit = inEdit(w, "editField");
+        QVERIFY(find && plain && noMatch && edit);
+        QVERIFY(!plain->isVisible());
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(edit->hasActiveFocus());
+        QVERIFY(edit->isVisible());
+        QVERIFY(!noMatch->isVisible());
+        const qreal shown = edit->property("rightPadding").toReal();
+        QCOMPARE(plain->property("rightPadding").toReal(), shown);
+        QCOMPARE(find->property("rightPadding").toReal(), shown);
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // The buttons under the video, a click on the fix, whose edit Cancel ends, and a double-click
+    // on a row; and the finding's particulars under their disclosure.
     void theButtonsAndADoubleClickAskReview() {
         Shown w({media()});
         QVERIFY(w.start());
@@ -1865,6 +3539,15 @@ private slots:
         w.click(undo);
         QTRY_COMPARE(w.decision(0), "To review");
         QCOMPARE(w.bridge.sent, (QStringList{"Accept", "Undo", "Reject", "Undo"}));
+        QQuickItem *cancel = inEdit(w, "cancelButton");
+        QQuickItem *line = inEdit(w, "blockLine");
+        QVERIFY(cancel && line);
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+        w.click(line);
+        QTRY_VERIFY(cancel->isVisible());
+        w.click(cancel);
+        QCOMPARE(w.bridge.sent.mid(4), (QStringList{"Edit", "CancelEdit"}));
+        QTRY_VERIFY(!cancel->isVisible());
 
         QQuickItem *particulars = w.item("technicalLines");
         QVERIFY(particulars);
@@ -1887,107 +3570,328 @@ private slots:
         QTRY_COMPARE(w.bridge.statusLine(), "Opening E01 at 0:00:20.000");
     }
 
-    // Reject, Accept and Undo sit in the toolbar, in that order, at its right: Accept highlighted,
-    // none taking the keys from the window, and the Finding menu saying the buttons' words. At the
-    // window's least width, at the platform's text size and at the largest Settings offers, a title
-    // and counts too long for the bar are cut before the buttons, and leave all three whole in it.
-    void theToolbarHoldsRejectAcceptAndUndo_data() {
-        QTest::addColumn<bool>("largest");
-        QTest::newRow("the platform's size") << false;
-        QTest::newRow("the largest size") << true;
+    void aRowOfSeveralOpensAndClosesByItsTriangle_data() {
+        QTest::addColumn<QString>("style");
+        for (const char *style : {"twoLines", "compact", "rich"}) {
+            QTest::newRow(style) << QString::fromLatin1(style);
+        }
     }
-    void theToolbarHoldsRejectAcceptAndUndo() {
-        QFETCH(bool, largest);
+    // A click on a row of several's triangle selects the row and opens it, and another closes it:
+    // the triangle says which, as Finding ▸ Show Each Episode's check does, and a screen reader is
+    // told so in those words, and can press it. It comes first in a row of every style, in a column
+    // as tall as the row that takes the click anywhere in it; the row's members have none, and sit
+    // in from the row's parts. Two quick clicks on it open and close the row, and are no
+    // double-click on the row, which would open the video.
+    void aRowOfSeveralOpensAndClosesByItsTriangle() {
+        QFETCH(QString, style);
+        Shown w({media()});
+        w.settings.setRowStyle(style);
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.delegate(0) && drawnStyle(w.delegate(0)) == style);
+        QObject *showEach = w.find("showEachEpisode");
+        QVERIFY(showEach);
+        // Row 0's triangle, wherever the list has put the row; and where a row's first part after
+        // the triangle starts in it.
+        const auto triangle = [&w] {
+            QQuickItem *row = w.delegate(0);
+            return row ? Shown::item(row, "rowDisclosure") : nullptr;
+        };
+        const char *first = style == "compact" ? "rowGlyph" : style == "rich" ? "rowTile" : "badge";
+        const auto starts = [first](QQuickItem *row) {
+            QQuickItem *part = Shown::item(row, first);
+            return part ? part->mapToItem(row, QPointF(0, 0)).x() : -1.0;
+        };
+        QVERIFY(triangle() && triangle()->isVisible());
+        QCOMPARE(triangle()->property("text").toString(), "▸");
+        QCOMPARE(triangle()->mapToItem(w.delegate(0), QPointF(0, 0)), QPointF(0, 0));
+        QCOMPARE(triangle()->height(), w.delegate(0)->height());
+        // A point in the triangle's column, `x` and `y` from its top left. The column's first
+        // 8 px are under the hold of the handle between the sidebar and the list, which takes a
+        // press there.
+        const auto inColumn = [&triangle](qreal x, qreal y) {
+            return triangle()->mapToScene(QPointF(x, y)).toPoint();
+        };
+        const qreal ends =
+            triangle()->mapToItem(w.delegate(0), QPointF(triangle()->width(), 0)).x();
+        QVERIFY2(ends <= starts(w.delegate(0)),
+                 qPrintable(QStringLiteral("the triangle ends at %1, the row's %2 starts at %3")
+                                .arg(ends)
+                                .arg(QLatin1String(first))
+                                .arg(starts(w.delegate(0)))));
+        QVERIFY(!showEach->property("checked").toBool());
+
+        qsizetype from = w.bridge.sent.size();
+        QTest::mouseClick(w.window, Qt::LeftButton, {}, inColumn(9, 1));
+        QStringList sent = w.since(from);
+        QVERIFY2(sent.size() == 2 && sent[0].startsWith("Select row ") && sent[1] == "Toggle",
+                 qPrintable(sent.join(" | ")));
+        QTRY_COMPARE(w.rows(), 4);
+        QTRY_COMPARE(triangle()->property("text").toString(), "▾");
+        QTRY_VERIFY(showEach->property("checked").toBool());
+        for (const int member : {1, 2}) {
+            QTRY_VERIFY(w.delegate(member));
+            QQuickItem *drawn = Shown::item(w.delegate(member), "rowDisclosure");
+            QVERIFY2(!drawn || !drawn->isVisible(), qPrintable(QString::number(member)));
+            QVERIFY2(starts(w.delegate(member)) > starts(w.delegate(0)) + 0.5,
+                     qPrintable(QStringLiteral("member %1's %2 starts at %3, the row's at %4")
+                                    .arg(member)
+                                    .arg(QLatin1String(first))
+                                    .arg(starts(w.delegate(member)))
+                                    .arg(starts(w.delegate(0)))));
+        }
+
+        from = w.bridge.sent.size();
+        QTest::mouseClick(w.window, Qt::LeftButton, {},
+                          inColumn(triangle()->width() - 1, triangle()->height() - 1));
+        sent = w.since(from);
+        QVERIFY2(sent.size() == 2 && sent[0].startsWith("Select row ") && sent[1] == "Toggle",
+                 qPrintable(sent.join(" | ")));
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_COMPARE(triangle()->property("text").toString(), "▸");
+        QTRY_VERIFY(!showEach->property("checked").toBool());
+
+        from = w.bridge.sent.size();
+        QTest::mouseDClick(w.window, Qt::LeftButton, {}, w.middle(triangle()));
+        sent = w.since(from);
+        QVERIFY2(sent.size() == 4 && sent[0].startsWith("Select row ") && sent[1] == "Toggle" &&
+                     sent[2] == sent[0] && sent[3] == "Toggle",
+                 qPrintable(sent.join(" | ")));
+        // Review takes the actions in order: once it has answered a move sent after the clicks, it
+        // has answered them too.
+        QTest::keyClick(w.window, Qt::Key_J);
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        QCOMPARE(w.rows(), 2);
+        QCOMPARE(triangle()->property("text").toString(), "▸");
+        QVERIFY(!showEach->property("checked").toBool());
+
+        QAccessibleInterface *said = QAccessible::queryAccessibleInterface(triangle());
+        QVERIFY(said && said->actionInterface());
+        QCOMPARE(said->role(), QAccessible::Button);
+        QCOMPARE(said->text(QAccessible::Name), "Show Each Episode");
+        QVERIFY(said->state().checkable);
+        QVERIFY(!said->state().checked);
+        for (const int rows : {4, 2}) {
+            from = w.bridge.sent.size();
+            said->actionInterface()->doAction(QAccessibleActionInterface::pressAction());
+            sent = w.since(from);
+            QVERIFY2(sent.size() == 2 && sent[0] == selecting(w, 0) && sent[1] == "Toggle",
+                     qPrintable(sent.join(" | ")));
+            QTRY_COMPARE(w.rows(), rows);
+            QTRY_COMPARE(QAccessible::queryAccessibleInterface(triangle())->state().checked,
+                         rows == 4);
+        }
+    }
+
+    // A row of one keeps the triangle's room, so that its parts start where a row of several's do,
+    // but draws no triangle there, and a click there is the row's; with accessibility on, a screen
+    // reader is told of the one triangle there is, named for what it does, and of no glyph. Open or
+    // closed, the triangle is one width, so that the row's parts stay put as it opens.
+    void aRowOfOneKeepsTheTrianglesRoomAndDrawsNone() {
+        QAccessible::setActive(true);
+        const auto inactive = qScopeGuard([] { QAccessible::setActive(false); });
+        QQmlEngine engine;
+        QQmlComponent component(&engine);
+        component.setData(QByteArrayLiteral(R"(
+import QtQuick
+import Subcheck
+
+Window {
+    width: 200
+    height: 100
+
+    Row {
+        Disclosure {
+            objectName: "several"
+        }
+        Disclosure {
+            objectName: "one"
+            shown: false
+        }
+    }
+}
+)"),
+                          QUrl(QStringLiteral("disclosure.qml")));
+        const std::unique_ptr<QObject> made(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(made.get());
+        QVERIFY2(window, qPrintable(component.errorString()));
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto *several = window->findChild<QQuickItem *>("several");
+        auto *one = window->findChild<QQuickItem *>("one");
+        QVERIFY(several && one);
+        QSignalSpy severalToggled(several, SIGNAL(toggled()));
+        QSignalSpy oneToggled(one, SIGNAL(toggled()));
+        QVERIFY(several->width() > 0);
+        QCOMPARE(one->width(), several->width());
+        QCOMPARE(several->opacity(), 1.0);
+        QCOMPARE(one->opacity(), 0.0);
+        const qreal closed = several->width();
+        several->setProperty("open", true);
+        QCOMPARE(several->property("text").toString(), "▾");
+        QCOMPARE(several->width(), closed);
+        const auto middle = [](QQuickItem *of) {
+            return of->mapToScene(QPointF(of->width() / 2, of->height() / 2)).toPoint();
+        };
+        QTest::mouseClick(window, Qt::LeftButton, {}, middle(several));
+        QTest::mouseClick(window, Qt::LeftButton, {}, middle(one));
+        QCOMPARE(severalToggled.count(), 1);
+        QCOMPARE(oneToggled.count(), 0);
+
+        QCOMPARE(accessibleNames(QAccessible::queryAccessibleInterface(window)),
+                 QStringList{"Show Each Episode"});
+        QAccessibleInterface *said = QAccessible::queryAccessibleInterface(several);
+        QVERIFY(said && said->actionInterface());
+        QVERIFY(said->state().checked);
+        said->actionInterface()->doAction(QAccessibleActionInterface::pressAction());
+        QCOMPARE(severalToggled.count(), 2);
+    }
+
+    void aMemberSitsInFromItsRowAtTheSmallestAndLargestSize_data() {
+        QTest::addColumn<QString>("style");
+        QTest::addColumn<qreal>("points");
+        for (const char *style : {"compact", "twoLines", "rich"}) {
+            for (const qreal points : {6.0, 24.0}) {
+                QTest::addRow("%s at %g pt", style, points) << QString::fromLatin1(style) << points;
+            }
+        }
+    }
+    // An open row's members sit in from the row's parts at every size of text, from the least
+    // Settings offers to the largest: each member's first part starts right of its row's.
+    void aMemberSitsInFromItsRowAtTheSmallestAndLargestSize() {
+        QFETCH(QString, style);
+        QFETCH(qreal, points);
+        Shown w({media()});
+        w.settings.setRowStyle(style);
+        w.settings.setListTextSize(points);
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.find("showEachEpisode")->property("enabled").toBool());
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QTRY_COMPARE(w.rows(), 4);
+        const char *first = style == "compact" ? "rowGlyph" : style == "rich" ? "rowTile" : "badge";
+        const auto starts = [&w, first](int at) {
+            QQuickItem *row = w.delegate(at);
+            QQuickItem *part = row ? Shown::item(row, first) : nullptr;
+            return part ? part->mapToItem(row, QPointF(0, 0)).x() : -1.0;
+        };
+        QTRY_VERIFY(w.delegate(0) && w.delegate(1) && w.delegate(2));
+        const char *label = style == "compact" ? "rowGlyph" : "rowPlace";
+        QCOMPARE(Shown::item(w.delegate(0), label)->property("font").value<QFont>().pointSizeF(),
+                 points);
+        for (const int member : {1, 2}) {
+            QTRY_VERIFY2(starts(member) > starts(0) + 0.5,
+                         qPrintable(QStringLiteral("member %1's %2 starts at %3, the row's at %4")
+                                        .arg(member)
+                                        .arg(QLatin1String(first))
+                                        .arg(starts(member))
+                                        .arg(starts(0))));
+        }
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QTRY_COMPARE(w.rows(), 2);
+    }
+
+    // Undo, Reject and Accept sit in a row of their own under the video, Undo at its left and the
+    // other two at its right, whole at each size of text the window takes, and the details panel
+    // and the window are never narrower than the row. The row takes the window's size of text, not
+    // the details panel's, takes no focus, and stays where it is as the details scroll, the finding
+    // changes and a decision is made and taken back.
+    void theDecisionsSitUnderTheVideo_data() {
+        QTest::addColumn<qreal>("points");
+        // Only for its least and most sizes.
+        QTemporaryDir dir;
+        WindowSettings sizes(
+            std::make_unique<QSettings>(dir.path() + "/subcheck-qt.conf", QSettings::IniFormat),
+            QGuiApplication::platformName());
+        QTest::newRow("the least size") << sizes.leastHalfPoints() / 2.0;
+        QTest::newRow("the platform's size") << qreal(0);
+        QTest::newRow("the largest size") << sizes.mostHalfPoints() / 2.0;
+    }
+    void theDecisionsSitUnderTheVideo() {
+        QFETCH(qreal, points);
         Shown w({media()});
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
-        if (largest) {
-            w.settings.setWindowTextSize(w.settings.mostHalfPoints() / 2.0);
+        if (points > 0) {
+            w.settings.setWindowTextSize(points);
         }
-        w.window->resize(w.window->minimumSize());
-        QTRY_COMPARE(w.window->width(), w.window->minimumWidth());
+        // Another size for the details panel, so that the row is seen to take the window's.
+        w.settings.setDetailsTextSize(w.settings.windowTextSize() == 24 ? 6 : 24);
+        QQuickItem *panel = w.item("details");
+        QQuickItem *decisions = w.item("decisions");
         QQuickItem *toolbar = w.item("toolbar");
-        QQuickItem *title = w.item("title");
-        QQuickItem *counts = w.item("counts");
-        QVERIFY(toolbar && title && counts);
-        QCOMPARE(counts->property("font").value<QFont>().pointSizeF(), w.settings.windowTextSize());
+        QQuickItem *scroll = w.item("detailsScroll");
+        QQuickItem *video = w.item("video");
+        QVERIFY(panel && decisions && toolbar && scroll && video);
+        // Read each time: the row's width follows its font's, and settles after the text size does.
+        const auto least = [decisions] {
+            return 160 + 260 + 2 + std::max(340, int(std::ceil(decisions->implicitWidth())));
+        };
+        // A window is never shrunk to a lowered minimum, so it is asked for the least each time the
+        // least has moved.
+        QTRY_VERIFY2(
+            [&] {
+                w.window->resize(w.window->minimumWidth(), w.window->minimumHeight());
+                return w.window->minimumWidth() == least() && w.window->width() == least();
+            }(),
+            qPrintable(QStringLiteral("minimumWidth %1, width %2, least %3")
+                           .arg(w.window->minimumWidth())
+                           .arg(w.window->width())
+                           .arg(least())));
+        QTRY_COMPARE(panel->width(), qreal(least() - 160 - 260 - 2));
         const std::vector<std::pair<const char *, QString>> words = {
-            {"rejectButton", "Reject"}, {"acceptButton", "Accept"}, {"undoButton", "Undo"}};
+            {"undoButton", "Undo"}, {"rejectButton", "Reject"}, {"acceptButton", "Accept"}};
         QList<QQuickItem *> buttons;
         for (const auto &[name, text] : words) {
             QQuickItem *button = w.item(name);
             QVERIFY2(button, name);
             QCOMPARE(button->property("text").toString(), text);
-            QVERIFY2(toolbar->isAncestorOf(button), name);
+            QVERIFY2(panel->isAncestorOf(button), name);
+            QVERIFY2(!toolbar->isAncestorOf(button), name);
+            QVERIFY2(!scroll->isAncestorOf(button), name);
             QCOMPARE(button->property("focusPolicy").value<Qt::FocusPolicy>(), Qt::NoFocus);
+            QCOMPARE(button->property("font").value<QFont>().pointSizeF(),
+                     w.settings.windowTextSize());
+            QVERIFY2(button->width() >= button->implicitWidth() - 0.5, name);
+            const QPointF at = button->mapToItem(panel, QPointF(0, 0));
+            QVERIFY2(at.x() >= 0 && at.x() + button->width() <= panel->width() + 0.5, name);
             buttons << button;
         }
-        const auto left = [](QQuickItem *of) { return of->mapToScene(QPointF(0, 0)).x(); };
+        QVERIFY(buttons[2]->property("highlighted").toBool());
+        const auto left = [panel](QQuickItem *of) { return of->mapToItem(panel, QPointF()).x(); };
         QVERIFY(left(buttons[0]) < left(buttons[1]));
         QVERIFY(left(buttons[1]) < left(buttons[2]));
-        QVERIFY(buttons[1]->property("highlighted").toBool());
-        QCOMPARE(w.find("accept")->property("text").toString(), "&Accept");
-        QCOMPARE(w.find("reject")->property("text").toString(), "&Reject");
+        QVERIFY(qAbs(left(buttons[0]) - 8) < 0.5);
+        QVERIFY(qAbs(left(buttons[2]) + buttons[2]->width() - (panel->width() - 8)) < 0.5);
+        const qreal videoBottom = video->mapToItem(panel, QPointF(0, video->height())).y();
+        const qreal top = decisions->mapToItem(panel, QPointF()).y();
+        QVERIFY(top >= videoBottom - 0.5);
+        QVERIFY(top + decisions->height() <= scroll->mapToItem(panel, QPointF()).y() + 0.5);
 
-        // The title and the counts are a column of their own, beside the buttons.
-        QQuickItem *column = title->parentItem();
-        QVERIFY(column->isAncestorOf(counts));
-        // What is out of place in the bar, nothing once it is laid out at the window's width: the
-        // column ends before Reject starts, and each button is whole inside the bar.
-        const auto outOfPlace = [toolbar, column, &buttons] {
-            QStringList out;
-            const qreal columnEnds = column->mapToItem(toolbar, QPointF(column->width(), 0)).x();
-            const qreal rejectStarts = buttons[0]->mapToItem(toolbar, QPointF(0, 0)).x();
-            if (columnEnds > rejectStarts) {
-                out << QStringLiteral("the title and counts end at %1, Reject starts at %2")
-                           .arg(columnEnds)
-                           .arg(rejectStarts);
-            }
-            for (QQuickItem *button : std::as_const(buttons)) {
-                const qreal starts = button->mapToItem(toolbar, QPointF(0, 0)).x();
-                const qreal ends = button->mapToItem(toolbar, QPointF(button->width(), 0)).x();
-                if (starts < 0 || ends > toolbar->width() ||
-                    button->width() < button->implicitWidth()) {
-                    out << QStringLiteral("%1 runs from %2 to %3, %4 of its %5 wide")
-                               .arg(button->objectName())
-                               .arg(starts)
-                               .arg(ends)
-                               .arg(button->width())
-                               .arg(button->implicitWidth());
-                }
-            }
-            return out;
-        };
-        // Settled at the window's least width and its text size: the bar's width and the buttons'
-        // alike at two looks, with the window free to draw between them.
-        QList<qreal> lastWidths;
-        const auto settled = [&w, toolbar, &buttons, &lastWidths] {
-            QList<qreal> widths{toolbar->width()};
-            for (QQuickItem *button : std::as_const(buttons)) {
-                widths << button->implicitWidth() << button->width();
-            }
-            const bool same = widths == lastWidths;
-            lastWidths = widths;
-            return same && toolbar->width() == w.window->width();
-        };
-        QTRY_VERIFY(settled());
-        // A title and counts too long for the bar, and the bar laid out for them, as the window
-        // lays out what changed before each frame it draws.
-        QSignalSpy laidOut(w.window, &QQuickWindow::afterAnimating);
-        title->setProperty("text", QStringLiteral("A very long name for a show ").repeated(10));
-        counts->setProperty("text", QStringLiteral("40 to review · 10 accepted · ").repeated(10));
-        QVERIFY(laidOut.wait());
-        const QStringList out = outOfPlace();
-        QVERIFY2(out.isEmpty(), qPrintable(out.join("; ")));
-        QVERIFY(title->property("truncated").toBool());
-        QVERIFY(counts->property("truncated").toBool());
+        // Where the row is in the window, kept and compared after what would move it.
+        const auto sceneY = [decisions] { return decisions->mapToScene(QPointF()).y(); };
+        const qreal kept = sceneY();
+        QQuickItem *view = detailsView(w);
+        QTRY_VERIFY(view->property("contentHeight").toReal() > view->height());
+        view->setProperty("contentY", view->property("contentHeight").toReal() - view->height());
+        QCOMPARE(sceneY(), kept);
+        QTest::keyClick(w.window, Qt::Key_J);
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        QCOMPARE(sceneY(), kept);
+        QTest::keyClick(w.window, Qt::Key_A);
+        QTRY_COMPARE(w.bridge.detail()->stateWord(), "Accepted");
+        QCOMPARE(sceneY(), kept);
+        QTest::keyClick(w.window, Qt::Key_U);
+        QTRY_COMPARE(w.bridge.detail()->stateWord(), "To review");
+        QCOMPARE(sceneY(), kept);
     }
 
     // Accept and Reject act on the finding shown, so with none to act on they are greyed, never
-    // hidden, so that the toolbar keeps its width: while a greyed episode's log shows in the
-    // finding's place, while Settings holds the keys and while the filter shows no finding. A click
-    // on one then asks review nothing. The Finding menu's Accept, Reject and Back to Undecided, and
-    // with them their keys, follow the same rule.
+    // hidden, so that the row under the video keeps its place: while a greyed episode's log shows
+    // in the finding's place, while Settings holds the keys and while the filter shows no finding.
+    // Undo is neither hidden nor greyed in any of them. A click on one then asks review nothing.
+    // The Finding menu's Accept, Reject and Back to Undecided, and with them their keys, follow the
+    // same rule.
     void acceptAndRejectGreyWithNoFindingToActOn() {
         Shown w({clean(), media()});
         QVERIFY(w.start());
@@ -1995,14 +3899,22 @@ private slots:
         QTRY_VERIFY(w.item("episode0") && w.item("filter2") && w.delegate(0));
         QQuickItem *accept = w.item("acceptButton");
         QQuickItem *reject = w.item("rejectButton");
-        QVERIFY(accept && reject);
-        // Whether each is enabled and whether it shows, Accept's then Reject's.
-        const auto state = [accept, reject] {
-            return QList<bool>{accept->property("enabled").toBool(), accept->isVisible(),
-                               reject->property("enabled").toBool(), reject->isVisible()};
+        QQuickItem *undo = w.item("undoButton");
+        QQuickItem *row = w.item("decisions");
+        QVERIFY(accept && reject && undo && row);
+        // Whether each is enabled and whether it shows, Accept's, Reject's, then Undo's, which
+        // never waits for a finding, and the row's, which shows.
+        const auto state = [accept, reject, undo, row] {
+            return QList<bool>{accept->property("enabled").toBool(),
+                               accept->isVisible(),
+                               reject->property("enabled").toBool(),
+                               reject->isVisible(),
+                               undo->property("enabled").toBool(),
+                               undo->isVisible(),
+                               row->isVisible()};
         };
-        const QList<bool> enabled{true, true, true, true};
-        const QList<bool> greyed{false, true, false, true};
+        const QList<bool> enabled{true, true, true, true, true, true, true};
+        const QList<bool> greyed{false, true, false, true, true, true, true};
         // Whether the Finding menu's Accept, Reject and Back to Undecided are each enabled.
         const auto items = [&w] {
             QList<bool> each;
@@ -2053,6 +3965,1758 @@ private slots:
             QTest::keyClick(w.window, key);
         }
         QCOMPARE(w.since(from), QStringList());
+    }
+
+    // E opens the edit: the fix's line gives way to a field in its font holding review's wording,
+    // the cursor at its end, and the field has the keys. What is typed asks review nothing until
+    // Return saves it, which accepts the finding and closes the field. The keypad's Enter saves as
+    // Return does. Both decisions are undone, so that the run is left as found.
+    void editWordingOpensTheFieldWithReviewsWordingAndSaves() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *field = inEdit(w, "editField");
+        QQuickItem *line = inEdit(w, "blockLine");
+        QVERIFY(field && line);
+        QVERIFY(!field->isVisible());
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+
+        qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_E);
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QTRY_VERIFY(field->hasActiveFocus());
+        QVERIFY(field->isVisible());
+        QVERIFY(!line->isVisible());
+        const QString wording = w.bridge.editWording();
+        QVERIFY(!wording.isEmpty());
+        QCOMPARE(field->property("text").toString(), wording);
+        QCOMPARE(field->property("cursorPosition").toInt(), wording.size());
+        QCOMPARE(field->property("font").value<QFont>(), line->property("font").value<QFont>());
+
+        typeIn(w, "!");
+        QCOMPARE(field->property("text").toString(), wording + "!");
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "Reword " + wording + "!"}));
+        QTRY_COMPARE(w.decision(0), "Accepted");
+        QTRY_VERIFY(!field->isVisible());
+        QVERIFY(line->isVisible());
+
+        // The accept moved on, to the row the second edit is of.
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        const QString second = w.bridge.editWording();
+        QCOMPARE(field->property("text").toString(), second);
+        QTest::keyClick(w.window, Qt::Key_Enter, Qt::KeypadModifier);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "Reword " + second}));
+        QTRY_COMPARE(w.decision(1), "Accepted");
+        QTRY_VERIFY(!field->isVisible());
+
+        QTest::keyClick(w.window, Qt::Key_U);
+        QTRY_COMPARE(w.decision(1), "To review");
+        QTest::keyClick(w.window, Qt::Key_U);
+        QTRY_COMPARE(w.decision(0), "To review");
+    }
+
+    // Esc in the field, or Cancel, ends the edit, as review is asked to. Save and Accept with no
+    // wording is refused by review, on the status bar, and the edit goes on, the field with the
+    // keys.
+    void escOrCancelEndsTheEditAndAnEmptyWordingIsRefused() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *field = inEdit(w, "editField");
+        QQuickItem *save = inEdit(w, "saveButton");
+        QQuickItem *cancel = inEdit(w, "cancelButton");
+        QVERIFY(field && save && cancel);
+        QCOMPARE(save->property("text").toString(), "Save and Accept");
+        QVERIFY(save->property("highlighted").toBool());
+        QCOMPARE(cancel->property("text").toString(), "Cancel");
+        for (QQuickItem *button : {save, cancel}) {
+            QCOMPARE(button->property("focusPolicy").value<Qt::FocusPolicy>(), Qt::NoFocus);
+        }
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.bridge.sent, (QStringList{"Edit", "CancelEdit"}));
+        QTRY_VERIFY(!field->isVisible());
+
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+        QMetaObject::invokeMethod(w.find("edit"), "trigger");
+        QTRY_VERIFY(field->hasActiveFocus());
+        QVERIFY(cancel->isVisible());
+        w.click(cancel);
+        QCOMPARE(w.bridge.sent.mid(2), (QStringList{"Edit", "CancelEdit"}));
+        QTRY_VERIFY(!field->isVisible());
+
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        field->setProperty("text", QString());
+        const qsizetype from = w.bridge.sent.size();
+        w.click(save);
+        QCOMPARE(w.since(from), QStringList{"Reword "});
+        QTRY_COMPARE(w.bridge.statusLine(), "The wording cannot be empty");
+        QVERIFY(w.bridge.editing());
+        QVERIFY(field->isVisible());
+        QVERIFY(field->hasActiveFocus());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!field->isVisible());
+        QCOMPARE(w.decision(0), "To review");
+    }
+
+    // While the field has the keys, those it types, moves through or has no use for in one line are
+    // its own: none reaches the window's shortcuts, the list's moves, the video's and the View
+    // menu's letter among them, nor any shortcut the window gains.
+    void theEditFieldTakesItsKeys() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(field);
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        const QString wording = field->property("text").toString();
+        const qsizetype from = w.bridge.sent.size();
+        for (const Qt::Key key :
+             {Qt::Key_Up, Qt::Key_Down, Qt::Key_PageUp, Qt::Key_PageDown, Qt::Key_Home, Qt::Key_End,
+              Qt::Key_Space, Qt::Key_A, Qt::Key_Left, Qt::Key_Right, Qt::Key_V}) {
+            const QString name = QKeySequence(key).toString();
+            QKeyEvent override(QEvent::ShortcutOverride, key, Qt::NoModifier);
+            override.ignore();
+            QCoreApplication::sendEvent(field, &override);
+            QVERIFY2(override.isAccepted(), qPrintable(name));
+            QTest::keyClick(w.window, key);
+            QVERIFY2(w.since(from).isEmpty(), qPrintable(name + ": " + w.since(from).join(" | ")));
+            QVERIFY2(field->hasActiveFocus(), qPrintable(name));
+        }
+        QCOMPARE(field->property("text").toString(), wording + " av");
+        QTest::qWait(100);
+        QCOMPARE(w.since(from), QStringList());
+        QVERIFY(w.bridge.editing());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), QStringList{"CancelEdit"});
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // Ctrl+Z in the field undoes what was typed there, back to the wording it opened with, and asks
+    // review nothing: the decision before the edit stays. It is undone, so that the run is left as
+    // found.
+    void ctrlZInTheFieldUndoesTheTypingNotADecision() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(field);
+        QTest::keyClick(w.window, Qt::Key_A);
+        QTRY_COMPARE(w.decision(0), "Accepted");
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        const QString opened = field->property("text").toString();
+        typeIn(w, "zz");
+        QCOMPARE(field->property("text").toString(), opened + "zz");
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_Z, Qt::ControlModifier);
+        QCOMPARE(field->property("text").toString(), opened);
+        QTest::qWait(100);
+        QCOMPARE(w.since(from), QStringList());
+        QCOMPARE(w.decision(0), "Accepted");
+        QVERIFY(w.bridge.editing());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!w.bridge.editing());
+        QTest::keyClick(w.window, Qt::Key_U);
+        QTRY_COMPARE(w.decision(0), "To review");
+    }
+
+    // What is typed stays, and the field keeps the keys, whatever review or the window changes
+    // while it is open: review's message, a palette chosen, and the same edit with its entry
+    // renamed, as a re-check renames it.
+    void aChangeWhileTypingKeepsWhatWasTyped() {
+        const auto restore = qScopeGuard([] { useColours(Colours::Default); });
+        Shown w({media()});
+        std::optional<subcheck_ffi::Event::kChanged> last;
+        QObject::connect(&w.bridge, &SessionBridge::eventArrived, &w.bridge,
+                         [&last](const subcheck_ffi::Event &e) {
+                             const auto *change =
+                                 std::get_if<subcheck_ffi::Event::kChanged>(&e.get_variant());
+                             if (change) {
+                                 last = *change;
+                             }
+                         });
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *field = inEdit(w, "editField");
+        QQuickItem *bar = inEdit(w, "blockBar");
+        QVERIFY(field && bar);
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        typeIn(w, "abc");
+        const QString typed = field->property("text").toString();
+        QVERIFY(typed.endsWith("abc"));
+        // Whether the field still holds what was typed, and the keys.
+        const auto kept = [field, &typed] {
+            return field->isVisible() && field->hasActiveFocus() &&
+                   field->property("text").toString() == typed;
+        };
+
+        w.bridge.undo();
+        QTRY_COMPARE(w.bridge.statusLine(), "Nothing to undo");
+        QVERIFY(kept());
+
+        w.settings.setColours(QStringLiteral("deuteran"));
+        QTRY_COMPARE(bar->property("color").value<QColor>(),
+                     tones(Colours::Deuteran, dark()).added);
+        QVERIFY(kept());
+
+        QVERIFY(last && last->summary.edit);
+        subcheck_ffi::Summary renamed = last->summary;
+        renamed.edit->entry = subcheck_ffi::EntryKey(subcheck_ffi::EntryKey::kRow{{9001, 9002}});
+        QSignalSpy changed(&w.bridge, &SessionBridge::summaryChanged);
+        emit w.bridge.eventArrived(subcheck_ffi::Event(subcheck_ffi::Event::kChanged{
+            std::nullopt, renamed, std::nullopt, std::nullopt, std::nullopt, std::nullopt}));
+        QTRY_VERIFY(changed.count() > 0);
+        QVERIFY(w.bridge.editing());
+        QVERIFY(kept());
+
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // A text field's own right-click menu, the edit's or the Find box's, has the keys while it is
+    // open, as a menu of the window's has them, whichever window a key reaches, the menu's own or
+    // the window: the window's letters ask review nothing. Esc closes it, and the field has the
+    // keys again, the Find field with the "No match" it showed, as it took no keys by a click or
+    // Ctrl+F; Esc again ends the edit or gives the window its keys back from the box, which stays,
+    // and the window's keys are its own again.
+    void aTextFieldsOwnMenuHasTheKeys() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(field);
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        const QString opened = field->property("text").toString();
+        // Whether the menu of the field `of` is open.
+        const auto menuOpen = [](QQuickItem *of) {
+            const QList<QObject *> parts = of->findChildren<QObject *>();
+            return std::any_of(parts.begin(), parts.end(), [](QObject *part) {
+                return part->inherits("QQuickMenu") && part->property("opened").toBool();
+            });
+        };
+        QTest::mouseClick(w.window, Qt::RightButton, {}, w.middle(field));
+        QTRY_VERIFY(menuOpen(field));
+        QWindow *menu = QGuiApplication::focusWindow();
+        QVERIFY(menu);
+        const qsizetype from = w.bridge.sent.size();
+        for (const Qt::Key key : {Qt::Key_A, Qt::Key_X, Qt::Key_N}) {
+            for (QWindow *to : {menu, static_cast<QWindow *>(w.window)}) {
+                QTest::keyClick(to, key);
+            }
+        }
+        QTest::qWait(100);
+        QCOMPARE(w.since(from), QStringList());
+        QVERIFY(menuOpen(field));
+        QVERIFY(w.bridge.editing());
+        QTest::keyClick(menu, Qt::Key_Escape);
+        QTRY_VERIFY(!menuOpen(field));
+        // The window manager gives the keys back to the window the menu was over, which offscreen
+        // has none to do.
+        w.window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(w.window));
+        QTRY_VERIFY(field->hasActiveFocus());
+        QCOMPARE(field->property("text").toString(), opened);
+        QTest::keyClick(w.window, Qt::Key_End);
+        QTest::keyClick(w.window, Qt::Key_X);
+        QCOMPARE(field->property("text").toString(), opened + "x");
+        QCOMPARE(w.since(from), QStringList());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), QStringList{"CancelEdit"});
+        QTRY_VERIFY(!w.bridge.editing());
+        QTRY_VERIFY(w.find("clear")->property("enabled").toBool());
+        QTest::keyClick(w.window, Qt::Key_X);
+        QCOMPARE(w.last(), "Clear");
+
+        QQuickItem *findBox = w.item("findBox");
+        QQuickItem *findField = w.item("findField");
+        QQuickItem *noMatch = w.item("noMatch");
+        QVERIFY(findBox && findField && noMatch);
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(findField->hasActiveFocus());
+        typeIn(w, "zzz");
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QVERIFY(noMatch->isVisible());
+        QTest::mouseClick(w.window, Qt::RightButton, {}, w.middle(findField));
+        QTRY_VERIFY(menuOpen(findField));
+        QWindow *findMenu = QGuiApplication::focusWindow();
+        QVERIFY(findMenu);
+        const qsizetype found = w.bridge.sent.size();
+        for (const Qt::Key key : {Qt::Key_A, Qt::Key_X, Qt::Key_N}) {
+            for (QWindow *to : {findMenu, static_cast<QWindow *>(w.window)}) {
+                QTest::keyClick(to, key);
+            }
+        }
+        QTest::qWait(100);
+        QCOMPARE(w.since(found), QStringList());
+        QVERIFY(menuOpen(findField));
+        QTest::keyClick(findMenu, Qt::Key_Escape);
+        QTRY_VERIFY(!menuOpen(findField));
+        w.window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(w.window));
+        QTRY_VERIFY(findField->hasActiveFocus());
+        QVERIFY(noMatch->isVisible());
+        QCOMPARE(findField->property("text").toString(), "zzz");
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QVERIFY(!findField->hasActiveFocus());
+        QVERIFY(findBox->isVisible());
+        QCOMPARE(w.since(found), QStringList());
+        QTest::keyClick(w.window, Qt::Key_X);
+        QCOMPARE(w.since(found), QStringList{"Clear"});
+    }
+
+    // A click on another row selects it, and review ends the edit, the words typed with it: the
+    // field closes, and the row it was of is undecided still.
+    void movingOffAnEditEndsIt() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.delegate(1));
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(field);
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        typeIn(w, "abc");
+        const qsizetype from = w.bridge.sent.size();
+        w.click(w.delegate(1));
+        const QStringList sent = w.since(from);
+        QVERIFY2(sent.size() == 1 && sent[0].startsWith("Select row "),
+                 qPrintable(sent.join(" | ")));
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        QTRY_VERIFY(!field->isVisible());
+        QVERIFY(!w.bridge.editing());
+        QCOMPARE(w.decision(0), "To review");
+        QCOMPARE(w.since(from), sent);
+    }
+
+    // A greyed episode clicked while an edit is open moves no selection, so the edit stays open
+    // under the episode's view, but its field, hidden there, gives the window its keys: Return and
+    // the keypad's Enter send nothing, as Show Each Episode waits in that view, and Space plays and
+    // pauses. A click on the grey row ends the view, and the field has its words and the keys
+    // again.
+    void aGreyedEpisodesViewHasTheKeysOfAnOpenEditUntilItEnds() {
+        Shown w({clean(), media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.item("episode0") && w.delegate(0));
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(field);
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        typeIn(w, "abc");
+        const QString typed = field->property("text").toString();
+        QVERIFY(typed.endsWith("abc"));
+
+        qsizetype from = w.bridge.sent.size();
+        w.click(w.item("episode0"));
+        QVERIFY2(w.since(from).size() == 1 && w.since(from).first().startsWith("SelectFile "),
+                 qPrintable(w.since(from).join(" | ")));
+        QTRY_VERIFY(w.bridge.showingEpisode());
+        QTRY_VERIFY(!field->isVisible());
+        QVERIFY(w.bridge.editing());
+        QVERIFY(!field->hasActiveFocus());
+        from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QTest::keyClick(w.window, Qt::Key_Enter, Qt::KeypadModifier);
+        QCOMPARE(w.since(from), QStringList());
+        QTest::keyClick(w.window, Qt::Key_Space);
+        QCOMPARE(w.since(from), QStringList{"Playback Pause"});
+        QCOMPARE(field->property("text").toString(), typed);
+        QVERIFY(w.bridge.editing());
+
+        from = w.bridge.sent.size();
+        w.click(w.delegate(w.bridge.selected()));
+        QVERIFY2(w.since(from).size() == 1 && w.since(from).first().startsWith("Select row "),
+                 qPrintable(w.since(from).join(" | ")));
+        QTRY_VERIFY(!w.bridge.showingEpisode());
+        QVERIFY(w.bridge.editing());
+        QTRY_VERIFY(field->isVisible() && field->hasActiveFocus());
+        QCOMPARE(field->property("text").toString(), typed);
+        QCOMPARE(detailsView(w)->property("contentY").toReal(), 0.0);
+        QVERIFY(inDetailsView(w, field));
+        typeIn(w, "d");
+        QCOMPARE(field->property("text").toString(), typed + "d");
+        QCOMPARE(w.since(from).size(), 1);
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.last(), "CancelEdit");
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // An edit opened with the details panel scrolled down, to the log under the finding, brings
+    // its field into view, so that what is typed is seen.
+    void anEditOpenedScrolledPastItsFieldBringsTheFieldIntoView() {
+        Shown w({clean(), media()});
+        clickE01AtTheLeastSize(w);
+        QQuickItem *view = detailsView(w);
+        QQuickItem *field = inEdit(w, "editField");
+        QQuickItem *fixed = w.item("fixedBlock");
+        QVERIFY(field && fixed);
+        const qreal down = view->property("contentHeight").toReal() - view->height();
+        QVERIFY(down > 0);
+        view->setProperty("contentY", down);
+        QCOMPARE(view->property("contentY").toReal(), down);
+        QVERIFY(topInDetails(w, fixed) + fixed->height() <= 0);
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QTRY_VERIFY2(inDetailsView(w, field),
+                     qPrintable(QStringLiteral("the field starts at %1 in a view %2 tall")
+                                    .arg(topInDetails(w, field))
+                                    .arg(view->height())));
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // While an edit is open, the decisions and Undo wait, by menu, key and button alike: a click
+    // beside the field would decide the plain fix, or undo another, and drop the typed wording.
+    // Save and Accept and Cancel decide the edit. Once it ends they are back.
+    void theDecisionsWaitWhileAnEditIsOpen() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *field = inEdit(w, "editField");
+        QQuickItem *cancel = inEdit(w, "cancelButton");
+        QVERIFY(field && cancel);
+        const QStringList actions{"accept", "reject", "clear", "edit", "undo"};
+        const QStringList buttons{"rejectButton", "acceptButton", "undoButton"};
+        // Which of them are enabled, by name.
+        const auto enabled = [&] {
+            QStringList on;
+            for (const QString &name : actions) {
+                if (w.find(qPrintable(name))->property("enabled").toBool()) {
+                    on << name;
+                }
+            }
+            for (const QString &name : buttons) {
+                QQuickItem *button = w.item(qPrintable(name));
+                if (!button->isVisible()) {
+                    on << name + " hidden";
+                }
+                if (button->property("enabled").toBool()) {
+                    on << name;
+                }
+            }
+            return on;
+        };
+        QTRY_COMPARE(enabled(), actions + buttons);
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QCOMPARE(enabled(), QStringList());
+        const qsizetype from = w.bridge.sent.size();
+        for (const QString &name : buttons) {
+            w.click(w.item(qPrintable(name)));
+        }
+        QCOMPARE(w.since(from), QStringList());
+        QVERIFY(field->hasActiveFocus());
+        w.click(cancel);
+        QCOMPARE(w.since(from), QStringList{"CancelEdit"});
+        QTRY_COMPARE(enabled(), actions + buttons);
+    }
+
+    // A timing fix is accepted or rejected, never reworded: with one selected, Edit Wording… is
+    // greyed in the menu, and a click on the fix asks for no edit.
+    void aTimingRowCannotBeReworded() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *edit = w.find("edit");
+        QQuickItem *area = inEdit(w, "rewordArea");
+        QVERIFY(edit && area);
+        QTRY_VERIFY(edit->property("enabled").toBool());
+        QVERIFY(area->isVisible());
+        QVERIFY(timingRowAtTheSelection(w));
+        QVERIFY(!w.bridge.canEdit());
+        QTRY_VERIFY(!edit->property("enabled").toBool());
+        QVERIFY(!area->isVisible());
+        QVERIFY(w.find("accept")->property("enabled").toBool());
+    }
+
+    // A click on the line with the fix opens its edit, the field's cursor where the click was: on
+    // the line's first drawn line, and on its second where it wraps, at a large size in a narrow
+    // panel. The pointer shows a text cursor over it. Open, the field takes its own clicks; E
+    // opens the edit with the cursor at its end, as a click's place is not kept. A click while the
+    // Find box has the keys gives them to the edit's field and greys the box, so that Return saves
+    // and never finds.
+    void aClickOnTheFixOpensTheEditWithTheCursorThere() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *area = inEdit(w, "rewordArea");
+        QQuickItem *line = inEdit(w, "blockLine");
+        QQuickItem *field = inEdit(w, "editField");
+        QQuickItem *findBox = w.item("findBox");
+        QQuickItem *findField = w.item("findField");
+        QVERIFY(area && line && field && findBox && findField);
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+        const QString wording = QStringLiteral("We should leave before it rains.");
+        QCOMPARE(text(w.bridge.findings()->at(0)->wording), wording);
+        QVERIFY(area->isVisible());
+        const QList<QObject *> handlers = area->children();
+        const auto hover = std::find_if(handlers.begin(), handlers.end(), [](QObject *each) {
+            return each->inherits("QQuickHoverHandler");
+        });
+        QVERIFY(hover != handlers.end());
+        QCOMPARE((*hover)->property("cursorShape").value<Qt::CursorShape>(), Qt::IBeamCursor);
+
+        // A point `across` and `down` the line, in the window.
+        const auto onLine = [line](qreal across, qreal down) {
+            return line->mapToScene(QPointF(across, down)).toPoint();
+        };
+        const qreal left = line->property("leftPadding").toReal();
+        const qreal top = line->property("topPadding").toReal();
+        // A quarter into the first character of a word before the change, which the plain font's
+        // metrics place.
+        const QFontMetricsF m(line->property("font").value<QFont>());
+        const qsizetype s = wording.indexOf("should");
+        qsizetype from = w.bridge.sent.size();
+        QTest::mouseClick(w.window, Qt::LeftButton, {},
+                          onLine(left + m.horizontalAdvance(wording.left(s)) +
+                                     m.horizontalAdvance(wording.at(s)) / 4,
+                                 top + m.height() / 2));
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QTRY_VERIFY(field->hasActiveFocus());
+        QCOMPARE(field->property("text").toString(), w.bridge.editWording());
+        QCOMPARE(field->property("cursorPosition").toInt(), s);
+
+        QVERIFY(!area->isVisible());
+        QTest::mouseClick(w.window, Qt::LeftButton, {},
+                          field->mapToScene(QPointF(1, field->height() / 2)).toPoint());
+        QCOMPARE(field->property("cursorPosition").toInt(), 0);
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
+        QTRY_VERIFY(!field->isVisible());
+
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QCOMPARE(field->property("cursorPosition").toInt(), w.bridge.editWording().size());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!field->isVisible());
+
+        w.settings.setDetailsTextSize(24);
+        w.window->resize(w.window->minimumWidth(), w.window->height());
+        QTRY_COMPARE(w.window->width(), w.window->minimumWidth());
+        QTRY_COMPARE(fixNotLaidOut(w, w.window->property("detailsLeast").toReal()), QString());
+        const QFontMetricsF large(line->property("font").value<QFont>());
+        QTRY_VERIFY2(line->height() >= 2 * large.lineSpacing(),
+                     qPrintable(QStringLiteral("the line is %1 tall, a line %2")
+                                    .arg(line->height())
+                                    .arg(large.lineSpacing())));
+        QTRY_VERIFY(area->isVisible());
+        QTRY_VERIFY(inDetailsView(w, line));
+        from = w.bridge.sent.size();
+        QTest::mouseClick(w.window, Qt::LeftButton, {},
+                          onLine(left + 1, top + 1.5 * large.lineSpacing()));
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QTRY_VERIFY(field->hasActiveFocus());
+        const int p = field->property("cursorPosition").toInt();
+        QVERIFY2(p > 0 && wording.at(p - 1) == ' ',
+                 qPrintable(QStringLiteral("the cursor is at %1 of \"%2\"").arg(p).arg(wording)));
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!field->isVisible());
+
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(findField->hasActiveFocus());
+        typeIn(w, "x");
+        QCOMPARE(findField->property("text").toString(), "x");
+        QTRY_VERIFY(area->isVisible());
+        from = w.bridge.sent.size();
+        w.click(line);
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QTRY_VERIFY(field->hasActiveFocus());
+        QVERIFY(!findField->hasActiveFocus());
+        QVERIFY(!findBox->isEnabled());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // A click anywhere on the block with the fix opens its edit, on its bar, its label and the room
+    // around its line as on the line, with the field's cursor at the line's character nearest the
+    // click: on the label, the first drawn line's at the click's x; below the line, the last
+    // drawn line's; beside a drawn line, its start or end. The pointer shows a text cursor over
+    // all of it.
+    void aClickAnywhereOnTheFixsBlockOpensTheEdit_data() {
+        QTest::addColumn<QString>("where");
+        for (const char *where :
+             {"the label", "the padding below the line", "right of a short line", "the bar",
+              "the label over a wrapped line", "below a wrapped line"}) {
+            QTest::newRow(where) << QString::fromLatin1(where);
+        }
+    }
+    void aClickAnywhereOnTheFixsBlockOpensTheEdit() {
+        QFETCH(QString, where);
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *fixed = w.item("fixedBlock");
+        QQuickItem *area = inEdit(w, "rewordArea");
+        QQuickItem *label = inEdit(w, "blockLabel");
+        QQuickItem *line = inEdit(w, "blockLine");
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(fixed && area && label && line && field);
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+        const QString wording = QStringLiteral("We should leave before it rains.");
+        QCOMPARE(text(w.bridge.findings()->at(0)->wording), wording);
+        if (where.contains(QStringLiteral("wrapped"))) {
+            w.settings.setDetailsTextSize(24);
+            w.window->resize(w.window->minimumWidth(), w.window->height());
+            QTRY_COMPARE(w.window->width(), w.window->minimumWidth());
+            QTRY_COMPARE(fixNotLaidOut(w, w.window->property("detailsLeast").toReal()), QString());
+            const qreal spacing =
+                QFontMetricsF(line->property("font").value<QFont>()).lineSpacing();
+            QTRY_VERIFY(line->property("contentHeight").toReal() >= 1.5 * spacing);
+        } else {
+            askRoomForOneLine(w, line);
+            if (QTest::currentTestFailed()) {
+                return;
+            }
+            QTRY_COMPARE(fixNotLaidOut(w, roomForOneLine), QString());
+        }
+        QTRY_VERIFY(area->isVisible());
+        QTRY_VERIFY(inDetailsView(w, fixed));
+        QCOMPARE(area->mapRectToScene(area->boundingRect()),
+                 fixed->mapRectToScene(fixed->boundingRect()));
+
+        // Places in the block: across, a quarter into the first character of a word before the
+        // change, as the plain font's metrics place it in the line, and the line's start; down,
+        // the middle of the label, of the line's first drawn line, and the block's foot.
+        const QFontMetricsF m(line->property("font").value<QFont>());
+        const qsizetype s = wording.indexOf("should");
+        const qreal left = line->property("leftPadding").toReal();
+        const qreal top = line->property("topPadding").toReal();
+        const QPointF onLine =
+            line->mapToItem(fixed, QPointF(left + m.horizontalAdvance(wording.left(s)) +
+                                               m.horizontalAdvance(wording.at(s)) / 4,
+                                           top + m.height() / 2));
+        const qreal lineStart = line->mapToItem(fixed, QPointF(left + 1, 0)).x();
+        const qreal onLabel = label->mapToItem(fixed, QPointF(0, label->height() / 2)).y();
+        const qreal foot = fixed->height() - 2;
+        QVERIFY(line->mapToItem(fixed, QPointF(0, line->height())).y() < foot);
+        QPointF in;
+        if (where.startsWith(QStringLiteral("the label"))) {
+            in = {onLine.x(), onLabel};
+        } else if (where == "the padding below the line") {
+            in = {onLine.x(), foot};
+        } else if (where == "right of a short line") {
+            // In the padding, short of the panel's scroll bar, which lies over the block's edge.
+            in = {line->mapToItem(fixed, QPointF(line->width(), 0)).x() + 2, onLine.y()};
+        } else if (where == "the bar") {
+            // Inside the bar and clear of the column handle's grip, which the check below proves.
+            in = {2, onLine.y()};
+        } else {
+            in = {lineStart, foot};
+        }
+        const QPoint at = fixed->mapToScene(in).toPoint();
+        if (where == "the bar") {
+            // The handle nearest the details panel: the one furthest right of those left of the
+            // block.
+            QQuickItem *grip = nullptr;
+            qreal gripX = -1;
+            for (QQuickItem *part : w.item("columns")->childItems()) {
+                const QList<QQuickItem *> inside = part->childItems();
+                const qreal x = part->mapToScene(QPointF()).x();
+                if (part->objectName() == QLatin1String("columnHandle") && !inside.isEmpty() &&
+                    x < fixed->mapToScene(QPointF()).x() && x > gripX) {
+                    grip = inside.first();
+                    gripX = x;
+                }
+            }
+            QVERIFY(grip);
+            QVERIFY2(!grip->contains(grip->mapFromScene(QPointF(at))),
+                     "the click is in the column handle's grip");
+        }
+
+        // Off the block first, so that the text cursor is the block's own.
+        QTest::mouseMove(w.window, w.middle(w.item("nowBlock")));
+        QTRY_VERIFY(w.window->cursor().shape() != Qt::IBeamCursor);
+        QTest::mouseMove(w.window, at);
+        QTRY_COMPARE(w.window->cursor().shape(), Qt::IBeamCursor);
+
+        const qsizetype from = w.bridge.sent.size();
+        QTest::mouseClick(w.window, Qt::LeftButton, {}, at);
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QTRY_VERIFY(field->hasActiveFocus());
+        const int p = field->property("cursorPosition").toInt();
+        if (where == "right of a short line") {
+            QCOMPARE(p, field->property("text").toString().size());
+        } else if (where == "the bar") {
+            QCOMPARE(p, 0);
+        } else if (where == "below a wrapped line") {
+            // The start of a drawn line after the first.
+            QVERIFY2(
+                p > 0 && wording.at(p - 1) == ' ',
+                qPrintable(QStringLiteral("the cursor is at %1 of \"%2\"").arg(p).arg(wording)));
+        } else {
+            QCOMPARE(p, s);
+        }
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // Where a click on the fix put the cursor goes with the selection: should review move to
+    // another finding before it opens the edit the click asked for, that finding's edit starts
+    // with the cursor at its end.
+    void aClicksPlaceNeverReachesAnotherFindingsEdit() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *details = w.item("details");
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(details && field);
+        // As a click leaves it while its edit waits for review.
+        QVERIFY(details->setProperty("cursorAt", 3));
+        QTest::keyClick(w.window, Qt::Key_J);
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QCOMPARE(field->property("cursorPosition").toInt(), w.bridge.editWording().size());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // An edit asked other than by a click on the fix, by E, Finding ▸ Edit Wording… or the
+    // right-click menu's, opens with the cursor at the wording's end, even while review has yet to
+    // answer a click on the fix: the click's place is for the edit that click asked for alone.
+    void anEditAskedOtherwiseOpensAtTheWordingsEnd_data() {
+        QTest::addColumn<QString>("how");
+        QTest::newRow("E") << "E";
+        QTest::newRow("Finding ▸ Edit Wording…") << "edit";
+        QTest::newRow("the right-click menu's Edit Wording…") << "rowEdit";
+    }
+    void anEditAskedOtherwiseOpensAtTheWordingsEnd() {
+        QFETCH(QString, how);
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *details = w.item("details");
+        QQuickItem *field = inEdit(w, "editField");
+        QObject *edit = w.find("edit");
+        QObject *menu = w.find("rowMenu");
+        QVERIFY(details && field && edit && menu);
+        QTRY_VERIFY(edit->property("enabled").toBool());
+        if (how == "rowEdit") {
+            w.rightClick(w.item("nowBlock"));
+            QTRY_VERIFY(menu->property("opened").toBool());
+        }
+        // As a click on the fix leaves it while its edit waits for review.
+        QVERIFY(details->setProperty("cursorAt", 3));
+        const qsizetype from = w.bridge.sent.size();
+        if (how == "E") {
+            QTest::keyClick(w.window, Qt::Key_E);
+        } else if (how == "edit") {
+            QVERIFY(QMetaObject::invokeMethod(edit, "trigger"));
+        } else {
+            QQuickItem *rowEdit = rowMenuItem(w, "rowEdit");
+            QVERIFY(rowEdit);
+            QTRY_VERIFY(rowEdit->property("enabled").toBool());
+            w.click(rowEdit);
+            QTRY_VERIFY(!menu->property("visible").toBool());
+            // The window manager gives the keys back to the window a menu drawn in a window of its
+            // own was over, which offscreen has none to do.
+            w.window->requestActivate();
+            QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+        }
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QTRY_VERIFY(field->hasActiveFocus());
+        QCOMPARE(field->property("cursorPosition").toInt(), w.bridge.editWording().size());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // A click on the fix that review answers with no edit open, as under a question, which the
+    // Edit only lets go, leaves its place to no later edit: E then opens one with the cursor at its
+    // end.
+    void aClickReviewAnswersWithNoEditLeavesNoPlace() {
+        Shown w({media()});
+        bool asked = false;
+        connect(&w.bridge, &SessionBridge::eventArrived, &w.bridge,
+                [&asked](const subcheck_ffi::Event &e) {
+                    if (const auto *change =
+                            std::get_if<subcheck_ffi::Event::kChanged>(&e.get_variant())) {
+                        asked = change->summary.question.has_value();
+                    }
+                });
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *area = inEdit(w, "rewordArea");
+        QQuickItem *line = inEdit(w, "blockLine");
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(area && line && field);
+        const QString wording = QStringLiteral("We should leave before it rains.");
+        QCOMPARE(text(w.bridge.findings()->at(0)->wording), wording);
+        // Recheck asks first. The window has no way to ask it yet, so the test sends it.
+        w.bridge.send(subcheck_ffi::Action(subcheck_ffi::Action::kRecheck{}));
+        QTRY_VERIFY(asked);
+        QTRY_VERIFY(area->isVisible());
+        // A quarter into the first character of a word before the change, as a click that opens
+        // the edit puts the cursor there.
+        const QFontMetricsF m(line->property("font").value<QFont>());
+        const qsizetype s = wording.indexOf("should");
+        const qreal across = line->property("leftPadding").toReal() +
+                             m.horizontalAdvance(wording.left(s)) +
+                             m.horizontalAdvance(wording.at(s)) / 4;
+        const qreal down = line->property("topPadding").toReal() + m.height() / 2;
+        const qsizetype from = w.bridge.sent.size();
+        QTest::mouseClick(w.window, Qt::LeftButton, {},
+                          line->mapToScene(QPointF(across, down)).toPoint());
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QTRY_VERIFY(!asked);
+        QVERIFY(!w.bridge.editing());
+        QVERIFY(!field->isVisible());
+
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QCOMPARE(field->property("cursorPosition").toInt(), w.bridge.editWording().size());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "Edit", "CancelEdit"}));
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // A double-click on the fix, as on words to select them, opens one edit and asks nothing else,
+    // whether review answers the first click before the second comes or after it. Once the edit
+    // is open, Save and Accept and Cancel lie below every point a click on the block could be at,
+    // so that a second click that comes after the edit has opened lands on the field or empty
+    // room: at the foot of a line of one, which keeps room for two, on the lower half of a wrapped
+    // line's second, at the largest size in the narrowest window, at the block's foot, under a
+    // line of one and under a wrapped one, and on the label.
+    void aDoubleClickOnTheFixOpensOneEdit_data() {
+        QTest::addColumn<QString>("where");
+        QTest::addColumn<bool>("answered");
+        QTest::newRow("before review answers") << "the middle" << false;
+        QTest::newRow("at the foot of a line of one") << "the foot" << true;
+        QTest::newRow("on a wrapped line's second") << "the second line" << true;
+        QTest::newRow("at the block's foot") << "the block's foot" << true;
+        QTest::newRow("at a wrapped line's block's foot") << "the wrapped block's foot" << true;
+        QTest::newRow("on the label") << "the label" << true;
+    }
+    void aDoubleClickOnTheFixOpensOneEdit() {
+        QFETCH(QString, where);
+        QFETCH(bool, answered);
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *fixed = w.item("fixedBlock");
+        QQuickItem *area = inEdit(w, "rewordArea");
+        QQuickItem *label = inEdit(w, "blockLabel");
+        QQuickItem *line = inEdit(w, "blockLine");
+        QQuickItem *field = inEdit(w, "editField");
+        QQuickItem *save = inEdit(w, "saveButton");
+        QQuickItem *cancel = inEdit(w, "cancelButton");
+        QVERIFY(fixed && area && label && line && field && save && cancel);
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+        const qreal left = line->property("leftPadding").toReal();
+        // How many lines the line is drawn in, as its text is laid out: a rich text's lineCount is
+        // not kept.
+        const auto drawnLines = [line] {
+            const qreal spacing =
+                QFontMetricsF(line->property("font").value<QFont>()).lineSpacing();
+            return qRound(line->property("contentHeight").toReal() / spacing);
+        };
+        if (where == "the second line" || where == "the wrapped block's foot") {
+            w.settings.setDetailsTextSize(24);
+            w.window->resize(w.window->minimumWidth(), w.window->height());
+            QTRY_COMPARE(w.window->width(), w.window->minimumWidth());
+            QTRY_COMPARE(fixNotLaidOut(w, w.window->property("detailsLeast").toReal()), QString());
+            QVERIFY2(drawnLines() >= 2, qPrintable(QString::number(drawnLines())));
+        } else {
+            askRoomForOneLine(w, line);
+            if (QTest::currentTestFailed()) {
+                return;
+            }
+            QTRY_COMPARE(fixNotLaidOut(w, roomForOneLine), QString());
+            QCOMPARE(drawnLines(), 1);
+        }
+        QTRY_VERIFY(area->isVisible());
+        QTRY_VERIFY(inDetailsView(w, line));
+        const qreal spacing = QFontMetricsF(line->property("font").value<QFont>()).lineSpacing();
+        QPoint at;
+        if (where == "the middle") {
+            at = w.middle(line);
+        } else if (where == "the foot") {
+            at = line->mapToScene(QPointF(left + 1, line->height() - 1)).toPoint();
+        } else if (where == "the second line") {
+            at = line->mapToScene(
+                         QPointF(left + 1, line->property("topPadding").toReal() + 1.75 * spacing))
+                     .toPoint();
+        } else if (where == "the label") {
+            at = w.middle(label);
+        } else {
+            // Above Save and Accept's left end, which the press would reach were the buttons not
+            // kept below the block's foot.
+            at = fixed
+                     ->mapToScene(
+                         QPointF(fixed->property("leftPadding").toReal() + 1, fixed->height() - 1))
+                     .toPoint();
+        }
+        // Where a click asks for the edit, before it opens.
+        const QRectF covered = area->mapRectToScene(QRectF(0, 0, area->width(), area->height()));
+        QVERIFY(covered.contains(at));
+        const qsizetype from = w.bridge.sent.size();
+        if (answered) {
+            // Two clicks within the double-click interval, as their times say, with the events
+            // between them run, so that review answers the first and the edit opens.
+            QTest::mousePress(w.window, Qt::LeftButton, {}, at, 10);
+            QTest::mouseRelease(w.window, Qt::LeftButton, {}, at, 10);
+            QTRY_VERIFY(field->hasActiveFocus());
+            QTest::mousePress(w.window, Qt::LeftButton, {}, at, 10);
+            QTest::mouseRelease(w.window, Qt::LeftButton, {}, at, 10);
+        } else {
+            QTest::mouseDClick(w.window, Qt::LeftButton, {}, at);
+        }
+        QVERIFY2(w.since(from) == QStringList{"Edit"}, qPrintable(w.since(from).join(" | ")));
+        QTRY_VERIFY(field->hasActiveFocus());
+        QTest::qWait(100);
+        QVERIFY2(w.since(from) == QStringList{"Edit"}, qPrintable(w.since(from).join(" | ")));
+        QVERIFY(field->hasActiveFocus());
+        // The edit's parts laid out, as the next frame draws them.
+        w.item("fixedBlock")->property("contentItem").value<QQuickItem *>()->ensurePolished();
+        save->parentItem()->ensurePolished();
+        for (QQuickItem *button : {save, cancel}) {
+            QVERIFY(button->isVisible());
+            const QRectF drawn =
+                button->mapRectToScene(QRectF(0, 0, button->width(), button->height()));
+            QVERIFY2(!drawn.intersects(covered),
+                     qPrintable(QStringLiteral("%1 at %2,%3 %4x%5 under a click on the block, "
+                                               "which covered %6,%7 %8x%9")
+                                    .arg(button->property("text").toString())
+                                    .arg(drawn.x())
+                                    .arg(drawn.y())
+                                    .arg(drawn.width())
+                                    .arg(drawn.height())
+                                    .arg(covered.x())
+                                    .arg(covered.y())
+                                    .arg(covered.width())
+                                    .arg(covered.height())));
+        }
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // A click on the line with the fix after the edit a click opened has ended asks for the edit
+    // again, however soon after the first it comes: the edit came between the two, which are not a
+    // double-click. A double-click then asks once, as any does.
+    void aClickAfterTheEditAClickOpenedEndsAsksAgain() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *area = inEdit(w, "rewordArea");
+        QQuickItem *line = inEdit(w, "blockLine");
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(area && line && field);
+        QTRY_VERIFY(w.find("edit")->property("enabled").toBool());
+        QTRY_VERIFY(area->isVisible());
+        QTRY_VERIFY(inDetailsView(w, line));
+        const QPoint at = w.middle(line);
+        const qsizetype from = w.bridge.sent.size();
+        // Each click within the double-click interval of the one before, as their times say, with
+        // the events between them run.
+        QTest::mousePress(w.window, Qt::LeftButton, {}, at, 10);
+        QTest::mouseRelease(w.window, Qt::LeftButton, {}, at, 10);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(area->isVisible());
+        QTest::mousePress(w.window, Qt::LeftButton, {}, at, 10);
+        QTest::mouseRelease(w.window, Qt::LeftButton, {}, at, 10);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit", "Edit"}));
+        QTRY_VERIFY(field->hasActiveFocus());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(area->isVisible());
+        QTest::mouseDClick(w.window, Qt::LeftButton, {}, at, 10);
+        const QStringList asked{"Edit", "CancelEdit", "Edit", "CancelEdit", "Edit"};
+        QCOMPARE(w.since(from), asked);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QTest::qWait(100);
+        QCOMPARE(w.since(from), asked);
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), asked + QStringList{"CancelEdit"});
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // A click on the line with the fix that review answers with no edit open, as under a question,
+    // which the Edit only lets go, ends its ask as an edit opened does: the next click asks again,
+    // however soon after the first it comes, and opens the edit.
+    void aClickReviewAnswersWithNoEditEndsItsAsk() {
+        Shown w({media()});
+        bool asked = false;
+        connect(&w.bridge, &SessionBridge::eventArrived, &w.bridge,
+                [&asked](const subcheck_ffi::Event &e) {
+                    if (const auto *change =
+                            std::get_if<subcheck_ffi::Event::kChanged>(&e.get_variant())) {
+                        asked = change->summary.question.has_value();
+                    }
+                });
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *area = inEdit(w, "rewordArea");
+        QQuickItem *line = inEdit(w, "blockLine");
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(area && line && field);
+        // Recheck asks first. The window has no way to ask it yet, so the test sends it.
+        w.bridge.send(subcheck_ffi::Action(subcheck_ffi::Action::kRecheck{}));
+        QTRY_VERIFY(asked);
+        QTRY_VERIFY(area->isVisible());
+        QTRY_VERIFY(inDetailsView(w, line));
+        const QPoint at = w.middle(line);
+        const qsizetype from = w.bridge.sent.size();
+        // Each click within the double-click interval of the one before, as their times say, with
+        // the events between them run.
+        QTest::mousePress(w.window, Qt::LeftButton, {}, at, 10);
+        QTest::mouseRelease(w.window, Qt::LeftButton, {}, at, 10);
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QTRY_VERIFY(!asked);
+        QVERIFY(!w.bridge.editing());
+        QVERIFY(area->isVisible());
+        QTest::mousePress(w.window, Qt::LeftButton, {}, at, 10);
+        QTest::mouseRelease(w.window, Qt::LeftButton, {}, at, 10);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "Edit"}));
+        QTRY_VERIFY(field->hasActiveFocus());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "Edit", "CancelEdit"}));
+        QTRY_VERIFY(!w.bridge.editing());
+    }
+
+    // A click on the fix does nothing where it cannot be reworded: while Settings has the keys, as
+    // the decisions wait then too, and on Settings' sample of it; on a timing fix, which shows no
+    // text cursor either; and under a greyed episode's log, which hides the fix.
+    void aClickOnTheFixDoesNothingWhereItCannotReword() {
+        {
+            Shown w({media()});
+            QVERIFY(w.start());
+            QTRY_COMPARE(w.rows(), 2);
+            QQuickItem *fixed = w.item("fixedBlock");
+            QQuickItem *area = inEdit(w, "rewordArea");
+            QQuickItem *field = inEdit(w, "editField");
+            QQuickWindow *sw = w.settingsWindow();
+            QVERIFY(fixed && area && field && sw);
+            QTRY_VERIFY(area->isVisible());
+            const qsizetype from = w.bridge.sent.size();
+            QTest::keyClick(w.window, Qt::Key_Comma, Qt::ControlModifier);
+            QTRY_VERIFY(sw->isVisible());
+            QVERIFY(!area->isVisible());
+            w.click(fixed);
+            QQuickItem *sample = w.settingsItem("sampleFixed");
+            QVERIFY(sample);
+            QQuickItem *sampleArea = Shown::item(sample, "rewordArea");
+            QVERIFY(sampleArea);
+            QVERIFY(!sampleArea->isVisible());
+            w.click(sample);
+            QTest::keyClick(sw, Qt::Key_Escape);
+            QTRY_VERIFY(!sw->isVisible());
+            QTRY_VERIFY(area->isVisible());
+
+            QVERIFY(timingRowAtTheSelection(w));
+            QTRY_VERIFY(!area->isVisible());
+            w.click(fixed);
+            QTest::qWait(100);
+            QCOMPARE(w.since(from), QStringList());
+            QVERIFY(!field->isVisible());
+        }
+        Shown w({clean(), media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *fixed = w.item("fixedBlock");
+        QQuickItem *area = inEdit(w, "rewordArea");
+        QVERIFY(fixed && area);
+        QTRY_VERIFY(area->isVisible());
+        QTRY_VERIFY(w.item("episode0"));
+        w.click(w.item("episode0"));
+        QTRY_VERIFY(w.bridge.showingEpisode());
+        QTRY_VERIFY(!fixed->isVisible());
+        QVERIFY(!area->isVisible());
+    }
+
+    // A right-click on the line with the fix is still the finding's menu, for the selected row: it
+    // asks nothing and opens no edit.
+    void aRightClickOnTheFixIsStillTheMenu() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *menu = w.find("rowMenu");
+        QQuickItem *fixed = w.item("fixedBlock");
+        QQuickItem *area = inEdit(w, "rewordArea");
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(menu && fixed && area && field);
+        QTRY_VERIFY(area->isVisible());
+        const qsizetype from = w.bridge.sent.size();
+        w.rightClick(fixed);
+        QTRY_VERIFY(menu->property("opened").toBool());
+        QCOMPARE(menu->property("row").toInt(), w.bridge.selected());
+        QCOMPARE(w.since(from), QStringList());
+        QVERIFY(!field->isVisible());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!menu->property("visible").toBool());
+        QCOMPARE(w.since(from), QStringList());
+        QVERIFY(!field->isVisible());
+    }
+
+    // For a screen reader the line with the fix is a button named as the menus' Edit Wording…,
+    // which opens the edit with the cursor at its end; while the fix cannot be reworded, the
+    // window tells of none.
+    void theFixIsAButtonForAScreenReader() {
+        QAccessible::setActive(true);
+        const auto inactive = qScopeGuard([] { QAccessible::setActive(false); });
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *area = inEdit(w, "rewordArea");
+        QQuickItem *button = inEdit(w, "rewordButton");
+        QQuickItem *label = inEdit(w, "blockLabel");
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(area && button && label && field);
+        QTRY_VERIFY(area->isVisible());
+        const QString name = QStringLiteral("Edit Wording…");
+        QAccessibleInterface *said = QAccessible::queryAccessibleInterface(button);
+        QVERIFY(said && said->actionInterface());
+        QCOMPARE(said->role(), QAccessible::Button);
+        QCOMPARE(said->text(QAccessible::Name), name);
+        const QStringList names = accessibleNames(QAccessible::queryAccessibleInterface(w.window));
+        QCOMPARE(names.count(name), 1);
+        // The click area over the whole block is no button of its own, and the button covers only
+        // the line: the label's words stay for a screen reader's pointer review to meet.
+        QAccessibleInterface *label_said = QAccessible::queryAccessibleInterface(label);
+        QVERIFY(label_said);
+        QVERIFY(names.contains(label_said->text(QAccessible::Name)));
+        QVERIFY(!said->rect().intersects(label_said->rect()));
+        const qsizetype from = w.bridge.sent.size();
+        said->actionInterface()->doAction(QAccessibleActionInterface::pressAction());
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QTRY_VERIFY(field->hasActiveFocus());
+        QCOMPARE(field->property("cursorPosition").toInt(), w.bridge.editWording().size());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
+        QTRY_VERIFY(area->isVisible());
+
+        QVERIFY(timingRowAtTheSelection(w));
+        QTRY_VERIFY(!area->isVisible());
+        QVERIFY(!accessibleNames(QAccessible::queryAccessibleInterface(w.window)).contains(name));
+    }
+
+    // Ctrl+F gives the Find box at the toolbar's right the keys; the box shows from the start, and
+    // what is typed there asks review nothing. Return selects the next row after the selected one
+    // that holds the words, Shift+Return the one before, round past either end, as the box's › and
+    // ‹ do, which take no keys from the field. Words no row holds select nothing and say "No
+    // match", until the words change. None of it moves the list, which stays under its heading.
+    // The first row is opened, so that its line is in three rows of four, the row and its members,
+    // and the next and the one before differ.
+    void theFindBoxFindsFromTheSelectionAndSaysNoMatch() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *box = w.item("findBox");
+        QQuickItem *field = w.item("findField");
+        QQuickItem *next = w.item("findNext");
+        QQuickItem *noMatch = w.item("noMatch");
+        QQuickItem *list = w.item("findings");
+        QQuickItem *heading = w.item("heading");
+        QVERIFY(box && field && next && noMatch && list && heading);
+        QVERIFY(!w.item("findDone"));
+        QVERIFY(box->isVisible());
+        // Whether the list starts where its heading's row ends.
+        QQuickItem *headingRow = heading->parentItem();
+        const auto underItsHeading = [list, headingRow] {
+            return qAbs(list->mapToItem(headingRow, QPointF()).y() - headingRow->height()) < 0.5;
+        };
+        QVERIFY(underItsHeading());
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QTRY_COMPARE(w.rows(), 4);
+
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QVERIFY(box->isVisible());
+        QVERIFY(underItsHeading());
+        QVERIFY(text(w.bridge.findings()->at(0)->original).contains("befor"));
+        typeIn(w, "befor");
+        QCOMPARE(field->property("text").toString(), "befor");
+        QCOMPARE(w.since(from), QStringList());
+        // Each way to find, whether it goes back, and the row it lands on from the one selected.
+        const std::vector<std::tuple<QString, bool, int>> finds = {{"Return", false, 1},
+                                                                   {"Shift+Return", true, 0},
+                                                                   {"findPrevious", true, 2},
+                                                                   {"findNext", false, 0}};
+        for (const auto &[how, back, lands] : finds) {
+            QVERIFY2(w.bridge.findings()->find("befor", w.bridge.selected(), back) == lands,
+                     qPrintable(how));
+            const qsizetype before = w.bridge.sent.size();
+            if (how == "Return") {
+                QTest::keyClick(w.window, Qt::Key_Return);
+            } else if (how == "Shift+Return") {
+                QTest::keyClick(w.window, Qt::Key_Return, Qt::ShiftModifier);
+            } else {
+                w.click(w.item(qPrintable(how)));
+            }
+            QVERIFY2(w.since(before) == QStringList{selecting(w, lands)},
+                     qPrintable(how + ": " + w.since(before).join(" | ")));
+            QTRY_COMPARE(w.bridge.selected(), lands);
+            QVERIFY2(field->hasActiveFocus(), qPrintable(how));
+            QVERIFY2(!noMatch->isVisible(), qPrintable(how));
+            QVERIFY2(underItsHeading(), qPrintable(how));
+        }
+
+        // Ctrl+F selects the words, so that the next typed take their place.
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        typeIn(w, "zzz");
+        QCOMPARE(field->property("text").toString(), "zzz");
+        QCOMPARE(w.bridge.findings()->find("zzz", -1, false), -1);
+        const qsizetype before = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QVERIFY(noMatch->isVisible());
+        QCOMPARE(noMatch->property("text").toString(), "No match");
+        QVERIFY(underItsHeading());
+        w.click(next);
+        QVERIFY(noMatch->isVisible());
+        typeIn(w, "z");
+        QVERIFY(!noMatch->isVisible());
+        QCOMPARE(w.since(before), QStringList());
+        QCOMPARE(w.bridge.selected(), 0);
+        QVERIFY(underItsHeading());
+    }
+
+    // "No match" is the last search's: it stays while the field gives the window its keys, and as
+    // the field has them back with its window active again, and goes once the field takes them
+    // again, by Ctrl+F, a click, Tab or Shift+Tab. Words that are empty, or spaces alone, are no
+    // search: Return, Shift+Return, › and ‹ on them say nothing and select nothing. The box never
+    // hides.
+    void theFindBoxSaysNoMatchOnlyForTheSearchItShowsWith() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *box = w.item("findBox");
+        QQuickItem *field = w.item("findField");
+        QQuickItem *noMatch = w.item("noMatch");
+        QVERIFY(box && field && noMatch);
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(field->hasActiveFocus());
+        typeIn(w, "zzz");
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QVERIFY(noMatch->isVisible());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QVERIFY(!field->hasActiveFocus());
+        QVERIFY(noMatch->isVisible());
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QCOMPARE(field->property("selectedText").toString(), "zzz");
+        QVERIFY(!noMatch->isVisible());
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QVERIFY(noMatch->isVisible());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QVERIFY(!field->hasActiveFocus());
+        QVERIFY(noMatch->isVisible());
+        w.click(field);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QVERIFY(!noMatch->isVisible());
+        QCOMPARE(field->property("text").toString(), "zzz");
+        for (const bool back : {false, true}) {
+            QTest::keyClick(w.window, Qt::Key_Return);
+            QVERIFY(noMatch->isVisible());
+            QTest::keyClick(w.window, Qt::Key_Escape);
+            QVERIFY(!field->hasActiveFocus());
+            QVERIFY(noMatch->isVisible());
+            QTest::keyClick(w.window, back ? Qt::Key_Backtab : Qt::Key_Tab,
+                            back ? Qt::ShiftModifier : Qt::NoModifier);
+            QTRY_VERIFY2(field->hasActiveFocus(), back ? "Shift+Tab" : "Tab");
+            QVERIFY2(!noMatch->isVisible(), back ? "Shift+Tab" : "Tab");
+        }
+        // Another window active, then this one again, the field's keys with it.
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QVERIFY(noMatch->isVisible());
+        QWindow other;
+        other.resize(100, 100);
+        other.show();
+        other.requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(&other));
+        QTRY_VERIFY(!field->hasActiveFocus());
+        w.window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(w.window));
+        QTRY_VERIFY(field->hasActiveFocus());
+        QVERIFY(noMatch->isVisible());
+        other.close();
+
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QCOMPARE(field->property("selectedText").toString(), "zzz");
+        QTest::keyClick(w.window, Qt::Key_Backspace);
+        QCOMPARE(field->property("text").toString(), "");
+        for (const char *words : {"", "  "}) {
+            typeIn(w, words);
+            QCOMPARE(field->property("text").toString(), words);
+            QTest::keyClick(w.window, Qt::Key_Return);
+            QVERIFY2(!noMatch->isVisible(), words);
+            QTest::keyClick(w.window, Qt::Key_Return, Qt::ShiftModifier);
+            QVERIFY2(!noMatch->isVisible(), words);
+            w.click(w.item("findNext"));
+            QVERIFY2(!noMatch->isVisible(), words);
+            w.click(w.item("findPrevious"));
+            QVERIFY2(!noMatch->isVisible(), words);
+        }
+        QTest::qWait(100);
+        QCOMPARE(w.since(from), QStringList());
+        QCOMPARE(w.bridge.selected(), 0);
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QVERIFY(!field->hasActiveFocus());
+        QVERIFY(box->isVisible());
+    }
+
+    // While the Find field has the keys, those it ends by, moves through or types are its own:
+    // Return and the keypad's Enter find, and open or close no row; Up, Down, PgUp and PgDn move
+    // nothing; Home and End move through the words; the window's letters type themselves, Shift+G
+    // among them. Ctrl+F again selects what was typed. Esc gives the window its keys back and
+    // keeps the words, the box still there; a click in the field gives it the keys again.
+    void theFindBoxTakesItsKeysAndEscGivesThemBack() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *box = w.item("findBox");
+        QQuickItem *field = w.item("findField");
+        QVERIFY(box && field);
+        QVERIFY(!w.item("findDone"));
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(field->hasActiveFocus());
+        const qsizetype from = w.bridge.sent.size();
+        const std::vector<std::pair<Qt::Key, Qt::KeyboardModifiers>> keys = {
+            {Qt::Key_Return, {}}, {Qt::Key_Enter, Qt::KeypadModifier},
+            {Qt::Key_Up, {}},     {Qt::Key_Down, {}},
+            {Qt::Key_PageUp, {}}, {Qt::Key_PageDown, {}}};
+        for (const auto &[key, modifiers] : keys) {
+            const QString name = QKeySequence(key | modifiers).toString();
+            QTest::keyClick(w.window, key, modifiers);
+            QVERIFY2(w.since(from).isEmpty(), qPrintable(name + ": " + w.since(from).join(" | ")));
+            QVERIFY2(field->hasActiveFocus(), qPrintable(name));
+        }
+        QTest::keyClick(w.window, Qt::Key_J);
+        QTest::keyClick(w.window, Qt::Key_K);
+        QCOMPARE(field->property("text").toString(), "jk");
+        QTest::keyClick(w.window, Qt::Key_Home);
+        QCOMPARE(field->property("cursorPosition").toInt(), 0);
+        QTest::keyClick(w.window, Qt::Key_End);
+        QCOMPARE(field->property("cursorPosition").toInt(), 2);
+        QTest::keyClick(w.window, 'G', Qt::ShiftModifier);
+        QCOMPARE(field->property("text").toString(), "jkG");
+        QVERIFY(field->hasActiveFocus());
+        QCOMPARE(w.since(from), QStringList());
+        QCOMPARE(field->property("selectedText").toString(), "");
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QCOMPARE(field->property("selectedText").toString(), "jkG");
+        QVERIFY(field->hasActiveFocus());
+        QTest::qWait(100);
+        QCOMPARE(w.since(from), QStringList());
+        QCOMPARE(w.rows(), 2);
+        QCOMPARE(w.bridge.selected(), 0);
+
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QVERIFY(box->isVisible());
+        QVERIFY(!field->hasActiveFocus());
+        QCOMPARE(field->property("text").toString(), "jkG");
+        QCOMPARE(w.since(from), QStringList());
+        QTest::keyClick(w.window, Qt::Key_J);
+        QCOMPARE(w.since(from), QStringList{"Move 1"});
+
+        // A click in the field gives it the keys again, with the words it had.
+        w.click(field);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QCOMPARE(field->property("text").toString(), "jkG");
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QVERIFY(!field->hasActiveFocus());
+        QVERIFY(box->isVisible());
+        QTest::keyClick(w.window, Qt::Key_K);
+        QCOMPARE(w.since(from), (QStringList{"Move 1", "Move -1"}));
+    }
+
+    // While an edit is open, Find waits: from its box, Return would select another row, which ends
+    // the edit and drops its typed wording. The box is greyed, never hidden, and Ctrl+F types
+    // nothing into the edit's field. An edit opened while the box has the keys, by Finding ▸ Edit
+    // Wording… as E there is a letter the Find field types, takes them: the Find field, greyed,
+    // gives them up, and keeps its words. By the right-click menu's Edit Wording…, the right-click
+    // has given the window its keys already, and the edit takes them alike.
+    void theFindBoxWaitsWhileAnEditIsOpen() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *find = w.find("find");
+        QQuickItem *findField = w.item("findField");
+        QQuickItem *previous = w.item("findPrevious");
+        QQuickItem *next = w.item("findNext");
+        QQuickItem *editField = inEdit(w, "editField");
+        QQuickItem *now = w.item("nowBlock");
+        QObject *menu = w.find("rowMenu");
+        QVERIFY(find && findField && previous && next && editField && now && menu);
+        const QList<QQuickItem *> parts = {findField, previous, next};
+        QTRY_VERIFY(find->property("enabled").toBool());
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(editField->hasActiveFocus());
+        QTRY_VERIFY(!find->property("enabled").toBool());
+        for (QQuickItem *part : parts) {
+            QVERIFY2(!part->isEnabled(), qPrintable(part->objectName()));
+            QVERIFY2(part->isVisible(), qPrintable(part->objectName()));
+        }
+        const QString wording = editField->property("text").toString();
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QCOMPARE(editField->property("text").toString(), wording);
+        QVERIFY(editField->hasActiveFocus());
+        QVERIFY(!findField->hasActiveFocus());
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
+        QTRY_VERIFY(find->property("enabled").toBool());
+        for (QQuickItem *part : parts) {
+            QVERIFY2(part->isEnabled(), qPrintable(part->objectName()));
+        }
+
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(findField->hasActiveFocus());
+        QTest::keyClick(w.window, Qt::Key_E);
+        QCOMPARE(findField->property("text").toString(), "e");
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
+        QObject *edit = w.find("edit");
+        QTRY_VERIFY(edit->property("enabled").toBool());
+        QVERIFY(QMetaObject::invokeMethod(edit, "trigger"));
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit", "Edit"}));
+        QTRY_VERIFY(editField->hasActiveFocus());
+        QVERIFY(!findField->hasActiveFocus());
+        QVERIFY(!findField->isEnabled());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit", "Edit", "CancelEdit"}));
+        QTRY_VERIFY(!w.bridge.editing());
+        QCOMPARE(findField->property("text").toString(), "e");
+
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(findField->hasActiveFocus());
+        QTRY_VERIFY(edit->property("enabled").toBool());
+        const qsizetype menuFrom = w.bridge.sent.size();
+        w.rightClick(now);
+        QTRY_VERIFY(menu->property("opened").toBool());
+        QQuickItem *rowEdit = rowMenuItem(w, "rowEdit");
+        QVERIFY(rowEdit);
+        QTRY_VERIFY(rowEdit->property("enabled").toBool());
+        w.click(rowEdit);
+        QTRY_VERIFY(!menu->property("visible").toBool());
+        QCOMPARE(w.since(menuFrom), QStringList{"Edit"});
+        // The window manager gives the keys back to the window a menu drawn in a window of its own
+        // was over, which offscreen has none to do.
+        w.window->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+        QTRY_VERIFY(editField->hasActiveFocus());
+        QVERIFY(!findField->hasActiveFocus());
+        QVERIFY(!findField->isEnabled());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QCOMPARE(w.since(menuFrom), (QStringList{"Edit", "CancelEdit"}));
+        QTRY_VERIFY(!w.bridge.editing());
+        QCOMPARE(findField->property("text").toString(), "e");
+    }
+
+    // A click on a row, or on its triangle, while the Find field has the keys selects the row, the
+    // triangle opening or closing it too, and gives the window its keys back, the words kept: the
+    // box stays, and a letter after the click is the window's, not typed into the field.
+    void aClickOnARowTakesTheKeysFromTheFindBox_data() {
+        QTest::addColumn<QString>("style");
+        QTest::addColumn<bool>("triangle");
+        QTest::newRow("a Two Lines row") << "twoLines" << false;
+        QTest::newRow("a Two Lines row's triangle") << "twoLines" << true;
+        QTest::newRow("a Compact row") << "compact" << false;
+        QTest::newRow("a Compact row's triangle") << "compact" << true;
+    }
+    void aClickOnARowTakesTheKeysFromTheFindBox() {
+        QFETCH(QString, style);
+        QFETCH(bool, triangle);
+        Shown w({media()});
+        w.settings.setRowStyle(style);
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *field = w.item("findField");
+        QVERIFY(field);
+        // Opened, so that the find lands on another row than the one clicked.
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QTRY_COMPARE(w.rows(), 4);
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(field->hasActiveFocus());
+        typeIn(w, "befor");
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        QVERIFY(field->hasActiveFocus());
+        QTRY_VERIFY(w.delegate(0) && drawnStyle(w.delegate(0)) == style);
+        QStringList clicked{selecting(w, 0)};
+        const qsizetype from = w.bridge.sent.size();
+        if (triangle) {
+            // Past the column's first 8 px, which the handle between the sidebar and the list
+            // takes.
+            QQuickItem *disclosure = Shown::item(w.delegate(0), "rowDisclosure");
+            QVERIFY(disclosure && disclosure->isVisible());
+            QTest::mouseClick(
+                w.window, Qt::LeftButton, {},
+                disclosure->mapToScene(QPointF(9, disclosure->height() / 2)).toPoint());
+            clicked << "Toggle";
+        } else {
+            w.click(w.delegate(0));
+        }
+        QCOMPARE(w.since(from), clicked);
+        QTRY_COMPARE(w.bridge.selected(), 0);
+        QTRY_COMPARE(w.rows(), triangle ? 2 : 4);
+        QVERIFY(!field->hasActiveFocus());
+        QCOMPARE(field->property("text").toString(), "befor");
+        QTRY_VERIFY(w.find("accept")->property("enabled").toBool());
+        QTest::keyClick(w.window, Qt::Key_A);
+        QCOMPARE(w.since(from), clicked + QStringList{"Accept"});
+        QTRY_COMPARE(w.decision(0), "Accepted");
+        QCOMPARE(field->property("text").toString(), "befor");
+        QTest::keyClick(w.window, Qt::Key_U);
+        QCOMPARE(w.since(from), (clicked + QStringList{"Accept", "Undo"}));
+        QTRY_COMPARE(w.decision(0), "To review");
+    }
+
+    // A click on an entry of the sidebar, an episode, a filter or a review, while the Find field
+    // has the keys asks review about it and gives the window its keys back, the words kept: the
+    // box stays, and a letter after the click is the window's, not typed into the field.
+    void aClickInTheSidebarTakesTheKeysFromTheFindBox_data() {
+        QTest::addColumn<QString>("entry");
+        QTest::newRow("an episode") << "episode1";
+        QTest::newRow("a filter") << "filter1";
+        QTest::newRow("a review") << "review0";
+    }
+    void aClickInTheSidebarTakesTheKeysFromTheFindBox() {
+        QFETCH(QString, entry);
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *field = w.item("findField");
+        QVERIFY(field);
+        // A list makes its entries when it next lays itself out, which can come after the rows.
+        QTRY_VERIFY(w.item(qPrintable(entry)));
+        // Opened, so that the find lands on another row.
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QTRY_COMPARE(w.rows(), 4);
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(field->hasActiveFocus());
+        typeIn(w, "befor");
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        QVERIFY(field->hasActiveFocus());
+        const qsizetype from = w.bridge.sent.size();
+        w.click(w.item(qPrintable(entry)));
+        QVERIFY(!w.since(from).isEmpty());
+        QVERIFY(!field->hasActiveFocus());
+        QCOMPARE(field->property("text").toString(), "befor");
+        const qsizetype clicked = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_J);
+        QCOMPARE(w.since(clicked), QStringList{"Move 1"});
+        QCOMPARE(field->property("text").toString(), "befor");
+    }
+
+    // A right-click on a row, or on the finding in the details panel, while the Find field has the
+    // keys gives the window its keys back as its menu opens, the words kept: once the menu closes,
+    // by Esc or by an item, the keys are the window's, not the field's again, and a letter after it
+    // is the window's, not typed into the field.
+    void aRightClickMenuTakesTheKeysFromTheFindBox_data() {
+        QTest::addColumn<bool>("onDetails");
+        QTest::addColumn<bool>("byItem");
+        QTest::newRow("a row's, closed by Esc") << false << false;
+        QTest::newRow("a row's, closed by an item") << false << true;
+        QTest::newRow("the details', closed by Esc") << true << false;
+        QTest::newRow("the details', closed by an item") << true << true;
+    }
+    void aRightClickMenuTakesTheKeysFromTheFindBox() {
+        QFETCH(bool, onDetails);
+        QFETCH(bool, byItem);
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *field = w.item("findField");
+        QObject *menu = w.find("rowMenu");
+        QVERIFY(field && menu);
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(field->hasActiveFocus());
+        typeIn(w, "befor");
+        QTRY_VERIFY(w.delegate(0));
+        QQuickItem *clicked = onDetails ? w.item("nowBlock") : w.delegate(0);
+        QVERIFY(clicked && clicked->isVisible());
+        w.rightClick(clicked);
+        QTRY_VERIFY(menu->property("opened").toBool());
+        const qsizetype from = w.bridge.sent.size();
+        if (byItem) {
+            QQuickItem *accept = rowMenuItem(w, "rowAccept");
+            QVERIFY(accept);
+            QTRY_VERIFY(accept->property("enabled").toBool());
+            w.click(accept);
+        } else {
+            QTest::keyClick(w.window, Qt::Key_Escape);
+        }
+        QTRY_VERIFY(!menu->property("visible").toBool());
+        // The window manager gives the keys back to the window a menu drawn in a window of its own
+        // was over, which offscreen has none to do.
+        w.window->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+        QVERIFY(!field->hasActiveFocus());
+        QCOMPARE(field->property("text").toString(), "befor");
+        // Accept, by the menu's item or by A, then Undo by U: the window's keys.
+        if (!byItem) {
+            QTRY_VERIFY(w.find("accept")->property("enabled").toBool());
+            QTest::keyClick(w.window, Qt::Key_A);
+        }
+        QCOMPARE(w.since(from), QStringList{"Accept"});
+        QTRY_COMPARE(w.decision(0), "Accepted");
+        QTest::keyClick(w.window, Qt::Key_U);
+        QCOMPARE(w.since(from), (QStringList{"Accept", "Undo"}));
+        QTRY_COMPARE(w.decision(0), "To review");
+        QCOMPARE(field->property("text").toString(), "befor");
+    }
+
+    // A click on Undo, Reject or Accept under the video, on the video or on the list's Rows button,
+    // while the Find field has the keys, gives the window its keys back, the words kept: none of
+    // them takes the keys, and the box stays, so a letter after the click is the window's, not
+    // typed into the field. The Rows menu the button opens leaves the keys with the window as it
+    // closes.
+    void aClickUnderTheVideoOrOnRowsTakesTheKeysFromTheFindBox_data() {
+        QTest::addColumn<QString>("control");
+        QTest::addColumn<QStringList>("asks");
+        QTest::addColumn<QString>("decided");
+        QTest::newRow("Undo") << "undoButton" << QStringList{"Undo"} << "To review";
+        QTest::newRow("Reject") << "rejectButton" << QStringList{"Reject"} << "Rejected";
+        QTest::newRow("Accept") << "acceptButton" << QStringList{"Accept"} << "Accepted";
+        QTest::newRow("the video") << "video" << QStringList() << "To review";
+        QTest::newRow("the Rows button") << "rowStyleButton" << QStringList() << "To review";
+    }
+    void aClickUnderTheVideoOrOnRowsTakesTheKeysFromTheFindBox() {
+        QFETCH(QString, control);
+        QFETCH(QStringList, asks);
+        QFETCH(QString, decided);
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *field = w.item("findField");
+        QQuickItem *clicked = w.item(qPrintable(control));
+        QObject *rowsMenu = w.find("rowsMenu");
+        QVERIFY(field && clicked && rowsMenu);
+        // Opened, so that the find lands on another row, a member.
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QTRY_COMPARE(w.rows(), 4);
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(field->hasActiveFocus());
+        typeIn(w, "befor");
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        QVERIFY(field->hasActiveFocus());
+        QTRY_VERIFY(clicked->isEnabled());
+        const qsizetype from = w.bridge.sent.size();
+        w.click(clicked);
+        QCOMPARE(w.since(from), asks);
+        if (control == "rowStyleButton") {
+            QTRY_VERIFY(rowsMenu->property("opened").toBool());
+            QTest::keyClick(w.window, Qt::Key_Escape);
+            QTRY_VERIFY(!rowsMenu->property("visible").toBool());
+            // The window manager gives the keys back to the window a menu drawn in a window of its
+            // own was over, which offscreen has none to do.
+            w.window->requestActivate();
+            QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+        }
+        QVERIFY(!field->hasActiveFocus());
+        QCOMPARE(field->property("text").toString(), "befor");
+        // Undone once review has decided, so that the run is left as found.
+        QTRY_COMPARE(w.decision(1), decided);
+        QTest::keyClick(w.window, Qt::Key_U);
+        QCOMPARE(w.since(from), asks + QStringList{"Undo"});
+        QCOMPARE(field->property("text").toString(), "befor");
+        QTRY_COMPARE(w.decision(1), "To review");
+    }
+
+    // A click anywhere else in the window while the Find field has the keys gives the window its
+    // keys back, the words kept, whatever it lands on: the finding's place in the details panel,
+    // Technical details, the list below its rows, a handle between the columns, the toolbar's
+    // title, or the fix while review asks, whose Edit then only lets the question go, and opens no
+    // edit to take the keys.
+    void aClickAnywhereElseTakesTheKeysFromTheFindBox_data() {
+        QTest::addColumn<QString>("where");
+        QTest::newRow("the finding's place") << "place";
+        QTest::newRow("Technical details") << "technical";
+        QTest::newRow("the list below its rows") << "below the rows";
+        QTest::newRow("a column handle") << "a column handle";
+        QTest::newRow("the toolbar's title") << "title";
+        QTest::newRow("the fix while review asks") << "the fix";
+    }
+    void aClickAnywhereElseTakesTheKeysFromTheFindBox() {
+        QFETCH(QString, where);
+        Shown w({media()});
+        bool asked = false;
+        connect(&w.bridge, &SessionBridge::eventArrived, &w.bridge,
+                [&asked](const subcheck_ffi::Event &e) {
+                    if (const auto *change =
+                            std::get_if<subcheck_ffi::Event::kChanged>(&e.get_variant())) {
+                        asked = change->summary.question.has_value();
+                    }
+                });
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QQuickItem *box = w.item("findBox");
+        QQuickItem *field = w.item("findField");
+        QQuickItem *list = w.item("findings");
+        QVERIFY(box && field && list);
+        QTRY_VERIFY(w.delegate(1));
+        QPoint at;
+        QStringList asks;
+        if (where == "below the rows") {
+            QQuickItem *last = w.delegate(1);
+            const qreal end = last->mapToItem(list, QPointF(0, last->height())).y();
+            QVERIFY2(end < list->height() - 2, qPrintable(QString::number(end)));
+            at = list->mapToScene(QPointF(list->width() / 2, (end + list->height()) / 2)).toPoint();
+        } else if (where == "a column handle") {
+            at = w.handle(w.item("sidebar"), list->parentItem());
+        } else if (where == "the fix") {
+            // Recheck asks first. The window has no way to ask it yet, so the test sends it.
+            w.bridge.send(subcheck_ffi::Action(subcheck_ffi::Action::kRecheck{}));
+            QTRY_VERIFY(asked);
+            QQuickItem *area = inEdit(w, "rewordArea");
+            QQuickItem *line = inEdit(w, "blockLine");
+            QVERIFY(area && line);
+            QTRY_VERIFY(area->isVisible());
+            QTRY_VERIFY(inDetailsView(w, line));
+            at = w.middle(line);
+            asks << "Edit";
+        } else {
+            QQuickItem *clicked = w.item(qPrintable(where));
+            QVERIFY(clicked && clicked->isVisible());
+            if (where != "title") {
+                QTRY_VERIFY(inDetailsView(w, clicked));
+            }
+            at = w.middle(clicked);
+        }
+        QVERIFY(!box->contains(box->mapFromScene(at)));
+        QTest::keyClick(w.window, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(field->hasActiveFocus());
+        typeIn(w, "befor");
+        const qsizetype from = w.bridge.sent.size();
+        QTest::mouseClick(w.window, Qt::LeftButton, {}, at);
+        QCOMPARE(w.since(from), asks);
+        if (where == "the fix") {
+            QTRY_VERIFY(!asked);
+            QVERIFY(!w.bridge.editing());
+        }
+        QVERIFY(!field->hasActiveFocus());
+        QCOMPARE(field->property("text").toString(), "befor");
+        const qsizetype clicked = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_J);
+        QCOMPARE(w.since(clicked), QStringList{"Move 1"});
+        QCOMPARE(field->property("text").toString(), "befor");
     }
 
     // The three columns side by side, the list between; the video at the top of the details
@@ -2186,6 +5850,9 @@ private slots:
                                                             .check = subcheck_ffi::Check::kLlm,
                                                             .original_changed = was,
                                                             .wording_changed = now,
+                                                            .reason = "befor for before",
+                                                            .file = "/m/S1/E01.mkv",
+                                                            .editable = true,
                                                         }}});
         };
         QVERIFY(firstRowSays(original, wording));
@@ -2294,6 +5961,83 @@ private slots:
         QCOMPARE(w.window->size(), QSize(1100, 700));
         QTRY_COMPARE(qRound(w.item("sidebar")->width()), 250);
         QCOMPARE(qRound(w.item("details")->width()), 440);
+    }
+
+    // View ▸ Rows ▸ chooses the row style, and so does the menu the list's heading opens under its
+    // Rows button, with the same three items: each draws every row in its style at once, is the
+    // one checked, and is kept, so that the next start draws its rows in it from its first frame.
+    void theRowStyleIsChosenFromTheViewMenuOrTheListsHeadingAndSticksAcrossARestart() {
+        QTemporaryDir kept;
+        QVERIFY(kept.isValid());
+        const std::vector<std::pair<const char *, QString>> styles = {
+            {"rowsCompact", "compact"}, {"rowsTwoLines", "twoLines"}, {"rowsRich", "rich"}};
+        {
+            Shown w({media()}, kept.path());
+            QVERIFY(w.start());
+            QTRY_COMPARE(w.rows(), 2);
+            QCOMPARE(checkedRowStyles(w), QStringList{"rowsTwoLines"});
+            for (const auto &[name, style] : styles) {
+                QVERIFY(QMetaObject::invokeMethod(w.find(name), "trigger"));
+                QCOMPARE(w.settings.rowStyle(), style);
+                QTRY_COMPARE(drawnStyles(w), (QStringList{style, style}));
+                QCOMPARE(checkedRowStyles(w), QStringList{name});
+            }
+
+            QObject *menu = w.find("rowsMenu");
+            QQuickItem *button = w.item("rowStyleButton");
+            QVERIFY(menu && button);
+            QCOMPARE(button->property("text").toString(), "Rows");
+            QCOMPARE(menu->property("count").toInt(), 3);
+            // From Rich, each other style in turn, Compact last.
+            for (const int at : {1, 2, 0}) {
+                w.click(button);
+                QTRY_VERIFY(menu->property("opened").toBool());
+                auto *drawn = menu->property("background").value<QQuickItem *>();
+                const QRectF opened =
+                    drawn->mapRectToScene(QRectF(0, 0, drawn->width(), drawn->height()));
+                const QRectF under =
+                    button->mapRectToScene(QRectF(0, 0, button->width(), button->height()));
+                QVERIFY2(
+                    qAbs(opened.top() - under.bottom()) <= 1 && opened.left() < under.right() &&
+                        opened.right() > under.left(),
+                    qPrintable(QStringLiteral("the menu at %1, %2 to %3; the button %4, %5 to %6")
+                                   .arg(opened.top())
+                                   .arg(opened.left())
+                                   .arg(opened.right())
+                                   .arg(under.bottom())
+                                   .arg(under.left())
+                                   .arg(under.right())));
+                QQuickItem *item = nullptr;
+                QVERIFY(QMetaObject::invokeMethod(menu, "itemAt", Q_RETURN_ARG(QQuickItem *, item),
+                                                  Q_ARG(int, at)));
+                QVERIFY(item);
+                const auto &[name, style] = styles[at];
+                QCOMPARE(item->property("text").toString(),
+                         w.find(name)->property("text").toString());
+                w.click(item);
+                QTRY_VERIFY(!menu->property("visible").toBool());
+                QCOMPARE(w.settings.rowStyle(), style);
+                QTRY_COMPARE(drawnStyles(w), (QStringList{style, style}));
+                QCOMPARE(checkedRowStyles(w), QStringList{name});
+            }
+        }
+        // Every row the next window draws, from its first frame on; made before the window, so
+        // that it outlives every frame.
+        QStringList seen;
+        Shown w({media()}, kept.path());
+        QObject::connect(w.window, &QQuickWindow::afterAnimating, w.window, [&seen, &w] {
+            const QStringList now = drawnStyles(w);
+            for (const QString &style : now) {
+                if (!seen.contains(style)) {
+                    seen << style;
+                }
+            }
+        });
+        QCOMPARE(checkedRowStyles(w), QStringList{"rowsCompact"});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(!seen.isEmpty());
+        QCOMPARE(seen, QStringList{"compact"});
     }
 
     // A drag of one column's edge at a narrow window keeps that column's width and leaves the
@@ -2938,27 +6682,40 @@ private slots:
         QVERIFY(bottom(now) < topInDetails(w, fixed));
     }
 
-    // A palette chosen redraws the rows' states, badges and lines, the details' state, badge,
-    // blocks and marks, at once, in the palette's tones; and moves nothing: the selected row, the
-    // list's scroll and the panel's stay, and review is asked nothing.
+    // A palette chosen redraws the rows' coloured parts in each row style, Compact's glyph and
+    // change, Two Lines' states, badges and lines, and Rich's tile lines too, and the details'
+    // state, badge, blocks and marks, at once, in the palette's tones; and moves nothing: the
+    // selected row, the list's scroll and the panel's stay, and review is asked nothing.
+    void aPaletteChosenRedrawsTheRowsAndTheDetailsInPlace_data() {
+        QTest::addColumn<QString>("style");
+        for (const char *style : {"compact", "twoLines", "rich"}) {
+            QTest::newRow(style) << QString::fromLatin1(style);
+        }
+    }
     void aPaletteChosenRedrawsTheRowsAndTheDetailsInPlace() {
+        QFETCH(QString, style);
         const auto restore = qScopeGuard([] { useColours(Colours::Default); });
         Shown w({media()});
+        w.settings.setRowStyle(style);
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
         w.window->resize(w.window->minimumSize());
         QTRY_COMPARE(w.window->height(), 480);
         QTest::keyClick(w.window, Qt::Key_J);
         QTRY_COMPARE(w.bridge.selected(), 1);
-        // Rows made up after review's two, enough for the list to scroll.
+        // Rows made up after review's two: enough to scroll the list at these sizes in any font,
+        // with room to spare.
         FindingsModel *findings = w.bridge.findings();
         std::vector<subcheck_ffi::EntryView> more;
-        for (uint64_t id = 100; id < 120; ++id) {
+        for (uint64_t id = 100; id < 160; ++id) {
             more.push_back(rowOfTwelve(subcheck_ffi::EntryKey(subcheck_ffi::EntryKey::kRow{{id}})));
         }
         QVERIFY(findings->apply(subcheck_ffi::Splice{2, 0, more}));
         auto *list = qobject_cast<QQuickItem *>(w.find("findings"));
-        QTRY_VERIFY(list->property("contentHeight").toReal() > list->height() + 100);
+        QTRY_VERIFY2(list->property("contentHeight").toReal() > list->height() + 100,
+                     qPrintable(QStringLiteral("contentHeight %1, height %2")
+                                    .arg(list->property("contentHeight").toReal())
+                                    .arg(list->height())));
         list->setProperty("contentY", 60);
         auto *scroll = w.item("detailsScroll")->property("contentItem").value<QQuickItem *>();
         QTRY_VERIFY(scroll->property("contentHeight").toReal() - scroll->height() > 40);
@@ -2981,12 +6738,34 @@ private slots:
                     continue;
                 }
                 ++drawn;
+                const int at = row->property("index").toInt();
+                const auto says = [findings, at](int role) {
+                    return findings->data(findings->index(at), role);
+                };
+                QCOMPARE(says(FindingsModel::StateToneRole).value<QColor>(), t.pending);
+                if (style == "compact") {
+                    QQuickItem *glyph = Shown::item(row, "rowGlyph");
+                    QVERIFY(glyph);
+                    QCOMPARE(glyph->property("color").value<QColor>(), t.pending);
+                    const QString change = Shown::text(row, "rowChange");
+                    QCOMPARE(change, says(FindingsModel::ChangeRole).toString());
+                    QVERIFY2(change.contains(t.old.name()) && change.contains(t.added.name()),
+                             qPrintable(name + ": " + change));
+                    continue;
+                }
                 QCOMPARE(Shown::item(row, "rowState")->property("color").value<QColor>(),
                          t.pending);
                 QCOMPARE(Shown::item(row, "badge")->property("color").value<QColor>(), t.typoBadge);
                 const QString line = Shown::text(row, "rowLine");
                 QVERIFY2(line.contains(t.old.name()) && line.contains(t.added.name()),
                          qPrintable(name + ": " + line));
+                if (style == "rich") {
+                    // The tile is dark in every window, so it takes the palette's dark tones.
+                    const QString tile = Shown::text(row, "rowTileLine");
+                    QCOMPARE(tile, says(FindingsModel::TileLineRole).toString());
+                    QVERIFY2(tile.contains(tones(each, true).old.name()),
+                             qPrintable(name + ": " + tile));
+                }
             }
             QVERIFY(drawn > 2);
             QCOMPARE(Shown::item(panel, "state")->property("color").value<QColor>(), t.pending);
@@ -3029,9 +6808,10 @@ private slots:
             return of->property("font").value<QFont>().pointSizeF();
         };
         QQuickItem *panel = w.item("details");
-        const QList<QObject *> windowParts = {w.item("title"),      w.item("rejectButton"),
-                                              w.find("statusLine"), w.item("episode0"),
-                                              w.menu("&File"),      w.settingsWindow()};
+        const QList<QObject *> windowParts = {w.item("title"),        w.item("rejectButton"),
+                                              w.item("acceptButton"), w.item("undoButton"),
+                                              w.find("statusLine"),   w.item("episode0"),
+                                              w.menu("&File"),        w.settingsWindow()};
         const QList<QObject *> listParts = {w.item("heading"),
                                             Shown::item(w.delegate(0), "rowLine"),
                                             Shown::item(w.delegate(0), "rowState")};
@@ -3085,13 +6865,29 @@ private slots:
         QCOMPARE(size(w.item("place")), 12.0);
     }
 
-    // With the list's and the details panel's text at 14 pt, the narrowest window still has room
-    // for each column's least width, and each row's state in view.
+    // With the details panel's text at 14 pt and the list's at 14 pt, or at the largest, 24 pt, the
+    // narrowest window still has room for each column's least width, and in each row style each
+    // row's state in view: Compact's glyph whole; the others' glyph and word whole at 14 pt, and at
+    // 24 pt, where the line has no room for them beside the badge, the word cut short before the
+    // glyph, after the count and the place have given way. Nothing on the first line passes the
+    // row's margin.
+    void aNarrowWindowWithLargerTextKeepsEveryColumnAndEachRowsState_data() {
+        QTest::addColumn<QString>("style");
+        QTest::addColumn<qreal>("points");
+        for (const char *style : {"compact", "twoLines", "rich"}) {
+            for (const qreal points : {14.0, 24.0}) {
+                QTest::addRow("%s at %g pt", style, points) << QString::fromLatin1(style) << points;
+            }
+        }
+    }
     void aNarrowWindowWithLargerTextKeepsEveryColumnAndEachRowsState() {
+        QFETCH(QString, style);
+        QFETCH(qreal, points);
         Shown w({media()});
+        w.settings.setRowStyle(style);
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
-        w.settings.setListTextSize(14);
+        w.settings.setListTextSize(points);
         w.settings.setDetailsTextSize(14);
         w.window->resize(w.window->minimumSize());
         QTRY_COMPARE(w.window->width(), 762);
@@ -3106,14 +6902,47 @@ private slots:
         for (const int at : {0, 1}) {
             QTRY_VERIFY(w.delegate(at));
             QQuickItem *row = w.delegate(at);
-            QQuickItem *state = Shown::item(row, "rowState");
-            QCOMPARE(state->property("font").value<QFont>().pointSizeF(), 14.0);
-            const auto stateEnds = [row, state] {
-                return state->mapToItem(row, QPointF(state->width(), 0)).x();
+            QQuickItem *state = Shown::item(row, style == "compact" ? "rowGlyph" : "rowState");
+            QVERIFY(state);
+            QCOMPARE(state->property("font").value<QFont>().pointSizeF(), points);
+            // Where `part` ends in the row.
+            const auto ends = [row](QQuickItem *part) {
+                return part->mapToItem(row, QPointF(part->width(), 0)).x();
             };
-            QTRY_VERIFY2(stateEnds() <= row->width() - 8 + 0.5 &&
-                             qRound(state->width()) >= qFloor(state->implicitWidth()),
-                         qPrintable(QStringLiteral("the state ends at %1").arg(stateEnds())));
+            const bool whole = style == "compact" || points < 24;
+            const auto fits = [&] {
+                if (ends(state) > row->width() - 8 + 0.5) {
+                    return false;
+                }
+                if (whole) {
+                    return qRound(state->width()) >= qFloor(state->implicitWidth());
+                }
+                // The glyph, with the ellipsis after the word's start, in the room the label has
+                // past its padding.
+                const QString glyph =
+                    w.bridge.findings()
+                        ->data(w.bridge.findings()->index(at), FindingsModel::GlyphRole)
+                        .toString();
+                const qreal room = state->width() - state->property("leftPadding").toReal();
+                const QFontMetricsF metrics(state->property("font").value<QFont>());
+                return state->property("truncated").toBool() &&
+                       room >= metrics.horizontalAdvance(glyph + QStringLiteral(" …")) - 0.5;
+            };
+            QTRY_VERIFY2(fits(), qPrintable(QStringLiteral("the state ends at %1, %2 wide of %3")
+                                                .arg(ends(state))
+                                                .arg(state->width())
+                                                .arg(state->implicitWidth())));
+            for (const char *name : {"badge", "rowSeveral", "rowPlace", "rowTile"}) {
+                QQuickItem *part = Shown::item(row, name);
+                if (part && part->isVisible()) {
+                    QVERIFY2(ends(part) <= row->width() - 8 + 0.5,
+                             qPrintable(QStringLiteral("%1 ends at %2").arg(name).arg(ends(part))));
+                    if (!whole && QLatin1String(name) != "badge" &&
+                        QLatin1String(name) != "rowTile") {
+                        QVERIFY2(part->width() < 0.5, name);
+                    }
+                }
+            }
         }
         for (const char *name : {"nowBlock", "fixedBlock"}) {
             QQuickItem *block = Shown::item(details, name);
@@ -3121,9 +6950,10 @@ private slots:
         }
     }
 
-    // The toolbar, and the Controls that carry the list's and the details panel's sizes, leave
-    // hover on, so that what is in them still follows the pointer where the platform lets it: the
-    // toolbar's buttons, the list's scroll bar and the details' disclosure.
+    // The toolbar and the Find box in it, and the Controls that carry the list's and the details
+    // panel's sizes, leave hover on, so that what is in them still follows the pointer where the
+    // platform lets it: the Find box's ‹ and ›, the buttons under the video, the list's scroll bar
+    // and the details' disclosure.
     void theToolbarAndTheListAndDetailsControlsKeepHoverOn() {
         QStyleHints *hints = QGuiApplication::styleHints();
         const auto restore = qScopeGuard(
@@ -3132,8 +6962,8 @@ private slots:
         Shown w({media()});
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
-        for (const char *name :
-             {"rejectButton", "acceptButton", "undoButton", "findingsScrollBar", "technical"}) {
+        for (const char *name : {"findPrevious", "findNext", "rejectButton", "acceptButton",
+                                 "undoButton", "findingsScrollBar", "technical"}) {
             QQuickItem *item = w.item(name);
             QVERIFY2(item, name);
             QVERIFY2(item->property("hoverEnabled").toBool(), name);
@@ -3173,10 +7003,14 @@ private slots:
         QCOMPARE(sw->transientParent(), w.window);
         QCOMPARE(sw->modality(), Qt::ApplicationModal);
         QVERIFY(!sw->isVisible());
-        // No footer, and no button but the palettes' and Use the System Size.
+        // No footer, and no button shown but the palettes' and Use the System Size: its sample's
+        // blocks, which never edit, keep their edit's buttons hidden.
         QVERIFY(!sw->property("footer").value<QQuickItem *>());
         QStringList buttons;
         const std::function<void(QQuickItem *)> gather = [&buttons, &gather](QQuickItem *in) {
+            if (!in->isVisible()) {
+                return;
+            }
             if (in->inherits("QQuickAbstractButton") && !in->inherits("QQuickRadioButton")) {
                 buttons << in->objectName();
             }
@@ -3275,10 +7109,14 @@ private slots:
             }
         }
         for (const QKeySequence &key :
-             {QKeySequence("A"), QKeySequence("Space"), QKeySequence("J"), QKeySequence("Q"),
-              QKeySequence("Ctrl+W"), QKeySequence("Ctrl+Q"), QKeySequence("Down")}) {
+             {QKeySequence("A"), QKeySequence("E"), QKeySequence("Space"), QKeySequence("J"),
+              QKeySequence("Q"), QKeySequence("Ctrl+W"), QKeySequence("Ctrl+Q"),
+              QKeySequence("Down"), QKeySequence("Ctrl+C"), QKeySequence("Ctrl+F"),
+              QKeySequence("Home"), QKeySequence("Shift+G"), QKeySequence("PgDown")}) {
             QVERIFY2(keys.contains(key), qPrintable(key.toString()));
         }
+        // Copy Subtitle Line asks review nothing: what it would copy is held back too.
+        QGuiApplication::clipboard()->setText(QStringLiteral("held before Settings"));
 
         QTest::keyClick(w.window, Qt::Key_Comma, Qt::ControlModifier);
         QTRY_VERIFY(sw->isVisible());
@@ -3316,6 +7154,9 @@ private slots:
         QCOMPARE(w.settings.colours(), "default");
         QTest::qWait(100);
         QCOMPARE(w.since(from), QStringList());
+        // Find asks review nothing, so it is seen by its field, which would take the window's keys.
+        QVERIFY(!w.item("findField")->hasActiveFocus());
+        QCOMPARE(QGuiApplication::clipboard()->text(), "held before Settings");
         QCOMPARE(played.count(), 0);
         QCOMPARE(finished.count(), 0);
         QCOMPARE(w.bridge.statusLine(), status);

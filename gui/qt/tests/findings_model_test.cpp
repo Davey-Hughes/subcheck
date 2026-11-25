@@ -1,5 +1,5 @@
 // The list's model on splices of every shape a session sends, each under Qt's own checker of a
-// model's signals and indexes; and each entry as a Two Lines row draws it.
+// model's signals and indexes; and each entry as each row style draws it.
 #include "findings_model.h"
 #include "offscreen_main.h"
 #include "words.h"
@@ -44,6 +44,9 @@ EntryView row(uint64_t id, std::optional<State> state = State::kPending) {
         .check = Check::kLlm,
         .original_changed = Span{16, 21},
         .wording_changed = Span{16, 22},
+        .reason = "befor for before",
+        .file = "/m/S1/E01.mkv",
+        .editable = true,
     };
 }
 
@@ -246,6 +249,18 @@ private slots:
         QVERIFY(!model->keyAt(2));
     }
 
+    // The entry at an index of the list, as review sent it; none outside the list.
+    void aRowIsReadByItsIndexAndNoneOutside() {
+        EntryView second = row(3);
+        second.label = "E02";
+        QVERIFY(model->apply(splice(0, 0, {row(1), second})));
+        QVERIFY(model->at(0) && model->at(1));
+        QCOMPARE(QString::fromStdString(model->at(0)->label), "E01");
+        QCOMPARE(QString::fromStdString(model->at(1)->label), "E02");
+        QVERIFY(!model->at(-1));
+        QVERIFY(!model->at(model->rowCount()));
+    }
+
     // Each role passes on its own part of the entry: values unlike each other, so that a role
     // that read another's field shows.
     void eachRoleIsItsOwnPartOfTheRow() {
@@ -282,7 +297,7 @@ private slots:
         QCOMPARE(model->roleNames().value(FindingsModel::LineRole), "line");
         QCOMPARE(model->roleNames().value(FindingsModel::CutLineRole), "cutLine");
         QCOMPARE(model->roleNames().value(FindingsModel::LineReachRole), "lineReach");
-        QCOMPARE(model->roleNames().size(), 11);
+        QCOMPARE(model->roleNames().size(), 17);
 
         // A change far into its line: the three forms of it differ, and each role is its own.
         EntryView far = group(false);
@@ -389,8 +404,75 @@ private slots:
         }
     }
 
-    // Another palette redraws every row's coloured parts at once, in place: its badge, its state
-    // and its line in each form, now in the palette's tones; an empty list has nothing to redraw.
+    // Each row style's own roles: Compact's short place and change, Rich's reason and tile line,
+    // and whether a row opens into its members and is open. Values unlike each other, so that a
+    // role that read another's field shows.
+    void eachRowStylesRolesSayWhatTheirRowsShow() {
+        EntryView entry = group(true);
+        entry.total = 12;
+        entry.shown = 12;
+        entry.label = "E03";
+        entry.at_ms = 754'450;
+        entry.original = "Your going";
+        entry.wording = "You're going";
+        entry.original_changed = Span{0, 4};
+        entry.wording_changed = Span{0, 6};
+        entry.reason = "your for you're";
+        EntryView closed = group(false);
+        closed.total = 12;
+        EntryView inside = member(2);
+        inside.total = 12;
+        EntryView one = row(3);
+        QVERIFY(model->apply(splice(0, 0, {entry, closed, inside, one})));
+        QCOMPARE(role(*model, 0, FindingsModel::ShortPlaceRole).toString(), "E03 12:34");
+        QCOMPARE(role(*model, 0, FindingsModel::ChangeRole).toString(),
+                 changeLine("Your going", Span{0, 4}, "You're going", Span{0, 6}));
+        QCOMPARE(role(*model, 0, FindingsModel::ReasonRole).toString(), "your for you're");
+        QCOMPARE(role(*model, 0, FindingsModel::TileLineRole).toString(),
+                 marked("Your going", Span{0, 4}, true, Marking::InRow, true));
+        QCOMPARE(role(*model, 0, FindingsModel::ExpandableRole).toBool(), true);
+        QCOMPARE(role(*model, 0, FindingsModel::ExpandedRole).toBool(), true);
+        QCOMPARE(role(*model, 1, FindingsModel::ExpandableRole).toBool(), true);
+        QCOMPARE(role(*model, 1, FindingsModel::ExpandedRole).toBool(), false);
+        QCOMPARE(role(*model, 2, FindingsModel::ExpandableRole).toBool(), false);
+        QCOMPARE(role(*model, 3, FindingsModel::ExpandableRole).toBool(), false);
+        QCOMPARE(role(*model, 3, FindingsModel::ShortPlaceRole).toString(), "E01 0:01");
+        const QHash<int, QByteArray> names = model->roleNames();
+        QCOMPARE(names.value(FindingsModel::ShortPlaceRole), "shortPlace");
+        QCOMPARE(names.value(FindingsModel::ChangeRole), "change");
+        QCOMPARE(names.value(FindingsModel::ReasonRole), "reason");
+        QCOMPARE(names.value(FindingsModel::TileLineRole), "tileLine");
+        QCOMPARE(names.value(FindingsModel::ExpandableRole), "expandable");
+        QCOMPARE(names.value(FindingsModel::ExpandedRole), "expanded");
+
+        // A timing row is placed by its track, as its long place is.
+        EntryView signs = row(7);
+        signs.check = Check::kTiming;
+        signs.track = ListTrack{4, "English Signs", "eng", true};
+        // A row whose fixes differ says them in place of its change and its tile's line.
+        EntryView differ = group(false);
+        differ.check = Check::kTiming;
+        differ.fixes = {{Fix(Fix::kShift{2}), 1}, {Fix(Fix::kShift{1}), 1}};
+        // A row of one fix whose words do not change: its line as it is, escaped.
+        EntryView moved = row(9);
+        moved.check = Check::kTiming;
+        moved.fixes = {{Fix(Fix::kShift{2}), 1}};
+        moved.original = "<i>moved</i>";
+        moved.wording = "<i>moved</i>";
+        moved.original_changed = Span{0, 0};
+        moved.wording_changed = Span{0, 0};
+        QVERIFY(model->apply(splice(0, model->rowCount(), {signs, differ, moved})));
+        QCOMPARE(role(*model, 0, FindingsModel::ShortPlaceRole).toString(), "E01 English Signs");
+        const QString fixes = role(*model, 1, FindingsModel::LineRole).toString();
+        QCOMPARE(fixes, "2 frames late × 1 · 1 frame late × 1");
+        QCOMPARE(role(*model, 1, FindingsModel::ChangeRole).toString(), fixes);
+        QCOMPARE(role(*model, 1, FindingsModel::TileLineRole).toString(), fixes);
+        QCOMPARE(role(*model, 2, FindingsModel::ChangeRole).toString(), "&lt;i&gt;moved&lt;/i&gt;");
+    }
+
+    // Another palette redraws every row's coloured parts at once, in place: its badge, its state,
+    // its line in each form, its change and its tile's line, now in the palette's tones; an empty
+    // list has nothing to redraw.
     void anotherPaletteRedrawsEveryRowsColouredParts() {
         const auto restore = qScopeGuard([] { useColours(Colours::Default); });
         QSignalSpy changed(model.get(), &QAbstractItemModel::dataChanged);
@@ -405,14 +487,68 @@ private slots:
         QList<int> roles = changed[0][2].value<QList<int>>();
         std::sort(roles.begin(), roles.end());
         QList<int> expected = {
-            Qt::DisplayRole,         FindingsModel::KindToneRole, FindingsModel::StateToneRole,
-            FindingsModel::LineRole, FindingsModel::CutLineRole,  FindingsModel::LineReachRole};
+            Qt::DisplayRole,           FindingsModel::KindToneRole, FindingsModel::StateToneRole,
+            FindingsModel::LineRole,   FindingsModel::CutLineRole,  FindingsModel::LineReachRole,
+            FindingsModel::ChangeRole, FindingsModel::TileLineRole};
         std::sort(expected.begin(), expected.end());
         QCOMPARE(roles, expected);
         const Tones tritan = tones(Colours::Tritan, dark());
         QCOMPARE(role(*model, 1, FindingsModel::StateToneRole).value<QColor>(), tritan.old);
         QCOMPARE(role(*model, 0, FindingsModel::KindToneRole).value<QColor>(), tritan.typoBadge);
         QVERIFY(role(*model, 0, FindingsModel::LineRole).toString().contains(tritan.added.name()));
+        QVERIFY(
+            role(*model, 0, FindingsModel::ChangeRole).toString().contains(tritan.added.name()));
+        QVERIFY(role(*model, 0, FindingsModel::TileLineRole)
+                    .toString()
+                    .contains(tones(Colours::Tritan, true).old.name()));
+    }
+    // Find goes from a row to the next that holds the words, in its line as it is now or with its
+    // fix, its episode or why it was found, case and runs of spaces aside: round past the end, back
+    // with `back`, and the row it starts from last. From none, the first row, or the last going
+    // back. No words find nothing.
+    void findGoesToTheNextRowHoldingTheWordsAndWraps() {
+        QCOMPARE(model->find("your", -1, false), -1);
+        EntryView going = row(1);
+        going.original = "Your going";
+        EntryView why = row(3);
+        why.reason = "your for you're";
+        EntryView fifth = row(5);
+        fifth.label = "E05";
+        QVERIFY(model->apply(splice(0, 0, {going, why, fifth})));
+        QCOMPARE(model->find("your", -1, false), 0);
+        QCOMPARE(model->find("your", 0, false), 1);
+        QCOMPARE(model->find("your", 1, false), 0);
+        QCOMPARE(model->find("your", 0, true), 1);
+        QCOMPARE(model->find("your", -1, true), 1);
+        QCOMPARE(model->find("YOUR", -1, false), 0);
+        QCOMPARE(model->find("  your   going ", -1, false), 0);
+        QCOMPARE(model->find("E05", -1, false), 2);
+        // Why it was found: no row's line holds these.
+        QCOMPARE(model->find("you're", -1, false), 1);
+        // The fix's wording: the first row's line as it is now lacks these.
+        QCOMPARE(model->find("before it", -1, false), 0);
+        QCOMPARE(model->find("nothing", -1, false), -1);
+        QCOMPARE(model->find("", -1, false), -1);
+        QCOMPARE(model->find("   ", 0, false), -1);
+        // The one row that holds them, from itself: itself, either way.
+        QCOMPARE(model->find("E05", 2, false), 2);
+        QCOMPARE(model->find("E05", 2, true), 2);
+    }
+
+    // A line break or a run of spaces in what Find searches is one space, as in the words searched
+    // for: "have snacks" finds a line that breaks between the two, and a fix's wording with two
+    // spaces there, but not words with another between them.
+    void findTakesALineBreakOrARunOfSpacesAsOneSpace() {
+        EntryView apart = row(1);
+        apart.original = "We have more snacks.";
+        EntryView broken = row(3);
+        broken.original = "We could have\nsnacks.";
+        EntryView spaced = row(5);
+        spaced.wording = "Let's have  snacks together.";
+        QVERIFY(model->apply(splice(0, 0, {apart, broken, spaced})));
+        QCOMPARE(model->find("have snacks", -1, false), 1);
+        QCOMPARE(model->find("have snacks", 1, false), 2);
+        QCOMPARE(model->find("have snacks", 2, false), 1);
     }
 };
 

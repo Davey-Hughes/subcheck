@@ -46,6 +46,7 @@ QHash<int, QByteArray> FoldersModel::roleNames() const {
 }
 
 void FoldersModel::set(const std::vector<FolderView> &list) {
+    const int wasOpen = openRow();
     const bool same =
         list.size() == folders.size() &&
         std::equal(list.begin(), list.end(), folders.begin(),
@@ -54,11 +55,15 @@ void FoldersModel::set(const std::vector<FolderView> &list) {
         beginResetModel();
         folders = list;
         endResetModel();
-        return;
+    } else {
+        folders = list;
+        if (!folders.empty()) {
+            emit dataChanged(index(0), index(rowCount() - 1));
+        }
     }
-    folders = list;
-    if (!folders.empty()) {
-        emit dataChanged(index(0), index(rowCount() - 1));
+    const int open = openRow();
+    if (open != wasOpen || (!same && open >= 0)) {
+        emit openMoved();
     }
 }
 
@@ -67,6 +72,12 @@ std::optional<std::string> FoldersModel::pathAt(int row) const {
         return std::nullopt;
     }
     return folders[static_cast<size_t>(row)].path;
+}
+
+int FoldersModel::openRow() const {
+    const auto open = std::find_if(folders.begin(), folders.end(),
+                                   [](const FolderView &folder) { return folder.open; });
+    return open == folders.end() ? -1 : static_cast<int>(open - folders.begin());
 }
 
 FiltersModel::FiltersModel(QObject *parent)
@@ -167,7 +178,7 @@ QVariant EpisodesModel::data(const QModelIndex &index, int role) const {
     case StageRole:
         return stage(file);
     case CurrentRole:
-        return !followed.empty() && file.path == followed;
+        return !marked.empty() && file.path == marked;
     case NoFindingsRole:
         return hasNoFindings(file);
     default:
@@ -184,20 +195,29 @@ QHash<int, QByteArray> EpisodesModel::roleNames() const {
 }
 
 bool EpisodesModel::apply(const FilesSplice &change) {
-    return splice(*this, files, change.at, change.removed, change.inserted);
+    if (!splice(*this, files, change.at, change.removed, change.inserted)) {
+        return false;
+    }
+    if (change.removed > change.inserted.size() && rowOf(marked) >= 0) {
+        emit followed();
+    }
+    return true;
 }
 
 void EpisodesModel::follow(const std::string &file) {
-    if (file == followed) {
+    if (file == marked) {
         return;
     }
-    const int was = rowOf(followed);
-    followed = file;
-    const int now = rowOf(followed);
+    const int was = rowOf(marked);
+    marked = file;
+    const int now = rowOf(marked);
     for (int row : {was, now}) {
         if (row >= 0) {
             emit dataChanged(index(row), index(row), {CurrentRole});
         }
+    }
+    if (now >= 0) {
+        emit followed();
     }
 }
 
@@ -274,6 +294,7 @@ EpisodeOrder::EpisodeOrder(EpisodesModel *episodes, QObject *parent)
     setSourceModel(episodes);
     setDynamicSortFilter(true);
     sort(0);
+    connect(episodes, &EpisodesModel::followed, this, &EpisodeOrder::markMoved);
 }
 
 bool EpisodeOrder::noFindingsLast() const { return last; }

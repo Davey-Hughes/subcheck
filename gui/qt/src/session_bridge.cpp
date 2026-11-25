@@ -1,7 +1,12 @@
 #include "session_bridge.h"
 
 #include "overloaded.h"
+#include "reveal.h"
 #include "status_words.h"
+#include "words.h"
+
+#include <QClipboard>
+#include <QGuiApplication>
 
 #include <chrono>
 #include <exception>
@@ -182,6 +187,29 @@ QString SessionBridge::emptyWords() const {
                : QStringLiteral("No findings under this filter");
 }
 
+bool SessionBridge::canExpand() const {
+    const EntryView *entry = list.at(selected());
+    return entry && (entry->is_member || entry->total > 1);
+}
+
+bool SessionBridge::expanded() const {
+    const EntryView *entry = list.at(selected());
+    return entry && (entry->is_member || entry->expanded);
+}
+
+bool SessionBridge::editing() const { return summary.edit.has_value(); }
+
+QString SessionBridge::editWording() const {
+    return summary.edit ? QString::fromStdString(summary.edit->wording) : QString();
+}
+
+bool SessionBridge::canEdit() const {
+    const EntryView *entry = list.at(selected());
+    return entry && entry->editable;
+}
+
+bool SessionBridge::canCopy() const { return canCopyAt(selected()); }
+
 QString SessionBridge::episodeName() const {
     // An episode with no findings, clicked, has no finding to be beside: its view shows what the
     // click asked for, until it ends as the header's showingEpisode says. Else review sends the
@@ -240,6 +268,13 @@ void SessionBridge::move(int by) {
 
 void SessionBridge::toggle() { send(Action(Action::kToggle{})); }
 
+void SessionBridge::toggleRow(int row) {
+    if (list.at(row)) {
+        select(row);
+        toggle();
+    }
+}
+
 void SessionBridge::accept() { send(Action(Action::kAccept{})); }
 
 void SessionBridge::reject() { send(Action(Action::kReject{})); }
@@ -249,6 +284,56 @@ void SessionBridge::clear() { send(Action(Action::kClear{})); }
 void SessionBridge::undo() {
     send(Action(Action::kUndo{}));
     leaveQuietEpisode();
+}
+
+void SessionBridge::edit() {
+    send(Action(Action::kEdit{}));
+    editAt = asked;
+}
+
+void SessionBridge::reword(const QString &wording) {
+    send(Action(Action::kReword{wording.toStdString()}));
+}
+
+void SessionBridge::cancelEdit() { send(Action(Action::kCancelEdit{})); }
+
+bool SessionBridge::canCopyAt(int row) const {
+    const EntryView *entry = list.at(row);
+    return entry && entry->check != Check::kTiming;
+}
+
+void SessionBridge::copyLine(int row) {
+    if (canCopyAt(row)) {
+        QGuiApplication::clipboard()->setText(text(list.at(row)->original));
+    }
+}
+
+void SessionBridge::showInFolder(int row) {
+    if (const EntryView *entry = list.at(row)) {
+        reveal(text(entry->file));
+    }
+}
+
+bool SessionBridge::findNext(const QString &words, bool back) {
+    const int row = list.find(words, findFrom(), back);
+    const std::optional<EntryKey> key = list.keyAt(row);
+    if (!key) {
+        return false;
+    }
+    select(row);
+    found = Found{*key, asked};
+    return true;
+}
+
+int SessionBridge::findFrom() const {
+    if (found && found->at == asked && summary.answered < found->at) {
+        for (int row = 0; row < list.rowCount(); ++row) {
+            if (sameEntry(list.keyAt(row), found->key)) {
+                return row;
+            }
+        }
+    }
+    return selected();
 }
 
 void SessionBridge::play() { send(Action(Action::kPlay{})); }
@@ -381,9 +466,12 @@ void SessionBridge::changed(const Event::kChanged &change) {
     if (change.logs) {
         logs = change.logs->logs;
     }
-    // Whether review was asking as it took the action this change answers: the change before says.
+    // Whether review was asking as it took the action this change answers, and whether an edit was
+    // open: the change before says.
     const bool asking = summary.question.has_value();
+    const bool wasEditing = summary.edit.has_value();
     summary = change.summary;
+    const bool editAnswer = answersEdit();
     openFollows = summary.open_follows;
     loading.set(waitingForVideo());
     shows.show(summary);
@@ -398,6 +486,12 @@ void SessionBridge::changed(const Event::kChanged &change) {
     if (moved) {
         emit selectionMoved();
     }
+    if (summary.edit && !wasEditing) {
+        emit editOpened();
+    }
+    if (editAnswer) {
+        emit editAnswered();
+    }
     if (shown) {
         emit episodeShown();
     }
@@ -408,14 +502,24 @@ void SessionBridge::answered(uint64_t count) {
     const bool asking = summary.question.has_value();
     summary.answered = count;
     const Settled view = settleView(false, asking);
-    if (!view.changed) {
-        return;
+    if (view.changed) {
+        markEpisode();
+        emit summaryChanged();
+        if (view.shown) {
+            emit episodeShown();
+        }
     }
-    markEpisode();
-    emit summaryChanged();
-    if (view.shown) {
-        emit episodeShown();
+    if (answersEdit()) {
+        emit editAnswered();
     }
+}
+
+bool SessionBridge::answersEdit() {
+    if (!editAt || summary.answered < *editAt) {
+        return false;
+    }
+    editAt.reset();
+    return true;
 }
 
 SessionBridge::Settled SessionBridge::settleView(bool moved, bool asking) {
@@ -568,6 +672,8 @@ void SessionBridge::giveUp() {
 }
 
 void SessionBridge::closeSession(Session &session) { session.close(); }
+
+void SessionBridge::reveal(const QString &file) { revealFile(file, platformReveal()); }
 
 // On every way out: close, so that the pump's wait ends whatever the core thread is doing; join
 // the pump; then let go. A pump left waiting would hold the session and its core thread for good.

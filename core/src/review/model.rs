@@ -297,6 +297,8 @@ pub struct Review {
     /// Index into `entries()`.
     pub selected: usize,
     /// The edit under way, from `Edit` to its end. The UI holds the text, which `Reword` brings.
+    /// The user's moving the selection off its entry ends it; a re-check that hides the entry does
+    /// not.
     pub editing: Option<Edit>,
     /// Decisions made in this session, oldest first.
     pub undo: Vec<UndoStep>,
@@ -940,6 +942,18 @@ impl Review {
             .filter(|&i| self.state(i) == State::Pending)
             .collect();
         if pending.is_empty() { targets } else { pending }
+    }
+
+    /// Whether `Edit` on `e` opens an edit: none of what it decides ([`Review::to_decide`]) has a
+    /// timing fix, which is accepted or rejected, never reworded. `Edit` refuses by this rule and
+    /// the list sends it ([`session::EntryView::editable`]), so the two cannot drift.
+    ///
+    /// [`session::EntryView::editable`]: super::session::EntryView::editable
+    pub fn rewordable(&self, e: Entry) -> bool {
+        !self
+            .to_decide(e)
+            .iter()
+            .any(|&i| self.finding(i).timing.is_some())
     }
 
     pub fn selected_entry(&self) -> Option<Entry> {

@@ -7,8 +7,10 @@
 #include "told.h"
 #include "words.h"
 
+#include <QClipboard>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QGuiApplication>
 #include <QSignalSpy>
 #include <QTest>
 
@@ -104,25 +106,6 @@ protected:
     void closeSession(Session &session) override {
         unclosed = &session;
         throw std::runtime_error("close panicked");
-    }
-};
-
-// A bridge that, once `holding`, keeps each action from review as it tells it, counted as sent: a
-// test then stands in for review's answers, each at the moment it chooses, with the count review
-// would give it.
-class Holding : public Telling {
-public:
-    using Telling::Telling;
-
-    bool holding = false;
-
-    void send(Action action) override {
-        if (holding) {
-            sent << told(action);
-            ++asked;
-            return;
-        }
-        Telling::send(std::move(action));
     }
 };
 
@@ -353,6 +336,318 @@ private slots:
         QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
         QCOMPARE(o.bridge.selected(), 0);
         QCOMPARE(place(o.bridge, 0), "In 2 places E01 · 0:01");
+    }
+
+    // What Finding ▸ Show Each Episode says of the selected entry: whether it opens and closes, a
+    // row of several or one of its members, and whether it is open, which a member always is. A
+    // row's triangle selects its row, then toggles it; outside the list there is no row to toggle.
+    void theSelectedRowSaysWhetherItOpensAndIsOpen() {
+        Opened o({media()});
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        QVERIFY(o.bridge.canExpand());
+        QVERIFY(!o.bridge.expanded());
+        o.bridge.toggle();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 4);
+        QVERIFY(o.bridge.canExpand());
+        QVERIFY(o.bridge.expanded());
+        o.bridge.move(1);
+        QTRY_COMPARE(o.bridge.selected(), 1);
+        QCOMPARE(place(o.bridge, 1), "E01 · 0:01");
+        QVERIFY(o.bridge.canExpand());
+        QVERIFY(o.bridge.expanded());
+        o.bridge.toggle();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        QCOMPARE(o.bridge.selected(), 0);
+        QVERIFY(o.bridge.canExpand());
+        QVERIFY(!o.bridge.expanded());
+
+        qsizetype from = o.bridge.sent.size();
+        o.bridge.toggleRow(1);
+        const QStringList sent = o.bridge.sent.mid(from);
+        QVERIFY2(sent.size() == 2 && sent[0].startsWith("Select row ") && sent[1] == "Toggle",
+                 qPrintable(sent.join(" | ")));
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 4);
+        QCOMPARE(o.bridge.selected(), 1);
+        QVERIFY(o.bridge.expanded());
+        o.bridge.toggleRow(1);
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        QVERIFY(!o.bridge.expanded());
+        from = o.bridge.sent.size();
+        o.bridge.toggleRow(-1);
+        o.bridge.toggleRow(2);
+        QCOMPARE(o.bridge.sent.mid(from), QStringList());
+    }
+
+    // An edit is review's: whether one is open and the wording it opened with are what review's
+    // last change says, and it opens once, at the change that first has it, so that the window sets
+    // the field's text once per edit. A change while it is open opens nothing: review's message, or
+    // the same edit with its entry renamed, as a re-check renames it. Moving off the edit ends it,
+    // as review ends it then. The decision the last edit makes is undone, so that the run is left
+    // as found.
+    void theEditAndItsWordingComeFromReviewAndOpenOncePerEdit() {
+        Opened o({media()});
+        std::optional<Event::kChanged> last;
+        QObject::connect(
+            &o.bridge, &SessionBridge::eventArrived, &o.bridge, [&last](const Event &e) {
+                if (const auto *change = std::get_if<Event::kChanged>(&e.get_variant())) {
+                    last = *change;
+                }
+            });
+        QSignalSpy opened(&o.bridge, &SessionBridge::editOpened);
+        const auto wordingAt = [&o](int row) {
+            const EntryView *entry = o.bridge.findings()->at(row);
+            return entry ? QString::fromStdString(entry->wording) : QStringLiteral("(no row)");
+        };
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        QVERIFY(!o.bridge.editing());
+        QCOMPARE(o.bridge.editWording(), "");
+        QVERIFY(o.bridge.canEdit());
+
+        o.bridge.edit();
+        QTRY_VERIFY(o.bridge.editing());
+        QVERIFY(!o.bridge.editWording().isEmpty());
+        QCOMPARE(o.bridge.editWording(), wordingAt(0));
+        QCOMPARE(opened.count(), 1);
+        o.bridge.undo();
+        QTRY_COMPARE(o.bridge.statusLine(), "Nothing to undo");
+        QVERIFY(o.bridge.editing());
+        QCOMPARE(opened.count(), 1);
+        o.bridge.cancelEdit();
+        QTRY_VERIFY(!o.bridge.editing());
+        QCOMPARE(o.bridge.editWording(), "");
+
+        o.bridge.edit();
+        QTRY_COMPARE(opened.count(), 2);
+        o.bridge.move(1);
+        QTRY_COMPARE(o.bridge.selected(), 1);
+        QVERIFY(!o.bridge.editing());
+        o.bridge.edit();
+        QTRY_COMPARE(opened.count(), 3);
+        QVERIFY(o.bridge.editing());
+        QCOMPARE(o.bridge.editWording(), wordingAt(1));
+
+        // Review's last change again, its edit's entry under other IDs, the same wording.
+        QVERIFY(last && last->summary.edit);
+        Summary renamed = last->summary;
+        renamed.edit->entry = EntryKey(EntryKey::kRow{{9001, 9002}});
+        QSignalSpy changed(&o.bridge, &SessionBridge::summaryChanged);
+        emit o.bridge.eventArrived(Event(Event::kChanged{
+            std::nullopt, renamed, std::nullopt, std::nullopt, std::nullopt, std::nullopt}));
+        QTRY_VERIFY(changed.count() > 0);
+        QVERIFY(o.bridge.editing());
+        QCOMPARE(o.bridge.editWording(), wordingAt(1));
+        QCOMPARE(opened.count(), 3);
+
+        o.bridge.reword("Fixed.");
+        QTRY_VERIFY(!o.bridge.editing());
+        QTRY_COMPARE(decision(o.bridge, 1), "Accepted");
+        QCOMPARE(opened.count(), 3);
+        o.bridge.undo();
+        QTRY_COMPARE(decision(o.bridge, 1), "To review");
+    }
+
+    // Review answers an Edit at the first change or answer alone whose count reaches it, after the
+    // edit that change opens, and whether or not it opens one: under a question, which the Edit
+    // only lets go, none opens. A job's change before then answers nothing. Review is held back,
+    // and its changes stood in for, once it asks.
+    void anEditIsAnsweredAtTheCountThatReachesIt() {
+        StandIn s;
+        QStringList heard;
+        QObject::connect(&s.bridge, &SessionBridge::editOpened, &s.bridge,
+                         [&heard] { heard << "opened"; });
+        QObject::connect(&s.bridge, &SessionBridge::editAnswered, &s.bridge,
+                         [&heard] { heard << "answered"; });
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.bridge.edit();
+        QTRY_COMPARE(heard, (QStringList{"opened", "answered"}));
+        s.bridge.cancelEdit();
+        QTRY_VERIFY(!s.bridge.editing());
+        // Recheck asks. The window has no way to ask it yet, so the test sends it.
+        s.bridge.send(Action(Action::kRecheck{}));
+        QTRY_VERIFY(s.last && s.last->summary.question);
+        s.holdOnceQuiet();
+        QCOMPARE(heard, (QStringList{"opened", "answered"}));
+        heard.clear();
+        QSignalSpy changed(&s.bridge, &SessionBridge::summaryChanged);
+        const auto count = static_cast<uint64_t>(s.bridge.sent.size());
+        s.bridge.edit();
+        // A job's change: no action since the question.
+        s.answer(count, 0, 0);
+        QTRY_COMPARE(changed.count(), 1);
+        QCOMPARE(heard, QStringList());
+        // The Edit's answer: review only let the question go.
+        s.last->summary.question.reset();
+        s.answer(count + 1, 0, 0);
+        QTRY_COMPARE(heard, QStringList{"answered"});
+        QVERIFY(!s.bridge.editing());
+        // An Edit answered alone, as review answers an action that changes nothing it shows.
+        s.bridge.edit();
+        s.answerAlone(count + 2);
+        QTRY_COMPARE(heard, (QStringList{"answered", "answered"}));
+        QVERIFY(!s.bridge.editing());
+    }
+
+    // Copy Subtitle Line puts the selected row's line on the clipboard, as its file has it, and
+    // asks review nothing. A timing fix's row, a track's timing rather than a line, has no line to
+    // copy, nor has a row outside the list: the clipboard keeps what it held.
+    void copyLinePutsTheRowsLineOnTheClipboard() {
+        Opened o({media()});
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        QClipboard *clipboard = QGuiApplication::clipboard();
+        clipboard->clear();
+        const int at = o.bridge.selected();
+        QVERIFY(o.bridge.canCopy());
+        QVERIFY(o.bridge.canCopyAt(at));
+        const QString line = text(o.bridge.findings()->at(at)->original);
+        QVERIFY(!line.isEmpty());
+        o.bridge.copyLine(at);
+        QCOMPARE(clipboard->text(), line);
+
+        // A timing row made up in the selected row's place, with words of its own, drawn as
+        // review's next change would.
+        EntryView timing = *o.bridge.findings()->at(at);
+        timing.check = Check::kTiming;
+        timing.original = "a timing row's own words";
+        QVERIFY(o.bridge.findings()->apply(Splice{static_cast<uint64_t>(at), 1, {timing}}));
+        emit o.bridge.summaryChanged();
+        QVERIFY(!o.bridge.canCopy());
+        QVERIFY(!o.bridge.canCopyAt(at));
+        o.bridge.copyLine(at);
+        QCOMPARE(clipboard->text(), line);
+        QVERIFY(!o.bridge.canCopyAt(-1));
+        QVERIFY(!o.bridge.canCopyAt(o.bridge.findings()->rowCount()));
+        o.bridge.copyLine(-1);
+        o.bridge.copyLine(o.bridge.findings()->rowCount());
+        QCOMPARE(clipboard->text(), line);
+        QCOMPARE(o.bridge.sent, QStringList());
+    }
+
+    // Copy Subtitle Line and Show File in Folder chosen from the right-click menu of another row,
+    // before review has answered the click's Select: each takes the row clicked, not the one review
+    // still has selected. The second row is opened, so that its member in the second copy is a
+    // row whose line and file are both unlike the first row's.
+    void copyAndShowInFolderReadTheRowGivenNotTheSelection() {
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.bridge.toggleRow(1);
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 4);
+        s.bridge.select(0);
+        QTRY_COMPARE(s.bridge.selected(), 0);
+        s.holdOnceQuiet();
+        const EntryView *selected = s.bridge.findings()->at(0);
+        const EntryView *clicked = s.bridge.findings()->at(3);
+        QVERIFY(selected && clicked);
+        QVERIFY(clicked->original != selected->original);
+        QVERIFY(clicked->file != selected->file);
+
+        s.bridge.select(3);
+        QCOMPARE(s.bridge.selected(), 0);
+        s.bridge.copyLine(3);
+        QCOMPARE(QGuiApplication::clipboard()->text(), text(clicked->original));
+        s.bridge.showInFolder(3);
+        QCOMPARE(s.bridge.revealed, QStringList{text(clicked->file)});
+    }
+
+    // Show File in Folder shows the file of the row it is given, as review names it, and asks
+    // review nothing; outside the list there is no file, and nothing is shown.
+    void showInFolderRevealsTheRowsOwnFile() {
+        Opened o({media()});
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        const QString file = text(o.bridge.findings()->at(1)->file);
+        QVERIFY2(QFileInfo::exists(file), qPrintable(file));
+        o.bridge.showInFolder(1);
+        QCOMPARE(o.bridge.revealed, QStringList{file});
+        o.bridge.showInFolder(-1);
+        o.bridge.showInFolder(o.bridge.findings()->rowCount());
+        QCOMPARE(o.bridge.revealed, QStringList{file});
+        QCOMPARE(o.bridge.sent, QStringList());
+    }
+
+    // Find selects the row after the selected one that holds the words, as a click selects it, or
+    // the one before it going back; words no row holds select nothing, and say so. The seeded run's
+    // two rows are both of the first episode, so each holds the other's label.
+    void findNextSelectsTheMatchAndSaysWhenThereIsNone() {
+        Opened o({media()});
+        o.bridge.start();
+        QTRY_COMPARE(o.bridge.findings()->rowCount(), 2);
+        QCOMPARE(o.bridge.selected(), 0);
+        const QString label = text(o.bridge.findings()->at(1)->label);
+        const QString second = told(Action(Action::kSelect{o.bridge.findings()->at(1)->key}));
+        QVERIFY(o.bridge.findNext(label, false));
+        QCOMPARE(o.bridge.sent, QStringList{second});
+        QTRY_COMPARE(o.bridge.selected(), 1);
+        const QString first = told(Action(Action::kSelect{o.bridge.findings()->at(0)->key}));
+        QVERIFY(o.bridge.findNext(label, true));
+        QCOMPARE(o.bridge.sent, (QStringList{second, first}));
+        QTRY_COMPARE(o.bridge.selected(), 0);
+        QVERIFY(!o.bridge.findNext("no such words", false));
+        QVERIFY(!o.bridge.findNext("no such words", true));
+        QCOMPARE(o.bridge.sent, (QStringList{second, first}));
+    }
+
+    // Finds sent faster than review answers them go on each from the row the one before it found,
+    // not from review's selection, which is still the row before them all. Any other action lets
+    // that row go, as where review's selection then lands is review's to say: a find after a click
+    // goes on from review's selection, here the row clicked, which review still has selected; one
+    // after a move, from where review's answer to the move lands; and one after review's answer to
+    // the last find's Select, from where that answer left review's selection, as a question would,
+    // which a Select only lets go. The first row is opened, so that its line is in three rows of
+    // four, the row and its members; the finds start from the last row, which lacks it.
+    void findsSentFasterThanReviewAnswersGoOnFromTheLastMatch() {
+        StandIn s;
+        s.bridge.start();
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 2);
+        s.bridge.toggleRow(0);
+        QTRY_COMPARE(s.bridge.findings()->rowCount(), 4);
+        s.bridge.select(3);
+        QTRY_COMPARE(s.bridge.selected(), 3);
+        s.holdOnceQuiet();
+        const qsizetype from = s.bridge.sent.size();
+        const auto count = static_cast<uint64_t>(from);
+        QVERIFY(s.last && s.last->summary.answered == count && s.last->summary.file_selected);
+        FindingsModel *list = s.bridge.findings();
+        const QString words = "befor";
+        QCOMPARE(list->find(words, 3, false), 0);
+        QCOMPARE(list->find(words, 0, false), 1);
+        QCOMPARE(list->find(words, 1, false), 2);
+        QCOMPARE(list->find(words, 2, false), 0);
+        QStringList selects;
+        for (int row = 0; row < list->rowCount(); ++row) {
+            selects << told(Action(Action::kSelect{list->at(row)->key}));
+        }
+
+        QVERIFY(s.bridge.findNext(words, false));
+        QVERIFY(s.bridge.findNext(words, false));
+        QCOMPARE(s.bridge.sent.mid(from), (QStringList{selects[0], selects[1]}));
+        QCOMPARE(s.bridge.selected(), 3);
+        s.bridge.select(3);
+        QVERIFY(s.bridge.findNext(words, false));
+        QCOMPARE(s.bridge.sent.mid(from),
+                 (QStringList{selects[0], selects[1], selects[3], selects[0]}));
+
+        s.bridge.move(1);
+        const uint64_t file = *s.last->summary.file_selected;
+        const std::vector<uint64_t> lands = {0, 1, 3, 0, 1};
+        for (size_t i = 0; i < lands.size(); ++i) {
+            s.answer(count + 1 + i, file, lands[i]);
+        }
+        QTRY_COMPARE(s.bridge.selected(), 1);
+        QVERIFY(s.bridge.findNext(words, false));
+        QCOMPARE(s.bridge.sent.mid(from), (QStringList{selects[0], selects[1], selects[3],
+                                                       selects[0], "Move 1", selects[2]}));
+
+        QSignalSpy changed(&s.bridge, &SessionBridge::summaryChanged);
+        s.answer(count + 6, file, 1);
+        QTRY_COMPARE(changed.count(), 1);
+        QVERIFY(s.bridge.findNext(words, false));
+        QCOMPARE(s.bridge.sent.size(), from + 7);
+        QCOMPARE(s.bridge.sent.last(), selects[2]);
     }
 
     // What a dry run says of a finding shows in its details. The accept is undone before the words

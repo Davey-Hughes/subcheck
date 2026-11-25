@@ -192,6 +192,13 @@ pub struct EntryView {
     /// The part of `wording` that differs from `original`, in characters ([`Review::changes`]),
     /// as the detail has it.
     pub wording_changed: Range<usize>,
+    /// Why it was found, empty when nothing says: of a row's first shown member, as `label`.
+    pub reason: String,
+    /// Its file, as the store names it: of a row's first shown member, as `label`.
+    pub file: String,
+    /// Whether `Edit` on it opens an edit ([`Review::rewordable`]): `Edit`'s own rule, so that a
+    /// UI greys what review would refuse.
+    pub editable: bool,
 }
 
 /// The list as `m` shows it now.
@@ -239,6 +246,9 @@ fn entry_view(m: &Review, e: Entry, checked: &HashSet<&str>) -> EntryView {
         check: f.check(),
         original_changed,
         wording_changed,
+        reason: f.reason.clone(),
+        file: f.file.clone(),
+        editable: m.rewordable(e),
     }
 }
 
@@ -1584,6 +1594,44 @@ mod tests {
         assert_eq!(lyric.state, Some(State::Rejected));
         assert_eq!(lyric.label, "E02", "the first it shows");
         assert_eq!((lyric.shown, lyric.total), (2, 3));
+    }
+
+    // A row's reason and file are its first shown member's, as its label is. `editable` is `Edit`'s
+    // own rule: a timing row cannot be reworded.
+    #[test]
+    fn a_rows_view_says_why_which_file_and_whether_it_can_be_reworded() {
+        let mut m = sample();
+        let first = &m.run.findings[m.rows[0].members[0]];
+        let lyric = &entry_views(&m)[0];
+        assert_eq!((&lyric.reason, &lyric.file), (&first.reason, &first.file));
+        assert!(lyric.editable);
+        assert!(!entry_views(&with_timing())[1].editable, "a timing row");
+        // The filter that shows E02's member first, as `a_rows_view_says_what_its_list_line_says`
+        // ends with.
+        decide_as(&mut m, &[1], State::Accepted, Some("My own."));
+        decide_as(&mut m, &[2, 4], State::Rejected, None);
+        m.filter = Filter::Only(State::Rejected);
+        let lyric = &entry_views(&m)[0];
+        assert_eq!(lyric.label, "E02");
+        let e02 = &m.run.findings[m.rows[0].members[1]];
+        assert_eq!((&lyric.reason, &lyric.file), (&e02.reason, &e02.file));
+    }
+
+    // What the list sends is what `Edit` does, entry for entry, members included.
+    #[test]
+    fn an_entry_can_be_reworded_exactly_when_its_view_says_so() {
+        for fresh in [sample as fn() -> Review, with_timing] {
+            let mut m = fresh();
+            m.expanded = (0..m.rows.len()).collect();
+            let views = entry_views(&m);
+            for (i, view) in views.iter().enumerate() {
+                m.selected = i;
+                m.editing = None;
+                m.status = None;
+                act(&mut m, Action::Edit);
+                assert_eq!(m.editing.is_some(), view.editable, "{:?}", view.key);
+            }
+        }
     }
 
     #[test]

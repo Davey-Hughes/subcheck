@@ -214,6 +214,13 @@ pub struct EntryView {
     pub original_changed: Span,
     /// The part of `wording` that differs from `original`, in UTF-16 code units, as `Detail`'s.
     pub wording_changed: Span,
+    /// Why it was found, empty when nothing says: of a row's first shown member, as `label`.
+    pub reason: String,
+    /// Its file, as the store names it: of a row's first shown member, as `label`.
+    pub file: String,
+    /// Whether `Action::Edit` on it opens an edit: `Edit`'s own rule, so that a UI greys what
+    /// review would refuse.
+    pub editable: bool,
 }
 
 /// What found a finding ([`store::Check`]): the LLM, or the timing check.
@@ -1296,6 +1303,9 @@ impl From<session::EntryView> for EntryView {
             check,
             original_changed,
             wording_changed,
+            reason,
+            file,
+            editable,
         } = view;
         EntryView {
             key: key.into(),
@@ -1330,6 +1340,9 @@ impl From<session::EntryView> for EntryView {
             note: note.map(FileNote::from),
             mixed,
             check: check.into(),
+            reason,
+            file,
+            editable,
         }
     }
 }
@@ -2286,6 +2299,9 @@ mod tests {
             check: store::Check::Timing,
             original_changed: 3..8,
             wording_changed: 0..8,
+            reason: "befor for before".into(),
+            file: "/m/E01 字幕.mkv".into(),
+            editable: false,
         }
     }
 
@@ -2334,6 +2350,9 @@ mod tests {
             check: Check::Timing,
             original_changed: Span { start: 5, end: 10 },
             wording_changed: Span { start: 0, end: 9 },
+            reason: "befor for before".into(),
+            file: "/m/E01 字幕.mkv".into(),
+            editable: false,
         }
     }
 
@@ -3104,6 +3123,8 @@ mod tests {
         core.check = store::Check::Llm;
         core.original_changed = 0..0;
         core.wording_changed = 0..0;
+        core.reason = String::new();
+        core.file = String::new();
         let summary = session::Summary {
             title: String::new(),
             selected: None,
@@ -3209,6 +3230,10 @@ mod tests {
                 Span { start: 0, end: 0 },
                 Span { start: 0, end: 0 }
             )
+        );
+        assert_eq!(
+            (crossed.reason, crossed.file),
+            (String::new(), String::new())
         );
     }
 

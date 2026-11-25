@@ -110,6 +110,18 @@ pub enum WriteFor {
     },
 }
 
+impl WriteFor {
+    /// Whether the write, once written, has moved the user's selection: a decision moves it on to
+    /// the next entry and an undo to the entry it took back, while a decision a scan's new finding
+    /// inherits moves nothing of the user's. Each kind is named, so that a new one has to say.
+    fn moves_selection(&self) -> bool {
+        match self {
+            WriteFor::Decide { .. } | WriteFor::Undo => true,
+            WriteFor::Inherit { .. } => false,
+        }
+    }
+}
+
 /// What the user asks of review. Each UI maps its own keys, buttons and clicks to these, so the
 /// rules below are the same whichever drives them. While a question is open
 /// ([`Review::question`]), every action but `Answer` and `Interrupt` lets it go and does nothing
@@ -261,12 +273,28 @@ pub enum Task {
 pub fn update(m: &mut Review, input: Input, now: Timestamp) -> Vec<Effect> {
     m.kept_from = None;
     match input {
-        Input::Action(action) => perform(m, action, now),
+        // After `perform`, so that none of its early returns skips the check.
+        Input::Action(action) => {
+            let effects = perform(m, action, now);
+            end_edit_left_behind(m);
+            effects
+        }
+        // A decision or an undo written moves the selection, to the next entry or to the one it
+        // took back, and can leave an edit behind. A decision a scan's new finding inherits moves
+        // nothing of the user's: a re-check that hides the edited row leaves the edit open, and
+        // `Reword` decides it there.
         Input::Written {
             purpose,
             decisions,
             result,
-        } => written(m, purpose, &decisions, result),
+        } => {
+            let moved = purpose.moves_selection();
+            let effects = written(m, purpose, &decisions, result);
+            if moved {
+                end_edit_left_behind(m);
+            }
+            effects
+        }
         Input::ReadBack { path, view } => read_back(m, &path, view, now),
         Input::RunFound { path, found } => run_found(m, path, found),
         Input::Started {
@@ -481,6 +509,17 @@ fn perform(m: &mut Review, action: Action, now: Timestamp) -> Vec<Effect> {
     Vec::new()
 }
 
+/// An edit the selection has left ends. `Reword` decides the edit's entry wherever it is, so an
+/// edit left open off the selection would accept a finding no longer on screen. It says nothing, as
+/// `CancelEdit` says nothing.
+fn end_edit_left_behind(m: &mut Review) {
+    if let Some(edit) = &m.editing
+        && m.resolve(&edit.entry) != m.selected_entry()
+    {
+        m.editing = None;
+    }
+}
+
 /// The entry `key` names, where the list shows it; for a member of a collapsed row, that row. One
 /// whose findings all went, or that the list no longer shows, is not selected, and the status line
 /// says so: the UI that named it saw the list before a scan remade it.
@@ -543,16 +582,16 @@ fn answer(m: &mut Review, yes: bool) -> Vec<Effect> {
     }
 }
 
-/// `Edit`: the edit, on the selected entry. A timing fix is accepted or rejected, never reworded.
+/// `Edit`: the edit, on the selected entry, when it can be reworded ([`Review::rewordable`]).
 fn open_editor(m: &mut Review) {
     let Some(entry) = m.selected_entry() else {
         return;
     };
-    let targets = m.to_decide(entry);
-    if targets.iter().any(|&i| m.finding(i).timing.is_some()) {
+    if !m.rewordable(entry) {
         m.status = Some(Status::Refused(Refusal::TimingFix));
         return;
     }
+    let targets = m.to_decide(entry);
     m.editing = Some(Edit {
         entry: m.entry_key(entry),
         findings: targets.iter().map(|&i| m.finding(i).id).collect(),
@@ -2574,6 +2613,128 @@ mod tests {
         assert_eq!(act(&mut m, Action::Reword("Fixed.".into())), []);
         assert_eq!(m.editing, None);
         assert_eq!(m.status, Some(Status::Refused(Refusal::EditOutOfDate)));
+    }
+
+    // An edit is of the selected entry, and `Reword` decides that entry wherever it is: one the
+    // selection leaves ends, saying nothing, as `CancelEdit` says nothing.
+    #[test]
+    fn moving_off_an_edit_ends_it() {
+        let mut m = sample();
+        act(&mut m, Action::Edit);
+        assert!(m.editing.is_some());
+        act(&mut m, Action::Move(1));
+        assert_eq!((m.editing.clone(), m.status.clone()), (None, None));
+        let lyric = EntryKey::Row(vec![1, 2, 4]);
+        let snacks = EntryKey::Row(vec![3]);
+        // From an edit on the entry the first names, the actions after it. The lyric's row has a
+        // member of E02, so the files list's way off it is from E02's snacks row to E01.
+        let cases = [
+            (&lyric, vec![Action::Select(snacks.clone())]),
+            (&lyric, vec![Action::NextFile]),
+            (&snacks, vec![Action::PreviousFile]),
+            (
+                &snacks,
+                vec![Action::SelectFile(path(1)), Action::ShowFileFindings],
+            ),
+            (
+                &lyric,
+                vec![Action::SetFilter(Filter::Only(State::Accepted))],
+            ),
+        ];
+        for (from, actions) in cases {
+            let mut m = sample();
+            act(&mut m, Action::Select(from.clone()));
+            act(&mut m, Action::Edit);
+            assert!(m.editing.is_some());
+            let what = format!("{actions:?} from {from:?}");
+            for action in actions {
+                act(&mut m, action);
+            }
+            assert_eq!(m.editing, None, "{what}");
+        }
+        // A decision moves on once it is written.
+        let mut m = sample();
+        act(&mut m, Action::Edit);
+        let effects = act(&mut m, Action::Accept);
+        assert!(m.editing.is_some(), "still on the row");
+        written(&mut m, effects);
+        assert_eq!((m.selected, m.editing.clone()), (1, None));
+    }
+
+    #[test]
+    fn an_edit_stays_while_its_entry_stays_selected() {
+        let mut m = sample();
+        act(&mut m, Action::Edit);
+        for action in [
+            Action::Toggle,
+            Action::Select(EntryKey::Row(vec![1, 2, 4])),
+            Action::Move(0),
+        ] {
+            let what = format!("{action:?}");
+            act(&mut m, action);
+            assert!(m.editing.is_some(), "{what}");
+        }
+        assert!(m.expanded.contains(&0));
+        assert_eq!(
+            decided(&act(&mut m, Action::Reword("Snacks.".into()))),
+            [
+                (1, State::Accepted, Some("Snacks.")),
+                (2, State::Accepted, Some("Snacks.")),
+                (4, State::Accepted, Some("Snacks.")),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsing_from_the_member_being_edited_ends_the_edit() {
+        let mut m = sample();
+        act(&mut m, Action::Toggle);
+        act(&mut m, Action::Move(1));
+        assert_eq!(m.selected_entry(), Some(Entry::Member(0, 0)));
+        act(&mut m, Action::Edit);
+        assert_eq!(
+            m.editing.as_ref().map(|e| &e.entry),
+            Some(&EntryKey::Member(1))
+        );
+        act(&mut m, Action::Toggle);
+        assert_eq!(m.selected_entry(), Some(Entry::Row(0)));
+        assert_eq!(m.editing, None);
+    }
+
+    // A decision a re-checked finding inherits is the scan's, not a move of the user's.
+    #[test]
+    fn an_edit_goes_on_when_an_inherited_decision_hides_its_row() {
+        let mut m = sample();
+        decide_as(&mut m, &[1, 4], State::Accepted, None);
+        m.filter = Filter::Only(State::Pending);
+        act(&mut m, Action::Edit);
+        // E02 checked again: 2 comes back as 9, which takes the row's decision, so the filter
+        // shows none of the row's members.
+        let back = Input::ReadBack {
+            path: path(2),
+            view: Ok(Run {
+                files: vec![tests_support::file(2)],
+                findings: vec![
+                    finding(9, 2, TYPO, FIXED, 165_060),
+                    finding(
+                        3,
+                        2,
+                        "Let's have snacks together everyday.",
+                        "Let's have snacks together every day.",
+                        894_190,
+                    ),
+                ],
+                ..Run::default()
+            }),
+        };
+        let effects = update(&mut m, back, now());
+        written(&mut m, effects);
+        assert_eq!(m.entries(), [Entry::Row(1)]);
+        assert!(m.editing.is_some());
+        assert_eq!(
+            decided(&act(&mut m, Action::Reword("Mine.".into()))),
+            [(9, State::Accepted, Some("Mine."))]
+        );
     }
 
     #[test]

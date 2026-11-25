@@ -87,9 +87,13 @@ QString fixWords(const subcheck_ffi::Fix &fix);
 enum class Marking { InRow, InPanel };
 
 // `text` as markup, escaped, with its part `changed` (UTF-16 code units, as review sends them, and
-// as QString counts) marked as taken out (struck) or as put in. A span past the text's end is cut
-// to it.
+// as QString counts) marked as taken out (struck) or as put in, in the palette in use's tones for
+// the window's background. A span past the text's end is cut to it.
 QString marked(const QString &text, const subcheck_ffi::Span &changed, bool takenOut, Marking how);
+// The same, in the palette's tones for a dark background (`dark` true) or a light one, whatever the
+// window's: a Rich row's tile is dark in every window, where a light window's tones read poorly.
+QString marked(const QString &text, const subcheck_ffi::Span &changed, bool takenOut, Marking how,
+               bool dark);
 
 // A row's one line, each way the row can draw it. `whole` is the original with its changed part
 // struck and the wording's put in after it, the words the two share kept once: review's spans start
@@ -105,6 +109,13 @@ struct RowLine {
 };
 RowLine rowLine(const QString &original, const subcheck_ffi::Span &originalChanged,
                 const QString &wording, const subcheck_ffi::Span &wordingChanged);
+
+// A Compact row's change, "old → new": the original's changed part marked as taken out, as a row
+// marks it, then the wording's changed part marked as put in, with none of the words around them.
+// A side with no words is left out with its space, "old →" or "→ new", so that the arrow alone
+// reads as words taken out or words put in, and no space pads either end of the line.
+QString changeLine(const QString &original, const subcheck_ffi::Span &originalChanged,
+                   const QString &wording, const subcheck_ffi::Span &wordingChanged);
 
 // Whether the window is dark: its colours come in pairs, one for a light window and one for a
 // dark, chosen by the application palette's lightness, which the style draws with.

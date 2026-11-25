@@ -109,16 +109,24 @@ qt_add_qml_module(subcheck_window
     OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/qml/Subcheck"
     QML_FILES qml/Main.qml qml/Sidebar.qml qml/FindingRow.qml qml/DetailsPanel.qml
             qml/PlayIndicator.qml qml/ChangeBlock.qml qml/SettingsWindow.qml qml/LoadingArc.qml
-            qml/ListScrollBar.qml
+            qml/ListScrollBar.qml qml/CompactRow.qml qml/Disclosure.qml qml/KeyField.qml
+            qml/FindBox.qml qml/WholeMenu.qml
     SOURCES src/findings_model.h src/findings_model.cpp src/session_bridge.h
             src/session_bridge.cpp src/status_words.h src/status_words.cpp src/player_port.h
             src/player_port.cpp src/mpv_item.h src/mpv_item.cpp src/overloaded.h src/spliced.h
             src/words.h src/words.cpp src/sidebar_models.h src/sidebar_models.cpp
             src/detail_view.h src/detail_view.cpp src/window_settings.h src/window_settings.cpp
             src/menu_keys.h src/menu_keys.cpp src/loading_flag.h src/loading_flag.cpp
-            src/ending.h src/ending.cpp)
+            src/ending.h src/ending.cpp src/reveal.h src/reveal.cpp src/press_away.h
+            src/press_away.cpp src/key_names.h src/key_names.cpp)
 target_include_directories(subcheck_window PUBLIC src)
 target_link_libraries(subcheck_window PUBLIC subcheck_bindings Qt6::Quick MpvQt::MpvQt)
+# Show File in Folder asks the file manager over the session bus on Linux (reveal.h); macOS has the
+# Finder's `open -R`, and no D-Bus. Public, as reveal.h's showItems takes a bus.
+if(NOT APPLE)
+    find_package(Qt6 6.12 REQUIRED COMPONENTS DBus)
+    target_link_libraries(subcheck_window PUBLIC Qt6::DBus)
+endif()
 subcheck_warnings(subcheck_window)
 
 # The module's plugin, which registers its types: main.cpp imports it by name.
@@ -129,9 +137,13 @@ install(TARGETS subcheck-qt)
 
 enable_testing()
 
-# Every test's limit, in seconds: a session that never sends its next event fails its test,
-# instead of holding CTest, and the CI jobs, for good.
+# Every test's limit, in seconds, but every Qt test binary subcheck_window_test makes: their seed
+# steps keep this one, and the binaries have their own below. A session that never sends its next
+# event fails its test, instead of holding CTest, and the CI jobs, for good.
 set(SUBCHECK_TEST_TIMEOUT 60)
+# The seeded window tests' limit: one process runs every function of a window test, so its limit
+# covers them all, and is raised by hand as they grow; a session that hangs still ends the job.
+set(SUBCHECK_WINDOW_TEST_TIMEOUT 300)
 
 # The mpv config of every test that makes the video pane, in place of the user's: MpvQt reads
 # mpvqt/mpvqt.conf in Qt's config location. On Linux that is XDG_CONFIG_HOME. On macOS it is
@@ -189,10 +201,10 @@ set_tests_properties(findings_model_test PROPERTIES
 
 # The window's code that needs no session, each test on its own: the status bar's words for each
 # message, the window's other words and colours, the sidebar's lists, the details panel's words,
-# what the window remembers, when the busy animation over the video shows, and how the window ends
-# once review has.
+# what the window remembers, when the busy animation over the video shows, how the window ends
+# once review has, and how a file is shown in the file manager.
 foreach(name IN ITEMS status_words_test words_test sidebar_models_test detail_view_test
-                      window_settings_test loading_flag_test ending_test)
+                      window_settings_test loading_flag_test ending_test reveal_test)
     qt_add_executable(${name} tests/${name}.cpp)
     target_link_libraries(${name} PRIVATE subcheck_window Qt6::Test)
     subcheck_warnings(${name})
@@ -211,6 +223,10 @@ file(WRITE "${TEST_SCREENS}"
     "\"dpr\": 1}]}\n")
 set_tests_properties(window_settings_test PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=${TEST_SCREENS}")
+# reveal_test asks only a bus of its own, which nothing listens on. Should a test of it ever reach
+# the session bus, libdbus, with no address given, would find a desktop's in the runtime dir: there
+# is none.
+set_property(TEST reveal_test APPEND PROPERTY ENVIRONMENT_MODIFICATION XDG_RUNTIME_DIR=unset:)
 
 # The same two screens with the small one primary, for a window that comes back to a larger screen
 # than the one it starts on. The offscreen platform orders screens by name and the first is the
@@ -264,7 +280,8 @@ function(subcheck_window_test name)
         "SUBCHECK_CONFIG=${dir}/config.toml" "SUBCHECK_TEST_MEDIA=${dir}/media"
         "SUBCHECK_TEST_CLEAN=${dir}/clean" ${TEST_MPV_ENV} QT_QPA_PLATFORM=offscreen)
     set_tests_properties(${name} PROPERTIES
-        FIXTURES_REQUIRED ${name}_run ENVIRONMENT "${env}" TIMEOUT ${SUBCHECK_TEST_TIMEOUT})
+        FIXTURES_REQUIRED ${name}_run ENVIRONMENT "${env}"
+        TIMEOUT ${SUBCHECK_WINDOW_TEST_TIMEOUT})
 endfunction()
 
 subcheck_window_test(session_bridge_test)

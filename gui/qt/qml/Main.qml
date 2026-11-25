@@ -1,10 +1,13 @@
-// The window: its menus; a toolbar with the view's name and counts, Reject, Accept and Undo; three
-// columns, the sidebar, the findings and the details panel; the status bar; the Settings window;
-// and the fatal end's dialog. Layout, bindings and one-line handlers only: what each asks of review
-// is the bridge's (session_bridge.cpp), and what the window remembers the settings'
-// (window_settings.cpp). Its keys are the window's whatever has focus, but for a text field's,
-// which takes the keys it types, an open menu's, which takes them all (menu_keys.h), and the
-// Settings window's, which holds all of review's back.
+// The window: its menus, and a row's right-click menu; a toolbar with the view's name and counts,
+// and at its right the Find box, which Edit ▸ Find… gives the keys; three columns, the sidebar, the
+// findings and the details panel, with Undo, Reject and Accept under its video; the status bar; the
+// Settings window; and the fatal end's dialog. Layout, bindings and one-line handlers only: what
+// each asks of review is the bridge's (session_bridge.cpp), and what the window remembers the
+// settings' (window_settings.cpp). Its keys are the window's whatever has focus, but for a text
+// field's, which takes the keys it types and those it moves through and ends by (KeyField.qml), an
+// open menu's, which takes them all (menu_keys.h), and the Settings window's, which holds all of
+// review's back. A press anywhere in the window but on the Find box, while no menu has the keys,
+// takes the keys back from the box (press_away.h).
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -27,7 +30,9 @@ ApplicationWindow {
     // sidebar, whose widest leaves the other two their least.
     readonly property int sidebarLeast: 160
     readonly property int listLeast: 260
-    readonly property int detailsLeast: 340
+    // Never narrower than the details panel's three buttons, whose width follows the window's size
+    // of text and the style.
+    readonly property int detailsLeast: Math.max(340, Math.ceil(details.leastWidth))
     readonly property int handles: 2 * handleWidth
 
     // The lines between the window's parts. Qt Quick's palette has no separator role, so window
@@ -41,9 +46,12 @@ ApplicationWindow {
     // or a shortcut runs on neither.
     readonly property bool keysToReview: !settingsWindow.visible
 
-    // Whether Accept, Reject and Back to Undecided have a finding to act on, by menu, key or the
-    // toolbar's buttons alike: one shown, and not a greyed episode's log in its place.
+    // Whether Accept, Reject, Edit Wording… and Back to Undecided have a finding to act on, by
+    // menu, key or the buttons under the video alike: one shown, and not a greyed episode's log in
+    // its place. Not while an edit is open, which its own Save and Accept and Cancel decide: a
+    // click beside the field would decide the plain fix and drop the typed wording.
     readonly property bool canDecide: keysToReview && !bridge.showingEpisode && bridge.detail.shown
+                                      && !bridge.editing
 
     // The window's own size of text, which its menus and dialogs take too; the list and the details
     // panel each have their own below.
@@ -59,17 +67,34 @@ ApplicationWindow {
         bridge.quit();
     }
 
-    // An open menu has the keys, each of which is otherwise one of the window's shortcuts.
+    // An open menu has the keys, each of which is otherwise one of the window's shortcuts: a menu
+    // of the bar by this binding, any other by the popup it is drawn in (menu_keys.h).
     MenuKeys {
+        id: menuKeys
+
         target: window
         menuOpen: bar.menus.some(function (menu: Menu): bool {
             return menu.visible;
         })
     }
 
+    // A press of the pointer anywhere in the window but on the Find box, while no menu has the
+    // keys, gives the window its keys back from the box, its words kept (press_away.h).
+    PressAway {
+        target: window
+        keeper: findBox
+        menus: menuKeys
+        onPressedAway: findBox.release()
+    }
+
     // One filter is always the one shown, so that choosing it again keeps its check.
     ActionGroup {
         id: shownFilter
+    }
+
+    // One row style is always the one drawn, chosen from View ▸ Rows ▸ or the list's heading.
+    ActionGroup {
+        id: rowStyles
     }
 
     // A palette chosen in Settings shows at once, everywhere it is drawn.
@@ -91,7 +116,7 @@ ApplicationWindow {
     menuBar: MenuBar {
         id: bar
 
-        Menu {
+        WholeMenu {
             title: qsTr("&File")
 
             // Not StandardKey.Preferences, which some platforms leave with no key. Enabled while
@@ -126,23 +151,52 @@ ApplicationWindow {
                 onTriggered: window.bridge.quit()
             }
         }
-        Menu {
+        WholeMenu {
             title: qsTr("&Edit")
 
             // Not StandardKey.Undo, which has further keys on some platforms, that KDE's styles
-            // warn of as they draw the item.
+            // warn of as they draw the item. It waits while an edit is open, as its U and the
+            // button under the video do: review selects what an undo takes back, and the edit,
+            // with the wording typed, ends as the selection leaves it. Ctrl+Z in the field undoes
+            // the typing.
             Action {
                 objectName: "undo"
-                enabled: window.keysToReview
+                enabled: window.keysToReview && !window.bridge.editing
                 text: qsTr("&Undo")
                 shortcut: "Ctrl+Z"
                 onTriggered: window.bridge.undo()
             }
+            MenuSeparator {}
+            // The selected row's line, as its file has it; none for a timing fix, whose words are
+            // the timing check's. Not StandardKey.Copy, which has further keys on some platforms,
+            // that KDE's styles warn of as they draw the item. It waits while a greyed episode's
+            // view shows, as the finding's keys do. Ctrl+C in a text field is the field's own.
+            Action {
+                id: copyLineAction
+
+                objectName: "copyLine"
+                enabled: window.keysToReview && !window.bridge.showingEpisode
+                         && window.bridge.canCopy
+                text: qsTr("&Copy Subtitle Line")
+                shortcut: "Ctrl+C"
+                onTriggered: window.bridge.copyLine(window.bridge.selected)
+            }
+            // Gives the Find box the keys, its words selected. It waits while an edit is open: from
+            // the box, Return selects another row, which ends the edit and drops its typed wording.
+            // It does not wait while a greyed episode's view shows: what it does is select a row,
+            // which ends that view, as a click on a row does.
+            Action {
+                objectName: "find"
+                enabled: window.keysToReview && !window.bridge.editing
+                text: qsTr("&Find…")
+                shortcut: "Ctrl+F"
+                onTriggered: findBox.take()
+            }
         }
-        Menu {
+        WholeMenu {
             title: qsTr("&View")
 
-            Menu {
+            WholeMenu {
                 id: showMenu
 
                 title: qsTr("&Show")
@@ -166,6 +220,42 @@ ApplicationWindow {
                     onObjectRemoved: (index, item) => showMenu.removeAction(item as Action)
                 }
             }
+            // Each draws every row in its style at once, and is kept for the next start. The list's
+            // heading opens these three under its Rows button too.
+            WholeMenu {
+                title: qsTr("&Rows")
+
+                Action {
+                    id: rowsCompactAction
+
+                    objectName: "rowsCompact"
+                    text: qsTr("&Compact")
+                    checkable: true
+                    checked: window.settings.rowStyle === "compact"
+                    ActionGroup.group: rowStyles
+                    onTriggered: window.settings.rowStyle = "compact"
+                }
+                Action {
+                    id: rowsTwoLinesAction
+
+                    objectName: "rowsTwoLines"
+                    text: qsTr("&Two Lines")
+                    checkable: true
+                    checked: window.settings.rowStyle === "twoLines"
+                    ActionGroup.group: rowStyles
+                    onTriggered: window.settings.rowStyle = "twoLines"
+                }
+                Action {
+                    id: rowsRichAction
+
+                    objectName: "rowsRich"
+                    text: qsTr("&Rich")
+                    checkable: true
+                    checked: window.settings.rowStyle === "rich"
+                    ActionGroup.group: rowStyles
+                    onTriggered: window.settings.rowStyle = "rich"
+                }
+            }
             Action {
                 objectName: "noFindingsLast"
                 text: qsTr("&Episodes Without Findings Last")
@@ -181,13 +271,18 @@ ApplicationWindow {
                 onTriggered: window.bridge.switchView()
             }
         }
-        Menu {
+        WholeMenu {
             title: qsTr("F&inding")
 
-            // These four, and Enter, wait while a greyed episode's view shows: review still has the
-            // finding selected, but the panel shows the episode's log in its place, so a key would
-            // act on a finding not in view. The first three wait too while no finding shows.
+            // These six, and the keypad's Enter, wait while a greyed episode's view shows: review
+            // still has the finding selected, but the panel shows the episode's log in its place,
+            // so a key would act on a finding not in view. The first four wait too while no finding
+            // shows or an edit is open, as canDecide says; Edit Wording… while the selected entry's
+            // wording cannot be edited; and Show Each Episode while the selected entry is neither a
+            // row of several nor one of its members.
             Action {
+                id: acceptAction
+
                 objectName: "accept"
                 enabled: window.canDecide
                 text: qsTr("&Accept")
@@ -195,6 +290,8 @@ ApplicationWindow {
                 onTriggered: window.bridge.accept()
             }
             Action {
+                id: rejectAction
+
                 objectName: "reject"
                 enabled: window.canDecide
                 text: qsTr("&Reject")
@@ -202,6 +299,23 @@ ApplicationWindow {
                 onTriggered: window.bridge.reject()
             }
             Action {
+                id: editAction
+
+                objectName: "edit"
+                enabled: window.canDecide && window.bridge.canEdit
+                text: qsTr("&Edit Wording…")
+                shortcut: "E"
+                // Asked here, by E, this item or the right-click menu's, the edit opens with the
+                // cursor at the wording's end: a click on the fix that review has yet to answer
+                // leaves its place behind, which is for the edit that click asked for alone.
+                onTriggered: {
+                    details.cursorAt = -1;
+                    window.bridge.edit();
+                }
+            }
+            Action {
+                id: clearAction
+
                 objectName: "clear"
                 enabled: window.canDecide
                 text: qsTr("&Back to Undecided")
@@ -210,11 +324,26 @@ ApplicationWindow {
             }
             MenuSeparator {}
             Action {
+                id: playAction
+
                 objectName: "play"
                 enabled: window.keysToReview && !window.bridge.showingEpisode
                 text: qsTr("Show in &Video")
                 shortcut: "O"
                 onTriggered: window.bridge.play()
+            }
+            // Checked while the selected row is open, or one of its members is selected.
+            Action {
+                id: showEachEpisodeAction
+
+                objectName: "showEachEpisode"
+                enabled: window.keysToReview && !window.bridge.showingEpisode
+                         && window.bridge.canExpand
+                text: qsTr("&Show Each Episode")
+                shortcut: "Return"
+                checkable: true
+                checked: window.bridge.expanded
+                onTriggered: window.bridge.toggle()
             }
             MenuSeparator {}
             Action {
@@ -232,7 +361,7 @@ ApplicationWindow {
                 onTriggered: window.bridge.previousEpisode()
             }
         }
-        Menu {
+        WholeMenu {
             title: qsTr("Vi&deo")
 
             Action {
@@ -295,7 +424,8 @@ ApplicationWindow {
         }
     }
 
-    // The terminal's keys that no menu item has.
+    // The terminal's keys that no menu item has, and the keypad's Enter beside Show Each Episode's
+    // Return.
     Shortcut {
         enabled: window.keysToReview
         sequences: ["J", "Down"]
@@ -306,10 +436,33 @@ ApplicationWindow {
         sequences: ["K", "Up"]
         onActivated: window.bridge.move(-1)
     }
-    // As the Finding menu's items, it waits while a greyed episode's view shows.
+    // Moves, like J and K. A text field takes Home, End, PgUp, PgDn and letters itself, so these
+    // reach the list only when no field has the focus.
     Shortcut {
-        enabled: window.keysToReview && !window.bridge.showingEpisode
-        sequences: ["Return", "Enter"]
+        enabled: window.keysToReview
+        sequences: ["Home", "G"]
+        onActivated: window.bridge.select(0)
+    }
+    Shortcut {
+        enabled: window.keysToReview
+        sequences: ["End", "Shift+G"]
+        onActivated: window.bridge.select(list.count - 1)
+    }
+    Shortcut {
+        enabled: window.keysToReview
+        sequence: "PgUp"
+        onActivated: window.bridge.move(-list.pageRows)
+    }
+    Shortcut {
+        enabled: window.keysToReview
+        sequence: "PgDown"
+        onActivated: window.bridge.move(list.pageRows)
+    }
+    // The keypad's Enter, waiting as Show Each Episode does. A shortcut of its own, as Return is
+    // the menu item's alone: of two enabled shortcuts on one key, Qt runs neither.
+    Shortcut {
+        enabled: showEachEpisodeAction.enabled
+        sequence: "Enter"
         onActivated: window.bridge.toggle()
     }
     Shortcut {
@@ -318,7 +471,7 @@ ApplicationWindow {
         onActivated: window.bridge.cycleFilter()
     }
     Shortcut {
-        enabled: window.keysToReview
+        enabled: window.keysToReview && !window.bridge.editing
         sequence: "U"
         onActivated: window.bridge.undo()
     }
@@ -352,10 +505,12 @@ ApplicationWindow {
                 anchors.leftMargin: 8
                 anchors.rightMargin: 8
 
-                // Takes what the buttons leave, so that a long title or long counts are cut rather
-                // than push them out.
+                // Takes what the Find box leaves, so that a long title or long counts are cut
+                // first, not run on.
                 ColumnLayout {
                     spacing: 0
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
 
                     Label {
                         objectName: "title"
@@ -374,27 +529,13 @@ ApplicationWindow {
                         Layout.fillWidth: true
                     }
                 }
-                // Greyed with nothing to act on, never hidden, so that the bar keeps its width.
-                Button {
-                    objectName: "rejectButton"
-                    text: qsTr("Reject")
-                    enabled: window.canDecide
-                    focusPolicy: Qt.NoFocus
-                    onClicked: window.bridge.reject()
-                }
-                Button {
-                    objectName: "acceptButton"
-                    text: qsTr("Accept")
-                    enabled: window.canDecide
-                    focusPolicy: Qt.NoFocus
-                    highlighted: true
-                    onClicked: window.bridge.accept()
-                }
-                ToolButton {
-                    objectName: "undoButton"
-                    text: qsTr("Undo")
-                    focusPolicy: Qt.NoFocus
-                    onClicked: window.bridge.undo()
+                FindBox {
+                    id: findBox
+
+                    objectName: "findBox"
+                    bridge: window.bridge
+                    Layout.preferredWidth: implicitWidth
+                    Layout.minimumWidth: leastWidth
                 }
             }
         }
@@ -466,27 +607,67 @@ ApplicationWindow {
             SplitView.minimumWidth: window.listLeast
             font.pointSize: window.settings.listTextSize
 
-            Label {
-                id: heading
+            // The filter shown and its count, cut before the Rows button, which opens the View
+            // menu's Rows items under it.
+            RowLayout {
+                id: headingRow
 
-                objectName: "heading"
                 anchors.left: parent.left
                 anchors.right: parent.right
-                padding: 6
-                font.bold: true
-                text: window.bridge.heading
-                textFormat: Text.PlainText
+                spacing: 0
+
+                Label {
+                    objectName: "heading"
+                    padding: 6
+                    font.bold: true
+                    text: window.bridge.heading
+                    textFormat: Text.PlainText
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                }
+                ToolButton {
+                    id: rowStyleButton
+
+                    objectName: "rowStyleButton"
+                    text: qsTr("Rows")
+                    focusPolicy: Qt.NoFocus
+                    onClicked: rowsMenu.open()
+
+                    // Its right edge at the button's, so that it opens over the list it styles
+                    // rather than the details beside it.
+                    WholeMenu {
+                        id: rowsMenu
+
+                        objectName: "rowsMenu"
+                        x: rowStyleButton.width - width
+                        y: rowStyleButton.height
+
+                        MenuItem {
+                            action: rowsCompactAction
+                        }
+                        MenuItem {
+                            action: rowsTwoLinesAction
+                        }
+                        MenuItem {
+                            action: rowsRichAction
+                        }
+                    }
+                }
             }
 
             ListView {
                 id: list
 
                 objectName: "findings"
-                anchors.top: heading.bottom
+                anchors.top: headingRow.bottom
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.bottom: parent.bottom
                 clip: true
+                // A page is the rows on screen: the window knows its height, where the terminal
+                // pages by a fixed ten.
+                readonly property int pageRows: currentItem
+                    ? Math.max(1, Math.floor(height / currentItem.height)) : 1
                 // The selection is review's: the list only shows it.
                 keyNavigationEnabled: false
                 model: window.bridge.findings
@@ -513,10 +694,45 @@ ApplicationWindow {
                     border.color: tone
                     border.width: 1
                 }
-                delegate: FindingRow {
-                    width: ListView.view.width - listBar.room
-                    onPicked: window.bridge.select(index)
-                    onOpened: window.bridge.play()
+                // Rows of the style chosen. Two Lines and Rich are one row's two looks, so that a
+                // change between them redraws the rows in place; Compact's rows are their own. Two
+                // Components, not a Loader, which would give the rows none of the model's required
+                // properties.
+                delegate: window.settings.rowStyle === "compact" ? compactRow : findingRow
+
+                Component {
+                    id: compactRow
+
+                    CompactRow {
+                        id: compactDelegate
+
+                        width: ListView.view.width - listBar.room
+                        onPicked: window.bridge.select(index)
+                        onOpened: window.bridge.play()
+                        onDisclosed: window.bridge.toggleRow(index)
+                        onMenuAsked: at => {
+                            window.bridge.select(index);
+                            rowMenu.openFor(index, compactDelegate, at);
+                        }
+                    }
+                }
+                Component {
+                    id: findingRow
+
+                    FindingRow {
+                        id: findingDelegate
+
+                        width: ListView.view.width - listBar.room
+                        rich: window.settings.rowStyle === "rich"
+                        separator: window.separator
+                        onPicked: window.bridge.select(index)
+                        onOpened: window.bridge.play()
+                        onDisclosed: window.bridge.toggleRow(index)
+                        onMenuAsked: at => {
+                            window.bridge.select(index);
+                            rowMenu.openFor(index, findingDelegate, at);
+                        }
+                    }
                 }
             }
 
@@ -534,10 +750,13 @@ ApplicationWindow {
             objectName: "details"
             bridge: window.bridge
             separator: window.separator
+            canDecide: window.canDecide
+            windowFont: window.font
             columnsResizing: columns.resizing
             font.pointSize: window.settings.detailsTextSize
             SplitView.preferredWidth: window.settings.detailsWidth
             SplitView.minimumWidth: window.detailsLeast
+            onMenuAsked: at => rowMenu.openFor(window.bridge.selected, details, at)
         }
     }
 
@@ -548,6 +767,109 @@ ApplicationWindow {
         elide: Text.ElideRight
         text: window.bridge.statusLine
         textFormat: Text.PlainText
+    }
+
+    // Where the right-click menu opens from: a pixel square, moved to each click before the menu
+    // opens (rowMenu.openFor). In the window's content, which outlives every row.
+    Item {
+        id: menuAnchor
+
+        width: 1
+        height: 1
+    }
+
+    // The right-click menu of a row of the list, or of the finding in the details panel, for the
+    // row openFor is given, at the point of the click. Its first six are the Finding menu's own
+    // items, which act on review's selection: a right-click on a row selects it first, and review
+    // takes actions in order. Copy Subtitle Line and Show File in Folder ask review nothing, so
+    // they read the row clicked at once, as review may not have answered its Select yet (while a
+    // job runs, say): items of their own, so that Copy shows no key, Ctrl+C copying the selected
+    // row's line. Native where Qt has the platform's menus (on macOS, say), so that it is the
+    // system's own right-click menu, which has the keys while open. Wherever Qt has none, offscreen
+    // among them, Qt Quick draws it: in a popup window of its own over the window where the
+    // platform has such windows, and in the window where it has none. Either way the window's
+    // shortcuts hear each key first: MenuKeys' popup rule then gives the open menu its keys
+    // (menu_keys.h).
+    WholeMenu {
+        id: rowMenu
+
+        // The row it was last opened for.
+        property int row: -1
+        // Whether that row has a subtitle line to copy, read again as the menu opens and at each
+        // change of review's: either can find another entry at the same row number, a timing fix's
+        // in a line's place or the reverse, which a binding on the row number alone would miss.
+        property bool copyable: false
+
+        // Opens it for the list's row `index`, at `where` in `from`'s coordinates: the point the
+        // request came with, as Wayland gives a window no pointer position on the screen. It opens
+        // from menuAnchor, moved to that point first, and not at a point in a larger item: Wayland
+        // places a menu Qt draws in a popup window of its own below the rect of the item it opens
+        // from, whatever point it is given, so that item is the click's, a pixel square. Not the
+        // row's delegate either: popup makes the item it is given the menu's parent, and a row's
+        // delegate goes when the list changes under it, a filter or a style change, taking an open
+        // menu's parent with it.
+        function openFor(index: int, from: Item, where: point) {
+            rowMenu.row = index;
+            rowMenu.copyable = window.bridge.canCopyAt(index);
+            const at = window.contentItem.mapFromItem(from, where);
+            menuAnchor.x = at.x;
+            menuAnchor.y = at.y;
+            rowMenu.popup(menuAnchor, Qt.point(0, 0));
+        }
+
+        objectName: "rowMenu"
+        popupType: Popup.Native
+        // The rect Qt hands Wayland is the item's moved right by the menu's overlap and narrowed by
+        // twice it. A style's overlap shows only on a submenu, which this menu never is, so none:
+        // the rect is then menuAnchor's own, at the click, in every style.
+        overlap: 0
+
+        MenuItem {
+            objectName: "rowAccept"
+            action: acceptAction
+        }
+        MenuItem {
+            objectName: "rowReject"
+            action: rejectAction
+        }
+        MenuItem {
+            objectName: "rowEdit"
+            action: editAction
+        }
+        MenuItem {
+            objectName: "rowClear"
+            action: clearAction
+        }
+        MenuSeparator {}
+        MenuItem {
+            objectName: "rowPlay"
+            action: playAction
+        }
+        MenuItem {
+            objectName: "rowShowEachEpisode"
+            action: showEachEpisodeAction
+        }
+        MenuSeparator {}
+        MenuItem {
+            objectName: "rowCopy"
+            text: qsTr("&Copy Subtitle Line")
+            enabled: window.keysToReview && rowMenu.copyable
+            onTriggered: window.bridge.copyLine(rowMenu.row)
+        }
+        MenuItem {
+            objectName: "rowShowInFolder"
+            text: qsTr("Show &File in Folder")
+            enabled: window.keysToReview && rowMenu.row >= 0
+            onTriggered: window.bridge.showInFolder(rowMenu.row)
+        }
+
+        Connections {
+            target: window.bridge
+
+            function onSummaryChanged() {
+                rowMenu.copyable = window.bridge.canCopyAt(rowMenu.row);
+            }
+        }
     }
 
     SettingsWindow {

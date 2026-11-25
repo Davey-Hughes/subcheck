@@ -32,6 +32,8 @@ const QString windowTextKey = QStringLiteral("text/window");
 const QString listTextKey = QStringLiteral("text/list");
 const QString detailsTextKey = QStringLiteral("text/details");
 const QString noFindingsLastKey = QStringLiteral("view/noFindingsLast");
+const QString rowStyleKey = QStringLiteral("rows/style");
+const QString defaultRowStyle = QStringLiteral("twoLines");
 const QSize defaultSize(1280, 800);
 const int defaultSidebar = 220;
 const int defaultDetails = 480;
@@ -42,6 +44,18 @@ constexpr qreal leastSize = 6;
 constexpr qreal mostSize = 24;
 
 qreal halfPoint(qreal points) { return std::round(points * 2) / 2; }
+
+// The row style `name` names, or Two Lines for a name no style has, so that a name edited into the
+// file by hand still draws the list in a style it has.
+QString rowStyleNamed(const QString &name) {
+    for (const QLatin1String style :
+         {QLatin1String("compact"), QLatin1String("twoLines"), QLatin1String("rich")}) {
+        if (name == style) {
+            return name;
+        }
+    }
+    return defaultRowStyle;
+}
 
 // The platform's size of text, as the application's font resolves it: in points, though the
 // platform may have set it in pixels.
@@ -322,4 +336,17 @@ void WindowSettings::setNoFindingsLast(bool on) {
     }
     store->setValue(noFindingsLastKey, on);
     emit noFindingsLastChanged();
+}
+
+QString WindowSettings::rowStyle() const {
+    return rowStyleNamed(store->value(rowStyleKey).toString());
+}
+
+void WindowSettings::setRowStyle(const QString &name) {
+    const QString style = rowStyleNamed(name);
+    if (style == rowStyle()) {
+        return;
+    }
+    store->setValue(rowStyleKey, style);
+    emit rowStyleChanged();
 }

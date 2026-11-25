@@ -74,8 +74,8 @@ add or change one.
 clang-format, then a CMake build that generates the C++ bindings to `ffi/`, qmllint over the QML,
 the app's tests, the share of its C++ lines they reach, against CI's floor, and last a Release build
 of every target. Besides Rust from rustup, which the build asks for the toolchain
-`rust-toolchain.toml` names, it needs cmake, ninja, clang-format, Qt 6.12 (Quick, Test and qmllint),
-[MpvQt](https://invent.kde.org/libraries/mpvqt) 1.2.1 with mpv 0.38 or later,
+`rust-toolchain.toml` names, it needs cmake, ninja, clang-format, Qt 6.12 (Quick, Test, qmllint and,
+on Linux, D-Bus), [MpvQt](https://invent.kde.org/libraries/mpvqt) 1.2.1 with mpv 0.38 or later,
 [gcovr](https://gcovr.com), [Corrosion](https://github.com/corrosion-rs/corrosion) and
 [uniffi-bindgen-cpp](https://github.com/NordSecurity/uniffi-bindgen-cpp), installed with
 `cargo install` at the tag CI installs; it stops first, naming the command, when the bindgen is
@@ -88,19 +88,20 @@ The app is `subcheck-qt [run | paths…]`, which takes the run or paths `subchec
 with none opens the newest check's folders, as bare `subcheck review` does. Its window has three
 columns: a sidebar with the reviews (one per show folder the store holds, which a click opens), what
 the list shows (each filter with its count) and the view's episodes (a click selects one and its
-first finding, when it has one); the findings, two lines a row (what found it, its episode and time,
-its decision, and its line with the change marked, or for a timing row whose members the filter
-shows differ in their fixes, those fixes, counted); and the details panel, the video at its top, a
-mark in the video's corner saying whether it plays or is paused, then the selected finding, its line
-as the subtitles have it now in a block above the line with the fix. The toolbar at the top of the
-window, under the menus where the window draws them, shows the view's name and its counts, and at
-its right Reject, Accept and Undo. An episode the check found nothing in is greyed in the sidebar
-and says `No findings`. A click on one shows what its check said, alone under the video; the finding
-you were on stays greyed in the list, as the episode has none to go to, and Accept, Reject, Back to
-Undecided, Show in Video and Enter wait until you move to a finding again, by a move, a click or
-Undo. Accept and Reject in the toolbar, and Accept, Reject and Back to Undecided in the Finding menu
-and by A, R and X, wait too while no finding shows, as under a filter with no rows. View ▸ Episodes
-Without Findings Last lists those episodes after the rest, while N and P still go to the next and
+first finding, when it has one); the findings, in the style View ▸ Rows chooses (below), Two Lines
+until chosen; and the details panel, the video at its top, a mark in the video's corner saying
+whether it plays or is paused, then the selected finding, its line as the subtitles have it now in a
+block above the line with the fix. The toolbar at the top of the window, under the menus where the
+window draws them, shows the view's name and its counts, and at its right the Find box (below).
+Under the video a row of its own holds Undo at the left and Reject and Accept at the right, in the
+window's size of text, and stays put as the details scroll. An episode the check found nothing in is
+greyed in the sidebar and says `No findings`. A click on one shows what its check said, alone under
+the video; the finding you were on stays greyed in the list, as the episode has none to go to, and
+Accept, Reject, Back to Undecided, Edit Wording…, Show in Video, Copy Subtitle Line and Show Each
+Episode wait until you move to a finding again, by a move, a click or Undo. Reject and Accept under
+the video, and Accept, Reject, Edit Wording… and Back to Undecided in the Finding menu and by A, R,
+E and X, wait too while no finding shows, as under a filter with no rows. View ▸ Episodes Without
+Findings Last lists those episodes after the rest, while N and P still go to the next and
 previous episode in review's order. File ▸ Settings… (Ctrl+, or ⌘, on macOS) opens a window of its
 own that chooses the window's colours, the default or a palette for deuteranomaly/deuteranopia,
 protanomaly/protanopia, tritanomaly/tritanopia, or little or no colour vision, with a sample, and
@@ -109,16 +110,17 @@ until set; each choice applies at once, Esc or Ctrl+W (⌘W on macOS) closes Set
 Settings is open no key of the main window's reaches review. The menus hold the rest and show their
 keys as this paragraph writes the window's: a letter alone is that key without Shift, and Shift is
 written out, so the menu's O is the terminal's `o`, and its Shift+O (⇧O on macOS) is the terminal's
-`O`. A, R and X accept, reject and put back to undecided, N and P go to the next and previous
-episode, V switches between a check and its folders, O (Show in Video) opens the selected finding in
-the video pane as the terminal's `o` does in mpv, playing on if the pane plays and paused if not,
-and Shift+O (Close Video) closes the video, leaving the pane black and review open; Space plays and
-pauses, Left and Right (← and → on macOS) seek 5 s, `,` and `.` 1 s, and `[` and `]` step a frame;
-Ctrl+Z undoes, and Ctrl+W and Ctrl+Q quit (⌘Z, ⌘W and ⌘Q on macOS). No menu shows the others: J and
-K (or Down and Up) move, Enter expands a row into its members or collapses it, F steps through the
-filters, U undoes and Q quits. No key in the window does what the terminal's `e`, `c`, `A`, `D`,
-`g`, `G`, Home, End, PgUp, PgDn, Tab or `?` does. A view shows its rows at once: the details panel's
-word on an episode's file (`This episode's file is missing`, or
+`O`. A, R and X accept, reject and put back to undecided, E edits the wording, N and P go to the
+next and previous episode, V switches between a check and its folders, O (Show in Video) opens the
+selected finding in the video pane as the terminal's `o` does in mpv, playing on if the pane plays
+and paused if not, and Shift+O (Close Video) closes the video, leaving the pane black and review
+open; Space plays and pauses, Left and Right (← and → on macOS) seek 5 s, `,` and `.` 1 s, and `[`
+and `]` step a frame; Ctrl+Z undoes, and Ctrl+W and Ctrl+Q quit (⌘Z, ⌘W and ⌘Q on macOS). No menu
+shows the others: J and K (or Down and Up) move, Home or G goes to the first finding, End or Shift+G
+to the last, PgUp and PgDn move by the rows the list shows at once (the terminal's page is 10), F
+steps through the filters, U undoes and Q quits; none of these acts while a text field has the keys.
+No key in the window does what the terminal's `c`, `A`, `D`, Tab or `?` does. A view shows its rows
+at once: the details panel's word on an episode's file (`This episode's file is missing`, or
 `This episode changed since it was checked`) comes once that file's check answers, so a share that
 is slow or does not answer holds up no row. Another view, by V or a review in the sidebar, takes the
 place of the one shown once it has been read (`Opening the view…`), and until then the view shown
@@ -150,6 +152,42 @@ not answer. While mpv's open waits on such a share, the process ends about 2 s a
 without waiting for mpv, with the window's settings kept as any quit keeps them. On a FUSE share
 (sshfs, rclone) the process ends only once the share answers, whatever waits on it, as no program
 can end a request a FUSE share has taken; the window is gone all the same.
+
+Each row of the findings is drawn in one of three styles, which View ▸ Rows (Compact, Two Lines,
+Rich) or the Rows button in the list's heading chooses, and which the window keeps for the next
+run. Compact is one line: the state's glyph, where the finding is, in short, and its change. Two
+Lines is the badge naming what found it, where it is and its decision on the first line, and on the
+second its line with the change marked, or for a timing row whose members the filter shows differ in
+their fixes, those fixes, counted. Rich adds a third line, why it was found, and at the row's left a
+dark tile with the line drawn on it as the video would show it. A line too long for its row is cut
+short with an ellipsis. A row of several opens into its members, and closes again, by the triangle
+at its left (▸ closed, ▾ open), by Enter, or by Finding ▸ Show Each Episode, which is checked while
+the row is open; a double-click on a row opens it in the video. A right-click on a row, or on the
+finding in the details panel, selects it first and then offers Accept, Reject, Edit Wording…, Back
+to Undecided, Show in Video, Show Each Episode, Copy Subtitle Line and Show File in Folder; the
+last asks the file manager to select the file, which it does in Finder and in a Linux file
+manager that answers on the session bus (Plasma's does), and otherwise opens the file's folder.
+
+Edit Wording… (E, the Finding menu or the right-click menu), or a click on the `+ With the fix`
+block, which shows a text cursor under the pointer while it can be reworded, turns its line into
+a field holding the wording, its cursor at the character nearest the click (at the end otherwise);
+a click does nothing on a timing fix. Return or Save and Accept saves the wording and accepts the
+finding; Esc or Cancel ends the edit and decides nothing; an empty wording is refused.
+While the field has the keys it takes the letters, Space, Return, Enter, Up, Down, PgUp, PgDn, Home,
+End, Esc and Ctrl+Z, which undoes the typing, never a decision. Moving to another finding ends the
+edit, deciding nothing and dropping the wording typed. While an edit is open Accept, Reject, Back to
+Undecided, Edit Wording… and Undo wait; Save and Accept and Cancel end it. Edit ▸ Copy Subtitle Line
+(Ctrl+C, ⌘C on macOS) copies the selected finding's line as the subtitles have it now, and waits
+for a timing row, which has no line of its own. The Find box at the toolbar's right finds a row:
+Return in it selects the next row, among the rows the list shows, whose line, wording, episode, as
+the row names it, or reason holds the words typed, Shift+Return the previous one, going round past
+the last row to the first; with none, the box says `No match`. Its ‹ and › buttons do the same.
+Edit ▸ Find… (Ctrl+F, ⌘F on macOS) gives the box the keys with its words selected; Esc gives them
+back to the window, keeping the words, and so does a press of the pointer anywhere in the window
+outside the box while no menu is open; a press that closes an open menu leaves the keys where
+that menu gives them back. The box is greyed while an edit is open. In the sidebar, the
+reviews' list scrolls to the open review and the episodes' list keeps the marked episode in view,
+when the mark moves and when a new list comes in.
 
 The video pane is mpv, inside the window through MpvQt. It reads its options from
 `$XDG_CONFIG_HOME/mpvqt/mpvqt.conf` on Linux (by default `~/.config/mpvqt/mpvqt.conf`) and

@@ -51,6 +51,19 @@ class SessionBridge : public QObject {
     Q_PROPERTY(QString statusLine READ statusLine NOTIFY summaryChanged)
     Q_PROPERTY(int selected READ selected NOTIFY summaryChanged)
     Q_PROPERTY(QString emptyWords READ emptyWords NOTIFY summaryChanged)
+    // Whether the selected entry opens and closes, as Finding ▸ Show Each Episode does it: a row of
+    // several, or one of its members, whose Toggle closes its row; and whether it is open, the row
+    // with its members shown, as a member's always is.
+    Q_PROPERTY(bool canExpand READ canExpand NOTIFY summaryChanged)
+    Q_PROPERTY(bool expanded READ expanded NOTIFY summaryChanged)
+    // Whether an edit is open, as review's last change says, and the wording it opened with, which
+    // the window's field starts from as editOpened says; and whether the selected entry's wording
+    // can be edited, which a timing fix's cannot.
+    Q_PROPERTY(bool editing READ editing NOTIFY summaryChanged)
+    Q_PROPERTY(QString editWording READ editWording NOTIFY summaryChanged)
+    Q_PROPERTY(bool canEdit READ canEdit NOTIFY summaryChanged)
+    // Whether the selected entry has a subtitle line to copy, as canCopyAt says.
+    Q_PROPERTY(bool canCopy READ canCopy NOTIFY summaryChanged)
     // The episode selected (the first as a view opens, then the one last clicked) and what the
     // check and apply said of it; empty but while it is the selected finding's or its row's, or one
     // the check found nothing in, clicked, until its view ends, as showingEpisode says.
@@ -102,6 +115,12 @@ public:
     QString statusLine() const;
     int selected() const;
     QString emptyWords() const;
+    bool canExpand() const;
+    bool expanded() const;
+    bool editing() const;
+    QString editWording() const;
+    bool canEdit() const;
+    bool canCopy() const;
     QString episodeName() const;
     QStringList episodeLog() const;
     bool showingEpisode() const;
@@ -115,10 +134,32 @@ public:
     // last: at an end, the entry already selected, which lets a message go.
     Q_INVOKABLE void move(int by);
     Q_INVOKABLE void toggle();
+    // The row at `row` opened or closed, as a click on its triangle asks: selected first, so that
+    // the Toggle is that row's whichever was selected, and a greyed episode's view ends as a click
+    // on the row ends it. Nothing outside the list, where the Toggle would be another row's.
+    Q_INVOKABLE void toggleRow(int row);
     Q_INVOKABLE void accept();
     Q_INVOKABLE void reject();
     Q_INVOKABLE void clear();
     Q_INVOKABLE void undo();
+    // The selected entry's wording opened for editing; the edit saved with `wording`, which accepts
+    // its findings with it, or refused, should it be empty; and the edit let go.
+    Q_INVOKABLE void edit();
+    Q_INVOKABLE void reword(const QString &wording);
+    Q_INVOKABLE void cancelEdit();
+    // Whether the entry at `row` has a subtitle line to copy: one in the list, but a timing fix's,
+    // whose words are what the timing check found of its track, not a line. That line to the
+    // clipboard, as its file has it; and the entry's file shown in the file manager. Each takes the
+    // row it is given, which from the right-click menu is the row clicked, whose Select review may
+    // not have answered yet; neither asks review anything.
+    Q_INVOKABLE bool canCopyAt(int row) const;
+    Q_INVOKABLE void copyLine(int row);
+    Q_INVOKABLE void showInFolder(int row);
+    // The row after the selected one that holds `words`, or before it with `back`, round past
+    // either end (FindingsModel::find), selected as a click selects it; false, with nothing sent,
+    // when no row holds them. The selected one, or the last find's until review answers it, as
+    // findFrom says.
+    Q_INVOKABLE bool findNext(const QString &words, bool back);
     // The selected entry's moment in the video pane; closing it; and the video's own.
     Q_INVOKABLE void play();
     Q_INVOKABLE void closePlayer();
@@ -168,6 +209,15 @@ signals:
     void summaryChanged();
     // Another entry of the list is selected, rather than the selected one refreshed in place.
     void selectionMoved();
+    // An edit opened: review's change has one, and the change before had none. Not at a change
+    // whose edit's entry has another key, as a re-check gives it when it renames the entry: that is
+    // the same edit, whose typed words must stay.
+    void editOpened();
+    // Review has answered the last Edit sent: at the first change or answer alone (an
+    // `Event::Answered`) whose count reaches it, after the editOpened that change may bring. With
+    // no edit open then, review opened none: it took the Edit while it asked, say, which only let
+    // the question go.
+    void editAnswered();
     // What the check said of an episode with no findings shows, for a click on it: the details
     // panel scrolls to it, as the panel can be scrolled down the finding it takes the place of.
     void episodeShown();
@@ -181,6 +231,10 @@ protected:
     // session's close do, so a test's bridge throws its own. The destructor's close is always
     // this one, as a destructor calls no override.
     virtual void closeSession(subcheck_ffi::Session &session);
+
+    // Shows `file` in the platform's file manager, or else opens its folder (reveal.h). Virtual, so
+    // that a test sees each file the window asks to show, and no test asks a real file manager.
+    virtual void reveal(const QString &file);
 
     // The actions sent to review, which review's count reaches once it has taken them all. Here, so
     // that a test that holds actions back from review, to stand in for its answers, counts them.
@@ -214,6 +268,12 @@ private:
         bool moved = false;
     };
 
+    // The entry the last find selected, and the count of its Select (findFrom).
+    struct Found {
+        subcheck_ffi::EntryKey key;
+        uint64_t at;
+    };
+
     // A greyed episode's view: the episode, and what the check and apply said of it as review last
     // sent them for its file. Held, so that the view still shows them in a change whose file is
     // already another's, as review's answer to the first of a click's two actions has it.
@@ -232,8 +292,11 @@ private:
     void apply(const subcheck_ffi::Event &event);
     void changed(const subcheck_ffi::Event::kChanged &change);
     // Review's answer alone, to an action that changed nothing it shows: nothing is said or drawn
-    // again, but for what the answer does to a greyed episode's view.
+    // again, but for what the answer does to a greyed episode's view, and editAnswered should it
+    // answer an Edit.
     void answered(uint64_t count);
+    // Whether review's count now reaches the last Edit sent, which is then no longer awaited.
+    bool answersEdit();
     // Brings a greyed episode's view up to review's summary, whose count says which actions review
     // has taken: `moved`, whether its change selected another entry; `asking`, whether review
     // asked as it took the action the change answers.
@@ -244,6 +307,13 @@ private:
     bool showView(const std::optional<std::string> &path, const std::optional<std::string> &file);
     // Marks in the sidebar the episode the details panel shows.
     void markEpisode();
+    // The row a find goes on from: the one the last find selected, while it is in the list, its
+    // Select is the last action sent and review has yet to answer it; else review's selection.
+    // Until review answers, its selection is still the row before the find, from which a quick
+    // next find would select the same row again. Any other action lets the row go, as where
+    // review's selection then lands is review's to say: a click, a move, a decision that moves
+    // review on.
+    int findFrom() const;
     // Whether a greyed episode's view shows: one is held, its episode is still in the list, and
     // review has that episode's file selected, or any file while an answer that changes the view is
     // awaited, as between the two answers to a click on an episode with findings. Then the details
@@ -314,6 +384,9 @@ private:
     uint64_t lastClick = 0;
     // What the last greyed click put aside, until review answers it.
     std::optional<BeforeClick> beforeClick;
+    std::optional<Found> found;
+    // The count of the last Edit sent, until review answers it (editAnswered).
+    std::optional<uint64_t> editAt;
     bool opened = false;
     bool quitting = false;
     bool done = false;

@@ -573,6 +573,39 @@ private slots:
         QVERIFY(!WindowSettings(in(dir), "offscreen").noFindingsLast());
     }
 
+    // The style the list draws its rows in is kept by its name, at once; Two Lines until another
+    // is chosen, and for a name no style has, whether kept or given.
+    void theRowStyleIsKeptByNameAndTwoLinesByDefault() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        WindowSettings settings(in(dir), "offscreen");
+        QCOMPARE(settings.rowStyle(), "twoLines");
+        QSignalSpy changed(&settings, &WindowSettings::rowStyleChanged);
+        for (const QString &style : {QStringLiteral("rich"), QStringLiteral("compact")}) {
+            changed.clear();
+            settings.setRowStyle(style);
+            QCOMPARE(changed.count(), 1);
+            QCOMPARE(settings.rowStyle(), style);
+            QCOMPARE(WindowSettings(in(dir), "offscreen").rowStyle(), style);
+            QCOMPARE(in(dir)->value("rows/style").toString(), style);
+        }
+        // The same style again changes nothing.
+        settings.setRowStyle("compact");
+        QCOMPARE(changed.count(), 1);
+        // A name no style has is Two Lines.
+        settings.setRowStyle("big");
+        QCOMPARE(changed.count(), 2);
+        QCOMPARE(settings.rowStyle(), "twoLines");
+
+        in(dir)->setValue("rows/style", "big");
+        WindowSettings unknown(in(dir), "offscreen");
+        QCOMPARE(unknown.rowStyle(), "twoLines");
+        QSignalSpy unchanged(&unknown, &WindowSettings::rowStyleChanged);
+        unknown.setRowStyle("big");
+        QCOMPARE(unknown.rowStyle(), "twoLines");
+        QCOMPARE(unchanged.count(), 0);
+    }
+
     // The Settings window's radio buttons, one for each palette in its order; the arrows step
     // through them and stop at either end.
     void eachPaletteIsAChoiceInOrderAndTheArrowsStopAtTheEnds() {

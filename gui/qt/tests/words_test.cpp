@@ -1,6 +1,6 @@
 // The window's own words and colours (words.h), with no session: every palette's tones, a
 // decision's look, a badge, a time, a count, and a line with its change marked, escaped and counted
-// in UTF-16 as review's spans are.
+// in UTF-16 as review's spans are, as each row style draws it.
 #include "offscreen_main.h"
 #include "words.h"
 
@@ -298,6 +298,55 @@ private slots:
         QCOMPARE(line("ab " + kept).cut, "…" + kept + change);
         // A space 25 units before it is not: the cut falls at the next one, just before the change.
         QCOMPARE(line("ab " + QString("c").repeated(23) + " ").cut, "…" + change);
+    }
+
+    // A Compact row's change: the words taken out, struck, an arrow, and the words put in, each
+    // marked and escaped as a row's line is; a side with no words is left out with its space.
+    void aCompactChangeIsTheOldWordsStruckThenTheNew() {
+        const Window light(false);
+        QCOMPARE(changeLine("Your going", Span{0, 4}, "You're going", Span{0, 6}),
+                 marked("Your", Span{0, 4}, true, Marking::InRow) + " → " +
+                     marked("You're", Span{0, 6}, false, Marking::InRow));
+        QCOMPARE(changeLine("the the end", Span{4, 8}, "the end", Span{4, 4}),
+                 marked("the ", Span{0, 4}, true, Marking::InRow) + " →");
+        QCOMPARE(changeLine("the end", Span{4, 4}, "the new end", Span{4, 8}),
+                 "→ " + marked("new ", Span{0, 4}, false, Marking::InRow));
+        const QString escaped = changeLine("a <i> b", Span{2, 5}, "a b", Span{2, 2});
+        QCOMPARE(escaped, marked("<i>", Span{0, 3}, true, Marking::InRow) + " →");
+        QVERIFY2(escaped.contains("&lt;i&gt;") && !escaped.contains("<i>"), qPrintable(escaped));
+    }
+
+    // A Rich row's tile is dark in every window, so its change is marked in the palette's dark
+    // tones in a light window too; and in its light tones when asked for them in a dark window:
+    // the argument picks the tones, never the window.
+    void aTileMarksItsChangeInThePalettesDarkTones() {
+        const auto restore = qScopeGuard([] { useColours(Colours::Default); });
+        for (const Colours each : everyColours) {
+            useColours(each);
+            const Tones onDark = tones(each, true);
+            const Tones onLight = tones(each, false);
+            const auto out = [](bool tile) {
+                return marked("Your going", Span{0, 4}, true, Marking::InRow, tile);
+            };
+            const auto in = [](bool tile) {
+                return marked("You're going", Span{0, 6}, false, Marking::InRow, tile);
+            };
+            {
+                const Window light(false);
+                QVERIFY2(out(true).contains(onDark.old.name()), qPrintable(out(true)));
+                QVERIFY2(in(true).contains(onDark.added.name()), qPrintable(in(true)));
+                for (const QColor &lit : {onLight.old, onLight.added}) {
+                    if (lit != onDark.old && lit != onDark.added) {
+                        QVERIFY2(!out(true).contains(lit.name()), qPrintable(out(true)));
+                        QVERIFY2(!in(true).contains(lit.name()), qPrintable(in(true)));
+                    }
+                }
+            }
+            const Window window(true);
+            QVERIFY(dark());
+            QVERIFY2(out(false).contains(onLight.old.name()), qPrintable(out(false)));
+            QVERIFY2(in(false).contains(onLight.added.name()), qPrintable(in(false)));
+        }
     }
 };
 

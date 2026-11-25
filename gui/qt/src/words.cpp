@@ -60,21 +60,21 @@ QString part(const QString &text, qsizetype from, qsizetype to) {
     return text.mid(from, to - from).toHtmlEscaped();
 }
 
-// `inner`, escaped already, marked as taken out or put in.
-QString mark(const QString &inner, bool takenOut, Marking how) {
+// `inner`, escaped already, marked as taken out or put in, in `tone`.
+QString mark(const QString &inner, bool takenOut, Marking how, const Tones &tone) {
     if (inner.isEmpty()) {
         return inner;
     }
     if (how == Marking::InRow) {
         // A struck part keeps its weight, so that the line's length reads as it was.
         return takenOut ? QStringLiteral("<s><font color=\"%1\">%2</font></s>")
-                              .arg(now().old.name(), inner)
+                              .arg(tone.old.name(), inner)
                         : QStringLiteral("<font color=\"%1\"><b>%2</b></font>")
-                              .arg(now().added.name(), inner);
+                              .arg(tone.added.name(), inner);
     }
     // Struck or bold as well as tinted, so that a reader who cannot tell the two tints apart
     // still tells the words apart.
-    const QColor tint = takenOut ? now().oldTint : now().addedTint;
+    const QColor tint = takenOut ? tone.oldTint : tone.addedTint;
     return QStringLiteral("<span style=\"background-color:%1\">%2</span>")
         .arg(tint.name(),
              (takenOut ? QStringLiteral("<s>%1</s>") : QStringLiteral("<b>%1</b>")).arg(inner));
@@ -213,9 +213,14 @@ QString fixWords(const Fix &fix) {
 }
 
 QString marked(const QString &text, const Span &changed, bool takenOut, Marking how) {
+    return marked(text, changed, takenOut, how, dark());
+}
+
+QString marked(const QString &text, const Span &changed, bool takenOut, Marking how, bool dark) {
     const auto start = static_cast<qsizetype>(changed.start);
     const auto end = static_cast<qsizetype>(changed.end);
-    return part(text, 0, start) + mark(part(text, start, end), takenOut, how) +
+    return part(text, 0, start) +
+           mark(part(text, start, end), takenOut, how, tones(colours(), dark)) +
            part(text, end, text.size());
 }
 
@@ -224,10 +229,11 @@ RowLine rowLine(const QString &original, const Span &originalChanged, const QStr
     const auto start =
         std::clamp<qsizetype>(static_cast<qsizetype>(originalChanged.start), 0, original.size());
     const auto end = static_cast<qsizetype>(originalChanged.end);
-    const QString out = mark(part(original, start, end), true, Marking::InRow);
+    const Tones tone = now();
+    const QString out = mark(part(original, start, end), true, Marking::InRow, tone);
     const QString in = mark(part(wording, static_cast<qsizetype>(wordingChanged.start),
                                  static_cast<qsizetype>(wordingChanged.end)),
-                            false, Marking::InRow);
+                            false, Marking::InRow, tone);
     const QString between = out.isEmpty() || in.isEmpty() ? QString() : QStringLiteral(" ");
     const QString change = out + between + in;
     const QString after = part(original, end, original.size());
@@ -242,6 +248,20 @@ RowLine rowLine(const QString &original, const Span &originalChanged, const QStr
     const QString ellipsis = QStringLiteral("…");
     return {upToChange + after, ellipsis + part(original, from, start) + change + after,
             upToChange + (after.isEmpty() ? QString() : ellipsis)};
+}
+
+QString changeLine(const QString &original, const Span &originalChanged, const QString &wording,
+                   const Span &wordingChanged) {
+    const Tones tone = now();
+    const QString out = mark(part(original, static_cast<qsizetype>(originalChanged.start),
+                                  static_cast<qsizetype>(originalChanged.end)),
+                             true, Marking::InRow, tone);
+    const QString in = mark(part(wording, static_cast<qsizetype>(wordingChanged.start),
+                                 static_cast<qsizetype>(wordingChanged.end)),
+                            false, Marking::InRow, tone);
+    const QString arrow = QStringLiteral("→");
+    return (out.isEmpty() ? arrow : out + QLatin1Char(' ') + arrow) +
+           (in.isEmpty() ? QString() : QLatin1Char(' ') + in);
 }
 
 bool dark() {

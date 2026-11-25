@@ -1,6 +1,6 @@
 // What the window asked of review, each action as one line, and a bridge that keeps each line as
-// it sends the action on: so that a test of a key, a menu item or a click checks the action it
-// sends, not only what review then did.
+// it sends the action on, or holds the action back from review: so that a test of a key, a menu
+// item or a click checks the action it sends, not only what review then did.
 #pragma once
 
 #include "overloaded.h"
@@ -106,15 +106,39 @@ inline QString told(const subcheck_ffi::Action &action) {
         action.get_variant());
 }
 
-// A bridge that keeps, in `sent`, each action it sends to review.
+// A bridge that keeps, in `sent`, each action it sends to review; and, in `revealed`, each file it
+// is asked to show in the file manager, which no test asks a real one to show.
 class Telling : public SessionBridge {
 public:
     using SessionBridge::SessionBridge;
 
     QStringList sent;
+    QStringList revealed;
 
     void send(subcheck_ffi::Action action) override {
         sent << told(action);
         SessionBridge::send(std::move(action));
+    }
+
+protected:
+    void reveal(const QString &file) override { revealed << file; }
+};
+
+// A bridge that, once `holding`, keeps each action from review as it tells it, counted as sent: a
+// test then stands in for review's answers, each at the moment it chooses, with the count review
+// would give it, or leaves the actions unanswered, as a review busy with a job would.
+class Holding : public Telling {
+public:
+    using Telling::Telling;
+
+    bool holding = false;
+
+    void send(subcheck_ffi::Action action) override {
+        if (holding) {
+            sent << told(action);
+            ++asked;
+            return;
+        }
+        Telling::send(std::move(action));
     }
 };

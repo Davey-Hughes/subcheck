@@ -3,7 +3,8 @@
 // its word says so, so that the grey is never the only sign. The reviews scroll on their own, in
 // a third of the sidebar at most, so that the filters and the episodes stay in view however many
 // reviews the store holds; the episodes scroll in what is left, and on a short window keep room
-// for a few entries, which the reviews give up. None takes the window's keys.
+// for a few entries, which the reviews give up. Each list keeps its mark in view, the open review
+// and the marked episode, so that neither is one to scroll to. None takes the window's keys.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -64,6 +65,8 @@ ColumnLayout {
         text: qsTr("Reviews")
     }
     ListView {
+        id: reviewList
+
         objectName: "reviews"
         clip: true
         boundsBehavior: Flickable.StopAtBounds
@@ -77,6 +80,27 @@ ColumnLayout {
             id: reviewsBar
 
             objectName: "reviewsScrollBar"
+        }
+
+        // The open review kept in view as review opens another or sends a new list, which a view
+        // shows from its top; with none open, nothing is scrolled to. Placed as the marked episode
+        // is, once review's change is applied, with the sidebar laid out first: the list's height
+        // follows a new list's length only at the next frame, and the review is placed against the
+        // height it will be drawn at.
+        function showOpen() {
+            sidebar.ensurePolished();
+            const row = sidebar.bridge.folders.openRow();
+            if (row >= 0) {
+                reviewList.positionViewAtIndex(row, ListView.Contain);
+            }
+        }
+
+        Connections {
+            target: sidebar.bridge.folders
+
+            function onOpenMoved() {
+                Qt.callLater(reviewList.showOpen);
+            }
         }
 
         delegate: Entry {
@@ -162,16 +186,28 @@ ColumnLayout {
             objectName: "episodesScrollBar"
         }
 
-        // The marked episode kept in view as the View menu changes the order, so that a person
-        // keeps their place in the list; with none marked, nothing is scrolled to.
+        // The marked episode kept in view as the View menu changes the order and as the mark
+        // moves, so that a person keeps their place in the list and need not look for the episode
+        // shown; with none marked, nothing is scrolled to. The sidebar is laid out first, and a
+        // moved mark placed once review's change is applied whole: a new list of reviews in the
+        // change, which can come after the mark, takes room from the episodes only at the next
+        // frame, and the mark placed in the taller view would be left out of the shorter one.
+        function showMarked() {
+            sidebar.ensurePolished();
+            const row = sidebar.bridge.episodes.markedRow();
+            if (row >= 0) {
+                episodeList.positionViewAtIndex(row, ListView.Contain);
+            }
+        }
+
         Connections {
             target: sidebar.bridge.episodes
 
             function onReordered() {
-                const row = sidebar.bridge.episodes.markedRow();
-                if (row >= 0) {
-                    episodeList.positionViewAtIndex(row, ListView.Contain);
-                }
+                episodeList.showMarked();
+            }
+            function onMarkMoved() {
+                Qt.callLater(episodeList.showMarked);
             }
         }
 

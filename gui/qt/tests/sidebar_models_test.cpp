@@ -51,6 +51,17 @@ std::vector<FileView> fiveEpisodes() {
         file("E05", ScanStage(ScanStage::kDone{1}))};
 }
 
+// Thirty reviews, /m/Show 0 to /m/Show 29, more than the sidebar shows at once, of which the one
+// at `open` is open; none for -1.
+std::vector<FolderView> manyReviews(int open) {
+    std::vector<FolderView> folders;
+    for (int i = 0; i < 30; ++i) {
+        const std::string name = "Show " + std::to_string(i);
+        folders.push_back(FolderView{"/m/" + name, name, 0, i == open});
+    }
+    return folders;
+}
+
 std::unique_ptr<QAbstractItemModelTester> tested(QAbstractItemModel *model) {
     return std::make_unique<QAbstractItemModelTester>(
         model, QAbstractItemModelTester::FailureReportingMode::QtTest);
@@ -365,6 +376,91 @@ private slots:
 
         model.follow("");
         QCOMPARE(order.markedRow(), -1);
+    }
+
+    // The mark moving onto a row of the list is said, through the order too, so that the sidebar
+    // can scroll to it; and so is a splice that removes rows while the marked file stays listed,
+    // as the list may have lost its place. Nothing else is: not the mark staying where it is or
+    // going off the list, not a splice that changes rows in place or inserts them, as a check's
+    // progress does at each step, and not one that removes the marked file.
+    void theMarkMovingIsSaid() {
+        EpisodesModel model;
+        QVERIFY(model.apply(FilesSplice{0, 0, fiveEpisodes()}));
+        EpisodeOrder order(&model);
+        const auto tester = tested(&order);
+        QSignalSpy followed(&model, &EpisodesModel::followed);
+        QSignalSpy moved(&order, &EpisodeOrder::markMoved);
+
+        model.follow("/m/S1/E02.mkv");
+        QCOMPARE(followed.count(), 1);
+        QCOMPARE(moved.count(), 1);
+        model.follow("/m/S1/E02.mkv");
+        QCOMPARE(followed.count(), 1);
+        model.follow("/m/S2/E01.mkv");
+        QCOMPARE(followed.count(), 1);
+        QCOMPARE(moved.count(), 1);
+        model.follow("/m/S1/E02.mkv");
+        QCOMPARE(followed.count(), 2);
+        QCOMPARE(moved.count(), 2);
+
+        // E04 and E05 removed, after the marked E02.
+        QVERIFY(model.apply(FilesSplice{3, 2, {}}));
+        QCOMPARE(labels(model), QStringList({"E01", "E02", "E03"}));
+        QCOMPARE(followed.count(), 3);
+        QCOMPARE(moved.count(), 3);
+
+        QVERIFY(model.apply(FilesSplice{0, 1, {file("E01", ScanStage(ScanStage::kReading{}))}}));
+        QVERIFY(model.apply(FilesSplice{0, 0, {file("E00")}}));
+        QCOMPARE(labels(model), QStringList({"E00", "E01", "E02", "E03"}));
+        QCOMPARE(followed.count(), 3);
+        QCOMPARE(moved.count(), 3);
+        QVERIFY(model.apply(FilesSplice{1, 3, {}}));
+        QCOMPARE(labels(model), QStringList({"E00"}));
+        QCOMPARE(followed.count(), 3);
+        QCOMPARE(moved.count(), 3);
+    }
+
+    // The open review's row, which the sidebar keeps in view, and each time it may have left the
+    // view: another row open, or a new list, which a view shows from its top, with one open. The
+    // same list with new counts changes in place, and keeps the view where it was.
+    void theOpenReviewIsFoundAndItsMoveSaid() {
+        FoldersModel model;
+        const auto tester = tested(&model);
+        QCOMPARE(model.openRow(), -1);
+        QSignalSpy moved(&model, &FoldersModel::openMoved);
+        QSignalSpy reset(&model, &QAbstractItemModel::modelReset);
+        model.set(manyReviews(25));
+        QCOMPARE(model.openRow(), 25);
+        QCOMPARE(moved.count(), 1);
+
+        std::vector<FolderView> counted = manyReviews(25);
+        for (FolderView &each : counted) {
+            each.to_review = 4;
+        }
+        model.set(counted);
+        QCOMPARE(role(model, 25, FoldersModel::CountRole).toInt(), 4);
+        QCOMPARE(model.openRow(), 25);
+        QCOMPARE(moved.count(), 1);
+
+        model.set(manyReviews(3));
+        QCOMPARE(model.openRow(), 3);
+        QCOMPARE(moved.count(), 2);
+        QCOMPARE(reset.count(), 1);
+
+        // Another list, the last folder gone, open at the same row.
+        std::vector<FolderView> fewer = manyReviews(3);
+        fewer.pop_back();
+        model.set(fewer);
+        QCOMPARE(reset.count(), 2);
+        QCOMPARE(model.openRow(), 3);
+        QCOMPARE(moved.count(), 3);
+
+        // None open: the open row is another, though there is none to show.
+        fewer[3].open = false;
+        model.set(fewer);
+        QCOMPARE(reset.count(), 2);
+        QCOMPARE(model.openRow(), -1);
+        QCOMPARE(moved.count(), 4);
     }
 
     // Where a file is in a word: apply's stage while an apply has it, else the check's.

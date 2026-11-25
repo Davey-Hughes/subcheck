@@ -5,6 +5,7 @@
 // status is 1 after an error, or when review has not ended within the wait below after a quit,
 // and 0 otherwise.
 #include "ending.h"
+#include "key_names.h"
 #include "player_port.h"
 #include "session_bridge.h"
 #include "window_settings.h"
@@ -62,6 +63,8 @@ int run(int argc, char **argv) {
     // first window: Linux's default, but not macOS's, which is Metal.
     QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
     QGuiApplication app(argc, argv);
+    // The window's names for keys, before its QML reads them (key_names.h).
+    KeyNames keyNames;
     // The names the platform's own place for the window's settings goes by, which macOS uses when
     // XDG_CONFIG_HOME is not set (WindowSettings::appStore), and Qt's caches.
     QCoreApplication::setOrganizationName(QStringLiteral("subcheck"));

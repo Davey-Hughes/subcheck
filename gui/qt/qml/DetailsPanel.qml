@@ -1,18 +1,21 @@
 // The details panel: the video, 16:9 at the panel's width, black until a finding is shown in it;
-// then the selected finding as the window words it: its line as it is now above its line with the
-// fix, each a block of its own that keeps its place from one finding to the next for a line of one
-// or two lines at the block's own font (one of three or more, or one drawn partly in a taller
-// fallback font, moves what is below it down), as Reject and Accept keep theirs in the toolbar,
-// beside Undo; below them its banners, its mark and why it was found; its file's particulars under
-// a disclosure; and what the check said of the episode selected while that is the finding's: below
-// the finding, set off by a line, or alone with none selected. For a click on an episode the check
-// found nothing in, its log shows alone, in the finding's place, while review keeps the finding
-// selected: below the finding, the two would read as one, and the log is not the finding's. Over
-// the video, whether it plays or is paused, and a busy animation while Show in Video waits for it,
-// in the highlight colour (LoadingArc) on a backing in the window's colour: a highlight can be as
-// dark as the pane is until mpv draws there, and every palette sets its highlight apart from its
-// window colour. While the window's columns are dragged, the video's frame is stretched across its
-// changing size, and drawn again at its size once the drag ends.
+// under it a row of its own with Undo at the left and Reject and Accept at the right, which stays
+// between the video and what scrolls; then the selected finding as the window words it: its line as
+// it is now above its line with the fix, each a block of its own that keeps its place from one
+// finding to the next for a line of one or two lines at the block's own font (one of three or
+// more, or one drawn partly in a taller fallback font, moves what is below it down); a click on
+// the block with the fix opens its edit at the nearest character, while it can be reworded, and
+// while an edit is open the line gives way to a field for its wording; below them its banners,
+// its mark and why it was found; its file's particulars under a disclosure; and what the check
+// said of the episode selected while that is the finding's: below the finding, set off by a line,
+// or alone with none selected. For a click on an episode the check found nothing in, its log shows
+// alone, in the finding's place, while review keeps the finding selected: below the finding, the
+// two would read as one, and the log is not the finding's. Over the video, whether it plays or is
+// paused, and a busy animation while Show in Video waits for it, in the highlight colour
+// (LoadingArc) on a backing in the window's colour: a highlight can be as dark as the pane is
+// until mpv draws there, and every palette sets its highlight apart from its window colour. While
+// the window's columns are dragged, the video's frame is stretched across its changing size, and
+// drawn again at its size once the drag ends.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -31,14 +34,41 @@ Control {
     property bool columnsResizing: false
     // The window's line between parts, drawn here between the finding and its episode's log.
     required property color separator
+    // Whether Reject and Accept have a finding to act on, which the window decides, as its menu and
+    // keys act on the same one.
+    required property bool canDecide
+    // The window's own font, which the decision row takes rather than this panel's: its buttons
+    // follow the window's size of text, as the menus and the toolbar do.
+    required property font windowFont
+    // The least width that shows the decision row's three buttons whole, which follows the window's
+    // size of text and the style's buttons; the window never makes the panel narrower.
+    readonly property real leastWidth: decisions.implicitWidth
     // Whether a greyed episode's log shows alone, in the finding's place. Its end can move no
     // selection, as a click on the finding's own row does not, so the finding comes back at its
-    // top here, as another finding opens at its own, rather than as far down as the log was.
+    // top here, as another finding opens at its own, rather than as far down as the log was. An
+    // edit stays open under it, as opening the episode moves no selection; the edit's field, hidden
+    // with the finding, gives the window its keys meanwhile, and takes them back with the words
+    // typed in it when the finding shows again.
     readonly property bool showingEpisode: bridge.showingEpisode
+    // Where the field's cursor goes as the edit a click on the fix asked for opens: at the line's
+    // character nearest the click, or at the end for -1. It waits for editOpened, as the field
+    // takes review's wording only then, and goes with review's answer to the Edit, which can open
+    // none, with the selection, and with an Edit asked otherwise, by E or a menu (Main.qml), so
+    // that a click's place never reaches a later edit, another finding's, or one asked before
+    // review answered it.
+    property int cursorAt: -1
+
+    // A right-click on the finding asks for its row's menu, at `at` in the panel's coordinates. A
+    // greyed episode's log, in the finding's place, has none: the finding it would act on is not in
+    // view.
+    signal menuAsked(point at)
 
     onShowingEpisodeChanged: {
         if (!panel.showingEpisode) {
             (scroll.contentItem as Flickable).contentY = 0;
+            if (panel.bridge.editing) {
+                panel.focusField();
+            }
         }
     }
 
@@ -79,6 +109,23 @@ Control {
         view.contentY = Math.max(0, Math.min(logHeading.y, view.contentHeight - view.height));
     }
 
+    // Gives the edit's field the keys, scrolled into view the least way if the panel was scrolled
+    // past it, so that what is typed is seen. The field and the column are laid out first, as the
+    // field has only just shown and would be placed at the next frame.
+    function focusField() {
+        const field = fixedBlock.field;
+        fixedBlock.contentItem.ensurePolished();
+        content.ensurePolished();
+        const view = scroll.contentItem as Flickable;
+        const top = field.mapToItem(view.contentItem, 0, 0).y;
+        if (top < view.contentY) {
+            view.contentY = top;
+        } else if (top + field.height > view.contentY + view.height) {
+            view.contentY = top + field.height - view.height;
+        }
+        field.forceActiveFocus();
+    }
+
     // Another finding opens at its top; the same one, refreshed, stays where it was scrolled to.
     // What the check said of an episode with no findings, shown for a click on it, is scrolled to:
     // the panel can be scrolled down the finding it takes the place of.
@@ -87,9 +134,28 @@ Control {
 
         function onSelectionMoved() {
             (scroll.contentItem as Flickable).contentY = 0;
+            panel.cursorAt = -1;
         }
         function onEpisodeShown() {
             panel.scrollToLog();
+        }
+        // The field starts from review's wording once, as the edit opens, and is the person's from
+        // then on: bound to the bridge, it would put review's wording back over the typing at every
+        // change review sends while the edit is open.
+        function onEditOpened() {
+            const field = fixedBlock.field;
+            field.text = panel.bridge.editWording;
+            field.cursorPosition = panel.cursorAt >= 0 ? Math.min(panel.cursorAt, field.length)
+                                                        : field.length;
+            panel.cursorAt = -1;
+            panel.focusField();
+        }
+        // With no edit open, review took the Edit while it asked, say: the click's ask ends.
+        function onEditAnswered() {
+            panel.cursorAt = -1;
+            if (!panel.bridge.editing) {
+                fixedBlock.answered();
+            }
         }
     }
 
@@ -141,6 +207,51 @@ Control {
             }
         }
 
+        // Fixed between the video and what scrolls, so that it never scrolls away nor moves with
+        // the finding's length. Greyed with nothing to act on, never hidden, so that it keeps its
+        // place.
+        Control {
+            id: decisions
+
+            objectName: "decisions"
+            font: panel.windowFont
+            leftPadding: 8
+            rightPadding: 8
+            topPadding: 6
+            bottomPadding: 6
+            Layout.fillWidth: true
+
+            contentItem: RowLayout {
+                spacing: 6
+
+                Button {
+                    objectName: "undoButton"
+                    text: qsTr("Undo")
+                    enabled: !panel.bridge.editing
+                    focusPolicy: Qt.NoFocus
+                    onClicked: panel.bridge.undo()
+                }
+                Item {
+                    Layout.fillWidth: true
+                }
+                Button {
+                    objectName: "rejectButton"
+                    text: qsTr("Reject")
+                    enabled: panel.canDecide
+                    focusPolicy: Qt.NoFocus
+                    onClicked: panel.bridge.reject()
+                }
+                Button {
+                    objectName: "acceptButton"
+                    text: qsTr("Accept")
+                    enabled: panel.canDecide
+                    focusPolicy: Qt.NoFocus
+                    highlighted: true
+                    onClicked: panel.bridge.accept()
+                }
+            }
+        }
+
         ScrollView {
             id: scroll
 
@@ -167,6 +278,9 @@ Control {
                     spacing: 2
                     visible: panel.detail.shown && !panel.bridge.showingEpisode
                     Layout.fillWidth: true
+                    ContextMenu.onRequested: position => {
+                        panel.menuAsked(finding.mapToItem(panel, position));
+                    }
 
                     RowLayout {
                         Layout.topMargin: 8
@@ -215,15 +329,25 @@ Control {
                         Layout.fillWidth: true
                     }
                     ChangeBlock {
+                        id: fixedBlock
+
                         objectName: "fixedBlock"
                         label: panel.detail.edited ? qsTr("+ With your wording")
                                                    : qsTr("+ With the fix")
                         line: panel.detail.fixed
                         tone: panel.detail.newTone
                         minLines: 2
+                        editing: panel.bridge.editing && !panel.showingEpisode
+                        rewordable: panel.canDecide && panel.bridge.canEdit
                         Layout.topMargin: 8
                         Layout.bottomMargin: 4
                         Layout.fillWidth: true
+                        onSaved: wording => panel.bridge.reword(wording)
+                        onCancelled: panel.bridge.cancelEdit()
+                        onRewordAsked: at => {
+                            panel.cursorAt = at;
+                            panel.bridge.edit();
+                        }
                     }
                     Lines {
                         objectName: "banners"

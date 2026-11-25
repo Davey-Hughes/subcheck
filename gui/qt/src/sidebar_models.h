@@ -39,6 +39,16 @@ public:
 
     // The path of the folder at `row`, for `OpenFolder`; none outside the list.
     std::optional<std::string> pathAt(int row) const;
+    // The row of the first folder whose view is shown, which the sidebar keeps in view; -1 for
+    // none.
+    Q_INVOKABLE int openRow() const;
+
+signals:
+    // openRow() is another row after a set, or the list is a new one with a folder open: a view
+    // shows a new list from its top, where the open folder may be out of view at the same row. The
+    // same list changed in place with the same folder open says nothing, as the view keeps its
+    // place.
+    void openMoved();
 
 private:
     std::vector<subcheck_ffi::FolderView> folders;
@@ -122,6 +132,15 @@ public:
     // decided still has them to show.
     static bool hasNoFindings(const subcheck_ffi::FileView &file);
 
+signals:
+    // The mark may be out of the list's view: follow() has moved it onto a row, or a splice has
+    // removed rows while the marked file is still listed, which can take the rows the view showed.
+    // A mark moved off the list says nothing, as there is no row to show; nor does a splice that
+    // only changes rows in place or inserts them, as a check's progress does at each step: the
+    // view keeps its place through those, and a list scrolled back to the mark at each would fight
+    // a person scrolling it.
+    void followed();
+
 private:
     template <typename M, typename I>
     friend bool splice(M &, std::vector<I> &, uint64_t, uint64_t, const std::vector<I> &);
@@ -129,7 +148,7 @@ private:
     int rowOf(const std::string &file) const;
 
     std::vector<subcheck_ffi::FileView> files;
-    std::string followed;
+    std::string marked;
 };
 
 // The episodes as the sidebar lists them: in review's order, or, while noFindingsLast is on, with
@@ -153,7 +172,7 @@ public:
     // The row of the episodes that `row` of this list shows; none outside the list.
     std::optional<int> sourceRow(int row) const;
     // The row of this list that shows the marked episode (CurrentRole), or -1 with none marked,
-    // which the sidebar scrolls to as the order changes.
+    // which the sidebar scrolls to as the order changes and as the mark moves.
     Q_INVOKABLE int markedRow() const;
 
 signals:
@@ -161,6 +180,9 @@ signals:
     // The list is in its new order after a change of noFindingsLast, so that a row read then is
     // that order's. The sorts review's splices make do not emit it.
     void reordered();
+    // The episodes' followed(), once this list is in step with them, so that markedRow() read
+    // then is the row the mark is on.
+    void markMoved();
 
 protected:
     // A row with findings before one without while noFindingsLast is on; otherwise, and within

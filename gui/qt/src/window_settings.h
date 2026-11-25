@@ -1,8 +1,9 @@
 // What the window remembers between runs: its size, the place of its frame where the platform lets
 // a window place itself, and the widths of its sidebar and details panel, the list taking what is
-// left; what the Settings window chooses, the palette and the size of each part's text; and whether
-// the View menu lists the episodes without findings last. The frame's place is what is kept and
-// what is restored, so that a window comes back to one place however many times it starts.
+// left; what the Settings window chooses, the palette and the size of each part's text; the style
+// the list draws its rows in; and whether the View menu lists the episodes without findings last.
+// The frame's place is what is kept and what is restored, so that a window comes back to one place
+// however many times it starts.
 #pragma once
 
 #include <QFont>
@@ -34,10 +35,10 @@ class WindowSettings : public QObject {
     // palette's name and words, in the Settings window's order, as {key, label}.
     Q_PROPERTY(QString colours READ colours WRITE setColours NOTIFY coloursChanged)
     Q_PROPERTY(QVariantList colourChoices READ colourChoices CONSTANT)
-    // The size of the text, in points, of each part of the window: the menus, toolbar, sidebar,
-    // status line and dialogs; the findings list with its heading; and the details panel. Unset,
-    // each is the platform's. Whole and half points only, from 6 to 24: a size kept outside that,
-    // or not a number, reads as the platform's.
+    // The size of the text, in points, of each part of the window: the menus, toolbar, the buttons
+    // under the video, sidebar, status line and dialogs; the findings list with its heading; and
+    // the details panel. Unset, each is the platform's. Whole and half points only, from 6 to 24: a
+    // size kept outside that, or not a number, reads as the platform's.
     Q_PROPERTY(
         qreal windowTextSize READ windowTextSize WRITE setWindowTextSize NOTIFY textSizesChanged)
     Q_PROPERTY(qreal listTextSize READ listTextSize WRITE setListTextSize NOTIFY textSizesChanged)
@@ -50,6 +51,9 @@ class WindowSettings : public QObject {
     // (EpisodeOrder). Off until set: a kept value is on only if it is true.
     Q_PROPERTY(bool noFindingsLast READ noFindingsLast WRITE setNoFindingsLast NOTIFY
                    noFindingsLastChanged)
+    // The style the findings list draws its rows in, by its kept name: "compact", "twoLines" or
+    // "rich". Two Lines until another is chosen: unset, or a name no style has, reads as it.
+    Q_PROPERTY(QString rowStyle READ rowStyle WRITE setRowStyle NOTIFY rowStyleChanged)
 
 public:
     // `store` is where they stick: the app's own settings (appStore), or a test's file. `platform`
@@ -139,11 +143,16 @@ public:
     // Kept at once.
     void setNoFindingsLast(bool on);
 
+    QString rowStyle() const;
+    // Kept at once; a name no style has keeps Two Lines.
+    void setRowStyle(const QString &name);
+
 signals:
     void columnsChanged();
     void coloursChanged();
     void textSizesChanged();
     void noFindingsLastChanged();
+    void rowStyleChanged();
 
 private:
     // The window as it last said it was, read whole at each thing it says: a platform can report a
