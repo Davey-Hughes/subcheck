@@ -18,6 +18,7 @@
 #include <QClipboard>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QFont>
@@ -40,6 +41,7 @@
 #include <QStyleHints>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QTimer>
 #include <QtMath>
 #include <QtQml/QQmlExtensionPlugin>
 
@@ -196,9 +198,26 @@ struct Shown {
     // not running.
     ~Shown() {
         if (engine.rootObjects().contains(window)) {
-            static_cast<void>(
-                QTest::qWaitFor([this] { return videoNotLaidOut().isEmpty(); }, 1000));
+            static_cast<void>(runUntil([this] { return videoNotLaidOut().isEmpty(); }, 1000));
         }
+    }
+
+    // Runs the events until `done` holds, or for `ms` all the same, in an event loop as the app
+    // runs them, not QTest's waits, which sleep between rounds of events: slept through while the
+    // video's place settles, Qt's animation timer is left to stop a driver that has already
+    // stopped, and Qt warns that it is not running in the next test.
+    static bool runUntil(const std::function<bool()> &done, int ms = 5000) {
+        QElapsedTimer clock;
+        clock.start();
+        while (!done()) {
+            if (clock.elapsed() >= ms) {
+                return false;
+            }
+            QEventLoop round;
+            QTimer::singleShot(5, &round, &QEventLoop::quit);
+            round.exec();
+        }
+        return true;
     }
 
     explicit Shown(std::vector<std::string> selector, const QString &kept = {},
@@ -461,7 +480,7 @@ private:
         }
         window->requestActivate();
         return QTest::qWaitForWindowActive(window) &&
-               QTest::qWaitFor([this] { return videoNotLaidOut().isEmpty(); });
+               runUntil([this] { return videoNotLaidOut().isEmpty(); });
     }
 };
 
@@ -6317,6 +6336,8 @@ Window {
         QCOMPARE(word->property("text").toString(), "Paused");
         QVERIFY(bars->isVisible());
         QVERIFY(!triangle->isVisible());
+        // One width playing and paused: this can fail only in a font that sets the two words more
+        // than half a pixel apart, as DejaVu, CI's, does; in the desktop's font it cannot.
         layOut(bar);
         const qreal pausedWidth = play->width();
         mpv->heard(QStringLiteral("vo-configured"), true);
