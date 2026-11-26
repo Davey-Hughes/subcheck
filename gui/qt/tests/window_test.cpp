@@ -679,6 +679,39 @@ void toTheLeastWidth(Shown &w) {
                        .arg(leastWindowWidth(w))));
 }
 
+// The window grown until the details' view holds the details panel's block with the fix whole, its
+// foot above the view's sideways scroll bar, which lies along the view's foot and takes a click
+// there: in the narrowest panel at the largest size of text, what is above the block wraps at the
+// panel's width and can push it that far down at the window's first height. Grown, not scrolled to,
+// for the reason roomForTheBar gives.
+void roomForTheFix(Shown &w) {
+    QQuickItem *fixed = w.item("fixedBlock");
+    QQuickItem *scroll = w.item("detailsScroll");
+    QVERIFY2(fixed && scroll, "no fixedBlock or detailsScroll");
+    QQuickItem *sideways = nullptr;
+    const QList<QQuickItem *> parts = scroll->childItems();
+    for (QQuickItem *part : parts) {
+        if (part->inherits("QQuickScrollBar") &&
+            part->property("orientation").value<Qt::Orientation>() == Qt::Horizontal) {
+            sideways = part;
+        }
+    }
+    QVERIFY2(sideways, "no sideways scroll bar");
+    // How far the block's foot lies below the bar's top.
+    const auto below = [fixed, sideways] {
+        return fixed->mapToScene(QPointF(0, fixed->height())).y() -
+               sideways->mapToScene(QPointF(0, 0)).y();
+    };
+    layOut(w.item("details"));
+    if (below() > 0) {
+        w.window->resize(w.window->width(), w.window->height() + qCeil(below()));
+    }
+    QTRY_VERIFY2(
+        below() <= 0 && inDetailsView(w, fixed),
+        qPrintable(
+            QStringLiteral("the block's foot is %1 below the scroll bar's top").arg(below())));
+}
+
 // The outline of the findings list's highlight, which marks the selected row.
 QColor selectionOutline(const Shown &w) {
     auto *selection = w.find("findings")->property("highlightItem").value<QQuickItem *>();
@@ -3443,6 +3476,122 @@ Window {
         QTRY_COMPARE(drawn("timing"), detail->timing());
     }
 
+    void theDetailsHeaderFitsTheNarrowestPanelAtTheLargestSize_data() {
+        QTest::addColumn<qreal>("points");
+        QTest::newRow("window text at the platform's size") << qreal(0);
+        QTest::newRow("window text at 6 pt") << 6.0;
+        QTest::newRow("window text at 24 pt") << 24.0;
+    }
+    // At the largest size of the details' text, in the narrowest details panel the window keeps at
+    // each size of its own text, the finding's kind, place and state each end inside the panel's
+    // column, the state whole while the badge leaves it the room and cut short otherwise, and the
+    // finding's blocks and the episode log's heading are no wider than the column: for review's
+    // first finding, a rejected one, and a timing one, whose wider badge can leave the state too
+    // little room.
+    void theDetailsHeaderFitsTheNarrowestPanelAtTheLargestSize() {
+        QFETCH(qreal, points);
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        if (points > 0) {
+            w.settings.setWindowTextSize(points);
+        }
+        w.settings.setDetailsTextSize(24);
+        QQuickItem *panel = w.item("details");
+        QVERIFY(panel);
+        // Whether the window and its video's place are laid out at the sizes of text, the window's
+        // least width the one they ask for, and, once `resized`, the window at it. Waited for in an
+        // event loop, after the sizes of text and again at the least width, for the reason
+        // Shown::runUntil gives.
+        const auto settled = [&w, panel](bool resized) {
+            const int least = leastWindowWidth(w);
+            return w.videoNotLaidOut().isEmpty() && w.window->minimumWidth() == least &&
+                   (!resized || qAbs(panel->width() - (least - 160 - 260 - 2)) < 0.5);
+        };
+        QVERIFY2(Shown::runUntil([&settled] { return settled(false); }),
+                 qPrintable(w.videoNotLaidOut()));
+        toTheLeastWidth(w);
+        if (QTest::currentTestFailed()) {
+            return;
+        }
+        QVERIFY2(Shown::runUntil([&settled] { return settled(true); }),
+                 qPrintable(QStringLiteral("the panel is %1 wide in a window %2 wide; %3")
+                                .arg(panel->width())
+                                .arg(w.window->width())
+                                .arg(w.videoNotLaidOut())));
+        DetailView *detail = w.bridge.detail();
+        QTRY_VERIFY(detail->shown());
+        QTRY_VERIFY(!w.bridge.episodeLog().isEmpty());
+        QTRY_VERIFY(Shown::item(panel, "episodeLogHeading")->isVisible());
+        QQuickItem *badge = Shown::item(panel, "detailKind")->parentItem();
+        QQuickItem *row = badge->parentItem();
+        QQuickItem *state = Shown::item(panel, "state");
+        QCOMPARE(state->property("font").value<QFont>().pointSizeF(), 24.0);
+
+        // What keeps `finding`'s header and blocks from lying inside the panel's column as the
+        // window lays them out next, said; nothing once they do.
+        const auto off = [&w, panel, badge, row, state](const QString &finding) {
+            layOut(panel);
+            QStringList said;
+            const std::vector<std::pair<const char *, QQuickItem *>> parts = {
+                {"the badge", badge},
+                {"the place", Shown::item(panel, "place")},
+                {"the state", state}};
+            for (const auto &[name, part] : parts) {
+                const qreal end = part->mapToItem(panel, QPointF(part->width(), 0)).x();
+                if (end > panel->width() - 8 + 0.5) {
+                    said << QStringLiteral("%1 ends at %2 in a panel %3 wide")
+                                .arg(QLatin1String(name))
+                                .arg(end)
+                                .arg(panel->width());
+                }
+            }
+            const qreal room =
+                row->width() - badge->width() - 2 * row->property("spacing").toReal();
+            const bool truncated = state->property("truncated").toBool();
+            const bool whole = !truncated && state->width() >= state->implicitWidth() - 0.5;
+            if (state->implicitWidth() <= room ? !whole : !truncated) {
+                said << QStringLiteral("the state is %1 wide of %2%3, with %4 beside the badge")
+                            .arg(state->width())
+                            .arg(state->implicitWidth())
+                            .arg(truncated ? QStringLiteral(", cut short") : QString())
+                            .arg(room);
+            }
+            const qreal column = detailsView(w)->width() - 16;
+            for (const char *name : {"nowBlock", "fixedBlock", "episodeLogHeading"}) {
+                QQuickItem *block = Shown::item(panel, name);
+                if (block->width() > column + 0.5) {
+                    said << QStringLiteral("%1 is %2 wide in a column %3 wide")
+                                .arg(QLatin1String(name))
+                                .arg(block->width())
+                                .arg(column);
+                }
+            }
+            // The heading's words wrap inside it, rather than run past its right edge.
+            QQuickItem *heading = Shown::item(panel, "episodeLogHeading");
+            const qreal words = heading->property("contentWidth").toReal();
+            if (words > heading->width() + 0.5) {
+                said << QStringLiteral("the log's heading draws %1 wide in its %2")
+                            .arg(words)
+                            .arg(heading->width());
+            }
+            return said.isEmpty() ? QString() : finding + ": " + said.join(QStringLiteral("; "));
+        };
+
+        QCOMPARE(w.bridge.selected(), 0);
+        QTRY_VERIFY2(off("row 0").isEmpty(), qPrintable(off("row 0")));
+        subcheck_ffi::Detail finding = everyPartOfAFinding();
+        detail->show(finding);
+        QCOMPARE(detail->stateWord(), "Rejected");
+        QTRY_VERIFY2(off("rejected").isEmpty(), qPrintable(off("rejected")));
+        finding.kind = subcheck_ffi::Kind(subcheck_ffi::Kind::kTiming{
+            {{2, std::nullopt, 60'000}}, {{1'000, 2'000}}, std::nullopt});
+        finding.state = subcheck_ffi::State::kPending;
+        detail->show(finding);
+        QCOMPARE(detail->stateWord(), "To review");
+        QTRY_VERIFY2(off("timing").isEmpty(), qPrintable(off("timing")));
+    }
+
     // Another finding opens at the top of the details panel, however far the last was scrolled;
     // the same finding, refreshed in place by a decision on it, stays where it was.
     void anotherFindingOpensAtTheTopOfTheDetails() {
@@ -4752,6 +4901,7 @@ Window {
                                     .arg(line->height())
                                     .arg(large.lineSpacing())));
         QTRY_VERIFY(area->isVisible());
+        roomForTheFix(w);
         QTRY_VERIFY(inDetailsView(w, line));
         from = w.bridge.sent.size();
         QTest::mouseClick(w.window, Qt::LeftButton, {},
@@ -4815,6 +4965,7 @@ Window {
             const qreal spacing =
                 QFontMetricsF(line->property("font").value<QFont>()).lineSpacing();
             QTRY_VERIFY(line->property("contentHeight").toReal() >= 1.5 * spacing);
+            roomForTheFix(w);
         } else {
             askRoomForOneLine(w, line);
             if (QTest::currentTestFailed()) {
@@ -5072,6 +5223,7 @@ Window {
             QTRY_COMPARE(w.window->width(), w.window->minimumWidth());
             QTRY_COMPARE(fixNotLaidOut(w, w.window->property("detailsLeast").toReal()), QString());
             QVERIFY2(drawnLines() >= 2, qPrintable(QString::number(drawnLines())));
+            roomForTheFix(w);
         } else {
             askRoomForOneLine(w, line);
             if (QTest::currentTestFailed()) {

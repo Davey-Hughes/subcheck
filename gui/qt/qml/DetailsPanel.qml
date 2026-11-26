@@ -258,10 +258,15 @@ Control {
                     }
 
                     RowLayout {
+                        id: row
+
                         Layout.topMargin: 8
+                        Layout.fillWidth: true
                         spacing: 6
 
                         Rectangle {
+                            id: badge
+
                             color: panel.detail.kindTone
                             radius: 3
                             implicitWidth: kind.implicitWidth + 10
@@ -283,11 +288,19 @@ Control {
                             elide: Text.ElideRight
                             Layout.fillWidth: true
                         }
+                        // No wider than the room the badge leaves it, so that the row never passes
+                        // the column: the place, which fills what is left, gives way first, and the
+                        // state, which each decision changes, is cut short only once the place has
+                        // no room left.
                         Label {
                             objectName: "state"
                             text: panel.detail.glyph + " " + panel.detail.stateWord
                             textFormat: Text.PlainText
                             color: panel.detail.stateTone
+                            elide: Text.ElideRight
+                            Layout.preferredWidth: Math.min(implicitWidth,
+                                                            Math.max(0, row.width - badge.width
+                                                                        - 2 * row.spacing))
                         }
                     }
 
@@ -421,6 +434,9 @@ Control {
                     Layout.fillWidth: true
                     Layout.topMargin: 10
                 }
+                // Wrapped at the column's width: unwrapped, the heading is as wide as its words at
+                // the least, the column lays out all it holds at least that wide, and the view cuts
+                // every block of the finding at its right edge.
                 Heading {
                     id: logHeading
 
@@ -428,6 +444,8 @@ Control {
                     text: qsTr("What the check said of %1").arg(panel.bridge.episodeName)
                     textFormat: Text.PlainText
                     visible: panel.bridge.episodeName !== ""
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
                 }
                 Lines {
                     objectName: "episodeLog"
