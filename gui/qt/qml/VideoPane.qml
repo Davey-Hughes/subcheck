@@ -36,6 +36,11 @@ Control {
     // The bar's Pop Out, or Pop In, was clicked.
     signal popAsked()
 
+    // The control bar's height were the pane `width` wide.
+    function barHeightAt(width: real): real {
+        return bar.heightAt(width);
+    }
+
     objectName: "videoPane"
 
     MpvItem {

@@ -50,6 +50,11 @@ Control {
     // the window never makes the panel narrower. The bar counts while the video is out too, on
     // purpose: the window then does not grow wider at once as the video comes back in.
     readonly property real leastWidth: Math.max(decisions.implicitWidth, videoLeastWidth)
+    // The least height the panel keeps under the video's place: the decisions' row whole, and
+    // under it the finding's first three lines of the panel's text below its top margin, so that
+    // what Accept and Reject act on can be read. The window counts it in its least height.
+    readonly property real leastHeightUnderVideo: decisions.implicitHeight
+                                                  + 3 * detailsLine.lineSpacing + 8
     // Whether a greyed episode's log shows alone, in the finding's place. Its end can move no
     // selection, as a click on the finding's own row does not, so the finding comes back at its
     // top here, as another finding opens at its own, rather than as far down as the log was. An
@@ -77,6 +82,12 @@ Control {
                 panel.focusField();
             }
         }
+    }
+
+    FontMetrics {
+        id: detailsLine
+
+        font: panel.font
     }
 
     component Heading: Label {

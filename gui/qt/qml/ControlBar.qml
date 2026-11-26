@@ -35,6 +35,26 @@ Control {
     // Pop Out, or Pop In, was clicked: the window takes the video out or puts it back.
     signal popAsked()
 
+    // The bar's height were it `width` wide, its groups wrapped as its Flow wraps them: a group
+    // that would pass the line's end starts a line, but for a line's first, and a line is as tall
+    // as its tallest group. The window keeps room for the bar at a width it is not laid out at.
+    function heightAt(width: real): real {
+        const room = width - bar.leftPadding - bar.rightPadding;
+        let height = 0;
+        let line = 0;
+        let x = 0;
+        for (const group of [playGroup, seekGroup, popGroup]) {
+            if (x > 0 && x + group.implicitWidth > room) {
+                height += line + groups.spacing;
+                line = 0;
+                x = 0;
+            }
+            x += group.implicitWidth + groups.spacing;
+            line = Math.max(line, group.implicitHeight);
+        }
+        return height + line + bar.topPadding + bar.bottomPadding;
+    }
+
     objectName: "controlBar"
     enabled: keysToReview
     leftPadding: 8
@@ -74,6 +94,8 @@ Control {
     }
 
     contentItem: Flow {
+        id: groups
+
         spacing: 6
 
         RowLayout {

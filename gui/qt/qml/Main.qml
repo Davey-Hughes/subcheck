@@ -67,7 +67,17 @@ ApplicationWindow {
     font.pointSize: settings.windowTextSize
 
     minimumWidth: sidebarLeast + listLeast + detailsLeast + handles
-    minimumHeight: 480
+    // Never so short that the details panel cuts off its row of decisions: room for the menu bar
+    // where the window draws it, the toolbar and the status line; for the video's place, 16:9 with
+    // its bar under it, at the details panel's least width; and for the row and the finding's first
+    // lines under it. At the panel's least width, not the width it has: at that, a drag that
+    // widened the details column would make the window taller under the pointer. While the video
+    // is out, it has no place there.
+    minimumHeight: Math.max(480, Math.ceil((bar.visible ? bar.height : 0) + header.height
+                                           + footer.height
+                                           + (videoOut ? 0 : detailsLeast * 9 / 16
+                                                             + videoPane.barHeightAt(detailsLeast))
+                                           + details.leastHeightUnderVideo))
     title: bridge.title
 
     // Review decides when the window ends: closing it is quitting.

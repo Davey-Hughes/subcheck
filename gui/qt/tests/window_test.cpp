@@ -4179,9 +4179,12 @@ Window {
 
     // Undo, Reject and Accept sit in a row of their own under the video, Undo at its left and the
     // other two at its right, whole at each size of text the window takes, and the details panel
-    // and the window are never narrower than the row. The row takes the window's size of text, not
-    // the details panel's, takes no focus, and stays where it is as the details scroll, the finding
-    // changes and a decision is made and taken back.
+    // and the window are never narrower than the row. At the window's least size the row lies
+    // wholly inside the panel, with room under it for a few lines of the finding: the least height
+    // counts the video's place, whose bar takes more lines as the text grows, and while the video
+    // is out it no longer does. The row takes the window's size of text, not the details panel's,
+    // takes no focus, and stays where it is as the details scroll, the finding changes and a
+    // decision is made and taken back.
     void theDecisionsSitUnderTheVideo_data() {
         QTest::addColumn<qreal>("points");
         // Only for its least and most sizes.
@@ -4191,6 +4194,10 @@ Window {
             QGuiApplication::platformName());
         QTest::newRow("the least size") << sizes.leastHalfPoints() / 2.0;
         QTest::newRow("the platform's size") << qreal(0);
+        // Between them, where the bar under the video first wraps onto more lines at the least
+        // width, in the desktop's fonts and in DejaVu.
+        QTest::newRow("14 pt") << qreal(14);
+        QTest::newRow("18 pt") << qreal(18);
         QTest::newRow("the largest size") << sizes.mostHalfPoints() / 2.0;
     }
     void theDecisionsSitUnderTheVideo() {
@@ -4250,10 +4257,51 @@ Window {
         QVERIFY(top >= videoBottom - 0.5);
         QVERIFY(top + decisions->height() <= scroll->mapToItem(panel, QPointF()).y() + 0.5);
 
+        // At the window's least height too, the row lies wholly inside the panel, and the details'
+        // view under it holds three lines of the finding's text under the finding's top margin, to
+        // a pixel: the layouts put what they hold on whole pixels.
+        QQuickItem *view = detailsView(w);
+        const qreal threeLines =
+            3 * QFontMetricsF(panel->property("font").value<QFont>()).lineSpacing() + 8;
+        const auto offAtTheLeast = [&w, panel, decisions, view, threeLines] {
+            w.window->resize(w.window->minimumWidth(), w.window->minimumHeight());
+            QStringList off;
+            if (w.window->height() != w.window->minimumHeight()) {
+                off << QStringLiteral("the window is %1 tall, its least %2")
+                           .arg(w.window->height())
+                           .arg(w.window->minimumHeight());
+            }
+            if (const QString video = w.videoNotLaidOut(); !video.isEmpty()) {
+                off << video;
+            }
+            const qreal foot = decisions->mapToItem(panel, QPointF(0, decisions->height())).y();
+            if (foot > panel->height() + 0.5) {
+                off << QStringLiteral("the row's foot is at %1 in a panel %2 tall, the window %3 "
+                                      "tall")
+                           .arg(foot)
+                           .arg(panel->height())
+                           .arg(w.window->height());
+            }
+            if (view->height() < threeLines - 1) {
+                off << QStringLiteral("the details' view is %1 tall, not %2")
+                           .arg(view->height())
+                           .arg(threeLines);
+            }
+            return off.join(QStringLiteral("; "));
+        };
+        QTRY_VERIFY2(offAtTheLeast().isEmpty(), qPrintable(offAtTheLeast()));
+        // The height the window counts for the bar at the least width is the one it is laid out at.
+        qreal counted = 0;
+        QVERIFY(QMetaObject::invokeMethod(w.videoItem("videoPane"), "barHeightAt",
+                                          Q_RETURN_ARG(qreal, counted),
+                                          Q_ARG(qreal, slot->width())));
+        QVERIFY2(
+            qAbs(counted - bar->height()) <= 0.5,
+            qPrintable(QStringLiteral("counted %1, laid out %2").arg(counted).arg(bar->height())));
+
         // Where the row is in the window, kept and compared after what would move it.
         const auto sceneY = [decisions] { return decisions->mapToScene(QPointF()).y(); };
         const qreal kept = sceneY();
-        QQuickItem *view = detailsView(w);
         QTRY_VERIFY(view->property("contentHeight").toReal() > view->height());
         view->setProperty("contentY", view->property("contentHeight").toReal() - view->height());
         QCOMPARE(sceneY(), kept);
@@ -4266,6 +4314,22 @@ Window {
         QTest::keyClick(w.window, Qt::Key_U);
         QTRY_COMPARE(w.bridge.detail()->stateWord(), "To review");
         QCOMPARE(sceneY(), kept);
+
+        // Out, the least height no longer counts the video's place, and back in it does again.
+        const int held = w.window->minimumHeight();
+        const qreal place = slot->height();
+        QObject *popOut = w.find("popOutVideo");
+        QVERIFY(popOut);
+        QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+        QTRY_VERIFY2(qAbs(w.window->minimumHeight() - std::max(480.0, held - place)) <= 1,
+                     qPrintable(QStringLiteral("held, the least height %1, the place %2 tall; out, "
+                                               "%3")
+                                    .arg(held)
+                                    .arg(place)
+                                    .arg(w.window->minimumHeight())));
+        QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+        QTRY_COMPARE(w.window->minimumHeight(), held);
+        QTRY_VERIFY(w.videoNotLaidOut().isEmpty());
     }
 
     // Accept and Reject act on the finding shown, so with none to act on they are greyed, never
