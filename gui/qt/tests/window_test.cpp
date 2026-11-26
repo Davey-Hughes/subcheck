@@ -6631,6 +6631,60 @@ Window {
         QCOMPARE(w.since(moved), QStringList{"Move 1"});
     }
 
+    // E typed in the pop-out opens the edit and gives the main window back the keys, so that the
+    // letters typed next go on into the edit's field and none of the main window's keys runs: the
+    // pop-out's keys are the main window's shortcuts, J's move and Q's quit among them, which would
+    // end the edit, dropping the wording, or quit.
+    void eTypedInThePopOutGivesTheEditsFieldTheKeys() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QVERIFY(QMetaObject::invokeMethod(w.find("popOutVideo"), "trigger"));
+        QQuickWindow *video = w.videoWindow();
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(video && field);
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(video));
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(video, Qt::Key_E);
+        QTRY_VERIFY(w.bridge.editing());
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+        QTRY_VERIFY(field->hasActiveFocus());
+        const QString wording = field->property("text").toString();
+        QTest::keyClick(QGuiApplication::focusWindow(), 'j');
+        QTest::keyClick(QGuiApplication::focusWindow(), 'q');
+        QCOMPARE(w.since(from), QStringList{"Edit"});
+        QVERIFY(w.bridge.editing());
+        QCOMPARE(field->property("text").toString(), wording + "jq");
+        // Ended unsaved, so that the run is left as found.
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!w.bridge.editing());
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
+    }
+
+    // Ctrl+F typed in the pop-out gives the Find box the keys, and the main window with them, so
+    // that the letters typed next go into the box and none of the main window's keys runs.
+    void ctrlFTypedInThePopOutGivesTheFindBoxTheKeys() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QVERIFY(QMetaObject::invokeMethod(w.find("popOutVideo"), "trigger"));
+        QQuickWindow *video = w.videoWindow();
+        QQuickItem *field = w.item("findField");
+        QVERIFY(video && field);
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(video));
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(video, Qt::Key_F, Qt::ControlModifier);
+        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+        QTRY_VERIFY(field->hasActiveFocus());
+        QTest::keyClick(QGuiApplication::focusWindow(), 'j');
+        QTest::keyClick(QGuiApplication::focusWindow(), 'q');
+        QCOMPARE(w.since(from), QStringList());
+        QCOMPARE(field->property("text").toString(), "jq");
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!field->hasActiveFocus());
+        QCOMPARE(w.since(from), QStringList());
+    }
+
     // Show in Video while the video is out: the busy animation shows in the pop-out once the wait
     // has lasted its moment, in place of the quiet line, and the title follows the file once it
     // shows.
@@ -9026,7 +9080,8 @@ Window {
     // shows, so that nothing of the video draws over the dialog, which the window draws in its
     // scene; and Pop Out waits, as the window has nothing left to show. The same whether review
     // ends before the window's first frame, as main.cpp starts it, with the video's window held,
-    // or with it out.
+    // or with it out, when the window takes the keys the pop-out had, so that Esc reaches the
+    // dialog.
     void aFatalEndTakesTheVideoOutFromUnderItsDialog() {
         enum class Before { FirstFrame, Held, Out };
         for (const Before before : {Before::FirstFrame, Before::Held, Before::Out}) {
@@ -9049,6 +9104,7 @@ Window {
                     QVERIFY2(QMetaObject::invokeMethod(popOut, "trigger"), round);
                     QVERIFY2(w.window->property("videoOut").toBool(), round);
                     QVERIFY2(video->isVisible(), round);
+                    QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(video));
                 } else {
                     QCOMPARE(container->property("window").value<QWindow *>(), video);
                 }
@@ -9060,6 +9116,9 @@ Window {
             QVERIFY2(video, round);
             QVERIFY2(!video->isVisible(), round);
             QVERIFY2(!popOut->property("enabled").toBool(), round);
+            if (before == Before::Out) {
+                QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+            }
         }
     }
 };

@@ -263,13 +263,21 @@ ApplicationWindow {
             // Gives the Find box the keys, its words selected. It waits while an edit is open: from
             // the box, Return selects another row, which ends the edit and drops its typed wording.
             // It does not wait while a greyed episode's view shows: what it does is select a row,
-            // which ends that view, as a click on a row does.
+            // which ends that view, as a click on a row does. Typed in the popped-out video, it
+            // gives this window the keys too, as the box is this window's: left with the pop-out,
+            // whose keys are this window's shortcuts, the next letter would run one, not go into
+            // the box.
             Action {
                 objectName: "find"
                 enabled: window.keysToReview && !window.bridge.editing
                 text: qsTr("&Find…")
                 shortcut: "Ctrl+F"
-                onTriggered: findBox.take()
+                onTriggered: {
+                    findBox.take();
+                    if (window.videoOut) {
+                        window.requestActivate();
+                    }
+                }
             }
         }
         WholeMenu {
@@ -933,6 +941,20 @@ ApplicationWindow {
         function onFatalChanged() {
             if (window.bridge.fatal !== "") {
                 videoWindow.visible = false;
+                // Out, this window takes the keys the pop-out had, so that Esc reaches the error's
+                // dialog: not every window manager gives a hidden window's keys to the window it
+                // is transient for.
+                if (window.videoOut) {
+                    window.requestActivate();
+                }
+            }
+        }
+        // An edit opened while the video is out, by E typed in the pop-out say, gives this window
+        // the keys, so that the edit's field has them: left with the pop-out, whose keys are this
+        // window's shortcuts, the next letter would run one, which would end the edit or quit.
+        function onEditOpened() {
+            if (window.videoOut) {
+                window.requestActivate();
             }
         }
     }
