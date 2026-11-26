@@ -16,6 +16,7 @@
 
 #include <QAccessible>
 #include <QClipboard>
+#include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -195,11 +196,15 @@ struct Shown {
     // Taken down once its video's place is laid out, or after a second all the same: the video's
     // window lays its bar out a frame or more after this one changes size, and this one answers
     // with a layout of its own; taken down between the two, Qt warns that its animation driver is
-    // not running.
+    // not running. Then what is still posted runs while the windows stand: Qt's animation timer
+    // stops itself by a queued call, which, left to run once the windows have gone, finds the
+    // driver stopped and warns in the next test.
     ~Shown() {
         if (engine.rootObjects().contains(window)) {
             static_cast<void>(runUntil([this] { return videoNotLaidOut().isEmpty(); }, 1000));
         }
+        QCoreApplication::sendPostedEvents();
+        QCoreApplication::processEvents();
     }
 
     // Runs the events until `done` holds, or for `ms` all the same, in an event loop as the app
@@ -1061,6 +1066,10 @@ private slots:
         // A warning from the QML at run time, a binding loop say, which qmllint cannot see, fails
         // the test that met it.
         QTest::failOnWarning(QRegularExpression(QStringLiteral("\\.qml:\\d+")));
+        // So does Qt's warning that its animation driver is not running, which a window taken down
+        // too early leaves for the next test (Shown's teardown): ctest prints nothing of a test
+        // that passes, so a warning that was only printed would go unseen.
+        QTest::failOnWarning(QRegularExpression(QStringLiteral("^QUnifiedTimer::")));
     }
 
     void theKeysAndAClickDriveReview() {
