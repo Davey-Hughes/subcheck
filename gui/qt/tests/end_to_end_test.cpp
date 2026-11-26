@@ -287,7 +287,8 @@ private slots:
         QVERIFY(xdotool({"key", "ctrl+w"}));
         QTRY_VERIFY_WITH_TIMEOUT(!xdotool(QStringList{"search"} + outside), 5000);
         QCOMPARE(ask(socket, "vo-configured").value("data").toBool(), true);
-        // A second back, from the main window.
+        // Pop In gave the main window back the keys: `,`, sent to the window that has them, seeks
+        // a second back from there.
         QVERIFY(xdotool({"key", "comma"}));
         QTRY_COMPARE_WITH_TIMEOUT(ask(socket, "time-pos").value("data").toDouble(), 2.0, 5000);
         quit(app);

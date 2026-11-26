@@ -95,34 +95,34 @@ its line as the subtitles have it now in a block above the line with the fix. Th
 of the window, under the menus where the window draws them, shows the view's name and its counts,
 and at its right the Find box (below). Under the video and its bar a row of its own holds Undo at
 the left and Reject and Accept at the right, in the window's size of text, and stays put as the
-details scroll. An episode the check found nothing in is
-greyed in the sidebar and says `No findings`. A click on one shows what its check said, alone under
-the video; the finding you were on stays greyed in the list, as the episode has none to go to, and
-Accept, Reject, Back to Undecided, Edit Wording…, Show in Video, Copy Subtitle Line and Show Each
-Episode wait until you move to a finding again, by a move, a click or Undo. Reject and Accept under
-the video, and Accept, Reject, Edit Wording… and Back to Undecided in the Finding menu and by A, R,
-E and X, wait too while no finding shows, as under a filter with no rows. View ▸ Episodes Without
-Findings Last lists those episodes after the rest, while N and P still go to the next and
-previous episode in review's order. File ▸ Settings… (Ctrl+, or ⌘, on macOS) opens a window of its
-own that chooses the window's colours, the default or a palette for deuteranomaly/deuteranopia,
-protanomaly/protanopia, tritanomaly/tritanopia, or little or no colour vision, with a sample, and
-the size of the text of the window, the findings list and the details panel, each the platform's
-until set; each choice applies at once, Esc or Ctrl+W (⌘W on macOS) closes Settings, and while
-Settings is open no key of the main window's reaches review. The menus hold the rest and show their
-keys as this paragraph writes the window's: a letter alone is that key without Shift, and Shift is
-written out, so the menu's O is the terminal's `o`, and its Shift+O (⇧O on macOS) is the terminal's
-`O`. A, R and X accept, reject and put back to undecided, E edits the wording, N and P go to the
-next and previous episode, V switches between a check and its folders, O (Show in Video) opens the
-selected finding in the video pane as the terminal's `o` does in mpv, playing on if the pane plays
-and paused if not, and Shift+O (Close Video) closes the video, leaving the pane black and review
-open; Space plays and pauses, Left and Right (← and → on macOS) seek 5 s, `,` and `.` 1 s, and `[`
-and `]` step a frame; Ctrl+Z undoes, and Ctrl+W and Ctrl+Q quit (⌘Z, ⌘W and ⌘Q on macOS), but Ctrl+W
-typed in the popped-out video (below) puts the video back. No menu shows the others: J and K (or
-Down and Up) move, Home or G goes to the first finding, End or Shift+G to the last, PgUp and PgDn
-move by the rows the list shows at once (the terminal's page is 10), F steps through the filters, U
-undoes and Q quits; none of these acts while a text field has the keys.
-No key in the window does what the terminal's `c`, `A`, `D`, Tab or `?` does. A view shows its rows
-at once: the details panel's word on an episode's file (`This episode's file is missing`, or
+details scroll. An episode the check found nothing in is greyed in the sidebar and says
+`No findings`. A click on one shows what its check said, alone under the video; the finding you were
+on stays greyed in the list, as the episode has none to go to, and Accept, Reject, Back to
+Undecided, Edit Wording…, Show in Video, Copy Subtitle Line and Show Each Episode wait until you
+move to a finding again, by a move, a click or Undo. Reject and Accept under the video, and Accept,
+Reject, Edit Wording… and Back to Undecided in the Finding menu and by A, R, E and X, wait too while
+no finding shows, as under a filter with no rows. View ▸ Episodes Without Findings Last lists those
+episodes after the rest, while N and P still go to the next and previous episode in review's order.
+File ▸ Settings… (Ctrl+, or ⌘, on macOS) opens a window of its own that chooses the window's
+colours, the default or a palette for deuteranomaly/deuteranopia, protanomaly/protanopia,
+tritanomaly/tritanopia, or little or no colour vision, with a sample, and the size of the text of
+the window, the findings list and the details panel, each the platform's until set; each choice
+applies at once, Esc or Ctrl+W (⌘W on macOS) closes Settings, and while Settings is open no key of
+the main window's reaches review. The menus hold the rest and show their keys as this paragraph
+writes the window's: a letter alone is that key without Shift, and Shift is written out, so the
+menu's O is the terminal's `o`, and its Shift+O (⇧O on macOS) is the terminal's `O`. A, R and X
+accept, reject and put back to undecided, E edits the wording, N and P go to the next and previous
+episode, V switches between a check and its folders, O (Show in Video) opens the selected finding in
+the video pane as the terminal's `o` does in mpv, playing on if the pane plays and paused if not,
+and Shift+O (Close Video) closes the video, leaving the pane black and review open; Space plays and
+pauses, Left and Right (← and → on macOS) seek 5 s, `,` and `.` 1 s, and `[` and `]` step a frame;
+Ctrl+Z undoes, and Ctrl+W and Ctrl+Q quit (⌘Z, ⌘W and ⌘Q on macOS), but Ctrl+W typed in the
+popped-out video (below) puts the video back. No menu shows the others: J and K (or Down and Up)
+move, Home or G goes to the first finding, End or Shift+G to the last, PgUp and PgDn move by the
+rows the list shows at once (the terminal's page is 10), F steps through the filters, U undoes and Q
+quits; none of these acts while a text field has the keys. No key in the window does what the
+terminal's `c`, `A`, `D`, Tab or `?` does. A view shows its rows at once: the details panel's word
+on an episode's file (`This episode's file is missing`, or
 `This episode changed since it was checked`) comes once that file's check answers, so a share that
 is slow or does not answer holds up no row. Another view, by V or a review in the sidebar, takes the
 place of the one shown once it has been read (`Opening the view…`), and until then the view shown
@@ -141,20 +141,20 @@ drag of a column or of the window's edge stays smooth. A column drag stretches t
 until the drag ends, when mpv draws it again at its new size. The window keeps its size and the
 popped-out video's, their places on X11 and macOS (Wayland lets no window place itself), its
 columns' widths, the episodes' order and its settings for the next run, in
-`$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf` on Linux and macOS
-when `XDG_CONFIG_HOME` is an absolute path; otherwise in `~/.config/subcheck/subcheck-qt.conf` on
-Linux and in the app's preferences on macOS. At the end it prints the counts as the terminal does,
-but names a view of paths as its window's title does: by the first path's last part, and `+N` for
-the others. It exits with 1 after an error, or when review has not ended 10 s after quitting, and
-with 0 otherwise. The 10 s gives one decision's write time to wait out another process's lock on the
-store, which the store waits up to 5 s for. It is not enough for several writes queued behind a lock
-held longer, or for an open that waits on the lock more than once: the window then closes review,
-which can lose a decision not yet written. Quitting waits on no file's check: the window closes and
-prints the counts at once, even while a check, or mpv's open of a file, waits on a share that does
-not answer. While mpv's open waits on such a share, the process ends about 2 s after the quit
-without waiting for mpv, with the window's settings kept as any quit keeps them. On a FUSE share
-(sshfs, rclone) the process ends only once the share answers, whatever waits on it, as no program
-can end a request a FUSE share has taken; the window is gone all the same.
+`$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf` on Linux and macOS when `XDG_CONFIG_HOME` is an
+absolute path; otherwise in `~/.config/subcheck/subcheck-qt.conf` on Linux and in the app's
+preferences on macOS. At the end it prints the counts as the terminal does, but names a view of
+paths as its window's title does: by the first path's last part, and `+N` for the others. It exits
+with 1 after an error, or when review has not ended 10 s after quitting, and with 0 otherwise. The
+10 s gives one decision's write time to wait out another process's lock on the store, which the
+store waits up to 5 s for. It is not enough for several writes queued behind a lock held longer, or
+for an open that waits on the lock more than once: the window then closes review, which can lose a
+decision not yet written. Quitting waits on no file's check: the window closes and prints the counts
+at once, even while a check, or mpv's open of a file, waits on a share that does not answer. While
+mpv's open waits on such a share, the process ends about 2 s after the quit without waiting for mpv,
+with the window's settings kept as any quit keeps them. On a FUSE share (sshfs, rclone) the process
+ends only once the share answers, whatever waits on it, as no program can end a request a FUSE share
+has taken; the window is gone all the same.
 
 Each row of the findings is drawn in one of three styles, which View ▸ Rows (Compact, Two Lines,
 Rich) or the Rows button in the list's heading chooses, and which the window keeps for the next
