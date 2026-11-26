@@ -90,11 +90,12 @@ columns: a sidebar with the reviews (one per show folder the store holds, which 
 the list shows (each filter with its count) and the view's episodes (a click selects one and its
 first finding, when it has one); the findings, in the style View ▸ Rows chooses (below), Two Lines
 until chosen; and the details panel, the video at its top, a mark in the video's corner saying
-whether it plays or is paused, then the selected finding, its line as the subtitles have it now in a
-block above the line with the fix. The toolbar at the top of the window, under the menus where the
-window draws them, shows the view's name and its counts, and at its right the Find box (below).
-Under the video a row of its own holds Undo at the left and Reject and Accept at the right, in the
-window's size of text, and stays put as the details scroll. An episode the check found nothing in is
+whether it plays or is paused, under the video its control bar (below), then the selected finding,
+its line as the subtitles have it now in a block above the line with the fix. The toolbar at the top
+of the window, under the menus where the window draws them, shows the view's name and its counts,
+and at its right the Find box (below). Under the video and its bar a row of its own holds Undo at
+the left and Reject and Accept at the right, in the window's size of text, and stays put as the
+details scroll. An episode the check found nothing in is
 greyed in the sidebar and says `No findings`. A click on one shows what its check said, alone under
 the video; the finding you were on stays greyed in the list, as the episode has none to go to, and
 Accept, Reject, Back to Undecided, Edit Wording…, Show in Video, Copy Subtitle Line and Show Each
@@ -115,10 +116,11 @@ next and previous episode, V switches between a check and its folders, O (Show i
 selected finding in the video pane as the terminal's `o` does in mpv, playing on if the pane plays
 and paused if not, and Shift+O (Close Video) closes the video, leaving the pane black and review
 open; Space plays and pauses, Left and Right (← and → on macOS) seek 5 s, `,` and `.` 1 s, and `[`
-and `]` step a frame; Ctrl+Z undoes, and Ctrl+W and Ctrl+Q quit (⌘Z, ⌘W and ⌘Q on macOS). No menu
-shows the others: J and K (or Down and Up) move, Home or G goes to the first finding, End or Shift+G
-to the last, PgUp and PgDn move by the rows the list shows at once (the terminal's page is 10), F
-steps through the filters, U undoes and Q quits; none of these acts while a text field has the keys.
+and `]` step a frame; Ctrl+Z undoes, and Ctrl+W and Ctrl+Q quit (⌘Z, ⌘W and ⌘Q on macOS), but Ctrl+W
+typed in the popped-out video (below) puts the video back. No menu shows the others: J and K (or
+Down and Up) move, Home or G goes to the first finding, End or Shift+G to the last, PgUp and PgDn
+move by the rows the list shows at once (the terminal's page is 10), F steps through the filters, U
+undoes and Q quits; none of these acts while a text field has the keys.
 No key in the window does what the terminal's `c`, `A`, `D`, Tab or `?` does. A view shows its rows
 at once: the details panel's word on an episode's file (`This episode's file is missing`, or
 `This episode changed since it was checked`) comes once that file's check answers, so a share that
@@ -136,9 +138,10 @@ while Show in Video is still opening a video, decides whether the video lands pl
 a second Space undoes the first; pressed while the check waits and no video is open, it adds
 `, will play` to the status line (`Opening E05 at 0:02:45.060, will play`). While a video plays, a
 drag of a column or of the window's edge stays smooth. A column drag stretches the video's frame
-until the drag ends, when mpv draws it again at its new size. The window keeps its size, its place
-on X11 and macOS (Wayland lets no window place itself), its columns' widths, the episodes' order and
-its settings for the next run, in `$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf` on Linux and macOS
+until the drag ends, when mpv draws it again at its new size. The window keeps its size and the
+popped-out video's, their places on X11 and macOS (Wayland lets no window place itself), its
+columns' widths, the episodes' order and its settings for the next run, in
+`$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf` on Linux and macOS
 when `XDG_CONFIG_HOME` is an absolute path; otherwise in `~/.config/subcheck/subcheck-qt.conf` on
 Linux and in the app's preferences on macOS. At the end it prints the counts as the terminal does,
 but names a view of paths as its window's title does: by the first path's last part, and `+N` for
@@ -174,7 +177,8 @@ a field holding the wording, its cursor at the character nearest the click (at t
 a click does nothing on a timing fix. Return or Save and Accept saves the wording and accepts the
 finding; Esc or Cancel ends the edit and decides nothing; an empty wording is refused.
 While the field has the keys it takes the letters, Space, Return, Enter, Up, Down, PgUp, PgDn, Home,
-End, Esc and Ctrl+Z, which undoes the typing, never a decision. Moving to another finding ends the
+End, Esc and Ctrl+Z, which undoes the typing, never a decision. A click on the video or its control
+bar, in the window or popped out, leaves the keys with the field. Moving to another finding ends the
 edit, deciding nothing and dropping the wording typed. While an edit is open Accept, Reject, Back to
 Undecided, Edit Wording… and Undo wait; Save and Accept and Cancel end it. Edit ▸ Copy Subtitle Line
 (Ctrl+C, ⌘C on macOS) copies the selected finding's line as the subtitles have it now, and waits
@@ -188,6 +192,25 @@ outside the box while no menu is open; a press that closes an open menu leaves t
 that menu gives them back. The box is greyed while an edit is open. In the sidebar, the
 reviews' list scrolls to the open review and the episodes' list keeps the marked episode in view,
 when the mark moves and when a new list comes in.
+
+Under the video, its control bar holds Play/Pause, which says whether the video plays, with the mark
+the video's corner shows and the word Paused or Playing, and plays or pauses it at a click, as Space
+does; the time the video is at, to the millisecond (`0:02:45.060`); −5 s and +5 s, which seek 5 s as
+Left and Right do; ‹ Frame and Frame ›, which step a frame as `[` and `]` do; and Pop Out. The bar
+is in the window's size of text. Where it has too little room for one line, it wraps between its
+groups, Play/Pause and the time, the four seeks, and Pop Out, never inside one; the details panel is
+never narrower than the widest group, so at a large size of the window's text the window's least
+width grows. While the video is black and the busy animation is not showing, a line at its foot says
+`Show in Video, or press O`. View ▸ Pop Out Video, or the bar's Pop Out, takes the video and its bar
+out of the details panel into a window of their own, above the main window and tied to it, where the
+main window's keys work too. The video plays on as it goes out and comes back, and a video still
+opening opens where it has gone. Pop In, which the bar shows in Pop Out's place, that window's close
+button, or Ctrl+W (⌘W on macOS) typed in it puts the video back, and so does View ▸ Pop Out Video,
+which is checked while the video is out. The popped-out video's title names its episode
+(`E03 · subcheck`), or is `subcheck` while it shows none, and while it is out the row with Undo,
+Reject and Accept is at the top of the details panel. It opens at 960×540 the first time, in the
+middle of the main window's screen, and after that at the size it was left, and where it was left;
+on Wayland, which lets no window place itself, the compositor places it each time.
 
 The video pane is mpv, inside the window through MpvQt. It reads its options from
 `$XDG_CONFIG_HOME/mpvqt/mpvqt.conf` on Linux (by default `~/.config/mpvqt/mpvqt.conf`) and
