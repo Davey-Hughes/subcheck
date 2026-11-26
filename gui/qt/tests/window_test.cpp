@@ -6936,7 +6936,13 @@ Window {
                          part.name, w.since(from).join(QStringLiteral(" | ")))));
         }
 
+        // Pop Out and Pop In are named as they read, as the bar's other buttons are named.
+        const auto popSaid = [pop] {
+            QAccessibleInterface *named = QAccessible::queryAccessibleInterface(pop);
+            return named ? named->text(QAccessible::Name) : QStringLiteral("(no interface)");
+        };
         QCOMPARE(pop->property("text").toString(), "Pop Out");
+        QCOMPARE(popSaid(), "Pop Out");
         QCOMPARE(pop->property("focusPolicy").value<Qt::FocusPolicy>(), Qt::NoFocus);
         const qsizetype beforePop = w.bridge.sent.size();
         w.click(pop);
@@ -6944,6 +6950,7 @@ Window {
         QVERIFY(w.window->property("videoOut").toBool());
         QCOMPARE(container->property("window").value<QWindow *>(), nullptr);
         QCOMPARE(pop->property("text").toString(), "Pop In");
+        QCOMPARE(popSaid(), "Pop In");
         QCOMPARE(pop->window(), video);
         w.click(pop);
         QCOMPARE(w.since(beforePop), QStringList());

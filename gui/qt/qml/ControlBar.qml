@@ -194,6 +194,7 @@ Control {
                 text: bar.out ? qsTr("Pop In") : qsTr("Pop Out")
                 enabled: bar.canPopOut
                 focusPolicy: Qt.NoFocus
+                Accessible.name: bar.out ? qsTr("Pop In") : qsTr("Pop Out")
                 onClicked: bar.popAsked()
             }
         }
