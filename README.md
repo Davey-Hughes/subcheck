@@ -201,19 +201,19 @@ is in the window's size of text. Where it has too little room for one line, it w
 groups, Play/Pause and the time, the four seeks, and Pop Out, never inside one; the details panel is
 never narrower than the widest group, so at a large size of the window's text the window's least
 width grows. Its least height grows with the text too: under the video and its bar, at the details
-panel's least width, the window keeps room for the row with Undo, Reject and Accept and for three
-lines of the finding, and while the video is out, for those alone. While the video is black and the
-busy animation is not showing, a line at its foot says `Show in Video, or press O`. View ▸ Pop Out
-Video, or the bar's Pop Out, takes the video and its bar out of the details panel into a window of
-their own, above the main window and tied to it, where the main window's keys work too. The video
-plays on as it goes out and comes back, and a video still opening opens where it has gone. Pop In,
-which the bar shows in Pop Out's place, that window's close button, or Ctrl+W (⌘W on macOS) typed in
-it puts the video back, and so does View ▸ Pop Out Video, which is checked while the video is out.
-The popped-out video's title names its episode (`E03 · subcheck`), or is `subcheck` while it shows
-none, and while it is out the row with Undo, Reject and Accept is at the top of the details panel.
-It opens at 960×540 the first time, in the middle of the main window's screen, and after that at the
-size it was left, and where it was left; on Wayland, which lets no window place itself, the
-compositor places it each time.
+panel's least width, the window keeps room for the row with Undo, Reject and Accept and for the
+finding down to the first line of its subtitle as it is now, and while the video is out, for those
+alone. While the video is black and the busy animation is not showing, a line at its foot says
+`Show in Video, or press O`. View ▸ Pop Out Video, or the bar's Pop Out, takes the video and its bar
+out of the details panel into a window of their own, above the main window and tied to it, where the
+main window's keys work too. The video plays on as it goes out and comes back, and a video still
+opening opens where it has gone. Pop In, which the bar shows in Pop Out's place, that window's close
+button, or Ctrl+W (⌘W on macOS) typed in it puts the video back, and so does View ▸ Pop Out Video,
+which is checked while the video is out. The popped-out video's title names its episode
+(`E03 · subcheck`), or is `subcheck` while it shows none, and while it is out the row with Undo,
+Reject and Accept is at the top of the details panel. It opens at 960×540 the first time, in the
+middle of the main window's screen, and after that at the size it was left, and where it was left;
+on Wayland, which lets no window place itself, the compositor places it each time.
 
 The video pane is mpv, inside the window through MpvQt. It reads its options from
 `$XDG_CONFIG_HOME/mpvqt/mpvqt.conf` on Linux (by default `~/.config/mpvqt/mpvqt.conf`) and

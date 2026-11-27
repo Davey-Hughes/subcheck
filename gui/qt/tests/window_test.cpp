@@ -4293,13 +4293,16 @@ Window {
         QVERIFY(top + decisions->height() <= scroll->mapToItem(panel, QPointF()).y() + 0.5);
 
         // At the window's least height too, the row lies wholly inside the panel, and the details'
-        // view under it holds three lines of the finding's text under the finding's top margin, to
-        // a pixel: the layouts put what they hold on whole pixels.
+        // view under it, scrolled to its top, shows the finding as it is laid out down to the foot
+        // of the first line of what is in the subtitles now: the kind's row, then that block's
+        // label and the line's first line, at the block's own font, which the unseen layout of the
+        // line under it tells.
         QQuickItem *view = detailsView(w);
-        const qreal threeLines =
-            3 * QFontMetricsF(panel->property("font").value<QFont>()).lineSpacing() + 8;
-        const auto offAtTheLeast = [&w, panel, decisions, view, threeLines] {
+        QQuickItem *nowLine = Shown::item(w.item("nowBlock"), "lineLayout");
+        QVERIFY(nowLine);
+        const auto offAtTheLeast = [&w, panel, decisions, view, nowLine] {
             w.window->resize(w.window->minimumWidth(), w.window->minimumHeight());
+            view->setProperty("contentY", 0);
             QStringList off;
             if (w.window->height() != w.window->minimumHeight()) {
                 off << QStringLiteral("the window is %1 tall, its least %2")
@@ -4317,14 +4320,19 @@ Window {
                            .arg(panel->height())
                            .arg(w.window->height());
             }
-            if (view->height() < threeLines - 1) {
-                off << QStringLiteral("the details' view is %1 tall, not %2")
-                           .arg(view->height())
-                           .arg(threeLines);
+            QRectF first;
+            QMetaObject::invokeMethod(nowLine, "positionToRectangle", Q_RETURN_ARG(QRectF, first),
+                                      Q_ARG(int, 0));
+            const qreal lineFoot = nowLine->mapToItem(view, QPointF(0, first.bottom())).y();
+            if (first.isEmpty() || lineFoot > view->height() + 0.5) {
+                off << QStringLiteral("the subtitle's first line ends at %1 in a view %2 tall")
+                           .arg(lineFoot)
+                           .arg(view->height());
             }
             return off.join(QStringLiteral("; "));
         };
         QTRY_VERIFY2(offAtTheLeast().isEmpty(), qPrintable(offAtTheLeast()));
+        const int leastHeight = w.window->minimumHeight();
         // The height the window counts for the bar at the least width is the one it is laid out at.
         qreal counted = 0;
         QVERIFY(QMetaObject::invokeMethod(w.videoItem("videoPane"), "barHeightAt",
@@ -4349,6 +4357,13 @@ Window {
         QTest::keyClick(w.window, Qt::Key_U);
         QTRY_COMPARE(w.bridge.detail()->stateWord(), "To review");
         QCOMPARE(sceneY(), kept);
+        // Nor does the least height change from one finding to the next, or with none shown.
+        QCOMPARE(w.window->minimumHeight(), leastHeight);
+        w.bridge.setFilter(3);
+        QTRY_VERIFY(!w.bridge.detail()->shown());
+        QCOMPARE(w.window->minimumHeight(), leastHeight);
+        w.bridge.setFilter(0);
+        QTRY_COMPARE(w.rows(), 2);
 
         // Out, the least height no longer counts the video's place, and back in it does again.
         const int held = w.window->minimumHeight();
@@ -4365,6 +4380,17 @@ Window {
         QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
         QTRY_COMPARE(w.window->minimumHeight(), held);
         QTRY_VERIFY(w.videoNotLaidOut().isEmpty());
+
+        // The least height is counted at the details panel's least width, whatever its width now,
+        // at which the label of what is in the subtitles now can take fewer lines.
+        QQuickItem *list = w.item("findings");
+        QVERIFY(list);
+        w.window->resize(w.window->width() + 400, w.window->height());
+        QTRY_VERIFY(w.videoNotLaidOut().isEmpty());
+        w.drag(list, panel, -150);
+        QTRY_VERIFY(panel->width() > leastWindowWidth(w) - 160 - 260 - 2 + 100);
+        QTRY_VERIFY(w.videoNotLaidOut().isEmpty());
+        QCOMPARE(w.window->minimumHeight(), leastHeight);
     }
 
     // Accept and Reject act on the finding shown, so with none to act on they are greyed, never

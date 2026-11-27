@@ -50,11 +50,19 @@ Control {
     // the window never makes the panel narrower. The bar counts while the video is out too, on
     // purpose: the window then does not grow wider at once as the video comes back in.
     readonly property real leastWidth: Math.max(decisions.implicitWidth, videoLeastWidth)
+    // The width the window gives the panel at its narrowest: its least width, or more.
+    property real narrowestWidth: leastWidth
     // The least height the panel keeps under the video's place: the decisions' row whole, and
-    // under it the finding's first three lines of the panel's text below its top margin, so that
-    // what Accept and Reject act on can be read. The window counts it in its least height.
-    readonly property real leastHeightUnderVideo: decisions.implicitHeight
-                                                  + 3 * detailsLine.lineSpacing + 8
+    // under it the finding as it is laid out at the panel's narrowest, where the window counts its
+    // least height, down to the first line of what is in the subtitles now, so that what Accept and
+    // Reject act on can be read: the kind's row, whose badge is a line of the panel's text tall
+    // whatever the kind says, then that block's label and its line's first line, at the block's own
+    // font. The window counts it in its least height.
+    readonly property real leastHeightUnderVideo: decisions.implicitHeight + scroll.topPadding
+                                                  + scroll.bottomPadding + row.Layout.topMargin
+                                                  + badge.implicitHeight + finding.spacing
+                                                  + nowBlock.Layout.topMargin
+                                                  + nowBlock.leastFirstLineFoot
     // Whether a greyed episode's log shows alone, in the finding's place. Its end can move no
     // selection, as a click on the finding's own row does not, so the finding comes back at its
     // top here, as another finding opens at its own, rather than as far down as the log was. An
@@ -82,12 +90,6 @@ Control {
                 panel.focusField();
             }
         }
-    }
-
-    FontMetrics {
-        id: detailsLine
-
-        font: panel.font
     }
 
     component Heading: Label {
@@ -254,7 +256,7 @@ Control {
             ColumnLayout {
                 id: content
 
-                width: scroll.availableWidth - 16
+                width: scroll.availableWidth - 2 * x
                 x: 8
                 spacing: 2
 
@@ -319,11 +321,15 @@ Control {
                     // two lines, so that a line of one or two lines moves neither block: the
                     // banners and the mark, which come and go, are below them.
                     ChangeBlock {
+                        id: nowBlock
+
                         objectName: "nowBlock"
                         label: qsTr("− In the subtitles now")
                         line: panel.detail.now
                         tone: panel.detail.oldTone
                         minLines: 2
+                        leastWidth: panel.narrowestWidth - scroll.leftPadding - scroll.rightPadding
+                                    - 2 * content.x
                         Layout.topMargin: 8
                         Layout.fillWidth: true
                     }

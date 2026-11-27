@@ -880,6 +880,7 @@ ApplicationWindow {
             videoBarHeight: videoPane.barHeight
             videoLeastWidth: videoPane.leastWidth
             videoOut: window.videoOut
+            narrowestWidth: window.detailsLeast
             font.pointSize: window.settings.detailsTextSize
             SplitView.preferredWidth: window.settings.detailsWidth
             SplitView.minimumWidth: window.detailsLeast

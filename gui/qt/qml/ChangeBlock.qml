@@ -34,6 +34,15 @@ Control {
     // Whether a click on the block asks for its edit, as rewordAsked says, while it is not editing;
     // a screen reader is told of the line as a button then.
     property bool rewordable: false
+    // The block's width at the narrowest the window makes it, and how far below the block's top the
+    // first line of its line ends at that width: its top padding, its label as it wraps there, the
+    // room under the label and a line of the line's own font. From the label's words and the fonts
+    // alone, never the line shown, so that it is the same for every line and for none, whether the
+    // block shows or not: the window keeps room for it under the video.
+    property real leastWidth: width
+    readonly property real leastFirstLineFoot: topPadding + leastLabel.implicitHeight
+                                               + column.spacing + blockLine.topPadding
+                                               + Math.ceil(lineMetrics.lineSpacing)
 
     signal saved(string wording)
     signal cancelled
@@ -76,6 +85,8 @@ Control {
     }
 
     contentItem: ColumnLayout {
+        id: column
+
         // The block's baseline is its label's, so that a label beside the block can sit level with
         // it.
         baselineOffset: blockLabel.y + blockLabel.baselineOffset
@@ -199,6 +210,19 @@ Control {
                 onClicked: block.cancelled()
             }
         }
+    }
+
+    // The label laid out again, unseen, at the width it has were the block `leastWidth` wide.
+    Label {
+        id: leastLabel
+
+        width: Math.max(0, block.leastWidth - block.leftPadding - block.rightPadding)
+        text: blockLabel.text
+        textFormat: blockLabel.textFormat
+        font: blockLabel.font
+        wrapMode: blockLabel.wrapMode
+        visible: false
+        Accessible.ignored: true
     }
 
     // Over the whole block, its bar, its label and the padding around its line as well as the
