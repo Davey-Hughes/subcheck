@@ -735,8 +735,8 @@ private slots:
     // An Open's file is said to show once mpv plays it: a load as playback starts again, or as it
     // reaches the file's end while it settles; a seek in the file mpv has open as it lands. Not as
     // mpv answers the load, nor when the settle time ends with mpv having said nothing, as then mpv
-    // still shows the file before: that late load is said to show once it plays. A load that fails
-    // never shows.
+    // still shows the file before: that late load is said to show once it plays, and a seek in its
+    // file that lands meanwhile says nothing. A load that fails never shows.
     void anOpensFileIsSaidToShowOnceMpvPlaysIt() {
         QStringList shown;
         Rig r(std::chrono::milliseconds(100));
@@ -789,6 +789,26 @@ private slots:
         r.player.ended(End::Failed);
         QCOMPARE(r.reports, (QStringList{"opened paused", "failed: could not open /m/e.mkv"}));
         QCOMPARE(shown.size(), 4);
+
+        // A seek in a late load's file, which mpv names as its path before it plays: landed with
+        // mpv having said nothing, it still shows the file before; the late load shows once it
+        // plays.
+        r.reports.clear();
+        r.player.run(open(moment("/m/f.mkv", 0, std::nullopt)));
+        r.openWith();
+        r.mpv.answer(r.player);
+        QTRY_COMPARE_WITH_TIMEOUT(r.reports, QStringList{"opened paused"}, 2000);
+        r.player.run(open(moment("/m/f.mkv", 5'000'000, std::nullopt), How::kSeek));
+        r.openWith("/m/f.mkv");
+        QCOMPARE(r.mpv.last(), "set sub-visibility yes");
+        r.mpv.answer(r.player);
+        QCOMPARE(r.mpv.last(), "seek 0:00:05.000000 absolute+exact");
+        r.mpv.answer(r.player);
+        QTRY_COMPARE_WITH_TIMEOUT(r.reports, (QStringList{"opened paused", "opened paused"}), 2000);
+        QCOMPARE(shown.size(), 4);
+        r.player.restarted();
+        QCOMPARE(shown.size(), 5);
+        QCOMPARE(shown.last(), "/m/f.mkv");
     }
 
     // Whether an Open is under way, for the window's busy animation: from review's Open, its wait

@@ -456,7 +456,11 @@ void PlayerPort::seekTo(const PlayerCommand::kOpen &command, bool resume) {
                  QStringLiteral("absolute+exact")},
                 Landing::OnRestart, false,
                 [this, resume, shown = moment.file] {
-                    emit shows(shown);
+                    // In a load that is still late, the file has yet to play: restarted says it
+                    // shows once it does.
+                    if (!late) {
+                        emit shows(shown);
+                    }
                     opened(resume);
                 },
                 reload);

@@ -94,7 +94,7 @@ signals:
     // play, or reached the file's end as it settled, or its seek in the file mpv had open has
     // landed. Not at the load's answer, nor at the end of its settle time with mpv having said
     // nothing, as on a slow share: until the new file plays, mpv still shows the file before it.
-    // Said for that late load once it plays.
+    // Said for that late load once it plays, and not before for a seek in its file.
     void shows(const std::string &file);
 
 private:
