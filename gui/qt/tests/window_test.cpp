@@ -684,11 +684,11 @@ qreal contrast(const QColor &a, const QColor &b) {
 
 // What keeps `back`, a change block's background, from being a faint step from the window's colour:
 // one the eye sees, but that leaves the block in the window's light or dark. Away from the window's
-// text, so that it takes no contrast from the text nor from `tone`, the block's, drawn on it; or,
-// where `toward`, as on a window with no room for the step away, toward the text, so that it takes
-// no more contrast from the tone than the step is. Empty when it is one.
+// text, so that it takes no contrast from the text nor from any of `tones`, which the block draws
+// on it; or, where `toward`, as on a window with no room for the step away, toward the text, so
+// that it takes no more contrast from a tone than the step is. Empty when it is one.
 QString notAFaintStep(const QColor &window, const QColor &text, const QColor &back,
-                      const QColor &tone, bool toward = false) {
+                      const QList<QColor> &tones, bool toward = false) {
     QStringList off;
     const qreal step = contrast(back, window);
     if (step < 1.02 || step > 1.2) {
@@ -704,17 +704,19 @@ QString notAFaintStep(const QColor &window, const QColor &text, const QColor &ba
                         nearer ? QStringLiteral("nearer") : QStringLiteral("no nearer"),
                         text.name(), window.name());
     }
-    // A tone further from the window's colour than the block's is loses the step's contrast
-    // exactly, on a block a step toward the text: the least rounding is let pass.
-    const qreal kept =
-        (toward ? contrast(tone, window) / step : contrast(tone, window)) * (1 - 1e-9);
-    if (contrast(tone, back) < kept) {
-        off << QStringLiteral("the tone %1 is %2:1 on %3, %4:1 on the window's %5")
-                   .arg(tone.name())
-                   .arg(contrast(tone, back))
-                   .arg(back.name())
-                   .arg(contrast(tone, window))
-                   .arg(window.name());
+    for (const QColor &tone : tones) {
+        // A tone further from the window's colour than the block's is loses the step's contrast
+        // exactly, on a block a step toward the text: the least rounding is let pass.
+        const qreal kept =
+            (toward ? contrast(tone, window) / step : contrast(tone, window)) * (1 - 1e-9);
+        if (contrast(tone, back) < kept) {
+            off << QStringLiteral("the tone %1 is %2:1 on %3, %4:1 on the window's %5")
+                       .arg(tone.name())
+                       .arg(contrast(tone, back))
+                       .arg(back.name())
+                       .arg(contrast(tone, window))
+                       .arg(window.name());
+        }
     }
     return off.join(QStringLiteral("; "));
 }
@@ -4476,12 +4478,23 @@ Window {
         QVERIFY2(frame, qPrintable(frameKind.errorString()));
         const QMetaProperty leftPadding =
             scroll->metaObject()->property(scroll->metaObject()->indexOfProperty("leftPadding"));
+        // The style's own background, put back after as it was found, so that the rest of the
+        // test lays out as the style does. A control hides the background it gives up, and given
+        // it back, shows it only once what the style binds its visibility to changes. The
+        // paddings go back first, as a style that pads the view by its background's padding sets
+        // them again when the background comes back.
+        auto *styleFrame = scroll->property("background").value<QQuickItem *>();
+        const bool styleFrameShown = styleFrame && styleFrame->isVisible();
         {
-            const auto unframe = qScopeGuard([scroll, &leftPadding, &rightPadding] {
-                scroll->setProperty("background", QVariant::fromValue<QQuickItem *>(nullptr));
-                leftPadding.reset(scroll);
-                rightPadding.reset(scroll);
-            });
+            const auto unframe =
+                qScopeGuard([scroll, styleFrame, styleFrameShown, &leftPadding, &rightPadding] {
+                    leftPadding.reset(scroll);
+                    rightPadding.reset(scroll);
+                    scroll->setProperty("background", QVariant::fromValue(styleFrame));
+                    if (styleFrame) {
+                        styleFrame->setVisible(styleFrameShown);
+                    }
+                });
             QVERIFY(scroll->setProperty("background", QVariant::fromValue(frame)));
             leftPadding.write(scroll, leftPadding.read(scroll).toReal() + 3);
             rightPadding.write(scroll, padding + 5);
@@ -8374,7 +8387,7 @@ Window {
             auto *back = block->property("background").value<QQuickItem *>();
             QVERIFY(back);
             const QString off =
-                notAFaintStep(window, text, back->property("color").value<QColor>(), tone);
+                notAFaintStep(window, text, back->property("color").value<QColor>(), {tone});
             QVERIFY2(off.isEmpty(), qPrintable(off));
             QCOMPARE(back->property("topRightRadius").toReal(), 4.0);
             QCOMPARE(back->property("bottomRightRadius").toReal(), 4.0);
@@ -8394,28 +8407,30 @@ Window {
     // A palette whose alternate base is far from its window's colour, as macOS's dark one gives a
     // mid-grey, or is the window's own, leaves the blocks a faint step from the window's colour all
     // the same, in the details panel and in Settings' sample of them: away from the window's text,
-    // with their tones reading on them at least as well as on the window, where the window's colour
-    // has room for the step, as it has near white, where the clamp takes a part of it; toward the
-    // text on a pure white or pure black window, which has none, their tones losing no more than
-    // the step.
+    // with every palette's tones for the window's light or dark reading on them at least as well as
+    // on the window, where the window's colour has room for the step, as it has near white, where
+    // the clamp takes a part of it; toward the text on a pure white or pure black window, which has
+    // none, the tones losing no more than the step.
     void theBlocksStayAFaintStepFromTheWindowWhateverTheAlternateBase_data() {
         QTest::addColumn<QColor>("window");
         QTest::addColumn<QColor>("text");
         QTest::addColumn<QColor>("alternateBase");
+        QTest::addColumn<bool>("darkTones");
         QTest::addColumn<bool>("toward");
         QTest::newRow("a dark window, its alternate base a mid-grey")
-            << QColor("#1e1e1e") << QColor("#ffffff") << QColor("#8e8e8e") << false;
+            << QColor("#1e1e1e") << QColor("#ffffff") << QColor("#8e8e8e") << true << false;
         QTest::newRow("a window near white")
-            << QColor("#faf9f8") << QColor("#000000") << QColor("#eae9e8") << false;
+            << QColor("#faf9f8") << QColor("#000000") << QColor("#eae9e8") << false << false;
         QTest::newRow("a pure white window under black text")
-            << QColor("#ffffff") << QColor("#000000") << QColor("#ffffff") << true;
+            << QColor("#ffffff") << QColor("#000000") << QColor("#ffffff") << false << true;
         QTest::newRow("a pure black window under white text")
-            << QColor("#000000") << QColor("#ffffff") << QColor("#000000") << true;
+            << QColor("#000000") << QColor("#ffffff") << QColor("#000000") << true << true;
     }
     void theBlocksStayAFaintStepFromTheWindowWhateverTheAlternateBase() {
         QFETCH(QColor, window);
         QFETCH(QColor, text);
         QFETCH(QColor, alternateBase);
+        QFETCH(bool, darkTones);
         QFETCH(bool, toward);
         Shown w({media()});
         QVERIFY(w.start());
@@ -8432,7 +8447,22 @@ Window {
         far.setColor(QPalette::AlternateBase, alternateBase);
         QGuiApplication::setPalette(far);
         QTRY_COMPARE(paletteColour(w, "alternateBase"), alternateBase);
-        for (const char *name : {"nowBlock", "fixedBlock", "sampleNow", "sampleFixed"}) {
+        // The tones of each block's side, every palette's for the window's light or dark, from
+        // words' table rather than from the block: so that each palette's is checked, not only the
+        // one in use, and none the block still holds from before the palette changed.
+        const auto sideTones = [darkTones](QColor Tones::*side) {
+            QList<QColor> each;
+            for (const Colours colours : everyColours) {
+                each << tones(colours, darkTones).*side;
+            }
+            return each;
+        };
+        const std::vector<std::pair<const char *, QColor Tones::*>> blocks = {
+            {"nowBlock", &Tones::old},
+            {"fixedBlock", &Tones::added},
+            {"sampleNow", &Tones::old},
+            {"sampleFixed", &Tones::added}};
+        for (const auto &[name, side] : blocks) {
             QQuickItem *block = w.item(name) ? w.item(name) : w.settingsItem(name);
             QVERIFY2(block, name);
             const auto colour = [block](const char *role) {
@@ -8445,9 +8475,10 @@ Window {
             QTRY_COMPARE(colour("windowText"), text);
             auto *back = block->property("background").value<QQuickItem *>();
             QVERIFY2(back, name);
-            const auto off = [&window, &text, toward, back, block] {
-                return notAFaintStep(window, text, back->property("color").value<QColor>(),
-                                     block->property("tone").value<QColor>(), toward);
+            const QList<QColor> drawn = sideTones(side);
+            const auto off = [&window, &text, &drawn, toward, back] {
+                return notAFaintStep(window, text, back->property("color").value<QColor>(), drawn,
+                                     toward);
             };
             QTRY_VERIFY2(off().isEmpty(), qPrintable(QStringLiteral("%1: %2").arg(name, off())));
         }

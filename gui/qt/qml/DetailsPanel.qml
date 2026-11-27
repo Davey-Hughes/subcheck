@@ -266,9 +266,13 @@ Control {
             contentWidth: availableWidth
 
             // The room at the view's sides that a frame drawn around it takes, whatever the view
-            // holds: KDE's and Imagine's styles pad the view by their background's padding, KDE's
-            // only while that background shows. A style's background can be any item, so its
-            // padding is read by name, none where it has none.
+            // holds, in a style that pads the view by its background's padding while that
+            // background shows, as KDE's desktop style does where it frames the view and Imagine
+            // does, whose background always shows. A style that pads the view some other way, by
+            // padding of its own as KDE's Union and Breeze styles do, is not counted: there the
+            // label of what is in the subtitles now is counted wider than it is laid out, and can
+            // take more lines than the least height keeps room for. A style's background can be
+            // any item, so its padding is read by name, none where it has none.
             readonly property real framePadding: {
                 const side = (frame, name) => frame?.visible ? (frame[name] ?? 0) : 0;
                 return side(background, "leftPadding") + side(background, "rightPadding");
