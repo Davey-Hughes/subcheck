@@ -6792,9 +6792,10 @@ Window {
     }
 
     // A size of text or a palette changed while the video is out reaches the pop-out at once: its
-    // bar's buttons take the size and wrap inside the pop-out, whose size stays, and whose least
-    // width keeps each of the bar's groups whole; and its bar draws in the new palette. Put back,
-    // the window has no least size of its own, as the container sizes it.
+    // bar's buttons take the size and wrap inside the pop-out, whose size stays, whose least width
+    // keeps each of the bar's groups whole and whose least height is counted at that width; and its
+    // bar draws in the new palette. Put back, the window has no least size of its own, as the
+    // container sizes it.
     void aTextSizeChangedWhileOutReachesThePopOut() {
         Shown w({media()});
         QVERIFY(w.start());
@@ -6806,6 +6807,8 @@ Window {
         QQuickItem *bar = w.videoItem("controlBar");
         QVERIFY(video && bar);
         QCOMPARE(video->size(), QSize(960, 540));
+        const auto least = [bar] { return qCeil(bar->property("leastWidth").toReal()); };
+        const int smaller = least();
         w.settings.setWindowTextSize(24);
         const std::vector<const char *> buttons = {"playButton",          "back5Button",
                                                    "previousFrameButton", "nextFrameButton",
@@ -6815,6 +6818,8 @@ Window {
             QVERIFY2(button, name);
             QTRY_COMPARE(button->property("font").value<QFont>().pointSizeF(), 24.0);
         }
+        // The bar's groups laid out at the new size, which they are only at a frame after it.
+        QTRY_VERIFY(least() > smaller);
         auto *flow = bar->property("contentItem").value<QQuickItem *>();
         QVERIFY(flow);
         // What keeps a group of the bar from lying inside the pop-out, said; nothing once each
@@ -6838,9 +6843,30 @@ Window {
         };
         QTRY_VERIFY2(off().isEmpty(), qPrintable(off()));
         QCOMPARE(video->size(), QSize(960, 540));
-        const auto least = [bar] { return qCeil(bar->property("leastWidth").toReal()); };
         QTRY_COMPARE(video->minimumWidth(), least());
-        QTRY_COMPARE(video->minimumHeight(), qCeil(least() * 9.0 / 16 + bar->implicitHeight()));
+        // The least height is the same at every width on the way in to the least, where the bar
+        // wraps onto more lines than it takes wider, so that a drag that narrows the pop-out does
+        // not make it taller under the pointer; and at the least width it is the video at 16:9 and
+        // the bar as it is laid out there.
+        const int leastHeight = video->minimumHeight();
+        const QSize wide = video->size();
+        for (int width = video->width(); width > least();) {
+            width = std::max(least(), width - 80);
+            QVERIFY(resizeAndMove(video, QRect(video->position(), QSize(width, wide.height()))));
+            QTRY_VERIFY2(off().isEmpty(), qPrintable(off()));
+            QVERIFY2(video->minimumHeight() == leastHeight,
+                     qPrintable(QStringLiteral("the least height is %1 at %2 wide, %3 at %4")
+                                    .arg(video->minimumHeight())
+                                    .arg(width)
+                                    .arg(leastHeight)
+                                    .arg(wide.width())));
+        }
+        const qreal room = least() * 9.0 / 16 + bar->height();
+        QVERIFY2(leastHeight >= room - 0.5 && leastHeight < room + 1,
+                 qPrintable(QStringLiteral("the least height is %1, the video and the bar %2 at "
+                                           "the least width")
+                                .arg(leastHeight)
+                                .arg(room)));
 
         auto *background = bar->property("background").value<QQuickItem *>();
         QVERIFY(background);

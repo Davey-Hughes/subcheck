@@ -903,11 +903,14 @@ ApplicationWindow {
                ? qsTr("%1 · subcheck").arg(window.bridge.videoLabel) : qsTr("subcheck")
         flags: Qt.Window | (window.videoOut ? 0 : Qt.WindowDoesNotAcceptFocus)
         // Out, room for each group of the control bar whole and a video above it at 16:9, at the
-        // bar's height as it is laid out now. Held, none: the container sizes it, and for a layout
-        // pass after the size of text rises, the place can be narrower than the bar's least.
+        // least width, the bar as tall as it is there: at the width it has, a drag that narrowed
+        // the window would make it taller under the pointer, as the bar wraps onto more lines.
+        // Held, none: the container sizes it, and for a layout pass after the size of text rises,
+        // the place can be narrower than the bar's least.
         minimumWidth: window.videoOut ? Math.ceil(videoPane.leastWidth) : 0
         minimumHeight: window.videoOut
-                       ? Math.ceil(videoPane.leastWidth * 9 / 16 + videoPane.barHeight) : 0
+                       ? Math.ceil(videoPane.leastWidth * 9 / 16
+                                   + videoPane.barHeightAt(videoPane.leastWidth)) : 0
         onClosing: close => {
             close.accepted = false;
             window.popIn();
