@@ -111,9 +111,11 @@ ApplicationWindow {
 
     // Puts the video's window back in the details panel, and gives this window the keys, which
     // the pop-out had. What the pop-out last said of its size and place is kept first, before the
-    // container gives it the pane's, so that the next Pop Out opens where this one was left.
+    // container gives it the pane's, so that the next Pop Out opens where this one was left; that
+    // alone: what this window last said can be halfway through a maximize, and is kept once it
+    // settles.
     function popIn() {
-        window.settings.keep();
+        window.settings.keepVideo();
         window.videoOut = false;
         window.requestActivate();
     }

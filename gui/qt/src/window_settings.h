@@ -123,6 +123,11 @@ public:
     // Keeps what each window last said, if it has said anything since this last ran, and writes
     // everything kept to the store at once.
     Q_INVOKABLE void keep();
+    // Keeps what the popped-out video last said, if it has said anything since it was last kept,
+    // and nothing the main window has said, which can be halfway through a maximize: that is kept
+    // as it settles, by its own wait. Not written to the file at once: the store writes it at the
+    // event loop's next pass, and keep at the run's end.
+    Q_INVOKABLE void keepVideo();
 
     int sidebarWidth() const;
     int detailsWidth() const;

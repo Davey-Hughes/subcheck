@@ -626,8 +626,8 @@ private slots:
         QCOMPARE(in(dir)->value("video/size").toSize(), QSize(700, 400));
     }
 
-    // keep writes what the pop-out last said too, before it settled, as the window's Pop In and
-    // its end keep it. The file is read as text, as in keepWritesTheFileAtOnce.
+    // keep writes what the pop-out last said too, before it settled, as the window's end keeps it.
+    // The file is read as text, as in keepWritesTheFileAtOnce.
     void keepWritesThePopOutsLastWord() {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
@@ -645,6 +645,32 @@ private slots:
         QVERIFY2(group >= 0, text.constData());
         const QByteArray popOut = text.mid(group, text.indexOf("\n[", group + 1) - group);
         QVERIFY2(popOut.contains("size=@Size(700 400)"), text.constData());
+    }
+
+    // keepVideo, the window's Pop In, keeps what the pop-out last said, before it settled, and
+    // nothing of what the main window said that has not settled: a size it reported halfway through
+    // a maximize, before its state, stays out. The settle time outlasts the test, so that only the
+    // test's keeps run. Read through another QSettings on the file, which in this process reads the
+    // store's unwritten values.
+    void keepVideoKeepsThePopOutsLastWordAndNothingOfTheWindows() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        WindowSettings settings(in(dir), "offscreen", std::chrono::hours(1));
+        QQuickWindow main;
+        settings.show(&main);
+        QVERIFY(move(main, QSize(700, 500), QPoint(40, 30)));
+        settings.keep();
+        QQuickWindow video;
+        settings.showVideo(&video, &main);
+        QVERIFY(move(video, QSize(640, 360), QPoint(100, 100)));
+        QVERIFY(move(main, QSize(1900, 1000), QPoint(10, 10)));
+        settings.keepVideo();
+        const auto kept = in(dir);
+        QCOMPARE(kept->value("video/size").toSize(), QSize(640, 360));
+        QCOMPARE(kept->value("video/place").toPoint(), QPoint(100, 100) - frame);
+        QCOMPARE(kept->value("window/size").toSize(), QSize(700, 500));
+        QCOMPARE(kept->value("window/place").toPoint(), QPoint(40, 30) - frame);
+        QCOMPARE(kept->value("window/maximized").toBool(), false);
     }
 
     // Held by another window, as the details panel's container holds the video's, a window's size

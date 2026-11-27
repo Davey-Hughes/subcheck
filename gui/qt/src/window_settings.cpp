@@ -268,6 +268,8 @@ void WindowSettings::keep() {
     store->sync();
 }
 
+void WindowSettings::keepVideo() { keepSaid(videoWatch); }
+
 int WindowSettings::sidebarWidth() const {
     return store->value(sidebarKey, defaultSidebar).toInt();
 }
