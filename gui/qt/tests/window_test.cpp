@@ -669,6 +669,48 @@ QColor paletteColour(const Shown &w, const char *role) {
     return w.window->property("palette").value<QObject *>()->property(role).value<QColor>();
 }
 
+// The contrast between two colours as WCAG counts it: 1 for the same light, 21 for black on white.
+qreal contrast(const QColor &a, const QColor &b) {
+    const auto luminance = [](const QColor &c) {
+        const auto linear = [](qreal v) {
+            return v <= 0.04045 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4);
+        };
+        return 0.2126 * linear(c.redF()) + 0.7152 * linear(c.greenF()) + 0.0722 * linear(c.blueF());
+    };
+    const qreal x = luminance(a);
+    const qreal y = luminance(b);
+    return (std::max(x, y) + 0.05) / (std::min(x, y) + 0.05);
+}
+
+// What keeps `back`, a change block's background, from being a faint step from the window's colour
+// away from the window's text: one the eye sees, but that leaves the block in the window's light or
+// dark, and that takes no contrast from the text nor from `tone`, the block's, drawn on it. Empty
+// when it is one.
+QString notAFaintStep(const QColor &window, const QColor &text, const QColor &back,
+                      const QColor &tone) {
+    QStringList off;
+    const qreal step = contrast(back, window);
+    if (step < 1.02 || step > 1.2) {
+        off << QStringLiteral("%1 is %2:1 from the window's %3")
+                   .arg(back.name())
+                   .arg(step)
+                   .arg(window.name());
+    }
+    if (contrast(back, text) < contrast(window, text)) {
+        off << QStringLiteral("%1 is nearer the text's %2 than the window's %3 is")
+                   .arg(back.name(), text.name(), window.name());
+    }
+    if (contrast(tone, back) < contrast(tone, window)) {
+        off << QStringLiteral("the tone %1 is %2:1 on %3, %4:1 on the window's %5")
+                   .arg(tone.name())
+                   .arg(contrast(tone, back))
+                   .arg(back.name())
+                   .arg(contrast(tone, window))
+                   .arg(window.name());
+    }
+    return off.join(QStringLiteral("; "));
+}
+
 // The play mark drawn in `holder`: the glyph whose bars it draws while paused.
 QQuickItem *glyphIn(QQuickItem *holder) {
     QQuickItem *bars = Shown::item(holder, "pausedBars");
@@ -8241,9 +8283,10 @@ Window {
     }
 
     // The details panel stacks the line as it is now above the line with the fix, each a block: a
-    // bar 3 px wide down its left in its side's tone, its right corners rounded, on the style's
-    // alternate background; a label in bold capitals in the same tone, 2 pt below the panel's text;
-    // and the line, 2 pt above it. An edited finding's block says the wording is the person's.
+    // bar 3 px wide down its left in its side's tone, its right corners rounded, on the window's
+    // colour a faint step further from its text's; a label in bold capitals in the same tone, 2 pt
+    // below the panel's text; and the line, 2 pt above it. An edited finding's block says the
+    // wording is the person's.
     void theDetailsStackTheOldLineAboveTheNewAsBlocks() {
         Shown w({media()});
         QVERIFY(w.start());
@@ -8259,10 +8302,9 @@ Window {
         QCOMPARE(now->mapToScene(QPointF(0, 0)).x(), fixed->mapToScene(QPointF(0, 0)).x());
         QCOMPARE(now->width(), fixed->width());
         const qreal size = panel->property("font").value<QFont>().pointSizeF();
-        const QColor alternate = panel->property("palette")
-                                     .value<QObject *>()
-                                     ->property("alternateBase")
-                                     .value<QColor>();
+        const QObject *palette = panel->property("palette").value<QObject *>();
+        const QColor window = palette->property("window").value<QColor>();
+        const QColor text = palette->property("windowText").value<QColor>();
         const std::vector<std::tuple<QQuickItem *, QColor, QString>> blocks = {
             {now, detail->oldTone(), "− In the subtitles now"},
             {fixed, detail->newTone(), "+ With the fix"}};
@@ -8287,7 +8329,9 @@ Window {
             QVERIFY(top(line) > top(label));
             auto *back = block->property("background").value<QQuickItem *>();
             QVERIFY(back);
-            QCOMPARE(back->property("color").value<QColor>(), alternate);
+            const QString off =
+                notAFaintStep(window, text, back->property("color").value<QColor>(), tone);
+            QVERIFY2(off.isEmpty(), qPrintable(off));
             QCOMPARE(back->property("topRightRadius").toReal(), 4.0);
             QCOMPARE(back->property("bottomRightRadius").toReal(), 4.0);
             QCOMPARE(back->property("topLeftRadius").toReal(), 0.0);
@@ -8301,6 +8345,48 @@ Window {
         detail->show(edited);
         QCOMPARE(Shown::text(fixed, "blockLabel"), "+ With your wording");
         QCOMPARE(Shown::text(now, "blockLabel"), "− In the subtitles now");
+    }
+
+    // A palette whose alternate base is far from its window's colour, as macOS's dark one gives a
+    // mid-grey, leaves the blocks a faint step from the window's colour all the same, in the
+    // details panel and in Settings' sample of them, with their tones reading on them at least as
+    // well as on the window.
+    void theBlocksStayAFaintStepFromTheWindowWhateverTheAlternateBase() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QTRY_VERIFY(w.bridge.detail()->shown());
+        const auto putBack = qScopeGuard([] { QGuiApplication::setPalette(QPalette()); });
+        QPalette far;
+        far.setColor(QPalette::Window, QColor("#1e1e1e"));
+        far.setColor(QPalette::WindowText, QColor("#ffffff"));
+        far.setColor(QPalette::Base, QColor("#1e1e1e"));
+        far.setColor(QPalette::Text, QColor("#ffffff"));
+        far.setColor(QPalette::Button, QColor("#323232"));
+        far.setColor(QPalette::ButtonText, QColor("#ffffff"));
+        far.setColor(QPalette::AlternateBase, QColor("#8e8e8e"));
+        QGuiApplication::setPalette(far);
+        QTRY_COMPARE(paletteColour(w, "alternateBase"), QColor("#8e8e8e"));
+        for (const char *name : {"nowBlock", "fixedBlock", "sampleNow", "sampleFixed"}) {
+            QQuickItem *block = w.item(name) ? w.item(name) : w.settingsItem(name);
+            QVERIFY2(block, name);
+            const auto colour = [block](const char *role) {
+                return block->property("palette")
+                    .value<QObject *>()
+                    ->property(role)
+                    .value<QColor>();
+            };
+            QTRY_COMPARE(colour("window"), QColor("#1e1e1e"));
+            QTRY_COMPARE(colour("windowText"), QColor("#ffffff"));
+            auto *back = block->property("background").value<QQuickItem *>();
+            QVERIFY2(back, name);
+            const auto off = [&colour, back, block] {
+                return notAFaintStep(colour("window"), colour("windowText"),
+                                     back->property("color").value<QColor>(),
+                                     block->property("tone").value<QColor>());
+            };
+            QTRY_VERIFY2(off().isEmpty(), qPrintable(QStringLiteral("%1: %2").arg(name, off())));
+        }
     }
 
     // The two blocks keep their place from one finding to the next, so that the eye finds them

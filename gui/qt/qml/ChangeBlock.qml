@@ -1,12 +1,12 @@
 // One side of a change, as the details panel and the Settings window's sample draw it: a bar and a
-// label in the side's tone, then the line with its change marked, on the style's alternate
-// background. The label is written in capitals by its font, not in its text, so that a screen
-// reader reads it as words. Its text sizes are the block's font's, which it takes from where it
-// is put. The line can keep room for more lines than it has, so that what is below the block keeps
-// its place from one line to the next. While the block edits, the line gives way to a field for
-// the wording, in the line's font, over Save and Accept and Cancel, which take no keys from it.
-// A click anywhere on a block that can be reworded asks for its edit, at the line's character
-// nearest the click.
+// label in the side's tone, then the line with its change marked, on the window's colour a faint
+// step further from its text's. The label is written in capitals by its font, not in its text, so
+// that a screen reader reads it as words. Its text sizes are the block's font's, which it takes
+// from where it is put. The line can keep room for more lines than it has, so that what is below
+// the block keeps its place from one line to the next. While the block edits, the line gives way
+// to a field for the wording, in the line's font, over Save and Accept and Cancel, which take no
+// keys from it. A click anywhere on a block that can be reworded asks for its edit, at the line's
+// character nearest the click.
 // The line is rich text, and a Text cannot tell which character is under a point, so an unseen
 // TextEdit lays the same text out as the line does and tells it. The drawn line's characters are
 // the wording's one for one, as core collapses a line's spaces, but for a wording typed with a run
@@ -72,7 +72,19 @@ Control {
     }
 
     background: Rectangle {
-        color: block.palette.alternateBase
+        // The window's colour a faint step further from its text's, so that the block stands
+        // apart from what is around it in light and dark alike, and what is drawn on it, which
+        // reads against the window as the window's text does, loses none of its contrast there.
+        // Not the style's alternate base, which a platform can give far from the window's colour:
+        // macOS's dark palette gives a mid-grey, on which the tones and the marks lose theirs. As
+        // faint a step as Qt's own palettes put between the window and the alternate base.
+        color: {
+            const window = block.palette.window;
+            const text = block.palette.windowText;
+            const away = (from, to) => Math.max(0, Math.min(1, from + (from - to) * 0.035));
+            return Qt.rgba(away(window.r, text.r), away(window.g, text.g), away(window.b, text.b),
+                           window.a);
+        }
         topRightRadius: 4
         bottomRightRadius: 4
 
