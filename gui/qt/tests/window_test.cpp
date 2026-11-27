@@ -682,12 +682,13 @@ qreal contrast(const QColor &a, const QColor &b) {
     return (std::max(x, y) + 0.05) / (std::min(x, y) + 0.05);
 }
 
-// What keeps `back`, a change block's background, from being a faint step from the window's colour
-// away from the window's text: one the eye sees, but that leaves the block in the window's light or
-// dark, and that takes no contrast from the text nor from `tone`, the block's, drawn on it. Empty
-// when it is one.
+// What keeps `back`, a change block's background, from being a faint step from the window's colour:
+// one the eye sees, but that leaves the block in the window's light or dark. Away from the window's
+// text, so that it takes no contrast from the text nor from `tone`, the block's, drawn on it; or,
+// where `toward`, as on a window with no room for the step away, toward the text, so that it takes
+// no more contrast from the tone than the step is. Empty when it is one.
 QString notAFaintStep(const QColor &window, const QColor &text, const QColor &back,
-                      const QColor &tone) {
+                      const QColor &tone, bool toward = false) {
     QStringList off;
     const qreal step = contrast(back, window);
     if (step < 1.02 || step > 1.2) {
@@ -696,11 +697,18 @@ QString notAFaintStep(const QColor &window, const QColor &text, const QColor &ba
                    .arg(step)
                    .arg(window.name());
     }
-    if (contrast(back, text) < contrast(window, text)) {
-        off << QStringLiteral("%1 is nearer the text's %2 than the window's %3 is")
-                   .arg(back.name(), text.name(), window.name());
+    const bool nearer = contrast(back, text) < contrast(window, text);
+    if (nearer != toward) {
+        off << QStringLiteral("%1 is %2 the text's %3 than the window's %4 is")
+                   .arg(back.name(),
+                        nearer ? QStringLiteral("nearer") : QStringLiteral("no nearer"),
+                        text.name(), window.name());
     }
-    if (contrast(tone, back) < contrast(tone, window)) {
+    // A tone further from the window's colour than the block's is loses the step's contrast
+    // exactly, on a block a step toward the text: the least rounding is let pass.
+    const qreal kept =
+        (toward ? contrast(tone, window) / step : contrast(tone, window)) * (1 - 1e-9);
+    if (contrast(tone, back) < kept) {
         off << QStringLiteral("the tone %1 is %2:1 on %3, %4:1 on the window's %5")
                    .arg(tone.name())
                    .arg(contrast(tone, back))
@@ -8384,25 +8392,46 @@ Window {
     }
 
     // A palette whose alternate base is far from its window's colour, as macOS's dark one gives a
-    // mid-grey, leaves the blocks a faint step from the window's colour all the same, in the
-    // details panel and in Settings' sample of them, with their tones reading on them at least as
-    // well as on the window.
+    // mid-grey, or is the window's own, leaves the blocks a faint step from the window's colour all
+    // the same, in the details panel and in Settings' sample of them: away from the window's text,
+    // with their tones reading on them at least as well as on the window, where the window's colour
+    // has room for the step, as it has near white, where the clamp takes a part of it; toward the
+    // text on a pure white or pure black window, which has none, their tones losing no more than
+    // the step.
+    void theBlocksStayAFaintStepFromTheWindowWhateverTheAlternateBase_data() {
+        QTest::addColumn<QColor>("window");
+        QTest::addColumn<QColor>("text");
+        QTest::addColumn<QColor>("alternateBase");
+        QTest::addColumn<bool>("toward");
+        QTest::newRow("a dark window, its alternate base a mid-grey")
+            << QColor("#1e1e1e") << QColor("#ffffff") << QColor("#8e8e8e") << false;
+        QTest::newRow("a window near white")
+            << QColor("#faf9f8") << QColor("#000000") << QColor("#eae9e8") << false;
+        QTest::newRow("a pure white window under black text")
+            << QColor("#ffffff") << QColor("#000000") << QColor("#ffffff") << true;
+        QTest::newRow("a pure black window under white text")
+            << QColor("#000000") << QColor("#ffffff") << QColor("#000000") << true;
+    }
     void theBlocksStayAFaintStepFromTheWindowWhateverTheAlternateBase() {
+        QFETCH(QColor, window);
+        QFETCH(QColor, text);
+        QFETCH(QColor, alternateBase);
+        QFETCH(bool, toward);
         Shown w({media()});
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
         QTRY_VERIFY(w.bridge.detail()->shown());
         const auto putBack = qScopeGuard([] { QGuiApplication::setPalette(QPalette()); });
         QPalette far;
-        far.setColor(QPalette::Window, QColor("#1e1e1e"));
-        far.setColor(QPalette::WindowText, QColor("#ffffff"));
-        far.setColor(QPalette::Base, QColor("#1e1e1e"));
-        far.setColor(QPalette::Text, QColor("#ffffff"));
-        far.setColor(QPalette::Button, QColor("#323232"));
-        far.setColor(QPalette::ButtonText, QColor("#ffffff"));
-        far.setColor(QPalette::AlternateBase, QColor("#8e8e8e"));
+        far.setColor(QPalette::Window, window);
+        far.setColor(QPalette::WindowText, text);
+        far.setColor(QPalette::Base, window);
+        far.setColor(QPalette::Text, text);
+        far.setColor(QPalette::Button, window);
+        far.setColor(QPalette::ButtonText, text);
+        far.setColor(QPalette::AlternateBase, alternateBase);
         QGuiApplication::setPalette(far);
-        QTRY_COMPARE(paletteColour(w, "alternateBase"), QColor("#8e8e8e"));
+        QTRY_COMPARE(paletteColour(w, "alternateBase"), alternateBase);
         for (const char *name : {"nowBlock", "fixedBlock", "sampleNow", "sampleFixed"}) {
             QQuickItem *block = w.item(name) ? w.item(name) : w.settingsItem(name);
             QVERIFY2(block, name);
@@ -8412,14 +8441,13 @@ Window {
                     ->property(role)
                     .value<QColor>();
             };
-            QTRY_COMPARE(colour("window"), QColor("#1e1e1e"));
-            QTRY_COMPARE(colour("windowText"), QColor("#ffffff"));
+            QTRY_COMPARE(colour("window"), window);
+            QTRY_COMPARE(colour("windowText"), text);
             auto *back = block->property("background").value<QQuickItem *>();
             QVERIFY2(back, name);
-            const auto off = [&colour, back, block] {
-                return notAFaintStep(colour("window"), colour("windowText"),
-                                     back->property("color").value<QColor>(),
-                                     block->property("tone").value<QColor>());
+            const auto off = [&window, &text, toward, back, block] {
+                return notAFaintStep(window, text, back->property("color").value<QColor>(),
+                                     block->property("tone").value<QColor>(), toward);
             };
             QTRY_VERIFY2(off().isEmpty(), qPrintable(QStringLiteral("%1: %2").arg(name, off())));
         }
