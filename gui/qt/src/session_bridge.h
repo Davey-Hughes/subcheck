@@ -88,8 +88,8 @@ class SessionBridge : public QObject {
     Q_PROPERTY(bool videoLoading READ videoLoading NOTIFY videoLoadingChanged)
     // The name the episodes list gives the file of an Open that the player last said shows, which
     // the popped-out video's title says: empty before the first shows, from a Close's hand-over
-    // until the next shows, and should the list not name the file, as it names every file an Open
-    // can come from, a finding of the view.
+    // until an Open handed over after it shows, and should the list not name the file, as it names
+    // every file an Open can come from, a finding of the view.
     Q_PROPERTY(QString videoLabel READ videoLabel NOTIFY videoLabelChanged)
 
 public:
@@ -343,7 +343,7 @@ private:
     // summary has no check waiting and no Open to follow.
     bool waitingForVideo() const;
     // The player's command from review, handed to the port; an Open uses up `openFollows`, and a
-    // Close leaves the video nameless.
+    // Close leaves the video nameless until the next Open.
     void handOver(const subcheck_ffi::PlayerCommand &command);
     // The video's name, as videoLabel says, said if it changes.
     void nameVideo(const QString &name);
@@ -397,8 +397,10 @@ private:
     std::optional<Found> found;
     // The count of the last Edit sent, until review answers it (editAnswered).
     std::optional<uint64_t> editAt;
-    // The name of the file the player last said shows, as videoLabel says.
+    // The name of the file the player last said shows, as videoLabel says; and whether a Close has
+    // been handed over since the last Open, which leaves the video nameless whatever shows.
     QString videoName;
+    bool videoClosed = false;
     bool opened = false;
     bool quitting = false;
     bool done = false;

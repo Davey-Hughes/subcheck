@@ -6644,6 +6644,44 @@ Window {
         QCOMPARE(fake.last(), "stop");
         fake.answer(w.player);
         QTRY_COMPARE(reports, 3);
+
+        // A Close made while an Open still settles leaves the video nameless, though that Open,
+        // which the player runs ahead of the Close, then lands and plays its file until the
+        // Close's stop; the next Open names its file again once it shows.
+        QTest::keyClick(w.window, Qt::Key_O);
+        QTRY_COMPARE(fake.last(), "get path");
+        QCOMPARE(answeredUpToTheLoad(fake, w.player, QString::fromStdString(other->file)),
+                 QString());
+        w.player.restarted();
+        QCOMPARE(w.bridge.videoLabel(), "E02");
+        QTRY_COMPARE(reports, 4);
+        QTest::keyClick(w.window, Qt::Key_K);
+        QTRY_COMPARE(w.bridge.selected(), 1);
+        QCOMPARE(QString::fromStdString(w.bridge.findings()->at(1)->file), e01);
+        QTest::keyClick(w.window, Qt::Key_O);
+        QTRY_COMPARE(fake.last(), "get path");
+        QCOMPARE(answeredUpToTheLoad(fake, w.player, e01, QString::fromStdString(other->file)),
+                 QString());
+        QTest::keyClick(w.window, Qt::Key_O, Qt::ShiftModifier);
+        QTRY_COMPARE(w.bridge.videoLabel(), QString());
+        QVERIFY(w.player.opening());
+        w.player.restarted();
+        QTRY_COMPARE(reports, 5);
+        QCOMPARE(w.bridge.videoLabel(), QString());
+        QTRY_COMPARE(fake.last(), "get path");
+        fake.answer(w.player, e01);
+        QCOMPARE(fake.last(), "stop");
+        fake.answer(w.player);
+        QTRY_COMPARE(reports, 6);
+        QCOMPARE(w.bridge.videoLabel(), QString());
+        QCOMPARE(video->title(), "subcheck");
+        QTest::keyClick(w.window, Qt::Key_O);
+        QTRY_COMPARE(fake.last(), "get path");
+        QCOMPARE(answeredUpToTheLoad(fake, w.player, e01), QString());
+        QCOMPARE(w.bridge.videoLabel(), QString());
+        w.player.restarted();
+        QCOMPARE(w.bridge.videoLabel(), "E01");
+        QTRY_COMPARE(reports, 7);
     }
 
     // While the video is out, its place in the details panel goes, and the row of decisions is the

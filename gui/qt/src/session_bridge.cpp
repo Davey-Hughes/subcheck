@@ -69,7 +69,9 @@ SessionBridge::SessionBridge(std::vector<std::string> selector, PlayerPort &play
     // The end's release ends any Open, and with it the animation.
     connect(&port, &PlayerPort::openingChanged, this, [this] { loading.set(waitingForVideo()); });
     connect(&port, &PlayerPort::shows, this, [this](const std::string &file) {
-        nameVideo(QString::fromStdString(files.labelOf(file).value_or(std::string())));
+        if (!videoClosed) {
+            nameVideo(QString::fromStdString(files.labelOf(file).value_or(std::string())));
+        }
     });
     connect(&loading, &LoadingFlag::shownChanged, this, &SessionBridge::videoLoadingChanged);
     // Queued: each event the pump reads is applied on this object's thread, in the pump's order.
@@ -614,10 +616,14 @@ void SessionBridge::leaveQuietEpisode() {
 void SessionBridge::handOver(const PlayerCommand &command) {
     // An Open is what the change's open_follows told of, so the port's own count of it takes over
     // from here; no other command is. The Open's file is named once the port says it shows, as
-    // mpv shows the file before it until then; a Close ends the name at once.
+    // mpv shows the file before it until then; a Close ends the name at once, and for good until
+    // the next Open: an Open the port still runs ahead of the Close, or a load of one that was
+    // late, can show its file after the hand-over, until the Close's stop ends it.
     if (std::holds_alternative<PlayerCommand::kOpen>(command.get_variant())) {
         openFollows = false;
+        videoClosed = false;
     } else if (std::holds_alternative<PlayerCommand::kClose>(command.get_variant())) {
+        videoClosed = true;
         nameVideo(QString());
     }
     port.run(command);
