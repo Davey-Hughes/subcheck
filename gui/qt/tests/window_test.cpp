@@ -28,6 +28,7 @@
 #include <QFontMetricsF>
 #include <QKeyEvent>
 #include <QKeySequence>
+#include <QMetaProperty>
 #include <QPalette>
 #include <QPointingDevice>
 #include <QQmlApplicationEngine>
@@ -4364,6 +4365,35 @@ Window {
         QCOMPARE(w.window->minimumHeight(), leastHeight);
         w.bridge.setFilter(0);
         QTRY_COMPARE(w.rows(), 2);
+
+        // Nor with the view's padding, which a style that draws its scroll bar beside the finding
+        // grows by the bar's width while the finding overflows, as KDE's does: at that padding the
+        // subtitle's first line is still whole at the least height; and a padding at which the
+        // label of what is in the subtitles now would take more lines, were the least height
+        // counted from it, leaves the least height as it was. The label's words are as wide as
+        // its width unwrapped, and no line holds more than its width of them.
+        QQuickItem *scrollBar = nullptr;
+        for (QQuickItem *child : scroll->childItems()) {
+            if (child->inherits("QQuickScrollBar") &&
+                child->property("orientation").toInt() == Qt::Vertical) {
+                scrollBar = child;
+            }
+        }
+        QQuickItem *nowLabel = Shown::item(w.item("nowBlock"), "blockLabel");
+        QVERIFY(scrollBar && nowLabel);
+        const QMetaProperty rightPadding =
+            scroll->metaObject()->property(scroll->metaObject()->indexOfProperty("rightPadding"));
+        const qreal padding = rightPadding.read(scroll).toReal();
+        rightPadding.write(scroll, padding + scrollBar->width());
+        QTRY_VERIFY2(offAtTheLeast().isEmpty(), qPrintable(offAtTheLeast()));
+        QCOMPARE(w.window->minimumHeight(), leastHeight);
+        const int labelLines = nowLabel->property("lineCount").toInt();
+        const qreal moreLines = nowLabel->implicitWidth() / (labelLines + 2);
+        rightPadding.write(scroll, padding + scrollBar->width() + nowLabel->width() - moreLines);
+        QTRY_VERIFY(w.videoNotLaidOut().isEmpty());
+        QCOMPARE(w.window->minimumHeight(), leastHeight);
+        QVERIFY(rightPadding.reset(scroll));
+        QTRY_VERIFY2(offAtTheLeast().isEmpty(), qPrintable(offAtTheLeast()));
 
         // Out, the least height no longer counts the video's place, and back in it does again.
         const int held = w.window->minimumHeight();

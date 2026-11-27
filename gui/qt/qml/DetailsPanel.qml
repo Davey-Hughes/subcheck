@@ -328,7 +328,12 @@ Control {
                         line: panel.detail.now
                         tone: panel.detail.oldTone
                         minLines: 2
-                        leastWidth: panel.narrowestWidth - scroll.leftPadding - scroll.rightPadding
+                        // At the panel's narrowest, with room for a scroll bar beside the block
+                        // whether one shows or not: a style that draws its bar beside the view's
+                        // content pads the view by it only while the finding overflows, and
+                        // counted from that padding, the window's least height would change from
+                        // one finding to the next.
+                        leastWidth: panel.narrowestWidth - scroll.ScrollBar.vertical.width
                                     - 2 * content.x
                         Layout.topMargin: 8
                         Layout.fillWidth: true
