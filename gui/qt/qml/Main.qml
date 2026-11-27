@@ -93,10 +93,9 @@ ApplicationWindow {
     // hence null first. It is sized, placed and shown in this same handler, where it was left or
     // else at its first size in the middle of this window's screen (WindowSettings::showVideo): let
     // go, the window stays where the container held it, at the pane's size, and would show there
-    // first. Out, it takes the keys, but not while an edit is open: this window keeps them then, so
-    // that the next letter goes on into the edit's field, as the pop-out's keys are this window's
-    // shortcuts, a letter among them, which would end the edit or quit. This window asks for them
-    // once the pop-out shows, as a platform can give a window the keys as it shows it.
+    // first. Out, it takes the keys, but not while an edit is open: this window keeps them then,
+    // and takes them back should the window manager give them to the pop-out as it shows it
+    // (videoWindow).
     function popOut() {
         if (!window.videoWindowed || window.videoOut) {
             return;
@@ -105,9 +104,7 @@ ApplicationWindow {
         videoWindow.transientParent = null;
         videoWindow.transientParent = window;
         window.settings.showVideo(videoWindow, window);
-        if (window.bridge.editing) {
-            window.requestActivate();
-        } else {
+        if (!window.bridge.editing) {
             videoWindow.requestActivate();
         }
     }
@@ -912,6 +909,18 @@ ApplicationWindow {
         minimumHeight: window.videoOut
                        ? Math.ceil(videoPane.leastWidth * 9 / 16
                                    + videoPane.barHeightAt(videoPane.leastWidth)) : 0
+        // Given the keys while an edit is open, however it came by them, it gives them back to the
+        // main window, so that the next letter goes on into the edit's field: its keys are the main
+        // window's shortcuts, a letter among them, which would end the edit or quit. A window
+        // manager gives the keys to a window it maps, or one clicked, after anything asked before.
+        // Which window has the keys tells, not whether it is active: transient for the main
+        // window, it reads active whenever that one does. Nothing here asks the keys for it while an
+        // edit is open, so that the two windows never ask for them in turn.
+        onActiveFocusItemChanged: {
+            if (videoWindow.activeFocusItem !== null && window.bridge.editing) {
+                window.requestActivate();
+            }
+        }
         onClosing: close => {
             close.accepted = false;
             window.popIn();

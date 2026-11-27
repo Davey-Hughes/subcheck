@@ -6693,10 +6693,10 @@ Window {
         QVERIFY(field);
         QTRY_VERIFY(field->hasActiveFocus());
 
-        video->requestActivate();
-        QVERIFY(QTest::qWaitForWindowActive(video));
-        QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(video));
+        // The press as a window manager answers it, giving the pop-out the keys, which offscreen
+        // does not.
         const qsizetype clicked = w.bridge.sent.size();
+        video->requestActivate();
         w.click(w.videoItem("video"));
         QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
         QTRY_VERIFY(field->hasActiveFocus());
@@ -6755,10 +6755,10 @@ Window {
     }
 
     // Pop Out while an edit is open, by View ▸ Pop Out Video or by the bar's Pop Out, leaves the
-    // main window the keys, so that the letters typed next go on into the edit's field and none of
-    // the main window's keys runs: given to the pop-out, they would be the main window's
-    // shortcuts, J's move and Q's quit among them, which would end the edit, dropping the wording,
-    // or quit.
+    // main window the keys, even once the window manager has given them to the pop-out, so that
+    // the letters typed next go on into the edit's field and none of the main window's keys runs:
+    // kept by the pop-out, they would be the main window's shortcuts, J's move and Q's quit among
+    // them, which would end the edit, dropping the wording, or quit.
     void popOutWhileAnEditIsOpenLeavesTheFieldItsKeys() {
         Shown w({media()});
         QVERIFY(w.start());
@@ -6782,6 +6782,16 @@ Window {
             // Long enough for an activation asked for to have landed.
             static_cast<void>(Shown::runUntil([] { return false; }, 100));
             QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+            QVERIFY(field->hasActiveFocus());
+            // Then the pop-out given the keys, as a window manager gives them to a window it has
+            // mapped, after anything the main window asked: they come back once, as neither
+            // window asks for them in turn.
+            QSignalSpy keys(qGuiApp, &QGuiApplication::focusWindowChanged);
+            video->requestActivate();
+            QTRY_VERIFY(!keys.isEmpty());
+            QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+            static_cast<void>(Shown::runUntil([] { return false; }, 200));
+            QCOMPARE(keys.size(), 2);
             QVERIFY(field->hasActiveFocus());
             QTest::keyClick(QGuiApplication::focusWindow(), 'j');
             QTest::keyClick(QGuiApplication::focusWindow(), 'q');
