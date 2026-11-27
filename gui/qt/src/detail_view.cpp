@@ -125,6 +125,14 @@ QColor DetailView::stateTone() const {
     return detail ? stateLook(detail->state, false).tone : QColor();
 }
 
+QStringList DetailView::glyphs() const {
+    QStringList each;
+    for (const State state : {State::kPending, State::kAccepted, State::kRejected}) {
+        each << stateLook(state, false).glyph;
+    }
+    return each;
+}
+
 QColor DetailView::oldTone() const { return tones(colours(), dark()).old; }
 
 QColor DetailView::newTone() const { return tones(colours(), dark()).added; }

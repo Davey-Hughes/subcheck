@@ -91,6 +91,22 @@ private slots:
                               "Starts at 0:12:34.450", "Also in 2 other places"}));
     }
 
+    // The glyphs the panel counts its kind row by are those of every decision, one each, whichever
+    // finding is selected, or none.
+    void theGlyphsAreEveryDecisionsGlyph() {
+        DetailView view;
+        const QStringList glyphs = view.glyphs();
+        QStringList each;
+        for (const State state : {State::kPending, State::kAccepted, State::kRejected}) {
+            Detail d = line();
+            d.state = state;
+            view.show(d);
+            each << view.glyph();
+            QCOMPARE(view.glyphs(), glyphs);
+        }
+        QCOMPARE(glyphs, each);
+    }
+
     void aTimingFindingIsItsStretchesAndWhereItOpens() {
         Detail d = line();
         d.at_ms = std::nullopt;

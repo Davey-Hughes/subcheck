@@ -4358,6 +4358,20 @@ Window {
         QTest::keyClick(w.window, Qt::Key_U);
         QTRY_COMPARE(w.bridge.detail()->stateWord(), "To review");
         QCOMPARE(sceneY(), kept);
+        // At the least height the subtitle's first line is whole whatever the decision, whose
+        // glyph a font can lack and draw from a taller fallback: accepted and rejected too.
+        for (const auto &[key, word] :
+             {std::pair{Qt::Key_A, "Accepted"}, std::pair{Qt::Key_R, "Rejected"}}) {
+            QTest::keyClick(w.window, key);
+            QTRY_COMPARE(w.bridge.detail()->stateWord(), word);
+            // Taken back before the check, so that a failed check still leaves the run as found.
+            static_cast<void>(
+                Shown::runUntil([&offAtTheLeast] { return offAtTheLeast().isEmpty(); }));
+            const QString off = offAtTheLeast();
+            QTest::keyClick(w.window, Qt::Key_U);
+            QTRY_COMPARE(w.bridge.detail()->stateWord(), "To review");
+            QVERIFY2(off.isEmpty(), qPrintable(QStringLiteral("%1: %2").arg(word, off)));
+        }
         // Nor does the least height change from one finding to the next, or with none shown.
         QCOMPARE(w.window->minimumHeight(), leastHeight);
         w.bridge.setFilter(3);

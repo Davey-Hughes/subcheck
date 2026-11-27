@@ -25,6 +25,9 @@ class DetailView : public QObject {
     Q_PROPERTY(QString glyph READ glyph NOTIFY changed)
     Q_PROPERTY(QString stateWord READ stateWord NOTIFY changed)
     Q_PROPERTY(QColor stateTone READ stateTone NOTIFY changed)
+    // Every glyph `glyph` can be, one for each decision, whichever finding is selected: the panel
+    // lays them out unseen to count its kind row as tall as the tallest makes it.
+    Q_PROPERTY(QStringList glyphs READ glyphs CONSTANT)
     // The palette's tones for the words a change takes out and puts in, which the panel's blocks
     // draw their bars and labels in.
     Q_PROPERTY(QColor oldTone READ oldTone NOTIFY changed)
@@ -69,6 +72,7 @@ public:
     QString glyph() const;
     QString stateWord() const;
     QColor stateTone() const;
+    QStringList glyphs() const;
     QColor oldTone() const;
     QColor newTone() const;
     bool edited() const;

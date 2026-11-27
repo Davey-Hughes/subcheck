@@ -56,12 +56,13 @@ Control {
     // under it the finding as it is laid out at the panel's narrowest, where the window counts its
     // least height, down to the first line of what is in the subtitles now, so that what Accept and
     // Reject act on can be read: the kind's row, whose badge is a line of the panel's text tall
-    // whatever the kind says, then that block's label and its line's first line, at the block's own
-    // font. The window counts it in its least height.
+    // whatever the kind says, and whose state can be taller (stateGlyphs), then that block's label
+    // and its line's first line, at the block's own font. The window counts it in its least height.
     readonly property real leastHeightUnderVideo: decisions.implicitHeight + scroll.topPadding
                                                   + scroll.bottomPadding + row.Layout.topMargin
-                                                  + badge.implicitHeight + finding.spacing
-                                                  + nowBlock.Layout.topMargin
+                                                  + Math.max(badge.implicitHeight,
+                                                             stateGlyphs.implicitHeight)
+                                                  + finding.spacing + nowBlock.Layout.topMargin
                                                   + nowBlock.leastFirstLineFoot
     // Whether a greyed episode's log shows alone, in the finding's place. Its end can move no
     // selection, as a click on the finding's own row does not, so the finding comes back at its
@@ -177,6 +178,19 @@ Control {
                 fixedBlock.answered();
             }
         }
+    }
+
+    // The state's glyphs laid out unseen on one line, in the font of the state's label: a glyph
+    // the font lacks is drawn from a fallback, whose line can be taller than the badge, and the
+    // kind row is then as tall as that. All of them, whatever the finding's decision, so that the
+    // least height is the same for every finding and for none.
+    Label {
+        id: stateGlyphs
+
+        text: panel.detail.glyphs.join(" ")
+        textFormat: Text.PlainText
+        visible: false
+        Accessible.ignored: true
     }
 
     ColumnLayout {
