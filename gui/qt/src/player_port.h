@@ -90,6 +90,12 @@ public:
 signals:
     void reported(const subcheck_ffi::PlayerReport &report);
     void openingChanged();
+    // mpv shows `file`, an Open's, as far as the port can tell: the Open's load has started to
+    // play, or reached the file's end as it settled, or its seek in the file mpv had open has
+    // landed. Not at the load's answer, nor at the end of its settle time with mpv having said
+    // nothing, as on a slow share: until the new file plays, mpv still shows the file before it.
+    // Said for that late load once it plays.
+    void shows(const std::string &file);
 
 private:
     using Answer = std::function<void(const QVariant &data)>;

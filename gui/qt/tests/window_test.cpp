@@ -2,8 +2,9 @@
 // over the runs seeded for it: keys pressed, menu items chosen and rows, entries and buttons
 // clicked as a person would, through the QML's handlers to review and back. Every test leaves the
 // runs as it found them. Its video pane makes a real mpv, which offscreen can never show video:
-// the player's own tests run it on a fake. Its settings are in a directory each window makes and
-// removes, never the user's.
+// the player's own tests run it on a fake, and so do the tests here that need an Open to land. Its
+// settings are in a directory each window makes and removes, never the user's.
+#include "fake_mpv.h"
 #include "key_names.h"
 #include "menu_keys.h"
 #include "mpv_item.h"
@@ -612,6 +613,31 @@ bool inList(QQuickItem *list, QQuickItem *entry) {
 QQuickItem *inEdit(const Shown &w, const char *name) {
     QQuickItem *fixed = w.item("fixedBlock");
     return fixed ? Shown::item(fixed, name) : nullptr;
+}
+
+// Answers as mpv would the Open the window's player has under way on `mpv`, from its first
+// request, where mpv is, to its load of `file`, which is left to land: mpv with `held` open (none
+// when empty) and paused. What the player asked, said, should it not be what the Open asks;
+// nothing once it is.
+QString answeredUpToTheLoad(FakeMpv &mpv, PlayerPort &player, const QString &file,
+                            const QString &held = {}) {
+    QStringList expected{QStringLiteral("get path")};
+    QStringList asked{mpv.last()};
+    if (held.isEmpty()) {
+        mpv.answer(player, {}, QStringLiteral("property unavailable"));
+    } else {
+        mpv.answer(player, held);
+        expected << QStringLiteral("get pause");
+        asked << mpv.last();
+        mpv.answer(player, true);
+    }
+    expected << QStringLiteral("set pause yes") << QStringLiteral("loadfile %1 replace").arg(file);
+    asked << mpv.last();
+    mpv.answer(player);
+    asked << mpv.last().left(expected.last().size());
+    mpv.answer(player);
+    return asked == expected ? QString()
+                             : QStringLiteral("asked %1").arg(asked.join(QStringLiteral(" | ")));
 }
 
 // `text` typed a key at a time into what has the window's keys.
@@ -6497,10 +6523,15 @@ Window {
         QVERIFY2(there(video).isEmpty(), qPrintable(there(video)));
     }
 
-    // The pop-out's title names the episode of the file the video shows, once it shows one, as
-    // review's last Open named it; with none shown, or once the video is closed, it is the app's
-    // name. The main window's title is the view's all the while.
+    // The pop-out's title names the episode of the file the video shows, as the episodes list names
+    // it, once mpv shows that file; with none shown, or once the video is closed, it is the app's
+    // name. While an Open of another episode's file waits for mpv, past its settle time too, as on
+    // a slow share, the title keeps the episode whose frame still shows. The main window's title is
+    // the view's all the while. On a fake mpv in the pane's place, which the test answers as mpv
+    // would, and made first, as the window's end stops it.
     void thePopOutsTitleNamesTheEpisodeItShows() {
+        FakeMpv fake;
+        int reports = 0;
         Shown w({media()});
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
@@ -6508,19 +6539,55 @@ Window {
         QQuickWindow *video = w.videoWindow();
         auto *mpv = qobject_cast<MpvItem *>(w.videoItem("video"));
         QVERIFY(video && mpv);
+        connect(&w.player, &PlayerPort::reported, this,
+                [&reports](const subcheck_ffi::PlayerReport &) { ++reports; });
+        w.player.attach(&fake);
+        w.player.ready();
         QCOMPARE(video->title(), "subcheck");
-        const QString label = QString::fromStdString(w.bridge.findings()->at(0)->label);
-        QCOMPARE(label, "E01");
+        const auto *first = w.bridge.findings()->at(0);
+        QCOMPARE(QString::fromStdString(first->label), "E01");
+        const QString e01 = QString::fromStdString(first->file);
         QTest::keyClick(w.window, Qt::Key_O);
-        QTRY_COMPARE(w.bridge.videoLabel(), label);
+        QTRY_COMPARE(fake.last(), "get path");
+        QCOMPARE(answeredUpToTheLoad(fake, w.player, e01), QString());
         QCOMPARE(video->title(), "subcheck");
+        w.player.restarted();
         mpv->heard(QStringLiteral("vo-configured"), true);
         QCOMPARE(video->title(), "E01 · subcheck");
         QCOMPARE(w.window->title(), w.bridge.title());
+        QTRY_COMPARE(reports, 1);
+
+        // The row's members, the second of which is the finding in E02.
+        QTest::keyClick(w.window, Qt::Key_Return);
+        QTRY_COMPARE(w.rows(), 4);
+        QTest::keyClick(w.window, Qt::Key_J);
+        QTest::keyClick(w.window, Qt::Key_J);
+        QTRY_COMPARE(w.bridge.selected(), 2);
+        const auto *other = w.bridge.findings()->at(2);
+        QCOMPARE(QString::fromStdString(other->label), "E02");
+        QTest::keyClick(w.window, Qt::Key_O);
+        QTRY_COMPARE(fake.last(), "get path");
+        QCOMPARE(answeredUpToTheLoad(fake, w.player, QString::fromStdString(other->file), e01),
+                 QString());
+        QCOMPARE(video->title(), "E01 · subcheck");
+        // Reported opened once its settle time is up, mpv having said nothing; still to show.
+        QTRY_COMPARE(reports, 2);
+        QVERIFY(w.player.opening());
+        QCOMPARE(w.bridge.videoLabel(), "E01");
+        QCOMPARE(video->title(), "E01 · subcheck");
+        w.player.restarted();
+        QCOMPARE(video->title(), "E02 · subcheck");
+        QCOMPARE(w.window->title(), w.bridge.title());
+
         QTest::keyClick(w.window, Qt::Key_O, Qt::ShiftModifier);
         QTRY_COMPARE(w.bridge.videoLabel(), QString());
         QCOMPARE(video->title(), "subcheck");
         QCOMPARE(w.window->title(), w.bridge.title());
+        QTRY_COMPARE(fake.last(), "get path");
+        fake.answer(w.player, QString::fromStdString(other->file));
+        QCOMPARE(fake.last(), "stop");
+        fake.answer(w.player);
+        QTRY_COMPARE(reports, 3);
     }
 
     // While the video is out, its place in the details panel goes, and the row of decisions is the
@@ -6734,8 +6801,10 @@ Window {
 
     // Show in Video while the video is out: the busy animation shows in the pop-out once the wait
     // has lasted its moment, in place of the quiet line, and the title follows the file once it
-    // shows.
+    // shows, which it does here once a fake mpv in the pane's place, which the test answers as mpv
+    // would and makes first, as the window's end stops it, has played the file.
     void showInVideoWhilePoppedOutLoadsThere() {
+        FakeMpv fake;
         Shown w({media()});
         QVERIFY(w.start());
         QTRY_COMPARE(w.rows(), 2);
@@ -6757,11 +6826,21 @@ Window {
         // A coarse timer can end a little early.
         QVERIFY2(pressed.elapsed() >= 475, qPrintable(QString::number(pressed.elapsed())));
         QVERIFY(!line->isVisible());
-        QCOMPARE(w.bridge.videoLabel(), "E01");
         QCOMPARE(video->title(), "subcheck");
+        w.player.attach(&fake);
+        w.player.ready();
+        QCOMPARE(answeredUpToTheLoad(fake, w.player,
+                                     QString::fromStdString(w.bridge.findings()->at(0)->file)),
+                 QString());
         mpv->heard(QStringLiteral("vo-configured"), true);
+        QCOMPARE(video->title(), "subcheck");
+        w.player.restarted();
         QCOMPARE(video->title(), "E01 · subcheck");
         QTest::keyClick(video, Qt::Key_O, Qt::ShiftModifier);
+        QTRY_COMPARE(fake.last(), "get path");
+        fake.answer(w.player, QString::fromStdString(w.bridge.findings()->at(0)->file));
+        QCOMPARE(fake.last(), "stop");
+        fake.answer(w.player);
         QTRY_COMPARE(w.bridge.statusLine(), "Video closed");
         QCOMPARE(video->title(), "subcheck");
     }

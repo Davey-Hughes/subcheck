@@ -241,6 +241,9 @@ void PlayerPort::answered(std::uint64_t id, const QString &error, const QVariant
 
 void PlayerPort::restarted() {
     // A file plays: a late load's has landed, or another move did after it.
+    if (late) {
+        emit shows(*late);
+    }
     stopWaitingForLate();
     if (landing == Landing::OnRestart) {
         landed();
@@ -423,8 +426,13 @@ void PlayerPort::load(const PlayerCommand::kOpen &command, bool resume) {
                   "loadfile's index argument needs mpv 0.38 or later");
     land({QStringLiteral("loadfile"), file, QStringLiteral("replace"), QStringLiteral("-1"),
           options},
-         Landing::OnRestart, true,
-         [this, resume] { finish(PlayerReport(PlayerReport::kOpened{!resume})); });
+         Landing::OnRestart, true, [this, resume, shown = moment.file] {
+             // Late, the file has yet to play: restarted says it shows once it does.
+             if (!late) {
+                 emit shows(shown);
+             }
+             finish(PlayerReport(PlayerReport::kOpened{!resume}));
+         });
 }
 
 // The seek's steps in core's order, the subtitle track and subtitles on, then the seek itself: any
@@ -446,7 +454,12 @@ void PlayerPort::seekTo(const PlayerCommand::kOpen &command, bool resume) {
             land(
                 {QStringLiteral("seek"), mpvTime(moment.start_us),
                  QStringLiteral("absolute+exact")},
-                Landing::OnRestart, false, [this, resume] { opened(resume); }, reload);
+                Landing::OnRestart, false,
+                [this, resume, shown = moment.file] {
+                    emit shows(shown);
+                    opened(resume);
+                },
+                reload);
         },
         reload);
 }

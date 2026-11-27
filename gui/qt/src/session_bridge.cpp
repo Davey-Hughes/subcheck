@@ -68,6 +68,9 @@ SessionBridge::SessionBridge(std::vector<std::string> selector, PlayerPort &play
     connect(&port, &PlayerPort::reported, this, &SessionBridge::report);
     // The end's release ends any Open, and with it the animation.
     connect(&port, &PlayerPort::openingChanged, this, [this] { loading.set(waitingForVideo()); });
+    connect(&port, &PlayerPort::shows, this, [this](const std::string &file) {
+        nameVideo(QString::fromStdString(files.labelOf(file).value_or(std::string())));
+    });
     connect(&loading, &LoadingFlag::shownChanged, this, &SessionBridge::videoLoadingChanged);
     // Queued: each event the pump reads is applied on this object's thread, in the pump's order.
     connect(this, &SessionBridge::eventArrived, this, &SessionBridge::apply, Qt::QueuedConnection);
@@ -609,21 +612,23 @@ void SessionBridge::leaveQuietEpisode() {
 }
 
 void SessionBridge::handOver(const PlayerCommand &command) {
-    std::optional<QString> name;
     // An Open is what the change's open_follows told of, so the port's own count of it takes over
-    // from here; no other command is.
-    if (const auto *open = std::get_if<PlayerCommand::kOpen>(&command.get_variant())) {
+    // from here; no other command is. The Open's file is named once the port says it shows, as
+    // mpv shows the file before it until then; a Close ends the name at once.
+    if (std::holds_alternative<PlayerCommand::kOpen>(command.get_variant())) {
         openFollows = false;
-        name = QString::fromStdString(files.labelOf(open->moment.file).value_or(std::string()));
     } else if (std::holds_alternative<PlayerCommand::kClose>(command.get_variant())) {
-        name = QString();
-    }
-    if (name && *name != videoName) {
-        videoName = *name;
-        emit videoLabelChanged();
+        nameVideo(QString());
     }
     port.run(command);
     loading.set(waitingForVideo());
+}
+
+void SessionBridge::nameVideo(const QString &name) {
+    if (name != videoName) {
+        videoName = name;
+        emit videoLabelChanged();
+    }
 }
 
 bool SessionBridge::waitingForVideo() const {

@@ -86,10 +86,10 @@ class SessionBridge : public QObject {
     // Open, has lasted a moment, until a moment after it ends.
     Q_PROPERTY(PlayerPort *player READ player CONSTANT)
     Q_PROPERTY(bool videoLoading READ videoLoading NOTIFY videoLoadingChanged)
-    // The name the episodes list gives the file of the last Open handed to the player, which the
-    // popped-out video's title says: empty before the first Open, once a Close has been handed
-    // over, and should the list not name the file, as it names every file an Open can come from, a
-    // finding of the view.
+    // The name the episodes list gives the file of an Open that the player last said shows, which
+    // the popped-out video's title says: empty before the first shows, from a Close's hand-over
+    // until the next shows, and should the list not name the file, as it names every file an Open
+    // can come from, a finding of the view.
     Q_PROPERTY(QString videoLabel READ videoLabel NOTIFY videoLabelChanged)
 
 public:
@@ -342,9 +342,11 @@ private:
     // hand-over from the check to the Open nor at a change review sends while the Open runs, whose
     // summary has no check waiting and no Open to follow.
     bool waitingForVideo() const;
-    // The player's command from review, handed to the port; an Open uses up `openFollows` and names
-    // the video, and a Close leaves it nameless.
+    // The player's command from review, handed to the port; an Open uses up `openFollows`, and a
+    // Close leaves the video nameless.
     void handOver(const subcheck_ffi::PlayerCommand &command);
+    // The video's name, as videoLabel says, said if it changes.
+    void nameVideo(const QString &name);
     void ended(const subcheck_ffi::Event::kEnded &end);
     template <typename Call> void guarded(Call call);
     void report(subcheck_ffi::PlayerReport report);
@@ -395,7 +397,7 @@ private:
     std::optional<Found> found;
     // The count of the last Edit sent, until review answers it (editAnswered).
     std::optional<uint64_t> editAt;
-    // The name of the file the last Open handed over, as videoLabel says.
+    // The name of the file the player last said shows, as videoLabel says.
     QString videoName;
     bool opened = false;
     bool quitting = false;

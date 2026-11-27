@@ -732,6 +732,65 @@ private slots:
         QCOMPARE(r.mpv.requests.size(), sent);
     }
 
+    // An Open's file is said to show once mpv plays it: a load as playback starts again, or as it
+    // reaches the file's end while it settles; a seek in the file mpv has open as it lands. Not as
+    // mpv answers the load, nor when the settle time ends with mpv having said nothing, as then mpv
+    // still shows the file before: that late load is said to show once it plays. A load that fails
+    // never shows.
+    void anOpensFileIsSaidToShowOnceMpvPlaysIt() {
+        QStringList shown;
+        Rig r(std::chrono::milliseconds(100));
+        QObject::connect(&r.player, &PlayerPort::shows, [&shown](const std::string &file) {
+            shown << QString::fromStdString(file);
+        });
+        r.player.ready();
+        r.player.run(open(moment("/m/a.mkv", 0, std::nullopt)));
+        r.openWith();
+        r.mpv.answer(r.player);
+        QCOMPARE(shown, QStringList());
+        r.player.restarted();
+        QCOMPARE(shown, QStringList{"/m/a.mkv"});
+
+        r.player.run(open(moment("/m/a.mkv", 5'000'000, std::nullopt), How::kSeek));
+        r.openWith("/m/a.mkv");
+        QCOMPARE(r.mpv.last(), "set sub-visibility yes");
+        r.mpv.answer(r.player);
+        QCOMPARE(r.mpv.last(), "seek 0:00:05.000000 absolute+exact");
+        r.mpv.answer(r.player);
+        QCOMPARE(shown.size(), 1);
+        r.player.restarted();
+        QCOMPARE(shown, (QStringList{"/m/a.mkv", "/m/a.mkv"}));
+
+        r.reports.clear();
+        r.player.run(open(moment("/m/b.mkv", 0, std::nullopt)));
+        r.openWith("/m/a.mkv");
+        r.mpv.answer(r.player);
+        QTRY_COMPARE_WITH_TIMEOUT(r.reports, QStringList{"opened paused"}, 2000);
+        QCOMPARE(shown.size(), 2);
+        r.player.restarted();
+        QCOMPARE(shown.last(), "/m/b.mkv");
+
+        r.player.run(open(moment("/m/c.mkv", 0, std::nullopt)));
+        r.openWith("/m/b.mkv");
+        r.mpv.answer(r.player);
+        r.player.ended(End::Finished);
+        QCOMPARE(shown.size(), 4);
+        QCOMPARE(shown.last(), "/m/c.mkv");
+
+        r.player.run(open(moment("/m/d.mkv", 0, std::nullopt)));
+        r.openWith("/m/c.mkv");
+        r.mpv.answer(r.player);
+        r.player.ended(End::Failed);
+        r.reports.clear();
+        r.player.run(open(moment("/m/e.mkv", 0, std::nullopt)));
+        r.openWith();
+        r.mpv.answer(r.player);
+        QTRY_COMPARE_WITH_TIMEOUT(r.reports, QStringList{"opened paused"}, 2000);
+        r.player.ended(End::Failed);
+        QCOMPARE(r.reports, (QStringList{"opened paused", "failed: could not open /m/e.mkv"}));
+        QCOMPARE(shown.size(), 4);
+    }
+
     // Whether an Open is under way, for the window's busy animation: from review's Open, its wait
     // for the pane among it, until it reports, and on through a load that reported opened when its
     // settle time ended, mpv having said nothing, until that plays, reaches its file's end, or mpv
