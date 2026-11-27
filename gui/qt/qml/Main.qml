@@ -93,7 +93,10 @@ ApplicationWindow {
     // hence null first. It is sized, placed and shown in this same handler, where it was left or
     // else at its first size in the middle of this window's screen (WindowSettings::showVideo): let
     // go, the window stays where the container held it, at the pane's size, and would show there
-    // first.
+    // first. Out, it takes the keys, but not while an edit is open: this window keeps them then, so
+    // that the next letter goes on into the edit's field, as the pop-out's keys are this window's
+    // shortcuts, a letter among them, which would end the edit or quit. This window asks for them
+    // once the pop-out shows, as a platform can give a window the keys as it shows it.
     function popOut() {
         if (!window.videoWindowed || window.videoOut) {
             return;
@@ -102,7 +105,11 @@ ApplicationWindow {
         videoWindow.transientParent = null;
         videoWindow.transientParent = window;
         window.settings.showVideo(videoWindow, window);
-        videoWindow.requestActivate();
+        if (window.bridge.editing) {
+            window.requestActivate();
+        } else {
+            videoWindow.requestActivate();
+        }
     }
 
     // Puts the video's window back in the details panel, and gives this window the keys, which

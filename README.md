@@ -178,20 +178,20 @@ a click does nothing on a timing fix. Return or Save and Accept saves the wordin
 finding; Esc or Cancel ends the edit and decides nothing; an empty wording is refused.
 While the field has the keys it takes the letters, Space, Return, Enter, Up, Down, PgUp, PgDn, Home,
 End, Esc and Ctrl+Z, which undoes the typing, never a decision. A click on the video or its control
-bar, in the window or popped out, leaves the keys with the field. Moving to another finding ends the
-edit, deciding nothing and dropping the wording typed. While an edit is open Accept, Reject, Back to
-Undecided, Edit Wording… and Undo wait; Save and Accept and Cancel end it. Edit ▸ Copy Subtitle Line
-(Ctrl+C, ⌘C on macOS) copies the selected finding's line as the subtitles have it now, and waits
-for a timing row, which has no line of its own. The Find box at the toolbar's right finds a row:
-Return in it selects the next row, among the rows the list shows, whose line, wording, episode, as
-the row names it, or reason holds the words typed, Shift+Return the previous one, going round past
-the last row to the first; with none, the box says `No match`. Its ‹ and › buttons do the same.
-Edit ▸ Find… (Ctrl+F, ⌘F on macOS) gives the box the keys with its words selected; Esc gives them
-back to the window, keeping the words, and so does a press of the pointer anywhere in the window
-outside the box while no menu is open; a press that closes an open menu leaves the keys where
-that menu gives them back. The box is greyed while an edit is open. In the sidebar, the
-reviews' list scrolls to the open review and the episodes' list keeps the marked episode in view,
-when the mark moves and when a new list comes in.
+bar, in the window or popped out, leaves the keys with the field, and so does View ▸ Pop Out Video.
+Moving to another finding ends the edit, deciding nothing and dropping the wording typed. While an
+edit is open Accept, Reject, Back to Undecided, Edit Wording… and Undo wait; Save and Accept and
+Cancel end it. Edit ▸ Copy Subtitle Line (Ctrl+C, ⌘C on macOS) copies the selected finding's line as
+the subtitles have it now, and waits for a timing row, which has no line of its own. The Find box at
+the toolbar's right finds a row: Return in it selects the next row, among the rows the list shows,
+whose line, wording, episode, as the row names it, or reason holds the words typed, Shift+Return the
+previous one, going round past the last row to the first; with none, the box says `No match`. Its ‹
+and › buttons do the same. Edit ▸ Find… (Ctrl+F, ⌘F on macOS) gives the box the keys with its words
+selected; Esc gives them back to the window, keeping the words, and so does a press of the pointer
+anywhere in the window outside the box while no menu is open; a press that closes an open menu
+leaves the keys where that menu gives them back. The box is greyed while an edit is open. In the
+sidebar, the reviews' list scrolls to the open review and the episodes' list keeps the marked
+episode in view, when the mark moves and when a new list comes in.
 
 Under the video, its control bar holds Play/Pause, which says whether the video plays, with the mark
 the video's corner shows and the word Paused or Playing, and plays or pauses it at a click, as Space

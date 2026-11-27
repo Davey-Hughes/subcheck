@@ -6661,6 +6661,53 @@ Window {
         QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
     }
 
+    // Pop Out while an edit is open, by View ▸ Pop Out Video or by the bar's Pop Out, leaves the
+    // main window the keys, so that the letters typed next go on into the edit's field and none of
+    // the main window's keys runs: given to the pop-out, they would be the main window's
+    // shortcuts, J's move and Q's quit among them, which would end the edit, dropping the wording,
+    // or quit.
+    void popOutWhileAnEditIsOpenLeavesTheFieldItsKeys() {
+        Shown w({media()});
+        QVERIFY(w.start());
+        QTRY_COMPARE(w.rows(), 2);
+        QObject *popOut = w.find("popOutVideo");
+        QQuickWindow *video = w.videoWindow();
+        QQuickItem *field = inEdit(w, "editField");
+        QVERIFY(popOut && video && field);
+        const qsizetype from = w.bridge.sent.size();
+        QTest::keyClick(w.window, Qt::Key_E);
+        QTRY_VERIFY(w.bridge.editing());
+        QTRY_VERIFY(field->hasActiveFocus());
+        QString wording = field->property("text").toString();
+        for (const bool byTheBar : {false, true}) {
+            if (byTheBar) {
+                w.click(w.videoItem("popButton"));
+            } else {
+                QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+            }
+            QTRY_VERIFY(w.window->property("videoOut").toBool());
+            // Long enough for an activation asked for to have landed.
+            static_cast<void>(Shown::runUntil([] { return false; }, 100));
+            QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+            QVERIFY(field->hasActiveFocus());
+            QTest::keyClick(QGuiApplication::focusWindow(), 'j');
+            QTest::keyClick(QGuiApplication::focusWindow(), 'q');
+            wording += "jq";
+            QCOMPARE(w.since(from), QStringList{"Edit"});
+            QVERIFY(w.bridge.editing());
+            QCOMPARE(field->property("text").toString(), wording);
+            QVERIFY(QMetaObject::invokeMethod(popOut, "trigger"));
+            QTRY_VERIFY(!w.window->property("videoOut").toBool());
+            QTRY_VERIFY(w.videoNotLaidOut().isEmpty());
+            QTRY_COMPARE(QGuiApplication::focusWindow(), static_cast<QWindow *>(w.window));
+            QVERIFY(field->hasActiveFocus());
+        }
+        // Ended unsaved, so that the run is left as found.
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!w.bridge.editing());
+        QCOMPARE(w.since(from), (QStringList{"Edit", "CancelEdit"}));
+    }
+
     // Ctrl+F typed in the pop-out gives the Find box the keys, and the main window with them, so
     // that the letters typed next go into the box and none of the main window's keys runs.
     void ctrlFTypedInThePopOutGivesTheFindBoxTheKeys() {
