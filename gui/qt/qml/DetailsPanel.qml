@@ -265,6 +265,15 @@ Control {
             // its longest line unwrapped, and scrolls sideways.
             contentWidth: availableWidth
 
+            // The room at the view's sides that a frame drawn around it takes, whatever the view
+            // holds: KDE's and Imagine's styles pad the view by their background's padding, KDE's
+            // only while that background shows. A style's background can be any item, so its
+            // padding is read by name, none where it has none.
+            readonly property real framePadding: {
+                const side = (frame, name) => frame?.visible ? (frame[name] ?? 0) : 0;
+                return side(background, "leftPadding") + side(background, "rightPadding");
+            }
+
             // The finding, then what the check said of the episode selected, which shows with no
             // finding selected too.
             ColumnLayout {
@@ -342,13 +351,13 @@ Control {
                         line: panel.detail.now
                         tone: panel.detail.oldTone
                         minLines: 2
-                        // At the panel's narrowest, with room for a scroll bar beside the block
-                        // whether one shows or not: a style that draws its bar beside the view's
-                        // content pads the view by it only while the finding overflows, and
-                        // counted from that padding, the window's least height would change from
-                        // one finding to the next.
-                        leastWidth: panel.narrowestWidth - scroll.ScrollBar.vertical.width
-                                    - 2 * content.x
+                        // At the panel's narrowest, inside the view's frame, with room for a
+                        // scroll bar beside the block whether one shows or not: a style that draws
+                        // its bar beside the view's content pads the view by it only while the
+                        // finding overflows, and counted from that padding, the window's least
+                        // height would change from one finding to the next.
+                        leastWidth: panel.narrowestWidth - scroll.framePadding
+                                    - scroll.ScrollBar.vertical.width - 2 * content.x
                         Layout.topMargin: 8
                         Layout.fillWidth: true
                     }

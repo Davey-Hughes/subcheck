@@ -4451,6 +4451,42 @@ Window {
         QVERIFY(rightPadding.reset(scroll));
         QTRY_VERIFY2(offAtTheLeast().isEmpty(), qPrintable(offAtTheLeast()));
 
+        // A frame drawn around the view, which a style pads the view by on each side whatever the
+        // finding, as KDE's does by its background's padding where it frames the view, narrows
+        // the width the label of what is in the subtitles now is counted at by as much, so that
+        // the label never takes more lines than the least height counts; one not drawn narrows
+        // nothing. The subtitle's first line is still whole at the least height either way.
+        QQuickItem *nowBlock = w.item("nowBlock");
+        const auto least = [nowBlock] { return nowBlock->property("leastWidth").toReal(); };
+        const qreal unframed = least();
+        QQmlComponent frameKind(&w.engine);
+        frameKind.setData("import QtQuick\nItem { property real leftPadding: 3; property real "
+                          "rightPadding: 5 }",
+                          QUrl());
+        std::unique_ptr<QObject> made(frameKind.create());
+        auto *frame = qobject_cast<QQuickItem *>(made.get());
+        QVERIFY2(frame, qPrintable(frameKind.errorString()));
+        const QMetaProperty leftPadding =
+            scroll->metaObject()->property(scroll->metaObject()->indexOfProperty("leftPadding"));
+        {
+            const auto unframe = qScopeGuard([scroll, &leftPadding, &rightPadding] {
+                scroll->setProperty("background", QVariant::fromValue<QQuickItem *>(nullptr));
+                leftPadding.reset(scroll);
+                rightPadding.reset(scroll);
+            });
+            QVERIFY(scroll->setProperty("background", QVariant::fromValue(frame)));
+            leftPadding.write(scroll, leftPadding.read(scroll).toReal() + 3);
+            rightPadding.write(scroll, padding + 5);
+            QTRY_COMPARE(least(), unframed - 8);
+            QTRY_VERIFY2(offAtTheLeast().isEmpty(), qPrintable(offAtTheLeast()));
+            QVERIFY(w.window->minimumHeight() >= leastHeight);
+            frame->setVisible(false);
+            QTRY_COMPARE(least(), unframed);
+        }
+        QTRY_COMPARE(least(), unframed);
+        QTRY_VERIFY2(offAtTheLeast().isEmpty(), qPrintable(offAtTheLeast()));
+        QCOMPARE(w.window->minimumHeight(), leastHeight);
+
         // Out, the least height no longer counts the video's place, and back in it does again.
         const int held = w.window->minimumHeight();
         const qreal place = slot->height();
