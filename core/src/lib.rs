@@ -13,6 +13,7 @@ pub mod group;
 pub mod iso639;
 pub mod list;
 pub mod llm;
+pub mod login_env;
 pub mod mkv;
 pub mod player;
 pub mod review;

@@ -133,7 +133,12 @@ subcheck_warnings(subcheck_window)
 qt_add_executable(subcheck-qt src/main.cpp)
 target_link_libraries(subcheck-qt PRIVATE subcheck_window subcheck_windowplugin)
 subcheck_warnings(subcheck-qt)
-install(TARGETS subcheck-qt)
+# On macOS the window is an app, which cmake --install makes self-contained and signs.
+if(APPLE)
+    include(macos/bundle.cmake)
+else()
+    install(TARGETS subcheck-qt)
+endif()
 
 enable_testing()
 

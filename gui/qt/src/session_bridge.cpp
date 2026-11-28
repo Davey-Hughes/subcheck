@@ -128,6 +128,8 @@ void SessionBridge::start() {
     pump->start();
 }
 
+void SessionBridge::setLaunchNote(const QString &note) { launchNote = note; }
+
 FindingsModel *SessionBridge::findings() { return &list; }
 
 FoldersModel *SessionBridge::folders() { return &reviews; }
@@ -657,6 +659,9 @@ void SessionBridge::fail(const std::string &why) {
     err << "subcheck-qt: " << said << '\n';
     err.flush();
     fatalText = QString::fromStdString(said);
+    if (!launchNote.isEmpty()) {
+        fatalText += QStringLiteral("\n\n") + launchNote;
+    }
     emit fatalChanged();
 }
 

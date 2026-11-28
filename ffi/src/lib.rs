@@ -11,7 +11,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use subcheck_core::review::{detail, model, progress, session, status, update};
-use subcheck_core::{apply, group, list, llm, mkv, player, scan, store};
+use subcheck_core::{apply, group, list, llm, login_env, mkv, player, scan, store};
 
 uniffi::setup_scaffolding!();
 
@@ -73,6 +73,19 @@ impl Session {
 #[uniffi::export]
 pub fn finish() {
     group::finish();
+}
+
+/// To call first in the app's main, before any thread starts: when macOS itself started the
+/// process, the login shell's environment over launchd's, so that the app finds what it does from
+/// a terminal ([`login_env`]). None at once otherwise, and off macOS. `Some` says why the
+/// environment could not be read.
+///
+/// The caller's contract, unchecked here as an export is a safe function: no other thread exists
+/// yet, as it sets environment variables, which another thread could be reading.
+#[uniffi::export]
+pub fn import_login_environment() -> Option<String> {
+    // SAFETY: the caller's, that it is called first in main, before any thread starts.
+    unsafe { login_env::import_login_environment() }
 }
 
 /// An entry by its findings' IDs, which outlast a remake of the rows: a row by every member's, so
@@ -4348,5 +4361,12 @@ mod tests {
             dir.path().join("ran").exists(),
             "the child ran nothing: {said}"
         );
+    }
+
+    /// Off macOS nothing is read, whatever started the process.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn import_login_environment_is_none_off_macos() {
+        assert_eq!(import_login_environment(), None);
     }
 }

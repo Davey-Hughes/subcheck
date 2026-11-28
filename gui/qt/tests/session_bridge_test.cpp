@@ -797,6 +797,19 @@ private slots:
         QCOMPARE(finished.count(), 1);
     }
 
+    // The shell read's failure, kept for the dialog: a Finder launch has no stderr to read it on.
+    void aFatalEndCarriesTheLaunchNote() {
+        Opened o({"no-such-run"});
+        const QString note =
+            "could not read the login shell's environment: /bin/zsh gave none within 5 s";
+        o.bridge.setLaunchNote(note);
+        QSignalSpy fatal(&o.bridge, &SessionBridge::fatalChanged);
+        o.bridge.start();
+        QTRY_COMPARE(fatal.count(), 1);
+        QCOMPARE(o.bridge.fatal(), "no run named no-such-run\n\n" + note);
+        QCOMPARE(o.err.str(), "subcheck-qt: no run named no-such-run\n");
+    }
+
     // An error that gives no reason still has words for its dialog, which is the way out: closing
     // the window closes it, and ends with 1. The error is made up, as no real one is empty.
     void aFatalEndWithNoReasonStillShowsItsDialog() {

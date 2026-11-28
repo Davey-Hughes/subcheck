@@ -22,6 +22,7 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,9 +34,9 @@ Q_IMPORT_QML_PLUGIN(SubcheckPlugin)
 namespace {
 
 // As the terminal's main, once the window and its session are gone: while a signal is ending the
-// process, its cleanup ends it, rather than this status before a job's groups are ended. The first
-// call into the library when the window failed before opening a session, so a contract mismatch
-// throws here, which the bridge would have caught at open. The process's status.
+// process, its cleanup ends it, rather than this status before a job's groups are ended. A contract
+// mismatch throws at each call into the library, which the bridge says when its open meets it; when
+// the window failed before opening a session, here. The process's status.
 int finishing(int status) {
     try {
         subcheck_ffi::finish();
@@ -59,6 +60,23 @@ int finishing(int status) {
 
 // The window, from its start to its end: its status.
 int run(int argc, char **argv) {
+    // First, while the process has no other thread for setting the environment to race with: when
+    // macOS itself started the window, the login shell's environment, so that it finds the store,
+    // its settings and the tools where it does from a terminal. Why that failed is said on stderr,
+    // and again in a fatal end's dialog, as a Finder launch has no stderr anyone reads.
+    std::optional<std::string> launchNote;
+    try {
+        launchNote = subcheck_ffi::import_login_environment();
+    } catch (const std::exception &e) {
+        // The first call into the library, so a contract mismatch throws here, as may any other
+        // failure of the call. Said, and let go, as the bindings check again at each call until
+        // the check passes: the bridge's open meets a mismatch again and says it in the dialog,
+        // where a throw out of here would end the process with no window to say it in.
+        std::cerr << "subcheck-qt: " << e.what() << '\n';
+    }
+    if (launchNote) {
+        std::cerr << "subcheck-qt: " << *launchNote << '\n';
+    }
     // MpvQt draws mpv's frames with OpenGL, which Qt Quick must be asked for before it makes the
     // first window: Linux's default, but not macOS's, which is Metal.
     QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
@@ -89,6 +107,9 @@ int run(int argc, char **argv) {
     // closing review, which can drop a decision still queued, and exits with 1. A session stalled
     // for good, on a hung mount say, still ends the window.
     SessionBridge bridge(std::move(selector), player, std::cout, std::cerr, 10s);
+    if (launchNote) {
+        bridge.setLaunchNote(QString::fromStdString(*launchNote));
+    }
     WindowSettings settings(WindowSettings::appStore(), QGuiApplication::platformName());
     QQmlApplicationEngine engine;
     engine.setInitialProperties({{QStringLiteral("bridge"), QVariant::fromValue(&bridge)},

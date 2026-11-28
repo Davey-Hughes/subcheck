@@ -59,6 +59,9 @@ Building needs a C compiler (SQLite is compiled in). At run time:
 | mkvtoolnix | `apply` |
 | ffmpeg | `audio` |
 
+On an Apple Silicon Mac, [the macOS app](#the-macos-app) is the window with the CLI inside it,
+ready to download.
+
 ## Development
 
 `dev/check-all.sh` runs what CI gates on (rustfmt, clippy, the tests), with the `apply` and `audio`
@@ -140,18 +143,20 @@ until the drag ends, when mpv draws it again at its new size. The window keeps i
 on X11 and macOS (Wayland lets no window place itself), its columns' widths, the episodes' order and
 its settings for the next run, in `$XDG_CONFIG_HOME/subcheck/subcheck-qt.conf` on Linux and macOS
 when `XDG_CONFIG_HOME` is an absolute path; otherwise in `~/.config/subcheck/subcheck-qt.conf` on
-Linux and in the app's preferences on macOS. At the end it prints the counts as the terminal does,
-but names a view of paths as its window's title does: by the first path's last part, and `+N` for
-the others. It exits with 1 after an error, or when review has not ended 10 s after quitting, and
-with 0 otherwise. The 10 s gives one decision's write time to wait out another process's lock on the
-store, which the store waits up to 5 s for. It is not enough for several writes queued behind a lock
-held longer, or for an open that waits on the lock more than once: the window then closes review,
-which can lose a decision not yet written. Quitting waits on no file's check: the window closes and
-prints the counts at once, even while a check, or mpv's open of a file, waits on a share that does
-not answer. While mpv's open waits on such a share, the process ends about 2 s after the quit
-without waiting for mpv, with the window's settings kept as any quit keeps them. On a FUSE share
-(sshfs, rclone) the process ends only once the share answers, whatever waits on it, as no program
-can end a request a FUSE share has taken; the window is gone all the same.
+Linux and in the app's preferences on macOS. `Subcheck.app` opened from the Finder takes
+`XDG_CONFIG_HOME` from the login shell, as [The macOS app](#the-macos-app) says. At the end it
+prints the counts as the terminal does, but names a view of paths as its window's title does: by the
+first path's last part, and `+N` for the others. It exits with 1 after an error, or when review has
+not ended 10 s after quitting, and with 0 otherwise. The 10 s gives one decision's write time to
+wait out another process's lock on the store, which the store waits up to 5 s for. It is not enough
+for several writes queued behind a lock held longer, or for an open that waits on the lock more than
+once: the window then closes review, which can lose a decision not yet written. Quitting waits on no
+file's check: the window closes and prints the counts at once, even while a check, or mpv's open of
+a file, waits on a share that does not answer. While mpv's open waits on such a share, the process
+ends about 2 s after the quit without waiting for mpv, with the window's settings kept as any quit
+keeps them. On a FUSE share (sshfs, rclone) the process ends only once the share answers, whatever
+waits on it, as no program can end a request a FUSE share has taken; the window is gone all the
+same.
 
 Each row of the findings is drawn in one of three styles, which View ▸ Rows (Compact, Two Lines,
 Rich) or the Rows button in the list's heading chooses, and which the window keeps for the next
@@ -218,7 +223,28 @@ cmake --build ~/.cache/mpvqt-build
 cmake --install ~/.cache/mpvqt-build
 cmake -S gui/qt -B ~/.cache/subcheck-qt-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$HOME/.local/opt/mpvqt;$(brew --prefix)"
 cmake --build ~/.cache/subcheck-qt-build --target subcheck-qt
-~/.cache/subcheck-qt-build/subcheck-qt
+~/.cache/subcheck-qt-build/subcheck-qt.app/Contents/MacOS/subcheck-qt
+```
+
+On macOS the build makes the window an app, `subcheck-qt.app` in the build directory, which the
+last command runs; it loads Qt, MpvQt and mpv from where they are installed. `cmake --install`
+makes [the macOS app](#the-macos-app) of it, `Subcheck.app`, with them inside, and
+`gui/qt/macos/check-bundle.sh` checks that app. The install copies the window and the CLI as the
+build directory holds them, and builds neither, so the first command builds both:
+
+```sh
+cmake --build ~/.cache/subcheck-qt-build --target subcheck-qt subcheck
+cmake --install ~/.cache/subcheck-qt-build --prefix ~/.cache/subcheck-qt-app
+gui/qt/macos/check-bundle.sh ~/.cache/subcheck-qt-app/Subcheck.app
+```
+
+The install runs Qt's deploy (macdeployqt), brings in what the deploy left outside the app, adds
+the CLI and the licences of what the app carries, sets the oldest macOS it runs on, and signs it
+ad hoc. `check-bundle.sh`'s header says what each of its checks proves. Its `starts` check opens
+the window, which a session over ssh cannot; there, name the others:
+
+```sh
+gui/qt/macos/check-bundle.sh ~/.cache/subcheck-qt-app/Subcheck.app self-contained signed cli licenses
 ```
 
 CI also checks `Cargo.lock` against the [RustSec](https://rustsec.org) advisory database, in a
@@ -232,6 +258,87 @@ workflow's header, the one place that describes it.
 This repository's history before 2026-11-02 was in
 [daveyutils](https://github.com/Davey-Hughes/daveyutils): a `(daveyutils#N)` in a commit message is
 that repository's pull request N.
+
+### The macOS app
+
+`Subcheck.app` is the window with the CLI, Qt, MpvQt and libmpv inside it, so that a Mac needs
+nothing from Homebrew to run it. It is for Apple Silicon and macOS 26.0 or later: its libraries were
+built for the macOS of the CI runner that made it, and its `Info.plist`'s `LSMinimumSystemVersion`
+names the newest macOS any file in it was built for, so that an older Mac refuses it in the Finder
+rather than failing as it loads.
+
+GitHub's CI job `gui-macos (Release)` makes the app on every push, checks it with `check-bundle.sh`
+(above) and keeps it 14 days, as the artifact `Subcheck-macos-arm64`. With
+[gh](https://cli.github.com) logged in to GitHub, which a download of an artifact needs, these take
+the app of the newest run on main that passed, and unpack it in the current directory:
+
+```sh
+run=$(gh run list --repo Davey-Hughes/subcheck --workflow ci.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run download "$run" --repo Davey-Hughes/subcheck --name Subcheck-macos-arm64
+ditto -x -k Subcheck-macos-arm64.zip .
+```
+
+The download is `Subcheck-macos-arm64.zip`, a zip made by `ditto`, which keeps the symbolic links
+inside the app's frameworks; `ditto -x -k` or a double-click in the Finder opens it into
+`Subcheck.app`, which can then go where you keep apps, such as /Applications. gh marks nothing it
+downloads as quarantined, so the app opens at once. A browser, signed in to GitHub, downloads the
+same artifact from the run's page, as a zip that holds `Subcheck-macos-arm64.zip`, and marks it as
+quarantined: macOS then refuses to open the app the first time, as Apple has not notarized it, and
+System Settings ▸ Privacy & Security offers Open Anyway for it after that refusal. Or clear the mark
+before the first open, with `xattr -dr com.apple.quarantine Subcheck.app`. Right-click ▸ Open does
+not get past the refusal.
+
+The app is signed ad hoc, not with a Developer ID. macOS knows an app signed ad hoc by its contents
+alone, so each build is a new app to its privacy prompts: the question it asks before an app reads
+the Desktop, Documents or Downloads folder, or a network or removable volume, comes again with each
+new build. The login shell the window runs as it starts (below) counts as the app: a startup file
+that reads one of those places brings the question up as the app opens, and a question left
+unanswered for 5 s ends the shell's read.
+
+The CLI is `Subcheck.app/Contents/MacOS/subcheck`. A link to it from a directory on your PATH makes
+it the `subcheck` command, and a new copy of the app in the same place updates the command:
+
+```sh
+ln -s /Applications/Subcheck.app/Contents/MacOS/subcheck ~/.local/bin/subcheck   # any directory on your PATH
+```
+
+Inside the app are the window, `Contents/MacOS/subcheck-qt`, and the CLI, both GPL-3.0-or-later;
+Qt 6.12's QtBase, Qt Declarative and Qt SVG, whose libraries are LGPL-3.0 or GPL; MpvQt 1.2.1,
+LGPL-2.1 or LGPL-3.0; and libmpv with the libraries it links, ffmpeg among them, as Homebrew builds
+them, which makes libmpv GPL-2.0-or-later and ffmpeg GPL-3.0-or-later. subcheck being
+GPL-3.0-or-later, the app may carry GPL and LGPL libraries. `Contents/Resources/licenses/` holds
+what passing them on asks for:
+
+- `manifest.tsv`, a line for each library in the app: its file, the project and version it is from,
+  its licence, where that version's source is, and the Homebrew formula that built it (MpvQt, which
+  CI builds, has none);
+- a directory for each of those projects, with its licence files;
+- `formulae/`, each of those formulae as Homebrew installed it, which says how the library was built
+  from that source;
+- `subcheck/LICENSE`;
+- `rust-crates.txt`, each Rust crate the window and the CLI are built from but subcheck's own, with
+  its version, licence and repository and the licence files it ships.
+
+The app does not carry the programs subcheck runs, which it finds on `PATH` ([Install](#install)):
+mkvtoolnix for `apply` and the terminal's `A`, the `mpv` program for the terminal's `o` (the window
+plays video with the libmpv inside the app), ffmpeg for `audio`, and the LLM's command or server for
+`scan` and the terminal's `c`.
+
+An app the Finder, the Dock or `open` starts gets the environment macOS gives apps, which has none
+of what your shell's startup files set: no Homebrew directories on `PATH`, and no `XDG_*` or
+`SUBCHECK_*` variables. So as it starts, the window runs your login shell once, as `$SHELL -l -i -c`
+(`/bin/zsh` when `SHELL` is not an absolute path), and takes every variable the shell prints but
+those of the shell and the terminal (`PWD`, `SHLVL`, `TERM`, `SSH_CONNECTION`, `TMUX` and the
+like; `SSH_AUTH_SOCK` is kept) and those that would load another copy of a library the app
+carries, or plugins and modules built for another copy (`DYLD_*`, `QT_PLUGIN_PATH`,
+`QML2_IMPORT_PATH` and the like). Those of a Vulkan driver or layer, `JAVA_HOME` and `LIBAACS_PATH`
+are kept, as a terminal launch keeps them. It then finds the store and its settings where subcheck
+does in a terminal. The shell has 5 s to print its environment and is
+stopped if it has not, so a startup file that hangs holds the window back that long and no more.
+When the read fails, the window goes on with macOS's environment, and should it then end in its
+error dialog (`no runs yet`, say), the dialog says why the read failed.
+Started from a terminal, as `Subcheck.app/Contents/MacOS/subcheck-qt`, the window keeps the
+terminal's environment and runs no shell.
 
 ## Review
 

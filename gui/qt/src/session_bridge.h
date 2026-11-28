@@ -100,6 +100,10 @@ public:
     // Opens the session and starts reading its events. Apart from the constructor, so that what
     // shows the first event is connected before it can come.
     void start();
+    // What went wrong as the window started, which a fatal end's dialog says after its own error:
+    // an app the Finder started has no stderr anyone reads, and the cause of the end may be this.
+    // Not said on `err` again, where main has said it.
+    void setLaunchNote(const QString &note);
 
     FindingsModel *findings();
     FoldersModel *folders();
@@ -391,4 +395,5 @@ private:
     bool quitting = false;
     bool done = false;
     QString fatalText;
+    QString launchNote;
 };

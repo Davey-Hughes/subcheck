@@ -56,9 +56,11 @@ jobs:
   # The Qt app on macOS, built and tested as the gui job in .forgejo/workflows/ci.yml does it,
   # less clang-format, which one platform is enough for, and the C++ floor, which is measured there
   # only, as the Rust's is. Its Release leg builds every target Release, its tests not run, as the
-  # README's macOS commands build the app Release; it is a leg of its own so that it runs beside
-  # the Debug build and its tests rather than after them. Like that job it does not gate, so look
-  # at both legs before merging, as at the macOS leg above. Keep the steps the two share in step.
+  # README's macOS commands build the app Release, then makes Subcheck.app of that build, checks it,
+  # starts it again with Homebrew moved aside, and uploads it; it is a leg of its own so that it
+  # runs beside the Debug build and its tests rather than after them. Like that job it does not
+  # gate, so look at both legs before merging, as at the macOS leg above. Keep the steps the two
+  # share in step.
   #
   # Unlike that job, it keeps the bindgen and the outside crates in GitHub's cache, as both come out
   # the same from one run to the next. The bindgen's key hashes this file, the install line's tag
@@ -164,3 +166,53 @@ jobs:
           key: ${{ steps.crates.outputs.cache-primary-key }}
       - if: matrix.build == 'Debug'
         run: ctest --test-dir build --output-on-failure --no-tests=error
+      # The app as cmake --install makes it on a Mac, from the Release build the app ships as. In
+      # the runner's temporary directory, outside the checkout, so that none of it is in build/ or
+      # the crate cache.
+      - name: Make the app
+        if: matrix.build == 'Release'
+        run: cmake --install build --prefix "$RUNNER_TEMP/app"
+      # The script, not steps of its own, so that a release workflow can run the same checks; its
+      # header says what each proves. The runner has a window server, so the window starts on
+      # cocoa, as from the Finder.
+      - name: Check the app
+        if: matrix.build == 'Release'
+        run: gui/qt/macos/check-bundle.sh "$RUNNER_TEMP/app/Subcheck.app"
+      # The app must need nothing from Homebrew, and self-contained proves that of the load
+      # commands alone: a bundled library may still open a file by a path into Homebrew's prefix
+      # that it was built with, which a start where Homebrew is finds. So the window starts, and the
+      # CLI runs, with the prefix moved aside, by the system's shell and tools alone. The runner is
+      # thrown away after the job, and the prefix goes back in a step that runs whatever happened,
+      # before the steps after it and the job's own post steps, which may run Homebrew's programs.
+      - name: Move Homebrew aside
+        if: matrix.build == 'Release'
+        shell: /bin/bash -e {0}
+        run: sudo mv /opt/homebrew /opt/homebrew-aside
+      - name: Check the app without Homebrew
+        if: matrix.build == 'Release'
+        shell: /bin/bash -e {0}
+        env:
+          PATH: /usr/bin:/bin:/usr/sbin:/sbin
+        run: gui/qt/macos/check-bundle.sh "$RUNNER_TEMP/app/Subcheck.app" starts cli
+      - name: Put Homebrew back
+        if: always() && matrix.build == 'Release'
+        shell: /bin/bash -e {0}
+        run: if [ -d /opt/homebrew-aside ]; then sudo mv /opt/homebrew-aside /opt/homebrew; fi
+      # Zipped by ditto, which keeps the frameworks' symbolic links and the execute bits that
+      # upload-artifact's own zip drops; --keepParent, so that the zip opens as Subcheck.app.
+      - name: Zip the app
+        if: matrix.build == 'Release'
+        run: ditto -c -k --keepParent "$RUNNER_TEMP/app/Subcheck.app" "$RUNNER_TEMP/Subcheck-macos-arm64.zip"
+      # Zipped once more by upload-artifact, as Subcheck-macos-arm64, so that gh run download and
+      # a browser hand over ditto's zip whole: gh's unzip turns a symbolic link into a plain file,
+      # so it must meet only the outer zip, which holds no links. Kept 14 days rather than GitHub's
+      # default of 90, as each run of the leg uploads another. A missing zip fails the step, where
+      # the action's default only warns and the leg would pass with nothing uploaded.
+      - name: Upload the app
+        if: matrix.build == 'Release'
+        uses: actions/upload-artifact@v7
+        with:
+          name: Subcheck-macos-arm64
+          path: ${{ runner.temp }}/Subcheck-macos-arm64.zip
+          retention-days: 14
+          if-no-files-found: error
